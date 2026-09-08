@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
@@ -66,6 +67,21 @@ func applyConfigCredentialRequestRetry(auth *coreauth.Auth, retry *int) {
 		auth.Metadata = make(map[string]any)
 	}
 	auth.Metadata["request_retry"] = max(0, *retry)
+}
+
+func applyConfigRequestScopedErrors(auth *coreauth.Auth, rules []config.RequestScopedErrorRule) {
+	if auth == nil || len(rules) == 0 {
+		return
+	}
+	copied := slices.Clone(rules)
+	for index := range copied {
+		copied[index].Match = slices.Clone(copied[index].Match)
+		copied[index].MatchRegexr = slices.Clone(copied[index].MatchRegexr)
+	}
+	if auth.Metadata == nil {
+		auth.Metadata = make(map[string]any)
+	}
+	auth.Metadata["request_scoped_errors"] = copied
 }
 
 // addConfigHeadersToAttrs adds header configuration to auth attributes.

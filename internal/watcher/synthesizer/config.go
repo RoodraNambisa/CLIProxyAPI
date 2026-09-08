@@ -32,6 +32,9 @@ func (s *ConfigSynthesizer) Synthesize(ctx *SynthesisContext) ([]*coreauth.Auth,
 	if errRetry := ctx.Config.ValidateCredentialRequestRetries(); errRetry != nil {
 		return nil, errRetry
 	}
+	if errRules := ctx.Config.ValidateRequestScopedErrorRules(); errRules != nil {
+		return nil, errRules
+	}
 
 	// Gemini API Keys
 	out = append(out, s.synthesizeGeminiKeys(ctx)...)
@@ -109,6 +112,7 @@ func (s *ConfigSynthesizer) synthesizeGeminiKeyEntries(ctx *SynthesisContext, en
 		}
 		ApplyAuthExcludedModelsMeta(a, cfg, entry.ExcludedModels, "apikey")
 		applyConfigCredentialRequestRetry(a, entry.RequestRetry)
+		applyConfigRequestScopedErrors(a, entry.RequestScopedErrors)
 		out = append(out, a)
 	}
 	return out
@@ -159,6 +163,7 @@ func (s *ConfigSynthesizer) synthesizeClaudeKeys(ctx *SynthesisContext) []*corea
 		}
 		ApplyAuthExcludedModelsMeta(a, cfg, ck.ExcludedModels, "apikey")
 		applyConfigCredentialRequestRetry(a, ck.RequestRetry)
+		applyConfigRequestScopedErrors(a, ck.RequestScopedErrors)
 		out = append(out, a)
 	}
 	return out
@@ -211,6 +216,7 @@ func (s *ConfigSynthesizer) synthesizeCodexKeys(ctx *SynthesisContext) []*coreau
 		}
 		ApplyAuthExcludedModelsMeta(a, cfg, ck.ExcludedModels, "apikey")
 		applyConfigCredentialRequestRetry(a, ck.RequestRetry)
+		applyConfigRequestScopedErrors(a, ck.RequestScopedErrors)
 		out = append(out, a)
 	}
 	return out
@@ -269,6 +275,7 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 				UpdatedAt:  now,
 			}
 			applyConfigCredentialRequestRetry(a, compat.RequestRetry)
+			applyConfigRequestScopedErrors(a, compat.RequestScopedErrors)
 			out = append(out, a)
 			createdEntries++
 		}
@@ -300,6 +307,7 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 				UpdatedAt:  now,
 			}
 			applyConfigCredentialRequestRetry(a, compat.RequestRetry)
+			applyConfigRequestScopedErrors(a, compat.RequestScopedErrors)
 			out = append(out, a)
 		}
 	}
@@ -365,6 +373,7 @@ func (s *ConfigSynthesizer) synthesizeVertexCompat(ctx *SynthesisContext) []*cor
 		}
 		ApplyAuthExcludedModelsMeta(a, cfg, compat.ExcludedModels, "apikey")
 		applyConfigCredentialRequestRetry(a, compat.RequestRetry)
+		applyConfigRequestScopedErrors(a, compat.RequestScopedErrors)
 		out = append(out, a)
 	}
 	return out
