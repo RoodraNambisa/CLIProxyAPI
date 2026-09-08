@@ -31,6 +31,7 @@ var (
 // ClientSecretAuthorization is an opaque local capability. It contains no
 // upstream credential or original caller key, and every returned body is owned.
 type ClientSecretAuthorization struct {
+	digest    [sha256.Size]byte
 	principal string
 	owner     callOwner
 	model     string
@@ -102,6 +103,7 @@ func (s *clientSecretStore) put(token string, authorization ClientSecretAuthoriz
 	if len(s.entries) >= clientSecretMaxEntries || issuerEntries >= clientSecretMaxEntriesPerIssuer {
 		return errClientSecretCapacity
 	}
+	authorization.digest = hash
 	s.entries[hash] = authorization.clone()
 	return nil
 }
@@ -128,6 +130,15 @@ func (s *clientSecretStore) remove(token, principal string) {
 	if a, exists := s.entries[hash]; exists && a.principal == principal {
 		delete(s.entries, hash)
 	}
+}
+
+// valid rechecks the exact grant before a new connection is committed. A
+// copied authorization cannot survive expiration, revocation or replacement.
+func (s *clientSecretStore) valid(a ClientSecretAuthorization) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	current, exists := s.entries[a.digest]
+	return !s.closed && exists && current.principal == a.principal && current.owner == a.owner && current.model == a.model && current.expiresAt.Equal(a.expiresAt) && current.expiresAt.After(s.now())
 }
 
 func (s *clientSecretStore) close() {
