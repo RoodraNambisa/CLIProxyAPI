@@ -5719,7 +5719,7 @@ func (s *Service) registerModelsForAuthWithState(a *coreauth.Auth, preserveTrans
 							UserDefined: false,
 							Thinking:    thinking,
 						}
-						applyConfiguredModelContextLength(info, m)
+						applyConfiguredModelCatalogMetadata(info, m)
 						ms = append(ms, info)
 					}
 					// Register and return
@@ -6606,12 +6606,7 @@ func buildConfigModels[T modelEntry](models []T, ownedBy, modelType string) []*M
 			DisplayName: display,
 			UserDefined: true,
 		}
-		if name != "" {
-			if upstream := registry.LookupStaticModelInfo(name); upstream != nil && upstream.Thinking != nil {
-				info.Thinking = upstream.Thinking
-			}
-		}
-		applyConfiguredModelContextLength(info, model)
+		applyConfiguredModelCatalogMetadata(info, model)
 		out = append(out, info)
 	}
 	return out

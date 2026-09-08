@@ -2,7 +2,7 @@ package cliproxy
 
 import "github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 
-func applyConfiguredModelContextLength(info *ModelInfo, model modelEntry) {
+func applyConfiguredModelCatalogMetadata(info *ModelInfo, model modelEntry) {
 	if info == nil {
 		return
 	}
@@ -11,6 +11,21 @@ func applyConfiguredModelContextLength(info *ModelInfo, model modelEntry) {
 		info.ContextLength = upstream.ContextLength
 		if info.ContextLength <= 0 {
 			info.ContextLength = upstream.InputTokenLimit
+		}
+		info.InputTokenLimit = upstream.InputTokenLimit
+		if info.InputTokenLimit <= 0 {
+			info.InputTokenLimit = upstream.ContextLength
+		}
+		// MaxCompletionTokens also controls executor defaults; only inherit the
+		// catalog output limit here so request behavior remains unchanged.
+		info.OutputTokenLimit = upstream.OutputTokenLimit
+		if info.OutputTokenLimit <= 0 {
+			info.OutputTokenLimit = upstream.MaxCompletionTokens
+		}
+		info.SupportedInputModalities = upstream.SupportedInputModalities
+		info.SupportedOutputModalities = upstream.SupportedOutputModalities
+		if info.Thinking == nil {
+			info.Thinking = upstream.Thinking
 		}
 	}
 	if limit := model.GetMaxContextLength(); limit > 0 {
