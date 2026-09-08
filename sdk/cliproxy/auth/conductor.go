@@ -3047,6 +3047,9 @@ func (m *Manager) register(ctx context.Context, auth *Auth, requireAbsent bool) 
 	if errWeight := ValidateAuthWeight(auth); errWeight != nil {
 		return nil, errWeight
 	}
+	if errRules := prepareAuthRequestScopedErrors(auth); errRules != nil {
+		return nil, errRules
+	}
 	auth.requestRefreshFamilyID = ""
 	auth.ID = strings.TrimSpace(auth.ID)
 	if auth.ID == "" {
@@ -3305,6 +3308,9 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 		return nil, errWeight
 	}
 	auth = auth.Clone()
+	if errRules := prepareAuthRequestScopedErrors(auth); errRules != nil {
+		return nil, errRules
+	}
 	auth.ID = strings.TrimSpace(auth.ID)
 	clearRuntimeProxy(auth)
 	auth.requestRefreshFamilyID = ""
@@ -4924,6 +4930,9 @@ func (m *Manager) installPreparedRequestAuthWithRuntimeMetadata(
 	}
 	if refreshAware || authWeightConfigurationChanged(expected, current) {
 		carryForwardConfiguredAuthWeight(current, candidate)
+	}
+	if refreshAware || requestScopedErrorConfigurationChanged(expected, current) {
+		carryForwardConfiguredRequestScopedErrors(current, candidate)
 	}
 	clearRuntimeProxy(candidate)
 	if chatGPTWebEmailChanged(current, candidate) && m.shouldPersistAuth(ctx, candidate) {
@@ -10117,6 +10126,9 @@ func authIsRuntimeOnly(auth *Auth) bool {
 }
 
 func (m *Manager) persistWithoutLock(ctx context.Context, auth *Auth, syncCurrentHash bool) error {
+	if errRules := prepareAuthRequestScopedErrors(auth); errRules != nil {
+		return errRules
+	}
 	if errWeight := ValidateAuthWeight(auth); errWeight != nil {
 		return errWeight
 	}
@@ -10143,6 +10155,9 @@ func (m *Manager) persistWithoutLock(ctx context.Context, auth *Auth, syncCurren
 }
 
 func (m *Manager) persistNewWithoutLock(ctx context.Context, auth *Auth) error {
+	if errRules := prepareAuthRequestScopedErrors(auth); errRules != nil {
+		return errRules
+	}
 	if errWeight := ValidateAuthWeight(auth); errWeight != nil {
 		return errWeight
 	}
@@ -12912,6 +12927,7 @@ func (m *Manager) applyRefreshedAuth(ctx context.Context, expected, refreshBasel
 		carryForwardConcurrentRefreshMetadata(refreshBaseline, current, refreshOutput, updated)
 	}
 	carryForwardConfiguredAuthWeight(current, updated)
+	carryForwardConfiguredRequestScopedErrors(current, updated)
 	credentialChanged := prepareRefreshedChatGPTWebCredentialReplacement(current, updated, time.Now())
 	if !credentialChanged {
 		carryForwardConcurrentRefreshRuntimeState(refreshBaseline, current, updated)
@@ -12944,6 +12960,7 @@ func (m *Manager) applyRefreshedAuth(ctx context.Context, expected, refreshBasel
 		carryForwardConcurrentRefreshMetadata(refreshBaseline, current, refreshOutput, updated)
 	}
 	carryForwardConfiguredAuthWeight(current, updated)
+	carryForwardConfiguredRequestScopedErrors(current, updated)
 	credentialChanged = prepareRefreshedChatGPTWebCredentialReplacement(current, updated, time.Now())
 	if !credentialChanged {
 		carryForwardConcurrentRefreshRuntimeState(refreshBaseline, current, updated)

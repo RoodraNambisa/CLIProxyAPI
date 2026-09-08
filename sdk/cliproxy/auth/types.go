@@ -234,6 +234,7 @@ type Auth struct {
 
 	chatGPTWebCredentialGeneration string
 	requestRefreshFamilyID         string
+	requestScopedErrorRules        *authRequestScopedErrorSnapshot
 }
 
 type authInstanceState struct {
@@ -473,7 +474,11 @@ func (a *Auth) Clone() *Auth {
 	if len(a.Metadata) > 0 {
 		copyAuth.Metadata = make(map[string]any, len(a.Metadata))
 		for key, value := range a.Metadata {
-			copyAuth.Metadata[key] = value
+			if key == "request_scoped_errors" || key == "request-scoped-errors" {
+				copyAuth.Metadata[key] = cloneRequestScopedRuleMetadata(value)
+			} else {
+				copyAuth.Metadata[key] = value
+			}
 		}
 	}
 	if len(a.ModelStates) > 0 {

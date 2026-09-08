@@ -2,6 +2,7 @@ package auth
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"reflect"
@@ -11,6 +12,48 @@ import (
 )
 
 var requestScopedRuleMetadataKeys = [...]string{"request_scoped_errors", "request-scoped-errors"}
+
+type authRequestScopedErrorSnapshot struct {
+	digest [32]byte
+	rules  *config.CompiledRequestScopedErrors
+}
+
+// The caller owns auth until publication. Unchanged persistence snapshots reuse
+// the compiled object; neither matching nor result persistence compiles regexes.
+func prepareAuthRequestScopedErrors(auth *Auth) error {
+	if auth == nil {
+		return nil
+	}
+	var source map[string]any
+	for _, key := range requestScopedRuleMetadataKeys {
+		if value, exists := auth.Metadata[key]; exists {
+			if source == nil {
+				source = make(map[string]any, 2)
+			}
+			source[key] = value
+		}
+	}
+	if source == nil {
+		if auth.requestScopedErrorRules != nil {
+			auth.requestScopedErrorRules = nil
+		}
+		return nil
+	}
+	encoded, err := json.Marshal(source)
+	if err != nil {
+		return fmt.Errorf("request-scoped-errors contains invalid rule data")
+	}
+	digest := sha256.Sum256(encoded)
+	if current := auth.requestScopedErrorRules; current != nil && current.digest == digest {
+		return nil
+	}
+	rules, err := compileAuthRequestScopedErrors(auth)
+	if err != nil {
+		return err
+	}
+	auth.requestScopedErrorRules = &authRequestScopedErrorSnapshot{digest: digest, rules: rules}
+	return nil
+}
 
 func compileAuthRequestScopedErrors(auth *Auth) (*config.CompiledRequestScopedErrors, error) {
 	if auth == nil {
@@ -87,6 +130,7 @@ func carryForwardConfiguredRequestScopedErrors(current, next *Auth) {
 			delete(next.Metadata, key)
 		}
 	}
+	next.requestScopedErrorRules = current.requestScopedErrorRules
 }
 
 func requestScopedErrorConfigurationChanged(baseline, current *Auth) bool {
