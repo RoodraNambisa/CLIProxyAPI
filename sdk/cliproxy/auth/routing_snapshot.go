@@ -20,6 +20,7 @@ type routingRequestPolicy struct {
 	priorityRPM        map[int]int
 	priorityMaxRetries map[int]int
 	strictAffinity     bool
+	oauthErrorRules    map[string]*config.CompiledRequestScopedErrors
 }
 
 type routingRequestPolicyKey struct{}

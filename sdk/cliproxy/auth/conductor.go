@@ -1168,7 +1168,11 @@ func (m *Manager) SetSelector(selector Selector) {
 		routing = cfg.Routing
 	}
 	routing.FillFirstRange = fillFirstRangeFromSelector(selector)
-	m.routingPolicy.Store(newRoutingRequestPolicy(m, selector, routing))
+	policy := newRoutingRequestPolicy(m, selector, routing)
+	if previous := m.routingPolicy.Load(); previous != nil {
+		policy.oauthErrorRules = previous.oauthErrorRules
+	}
+	m.routingPolicy.Store(policy)
 	m.mu.Unlock()
 	if m.scheduler != nil {
 		m.scheduler.setSelector(selector)
@@ -1279,6 +1283,10 @@ func (m *Manager) SetConfig(cfg *internalconfig.Config) {
 	if m == nil {
 		return
 	}
+	if errRules := cfg.ValidateRequestScopedErrorRules(); errRules != nil {
+		log.WithError(errRules).Warn("ignoring invalid request-scoped error configuration")
+		return
+	}
 	m.routingUpdateMu.Lock()
 	defer m.routingUpdateMu.Unlock()
 	m.setConfigLocked(cfg)
@@ -1288,6 +1296,10 @@ func (m *Manager) SetConfig(cfg *internalconfig.Config) {
 // Existing request snapshots keep their selector and priority rules together.
 func (m *Manager) SetConfigAndSelector(cfg *internalconfig.Config, selector Selector) {
 	if m == nil {
+		return
+	}
+	if errRules := cfg.ValidateRequestScopedErrorRules(); errRules != nil {
+		log.WithError(errRules).Warn("ignoring invalid request-scoped error configuration")
 		return
 	}
 	m.routingUpdateMu.Lock()
@@ -1314,12 +1326,16 @@ func (m *Manager) setConfigLocked(cfg *internalconfig.Config) {
 	if cfg == nil {
 		cfg = &internalconfig.Config{}
 	}
+	// Both public configuration setters validate before publishing any state.
+	oauthErrorRules, _ := cfg.CompileOAuthRequestScopedErrors()
 	if m.scheduler != nil {
 		m.scheduler.setRoutingConfig(cfg.Routing)
 	}
 	m.mu.Lock()
 	m.runtimeConfig.Store(cfg)
-	m.routingPolicy.Store(newRoutingRequestPolicy(m, m.selector, cfg.Routing))
+	policy := newRoutingRequestPolicy(m, m.selector, cfg.Routing)
+	policy.oauthErrorRules = oauthErrorRules
+	m.routingPolicy.Store(policy)
 	if m.backingPathAuthDir != strings.TrimSpace(cfg.AuthDir) {
 		m.rebuildBackingPathIndexLocked(cfg)
 	}
