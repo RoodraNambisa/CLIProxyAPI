@@ -13,6 +13,28 @@ type ModelCatalogSnapshot struct {
 	Providers map[string][]string
 }
 
+// GetOpenAIModelCatalog captures the unrestricted catalog and capability
+// metadata together, retaining the existing global metadata selection rules.
+func (r *ModelRegistry) GetOpenAIModelCatalog() ModelCatalogSnapshot {
+	r.mutex.RLock()
+	defer r.mutex.RUnlock()
+	now := time.Now()
+	models, _ := r.buildAvailableModelsLocked("openai", now)
+	catalog := ModelCatalogSnapshot{
+		Models:    models,
+		Metadata:  make(map[string]*ModelInfo, len(models)),
+		Providers: make(map[string][]string, len(models)),
+	}
+	for _, model := range models {
+		id, _ := model["id"].(string)
+		if registration := r.models[id]; registration != nil {
+			catalog.Metadata[id] = cloneModelInfo(registration.Info)
+			catalog.Providers[id] = r.modelProvidersLocked(id, now)
+		}
+	}
+	return catalog
+}
+
 // GetAvailableModelsForProviders returns one catalog snapshot using only the
 // allowed providers' metadata. An empty allowlist returns an empty catalog.
 func (r *ModelRegistry) GetAvailableModelsForProviders(handlerType string, allowedProviders []string) []map[string]any {

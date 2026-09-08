@@ -1155,7 +1155,10 @@ func (r *ModelRegistry) GetModelCount(modelID string) int {
 func (r *ModelRegistry) GetModelProviders(modelID string) []string {
 	r.mutex.RLock()
 	defer r.mutex.RUnlock()
+	return r.modelProvidersLocked(modelID, time.Now())
+}
 
+func (r *ModelRegistry) modelProvidersLocked(modelID string, now time.Time) []string {
 	registration, exists := r.models[modelID]
 	if !exists || registration == nil || len(registration.Providers) == 0 {
 		return nil
@@ -1166,7 +1169,6 @@ func (r *ModelRegistry) GetModelProviders(modelID string) []string {
 		count int
 	}
 	providers := make([]providerCount, 0, len(registration.Providers))
-	now := time.Now()
 	for name, count := range registration.Providers {
 		if !providerHasCatalogAvailability(registration, name, count, r.clientProviders, now) {
 			continue

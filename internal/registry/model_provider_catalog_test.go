@@ -122,3 +122,65 @@ func TestProviderCatalogCapabilitySnapshotIsIndependent(t *testing.T) {
 		t.Fatal("deletion changed a returned snapshot or used another provider")
 	}
 }
+
+func TestUnrestrictedCatalogKeepsExistingVisibilityAndMetadata(t *testing.T) {
+	r := newTestModelRegistry()
+	r.RegisterClient("one", "codex", []*ModelInfo{{ID: "shared", DisplayName: "First", Thinking: &ThinkingSupport{Levels: []string{"low"}}}})
+	r.RegisterClient("two", "xai", []*ModelInfo{{ID: "shared", DisplayName: "Last", Thinking: &ThinkingSupport{Levels: []string{"high"}}}})
+	for _, state := range []string{"active", "quota", "disabled", "removed"} {
+		switch state {
+		case "quota":
+			r.SetModelQuotaExceeded("one", "shared")
+			r.SuspendClientModel("two", "shared", "quota")
+		case "disabled":
+			r.SuspendClientModel("one", "shared", "disabled")
+			r.SuspendClientModel("two", "shared", "disabled")
+		case "removed":
+			r.UnregisterClient("two")
+			r.ResumeClientModel("one", "shared")
+		}
+		catalog := r.GetOpenAIModelCatalog()
+		if !reflect.DeepEqual(catalog.Models, r.GetAvailableModels("openai")) {
+			t.Fatalf("%s changed legacy catalog visibility", state)
+		}
+		for _, model := range catalog.Models {
+			id := model["id"].(string)
+			if !reflect.DeepEqual(catalog.Metadata[id], r.GetModelInfo(id, "")) || !reflect.DeepEqual(catalog.Providers[id], r.GetModelProviders(id)) {
+				t.Fatalf("%s changed metadata selection", state)
+			}
+		}
+	}
+}
+
+func TestUnrestrictedCatalogUpdatesAreAtomicAndCloned(t *testing.T) {
+	r := newTestModelRegistry()
+	register := func(value int) {
+		r.RegisterClient("client", "codex", []*ModelInfo{{ID: "model", DisplayName: fmt.Sprint(value), ContextLength: value, Thinking: &ThinkingSupport{Levels: []string{"low"}}}})
+	}
+	register(1)
+	original := r.GetOpenAIModelCatalog()
+	var readers sync.WaitGroup
+	for range 8 {
+		readers.Go(func() {
+			for range 100 {
+				catalog := r.GetOpenAIModelCatalog()
+				if len(catalog.Models) != 1 || catalog.Models[0]["display_name"] != catalog.Metadata["model"].DisplayName || catalog.Models[0]["context_length"] != catalog.Metadata["model"].ContextLength {
+					t.Error("mixed catalog revision")
+					return
+				}
+				catalog.Metadata["model"].Thinking.Levels[0] = "mutated"
+				catalog.Providers["model"][0] = "mutated"
+			}
+		})
+	}
+	for value := 2; value < 100; value++ {
+		register(value)
+	}
+	readers.Wait()
+	if original.Models[0]["display_name"] != "1" || original.Metadata["model"].ContextLength != 1 || original.Metadata["model"].Thinking.Levels[0] != "low" || original.Providers["model"][0] != "codex" {
+		t.Fatal("returned snapshot was mutated")
+	}
+	if r.GetModelInfo("model", "codex").Thinking.Levels[0] != "low" {
+		t.Fatal("caller modified registry capability metadata")
+	}
+}
