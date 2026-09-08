@@ -651,6 +651,15 @@ nonstream-keepalive-interval: 0
 # upstream model's catalog window. Invalid values reject the configuration.
 # Changes apply to later catalog queries without retiring credentials or clearing
 # their cooldowns. These declarations do not increase actual upstream capacity.
+# thinking: optional capability object; omission/null inherits the catalog
+# (OpenAI compatibility keeps its existing low/medium/high default).
+# Example: thinking: {levels: [low, medium, high, xhigh]}
+# Budget models: thinking: {min: 1024, max: 32768, zero-allowed: true, dynamic-allowed: true}
+# Budgets require 0 <= min <= max <= 2147483647; 0/0 declares no budget range.
+# Valid levels: none, minimal, low, medium, high, xhigh, max, auto. Empty lists
+# are allowed; names are normalized only in runtime snapshots. Invalid types,
+# ranges or levels reject saves. Changes affect later requests, not in-flight
+# retries; this declaration cannot add reasoning capabilities to an upstream.
 # API key entries also accept request-scoped-errors with the rule format above.
 # For OpenAI compatibility, put the rules on the provider entry.
 # codex-api-key:

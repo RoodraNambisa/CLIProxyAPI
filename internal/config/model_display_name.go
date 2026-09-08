@@ -41,6 +41,13 @@ func validateModelCatalogFieldsYAML(data []byte) error {
 			if !contextLengths {
 				continue
 			}
+			thinking, err := credentialYAMLField(model, "thinking", make(map[*yaml.Node]bool))
+			if err != nil {
+				return err
+			}
+			if err := validateModelThinkingYAML(thinking); err != nil {
+				return fmt.Errorf("models[%d].thinking: %w", index, err)
+			}
 			limit, err := credentialYAMLField(model, "max-context-length", make(map[*yaml.Node]bool))
 			if err != nil {
 				return err

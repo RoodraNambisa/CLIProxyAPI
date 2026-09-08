@@ -1925,6 +1925,8 @@ func (k ClaudeKey) GetBaseURL() string { return k.BaseURL }
 
 // ClaudeModel describes a mapping between an alias and the actual upstream model name.
 type ClaudeModel struct {
+	// Thinking overrides the model's declared reasoning capability; nil inherits.
+	Thinking *registry.ThinkingSupport `yaml:"thinking,omitempty" json:"thinking,omitempty"`
 	// MaxContextLength overrides the advertised window; zero inherits the catalog.
 	MaxContextLength int `yaml:"max-context-length,omitempty" json:"max-context-length,omitempty"`
 	// DisplayName is an optional catalog label; blank inherits the model label.
@@ -1939,11 +1941,12 @@ type ClaudeModel struct {
 	ForceMapping bool `yaml:"force-mapping,omitempty" json:"force-mapping,omitempty"`
 }
 
-func (m ClaudeModel) GetName() string          { return m.Name }
-func (m ClaudeModel) GetDisplayName() string   { return m.DisplayName }
-func (m ClaudeModel) GetMaxContextLength() int { return m.MaxContextLength }
-func (m ClaudeModel) GetAlias() string         { return m.Alias }
-func (m ClaudeModel) GetForceMapping() bool    { return m.ForceMapping }
+func (m ClaudeModel) GetName() string                        { return m.Name }
+func (m ClaudeModel) GetDisplayName() string                 { return m.DisplayName }
+func (m ClaudeModel) GetMaxContextLength() int               { return m.MaxContextLength }
+func (m ClaudeModel) GetAlias() string                       { return m.Alias }
+func (m ClaudeModel) GetForceMapping() bool                  { return m.ForceMapping }
+func (m ClaudeModel) GetThinking() *registry.ThinkingSupport { return m.Thinking }
 
 // CodexKey represents the configuration for a Codex API key,
 // including the API key itself and an optional base URL for the API endpoint.
@@ -1993,6 +1996,8 @@ func (k CodexKey) GetBaseURL() string { return k.BaseURL }
 
 // CodexModel describes a mapping between an alias and the actual upstream model name.
 type CodexModel struct {
+	// Thinking overrides the model's declared reasoning capability; nil inherits.
+	Thinking *registry.ThinkingSupport `yaml:"thinking,omitempty" json:"thinking,omitempty"`
 	// MaxContextLength overrides the advertised window; zero inherits the catalog.
 	MaxContextLength int `yaml:"max-context-length,omitempty" json:"max-context-length,omitempty"`
 	// DisplayName is an optional catalog label; blank inherits the model label.
@@ -2007,11 +2012,12 @@ type CodexModel struct {
 	ForceMapping bool `yaml:"force-mapping,omitempty" json:"force-mapping,omitempty"`
 }
 
-func (m CodexModel) GetName() string          { return m.Name }
-func (m CodexModel) GetDisplayName() string   { return m.DisplayName }
-func (m CodexModel) GetMaxContextLength() int { return m.MaxContextLength }
-func (m CodexModel) GetAlias() string         { return m.Alias }
-func (m CodexModel) GetForceMapping() bool    { return m.ForceMapping }
+func (m CodexModel) GetName() string                        { return m.Name }
+func (m CodexModel) GetDisplayName() string                 { return m.DisplayName }
+func (m CodexModel) GetMaxContextLength() int               { return m.MaxContextLength }
+func (m CodexModel) GetAlias() string                       { return m.Alias }
+func (m CodexModel) GetForceMapping() bool                  { return m.ForceMapping }
+func (m CodexModel) GetThinking() *registry.ThinkingSupport { return m.Thinking }
 
 // GeminiKey represents the configuration for a Gemini API key,
 // including optional overrides for upstream base URL, proxy routing, and headers.
@@ -2053,6 +2059,8 @@ func (k GeminiKey) GetBaseURL() string { return k.BaseURL }
 
 // GeminiModel describes a mapping between an alias and the actual upstream model name.
 type GeminiModel struct {
+	// Thinking overrides the model's declared reasoning capability; nil inherits.
+	Thinking *registry.ThinkingSupport `yaml:"thinking,omitempty" json:"thinking,omitempty"`
 	// MaxContextLength overrides the advertised window; zero inherits the catalog.
 	MaxContextLength int `yaml:"max-context-length,omitempty" json:"max-context-length,omitempty"`
 	// DisplayName is an optional catalog label; blank inherits the model label.
@@ -2067,11 +2075,12 @@ type GeminiModel struct {
 	ForceMapping bool `yaml:"force-mapping,omitempty" json:"force-mapping,omitempty"`
 }
 
-func (m GeminiModel) GetName() string          { return m.Name }
-func (m GeminiModel) GetDisplayName() string   { return m.DisplayName }
-func (m GeminiModel) GetMaxContextLength() int { return m.MaxContextLength }
-func (m GeminiModel) GetAlias() string         { return m.Alias }
-func (m GeminiModel) GetForceMapping() bool    { return m.ForceMapping }
+func (m GeminiModel) GetName() string                        { return m.Name }
+func (m GeminiModel) GetDisplayName() string                 { return m.DisplayName }
+func (m GeminiModel) GetMaxContextLength() int               { return m.MaxContextLength }
+func (m GeminiModel) GetAlias() string                       { return m.Alias }
+func (m GeminiModel) GetForceMapping() bool                  { return m.ForceMapping }
+func (m GeminiModel) GetThinking() *registry.ThinkingSupport { return m.Thinking }
 
 // OpenAICompatibility represents the configuration for OpenAI API compatibility
 // with external providers, allowing model aliases to be routed through OpenAI API format.
@@ -2138,11 +2147,12 @@ type OpenAICompatibilityModel struct {
 	Thinking *registry.ThinkingSupport `yaml:"thinking,omitempty" json:"thinking,omitempty"`
 }
 
-func (m OpenAICompatibilityModel) GetName() string          { return m.Name }
-func (m OpenAICompatibilityModel) GetDisplayName() string   { return m.DisplayName }
-func (m OpenAICompatibilityModel) GetMaxContextLength() int { return m.MaxContextLength }
-func (m OpenAICompatibilityModel) GetAlias() string         { return m.Alias }
-func (m OpenAICompatibilityModel) GetForceMapping() bool    { return m.ForceMapping }
+func (m OpenAICompatibilityModel) GetName() string                        { return m.Name }
+func (m OpenAICompatibilityModel) GetDisplayName() string                 { return m.DisplayName }
+func (m OpenAICompatibilityModel) GetMaxContextLength() int               { return m.MaxContextLength }
+func (m OpenAICompatibilityModel) GetAlias() string                       { return m.Alias }
+func (m OpenAICompatibilityModel) GetForceMapping() bool                  { return m.ForceMapping }
+func (m OpenAICompatibilityModel) GetThinking() *registry.ThinkingSupport { return m.Thinking }
 
 // LoadConfig reads a YAML configuration file from the given path,
 // unmarshals it into a Config struct, applies environment variable overrides,
@@ -2285,6 +2295,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	}
 	if errModels := cfg.ValidateModelContextLengths(); errModels != nil {
 		return nil, errModels
+	}
+	if errThinking := cfg.ValidateModelThinking(); errThinking != nil {
+		return nil, errThinking
 	}
 	// Hash remote management key if plaintext is detected (nested)
 	// We consider a value to be already hashed if it looks like a bcrypt hash ($2a$, $2b$, or $2y$ prefix).
@@ -3934,6 +3947,9 @@ func SaveConfigPreserveComments(configFile string, cfg *Config) error {
 	}
 	if errModels := cfg.ValidateModelContextLengths(); errModels != nil {
 		return errModels
+	}
+	if errThinking := cfg.ValidateModelThinking(); errThinking != nil {
+		return errThinking
 	}
 	if errMedia := cfg.Codex.LiveMediaRelay.Validate(); errMedia != nil {
 		return errMedia

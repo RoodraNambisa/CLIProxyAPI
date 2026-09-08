@@ -1,6 +1,10 @@
 package config
 
-import "strings"
+import (
+	"strings"
+
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
+)
 
 // VertexCompatKey represents the configuration for Vertex AI-compatible API keys.
 // This supports third-party services that use Vertex AI-style endpoint paths
@@ -51,6 +55,8 @@ func (k VertexCompatKey) GetBaseURL() string { return k.BaseURL }
 // VertexCompatModel represents a model configuration for Vertex compatibility,
 // including the actual model name and its alias for API routing.
 type VertexCompatModel struct {
+	// Thinking overrides the model's declared reasoning capability; nil inherits.
+	Thinking *registry.ThinkingSupport `yaml:"thinking,omitempty" json:"thinking,omitempty"`
 	// MaxContextLength overrides the advertised window; zero inherits the catalog.
 	MaxContextLength int `yaml:"max-context-length,omitempty" json:"max-context-length,omitempty"`
 	// DisplayName is an optional catalog label; blank inherits the model label.
@@ -65,11 +71,12 @@ type VertexCompatModel struct {
 	ForceMapping bool `yaml:"force-mapping,omitempty" json:"force-mapping,omitempty"`
 }
 
-func (m VertexCompatModel) GetName() string          { return m.Name }
-func (m VertexCompatModel) GetDisplayName() string   { return m.DisplayName }
-func (m VertexCompatModel) GetMaxContextLength() int { return m.MaxContextLength }
-func (m VertexCompatModel) GetAlias() string         { return m.Alias }
-func (m VertexCompatModel) GetForceMapping() bool    { return m.ForceMapping }
+func (m VertexCompatModel) GetName() string                        { return m.Name }
+func (m VertexCompatModel) GetDisplayName() string                 { return m.DisplayName }
+func (m VertexCompatModel) GetMaxContextLength() int               { return m.MaxContextLength }
+func (m VertexCompatModel) GetAlias() string                       { return m.Alias }
+func (m VertexCompatModel) GetForceMapping() bool                  { return m.ForceMapping }
+func (m VertexCompatModel) GetThinking() *registry.ThinkingSupport { return m.Thinking }
 
 // SanitizeVertexCompatKeys deduplicates and normalizes Vertex-compatible API key credentials.
 func (cfg *Config) SanitizeVertexCompatKeys() {

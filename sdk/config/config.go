@@ -4,7 +4,14 @@
 // embed CLIProxyAPI without importing internal packages.
 package config
 
-import internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+import (
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
+)
+
+type ThinkingSupport = registry.ThinkingSupport
+
+const MaxModelThinkingBudget = internalconfig.MaxModelThinkingBudget
 
 type SDKConfig = internalconfig.SDKConfig
 type APIKeyGroup = internalconfig.APIKeyGroup
@@ -72,9 +79,12 @@ const (
 const RecommendedMaxChatGPTWebManualReloginConcurrency = internalconfig.RecommendedMaxChatGPTWebManualReloginConcurrency
 
 type GeminiKey = internalconfig.GeminiKey
+type GeminiModel = internalconfig.GeminiModel
 type CodexKey = internalconfig.CodexKey
+type CodexModel = internalconfig.CodexModel
 type CodexCustomModel = internalconfig.CodexCustomModel
 type ClaudeKey = internalconfig.ClaudeKey
+type ClaudeModel = internalconfig.ClaudeModel
 type VertexCompatKey = internalconfig.VertexCompatKey
 type VertexCompatModel = internalconfig.VertexCompatModel
 type OpenAICompatibility = internalconfig.OpenAICompatibility
