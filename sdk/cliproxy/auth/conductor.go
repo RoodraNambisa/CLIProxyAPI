@@ -2556,10 +2556,11 @@ func (m *Manager) wrapStreamResult(ctx, resultCtx context.Context, auth *Auth, a
 	return &cliproxyexecutor.StreamResult{Headers: headers, Chunks: out}
 }
 
-func (m *Manager) executeStreamWithModelPool(ctx, resultCtx context.Context, executor ProviderExecutor, auth *Auth, affinityProviders []string, provider string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, routeModel string, execModels []string, pooled bool, aliasResult OAuthModelAliasResult, onDone func() bool) (*cliproxyexecutor.StreamResult, error) {
+func (m *Manager) executeStreamWithModelPool(ctx, resultCtx context.Context, executor ProviderExecutor, auth *Auth, affinityProviders []string, provider string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, routeModel string, execModels []string, pooled bool, aliasResult OAuthModelAliasResult, onDone func() bool, snapshots ...*apiKeyModelRoutingSnapshot) (*cliproxyexecutor.StreamResult, error) {
 	if executor == nil {
 		return nil, &Error{Code: "executor_not_found", Message: "executor not registered"}
 	}
+	routing := m.modelRoutingForAttempt(snapshots)
 	var lastErr error
 	for idx, execModel := range execModels {
 		if !requestBodyReplayable(ctx, opts) {
@@ -2576,6 +2577,7 @@ func (m *Manager) executeStreamWithModelPool(ctx, resultCtx context.Context, exe
 		resultModel := m.stateModelForExecution(auth, routeModel, execModel, pooled)
 		execReq := req
 		execReq.Model = execModel
+		execReq = attachResolvedAPIKeyModelInfo(routing, execReq, auth, effectiveExecutionRouteModel(routeModel, opts), execModel)
 		releaseMu := sync.Mutex{}
 		execOpts := opts
 		replayOpts := cliproxyexecutor.Options{Alt: opts.Alt, Metadata: opts.Metadata}
@@ -5729,7 +5731,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		publishErrorResponseSourceMetadata(opts.Metadata, errorResponseSourceForAuth(auth, provider))
 		opts = withSelectedAuthInstanceMetadata(opts, auth)
 
-		models, pooled, aliasResult, _ := m.preparedExecutionModelsWithAlias(auth, routeModel, opts)
+		models, pooled, aliasResult, routing := m.preparedExecutionModelsWithAlias(auth, routeModel, opts)
 		if len(models) == 0 {
 			if strictSessionAffinity {
 				return cliproxyexecutor.Response{}, withAuthErrorResponseSource(newStrictSessionAffinityError("session bound auth has no executable models"), auth, provider)
@@ -5752,6 +5754,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			resultModel := m.stateModelForExecution(auth, routeModel, upstreamModel, pooled)
 			execReq := baseReq
 			execReq.Model = upstreamModel
+			execReq = attachResolvedAPIKeyModelInfo(routing, execReq, auth, effectiveExecutionRouteModel(routeModel, opts), upstreamModel)
 			unregisterAttemptRelease := registerRequestBodyReleaseCallback(execCtx, opts, func([]byte) {
 				execReq.Payload = nil
 				opts.OriginalRequest = nil
@@ -6011,7 +6014,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 		publishErrorResponseSourceMetadata(opts.Metadata, errorResponseSourceForAuth(auth, provider))
 		opts = withSelectedAuthInstanceMetadata(opts, auth)
 
-		models, pooled := m.preparedExecutionModels(auth, routeModel, opts)
+		models, pooled, _, routing := m.preparedExecutionModelsWithAlias(auth, routeModel, opts)
 		if len(models) == 0 {
 			if strictSessionAffinity {
 				return cliproxyexecutor.Response{}, withAuthErrorResponseSource(newStrictSessionAffinityError("session bound auth has no executable models"), auth, provider)
@@ -6034,6 +6037,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			resultModel := m.stateModelForExecution(auth, routeModel, upstreamModel, pooled)
 			execReq := baseReq
 			execReq.Model = upstreamModel
+			execReq = attachResolvedAPIKeyModelInfo(routing, execReq, auth, effectiveExecutionRouteModel(routeModel, opts), upstreamModel)
 			unregisterAttemptRelease := registerRequestBodyReleaseCallback(execCtx, opts, func([]byte) {
 				execReq.Payload = nil
 				opts.OriginalRequest = nil
@@ -6285,7 +6289,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		auth = preparedAuth
 		publishErrorResponseSourceMetadata(opts.Metadata, errorResponseSourceForAuth(auth, provider))
 		opts = withSelectedAuthInstanceMetadata(opts, auth)
-		models, pooled, aliasResult, _ := m.preparedExecutionModelsWithAlias(auth, routeModel, opts)
+		models, pooled, aliasResult, routing := m.preparedExecutionModelsWithAlias(auth, routeModel, opts)
 		if len(models) == 0 {
 			if strictSessionAffinity {
 				return nil, withAuthErrorResponseSource(newStrictSessionAffinityError("session bound auth has no executable models"), auth, provider)
@@ -6314,7 +6318,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			continue
 		}
 		roundState.markAttempted(auth)
-		streamResult, errStream := m.executeStreamWithModelPool(runtimeCtx, execCtx, executor, auth, providers, provider, execReq, opts, routeModel, models, pooled, aliasResult, releaseExecution)
+		streamResult, errStream := m.executeStreamWithModelPool(runtimeCtx, execCtx, executor, auth, providers, provider, execReq, opts, routeModel, models, pooled, aliasResult, releaseExecution, routing)
 		unregisterAttemptRelease()
 		if errStream != nil {
 			retiredDuringExecution := releaseExecution()
@@ -6368,7 +6372,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 							}
 							continue
 						}
-						streamResult, errStream = m.executeStreamWithModelPool(retryCtx, execCtx, executor, auth, providers, provider, execReq, opts, routeModel, models, pooled, aliasResult, releaseRetry)
+						streamResult, errStream = m.executeStreamWithModelPool(retryCtx, execCtx, executor, auth, providers, provider, execReq, opts, routeModel, models, pooled, aliasResult, releaseRetry, routing)
 						if errStream == nil {
 							return streamResult, nil
 						}
