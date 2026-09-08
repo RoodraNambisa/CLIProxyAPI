@@ -4254,6 +4254,10 @@ func (m *Manager) LoadWithReport(ctx context.Context) (StoreLoadReport, error) {
 		}
 		auth.EnsureIndex()
 		loadedAuth := auth.Clone()
+		if errRules := prepareAuthRequestScopedErrors(loadedAuth); errRules != nil {
+			log.WithError(errRules).Warn("auth: skipping credential with invalid request-scoped error rules")
+			continue
+		}
 		projectionPath := ""
 		if loadedAuth.Attributes != nil {
 			projectionPath = strings.TrimSpace(loadedAuth.Attributes["path"])

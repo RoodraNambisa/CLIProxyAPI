@@ -34,6 +34,9 @@ func ApplyFileAuthProjection(auth *Auth, opts FileAuthProjectionOptions) error {
 	if errWeight := ValidateAuthWeight(&Auth{Metadata: auth.Metadata}); errWeight != nil {
 		return errWeight
 	}
+	if errRules := prepareAuthRequestScopedErrors(auth); errRules != nil {
+		return errRules
+	}
 	metadata := auth.Metadata
 	provider := strings.ToLower(strings.TrimSpace(metadataStringValue(metadata, "type")))
 	if provider == "" {
