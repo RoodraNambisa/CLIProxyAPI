@@ -470,9 +470,8 @@ type Manager struct {
 	// oauthModelAlias stores global OAuth model alias mappings (alias -> upstream name) keyed by channel.
 	oauthModelAlias atomic.Value
 
-	// apiKeyModelAlias caches resolved model alias mappings for API-key auths.
-	// Keyed by auth.ID, value is alias(lower) -> upstream model (including suffix).
-	apiKeyModelAlias atomic.Value
+	// apiKeyModelRouting publishes aliases and capabilities from one config.
+	apiKeyModelRouting atomic.Pointer[apiKeyModelRoutingSnapshot]
 
 	// modelPoolOffsets tracks per-auth alias pool rotation state.
 	modelPoolOffsets map[string]int
@@ -779,7 +778,7 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 	// atomic.Value requires non-nil initial value.
 	manager.runtimeConfig.Store(&internalconfig.Config{})
 	manager.routingPolicy.Store(newRoutingRequestPolicy(manager, selector, internalconfig.RoutingConfig{FillFirstRange: fillFirstRangeFromSelector(selector)}))
-	manager.apiKeyModelAlias.Store(apiKeyModelAliasTable(nil))
+	manager.apiKeyModelRouting.Store(&apiKeyModelRoutingSnapshot{config: manager.currentConfig()})
 	manager.scheduler = newAuthScheduler(selector)
 	manager.executionMetrics = &cliproxyexecutor.RequestExecutionMetrics{}
 	manager.refreshPersistence.Store(newRefreshPersistenceCoordinator(store))
@@ -1350,6 +1349,7 @@ func (m *Manager) setConfigLocked(cfg *internalconfig.Config) {
 	}
 	m.mu.Lock()
 	m.runtimeConfig.Store(cfg)
+	m.rebuildAPIKeyModelAliasLocked(cfg)
 	policy := newRoutingRequestPolicy(m, m.selector, cfg.Routing)
 	policy.oauthErrorRules = oauthErrorRules
 	m.routingPolicy.Store(policy)
@@ -1357,7 +1357,6 @@ func (m *Manager) setConfigLocked(cfg *internalconfig.Config) {
 		m.rebuildBackingPathIndexLocked(cfg)
 	}
 	m.mu.Unlock()
-	m.rebuildAPIKeyModelAliasFromRuntimeConfig()
 }
 
 func (m *Manager) lookupAPIKeyUpstreamModel(authID, requestedModel string) string {
@@ -1372,7 +1371,7 @@ func (m *Manager) lookupAPIKeyUpstreamModel(authID, requestedModel string) strin
 	if requestedModel == "" {
 		return ""
 	}
-	table, _ := m.apiKeyModelAlias.Load().(apiKeyModelAliasTable)
+	table := m.loadAPIKeyModelRouting().aliases
 	if table == nil {
 		return ""
 	}
@@ -2736,12 +2735,12 @@ func (m *Manager) rebuildAPIKeyModelAliasFromRuntimeConfig() {
 	if m == nil {
 		return
 	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
 	if cfg == nil {
 		cfg = &internalconfig.Config{}
 	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
 	m.rebuildAPIKeyModelAliasLocked(cfg)
 }
 
@@ -2749,7 +2748,7 @@ func (m *Manager) rebuildAPIKeyModelAliasLocked(cfg *internalconfig.Config) {
 	if m == nil {
 		return
 	}
-	m.apiKeyModelAlias.Store(buildAPIKeyModelAliasTable(m.auths, cfg))
+	m.apiKeyModelRouting.Store(buildAPIKeyModelRoutingSnapshot(m.auths, cfg))
 }
 
 func buildAPIKeyModelAliasTable(auths map[string]*Auth, cfg *internalconfig.Config) apiKeyModelAliasTable {
@@ -2824,17 +2823,23 @@ func (m *Manager) removeAPIKeyModelAliasForAuthLocked(auth *Auth) {
 	if !strings.EqualFold(strings.TrimSpace(kind), "api_key") {
 		return
 	}
-	current, _ := m.apiKeyModelAlias.Load().(apiKeyModelAliasTable)
-	if len(current) == 0 {
+	current := m.loadAPIKeyModelRouting()
+	if len(current.aliases) == 0 && len(current.capabilities) == 0 {
 		return
 	}
-	next := make(apiKeyModelAliasTable, len(current))
-	for id, aliases := range current {
+	next := make(apiKeyModelAliasTable, len(current.aliases))
+	for id, aliases := range current.aliases {
 		if id != auth.ID {
 			next[id] = aliases
 		}
 	}
-	m.apiKeyModelAlias.Store(next)
+	capabilities := make(apiKeyModelCapabilityTable, len(current.capabilities))
+	for id, models := range current.capabilities {
+		if id != auth.ID {
+			capabilities[id] = models
+		}
+	}
+	m.apiKeyModelRouting.Store(&apiKeyModelRoutingSnapshot{config: current.config, aliases: next, capabilities: capabilities})
 }
 
 func compileAPIKeyModelAliasForModels[T interface {
@@ -3212,10 +3217,10 @@ func (m *Manager) register(ctx context.Context, auth *Auth, requireAbsent bool) 
 	m.installAuthLocked(auth.ID, authClone)
 	cleanupPending := m.sessionCleanupPendingLocked(auth.ID)
 	installed := authClone.Clone()
-	m.mu.Unlock()
 	if isAPIKeyAuth(existingBeforePersist) || isAPIKeyAuth(auth) {
-		m.rebuildAPIKeyModelAliasFromRuntimeConfig()
+		m.rebuildAPIKeyModelAliasLocked(m.currentConfig())
 	}
+	m.mu.Unlock()
 	if m.scheduler != nil {
 		m.scheduler.upsertAuth(installed.Clone())
 	}
@@ -3436,10 +3441,10 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	m.installAuthLocked(auth.ID, authClone)
 	cleanupPending := m.sessionCleanupPendingLocked(auth.ID)
 	installed := authClone.Clone()
-	m.mu.Unlock()
 	if isAPIKeyAuth(existingBeforePersist) || isAPIKeyAuth(auth) {
-		m.rebuildAPIKeyModelAliasFromRuntimeConfig()
+		m.rebuildAPIKeyModelAliasLocked(m.currentConfig())
 	}
+	m.mu.Unlock()
 	if m.scheduler != nil {
 		m.scheduler.upsertAuth(installed.Clone())
 	}
@@ -4340,7 +4345,7 @@ func (m *Manager) LoadWithReport(ctx context.Context) (StoreLoadReport, error) {
 	for {
 		cfg = m.currentConfig()
 		indexState := buildManagerAuthIndexState(loaded, items, true, cfg)
-		aliasTable := buildAPIKeyModelAliasTable(loaded, cfg)
+		modelRouting := buildAPIKeyModelRoutingSnapshot(loaded, cfg)
 
 		m.mu.Lock()
 		if m.storeRevision != storeRevision {
@@ -4374,7 +4379,7 @@ func (m *Manager) LoadWithReport(ctx context.Context) (StoreLoadReport, error) {
 		}
 		m.auths = loaded
 		m.applyManagerAuthIndexStateLocked(indexState)
-		m.apiKeyModelAlias.Store(aliasTable)
+		m.apiKeyModelRouting.Store(modelRouting)
 		m.mu.Unlock()
 		break
 	}

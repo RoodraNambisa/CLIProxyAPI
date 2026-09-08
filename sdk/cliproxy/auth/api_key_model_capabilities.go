@@ -28,6 +28,28 @@ type apiKeyModelRoutingSnapshot struct {
 
 type resolvedAPIKeyModelInfo struct{ info *registry.ModelInfo }
 
+func (m *Manager) loadAPIKeyModelRouting() *apiKeyModelRoutingSnapshot {
+	if m != nil {
+		if snapshot := m.apiKeyModelRouting.Load(); snapshot != nil {
+			return snapshot
+		}
+	}
+	return &apiKeyModelRoutingSnapshot{config: &config.Config{}}
+}
+
+func buildAPIKeyModelRoutingSnapshot(auths map[string]*Auth, cfg *config.Config) *apiKeyModelRoutingSnapshot {
+	if cfg == nil {
+		cfg = &config.Config{}
+	}
+	capabilities := make(apiKeyModelCapabilityTable)
+	for id, auth := range auths {
+		if models := compileAPIKeyModelCapabilitiesForAuth(cfg, auth); len(models) > 0 {
+			capabilities[id] = models
+		}
+	}
+	return &apiKeyModelRoutingSnapshot{config: cfg, aliases: buildAPIKeyModelAliasTable(auths, cfg), capabilities: capabilities}
+}
+
 // ResolvedAPIKeyModelInfo returns a private copy of this attempt's capabilities.
 func ResolvedAPIKeyModelInfo(req cliproxyexecutor.Request) (*registry.ModelInfo, bool) {
 	bound, ok := req.Metadata[resolvedAPIKeyModelInfoMetadataKey].(resolvedAPIKeyModelInfo)

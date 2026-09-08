@@ -86,18 +86,20 @@ func TestDeleteUpdatesAPIKeyModelAliasIncrementally(t *testing.T) {
 		t.Fatal(errRegister)
 	}
 
-	table, _ := manager.apiKeyModelAlias.Load().(apiKeyModelAliasTable)
+	snapshot := *manager.loadAPIKeyModelRouting()
+	table := snapshot.aliases
 	withSentinel := make(apiKeyModelAliasTable, len(table)+1)
 	for id, aliases := range table {
 		withSentinel[id] = aliases
 	}
 	withSentinel["sentinel"] = map[string]string{"sentinel": "sentinel"}
-	manager.apiKeyModelAlias.Store(withSentinel)
+	snapshot.aliases = withSentinel
+	manager.apiKeyModelRouting.Store(&snapshot)
 
 	if errDelete := manager.Delete(WithSkipPersist(t.Context()), "oauth-auth"); errDelete != nil {
 		t.Fatal(errDelete)
 	}
-	afterOAuth, _ := manager.apiKeyModelAlias.Load().(apiKeyModelAliasTable)
+	afterOAuth := manager.loadAPIKeyModelRouting().aliases
 	if afterOAuth["sentinel"] == nil || afterOAuth["api-key-auth"] == nil {
 		t.Fatalf("non-API-key deletion rebuilt aliases: %#v", afterOAuth)
 	}
@@ -105,7 +107,7 @@ func TestDeleteUpdatesAPIKeyModelAliasIncrementally(t *testing.T) {
 	if errDelete := manager.Delete(WithSkipPersist(t.Context()), "api-key-auth"); errDelete != nil {
 		t.Fatal(errDelete)
 	}
-	afterAPIKey, _ := manager.apiKeyModelAlias.Load().(apiKeyModelAliasTable)
+	afterAPIKey := manager.loadAPIKeyModelRouting().aliases
 	if afterAPIKey["sentinel"] == nil {
 		t.Fatalf("API-key deletion rebuilt the full alias table: %#v", afterAPIKey)
 	}
