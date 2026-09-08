@@ -740,6 +740,10 @@ nonstream-keepalive-interval: 0
 # `same-account-only` keeps only states known to belong to the selected account, and `strip` removes all.
 # Upstream response states are always recorded and returned to the client. The default is `guard-cross-account`.
 # codex:
+#   # Boolean, default false (missing/null also disable new Live work).
+#   # Disabling blocks new sessions, client secrets and connections, cancels pending setup,
+#   # and keeps established sessions and authenticated hangup/cleanup available.
+#   live-enabled: false
 #   identity-confuse: false
 #   # Preserve explicit non-empty string prompt_cache_key values across identity remapping.
 #   # Defaults to false. Missing/invalid keys keep existing generation behavior.

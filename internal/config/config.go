@@ -543,6 +543,8 @@ type CodexHeaderDefaults struct {
 
 // CodexConfig configures provider-wide Codex request behavior.
 type CodexConfig struct {
+	// LiveEnabled admits new realtime sessions, credentials and connections.
+	LiveEnabled bool `yaml:"live-enabled" json:"live-enabled"`
 	// OptimizeMultiAgentV2 prepares collaboration tools for official Codex clients.
 	OptimizeMultiAgentV2 bool `yaml:"optimize-multi-agent-v2" json:"optimize-multi-agent-v2"`
 	// OrphanDelegationCompatibility repairs known orphan app delegation results in subagents.
@@ -2234,6 +2236,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	}
 	if errAlphaSearch := validateCodexAlphaSearchYAML(data); errAlphaSearch != nil {
 		return nil, errAlphaSearch
+	}
+	if errLive := validateCodexLiveEnabledYAML(data); errLive != nil {
+		return nil, errLive
 	}
 	if err = yaml.Unmarshal(data, &cfg); err != nil {
 		if optional {

@@ -22,6 +22,16 @@ func TestCodexAlphaSearchConfigChangeDetails(t *testing.T) {
 	}
 }
 
+func TestCodexLiveEnabledConfigChangeDetails(t *testing.T) {
+	oldCfg, newCfg := &config.Config{}, &config.Config{Codex: config.CodexConfig{LiveEnabled: true}}
+	if changes := BuildConfigChangeDetails(oldCfg, newCfg); len(changes) != 1 || changes[0] != "codex.live-enabled: false -> true" {
+		t.Fatal("live admission change was not reported")
+	}
+	if changes := BuildConfigChangeDetails(newCfg, newCfg); len(changes) != 0 {
+		t.Fatal("unchanged live admission produced a change")
+	}
+}
+
 func TestBuildConfigChangeDetails(t *testing.T) {
 	oldCfg := &config.Config{
 		Port:    8080,

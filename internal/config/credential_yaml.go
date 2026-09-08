@@ -11,6 +11,7 @@ import (
 )
 
 var credentialYAMLTypes = map[string]reflect.Type{
+	"codex":                       reflect.TypeFor[CodexConfig](),
 	"gemini-api-key":              reflect.TypeFor[GeminiKey](),
 	"interactions-api-key":        reflect.TypeFor[GeminiKey](),
 	"claude-api-key":              reflect.TypeFor[ClaudeKey](),
@@ -135,7 +136,7 @@ func matchRequestScopedErrorYAMLRule(original []*yaml.Node, used []bool, target 
 	return -1
 }
 
-// Materialize credential aliases and merges before updating fields. Otherwise
+// Materialize credential and Codex policy aliases before updating fields. Otherwise
 // deleting a known field can reintroduce its old value from an inherited map.
 func prepareCredentialYAMLForSave(root *yaml.Node) error {
 	for name := range credentialYAMLTypes {
