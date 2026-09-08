@@ -1283,6 +1283,10 @@ func (m *Manager) SetConfig(cfg *internalconfig.Config) {
 	if m == nil {
 		return
 	}
+	if errModels := cfg.ValidateModelContextLengths(); errModels != nil {
+		log.WithError(errModels).Warn("ignoring invalid model context length configuration")
+		return
+	}
 	if errRules := cfg.ValidateRequestScopedErrorRules(); errRules != nil {
 		log.WithError(errRules).Warn("ignoring invalid request-scoped error configuration")
 		return
@@ -1296,6 +1300,10 @@ func (m *Manager) SetConfig(cfg *internalconfig.Config) {
 // Existing request snapshots keep their selector and priority rules together.
 func (m *Manager) SetConfigAndSelector(cfg *internalconfig.Config, selector Selector) {
 	if m == nil {
+		return
+	}
+	if errModels := cfg.ValidateModelContextLengths(); errModels != nil {
+		log.WithError(errModels).Warn("ignoring invalid model context length configuration")
 		return
 	}
 	if errRules := cfg.ValidateRequestScopedErrorRules(); errRules != nil {
