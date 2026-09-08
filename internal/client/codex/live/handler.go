@@ -2,7 +2,9 @@ package live
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
+	"io"
 	"net/http"
 	"strings"
 	"sync"
@@ -34,11 +36,13 @@ type Handler struct {
 	websocketBaseURL string
 	calls            *callStore
 	callURL          string
+	clientSecrets    *clientSecretStore
+	secretRandom     io.Reader
 }
 
 func NewHandler(cfg *config.Config, manager *auth.Manager) *Handler {
 	ctx, cancel := context.WithCancel(context.Background())
-	h := &Handler{manager: manager, root: ctx, shutdown: cancel, websocketBaseURL: "wss://api.openai.com/v1", calls: newCallStore(), callURL: "https://chatgpt.com/backend-api/codex/realtime/calls?intent=quicksilver&architecture=avas"}
+	h := &Handler{manager: manager, root: ctx, shutdown: cancel, websocketBaseURL: "wss://api.openai.com/v1", calls: newCallStore(), callURL: "https://chatgpt.com/backend-api/codex/realtime/calls?intent=quicksilver&architecture=avas", clientSecrets: newClientSecretStore(), secretRandom: rand.Reader}
 	h.UpdateConfig(cfg)
 	return h
 }
@@ -76,6 +80,7 @@ func (h *Handler) Close() {
 	h.shutdown()
 	h.updateMu.Unlock()
 	h.calls.close()
+	h.clientSecrets.close()
 }
 
 type liveRequest struct {
