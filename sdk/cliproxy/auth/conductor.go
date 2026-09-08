@@ -9676,6 +9676,9 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 }
 
 func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, error) {
+	if ctx != nil && ctx.Err() != nil {
+		return nil, nil, ctx.Err()
+	}
 	m.triggerDueChatGPTWebImageQuotaRefreshes([]string{provider}, model, opts, tried, nil, false)
 	if !m.useSchedulerFastPath(ctx) {
 		auth, executor, errPick := m.pickNextLegacy(ctx, provider, model, opts, tried)
@@ -9907,6 +9910,9 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 }
 
 func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}, pickAllowed ...func(*Auth) bool) (*Auth, ProviderExecutor, string, error) {
+	if ctx != nil && ctx.Err() != nil {
+		return nil, nil, "", ctx.Err()
+	}
 	var allowed func(*Auth) bool
 	if len(pickAllowed) > 0 {
 		allowed = pickAllowed[0]
