@@ -46,7 +46,11 @@ func (h *Handler) HandleSideband(c *gin.Context) {
 		return
 	}
 	owner, _ := requestCallOwner(c)
-	call, busy := h.calls.claim(id, owner)
+	secretPrincipal := ""
+	if grant, temporary := clientSecretAuthorization(c); temporary {
+		secretPrincipal = grant.principal
+	}
+	call, busy := h.calls.claimForGrant(id, owner, secretPrincipal)
 	if busy {
 		r.fail(c, nil, nil, http.StatusConflict, "Realtime call already has an active sideband connection", "invalid_request_error", "realtime_call_busy", nil, nil)
 		return

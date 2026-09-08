@@ -183,3 +183,26 @@ func (p callPayload) withModel(model string) (callPayload, error) {
 	}
 	return callPayload{body: body, contentType: "application/json", model: model}, errJSON
 }
+
+func (p callPayload) withClientSecret(grant ClientSecretAuthorization) (callPayload, error) {
+	var payload map[string]json.RawMessage
+	if p.contentType == "application/json" {
+		var errObject error
+		payload, errObject = callJSONObject(p.body, "call")
+		if errObject != nil {
+			return callPayload{}, errObject
+		}
+	} else {
+		sdp, _ := json.Marshal(string(p.body))
+		payload = map[string]json.RawMessage{"sdp": sdp}
+	}
+	payload["session"] = append(json.RawMessage(nil), grant.session...)
+	if _, exists := payload["model"]; exists {
+		payload["model"], _ = json.Marshal(grant.model)
+	}
+	body, errJSON := json.Marshal(payload)
+	if len(body) > maxCallBodySize {
+		return callPayload{}, errCallBodyTooLarge
+	}
+	return callPayload{body: body, contentType: "application/json", model: grant.model}, errJSON
+}

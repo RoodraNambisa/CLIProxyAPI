@@ -42,6 +42,19 @@ func (h *Handler) HandleCall(c *gin.Context) {
 		return
 	}
 	owner, _ := requestCallOwner(c)
+	secretPrincipal := ""
+	if grant, temporary := clientSecretAuthorization(c); temporary {
+		payload, errPayload = payload.withClientSecret(grant)
+		if errPayload != nil {
+			status := http.StatusBadRequest
+			if errors.Is(errPayload, errCallBodyTooLarge) {
+				status = http.StatusRequestEntityTooLarge
+			}
+			r.fail(c, errPayload, nil, status, "Failed to apply realtime credential session", "invalid_request_error", "invalid_realtime_request", nil, nil)
+			return
+		}
+		secretPrincipal = grant.principal
+	}
 	// Copy only immutable accounting metadata. Never detach the entire request
 	// with WithoutCancel, which would retain Gin and the request body for an hour.
 	lifetime := h.root
@@ -111,7 +124,7 @@ func (h *Handler) HandleCall(c *gin.Context) {
 		r.fail(c, nil, lease, http.StatusBadGateway, "Realtime response is missing an answer or valid call ID", "api_error", "invalid_realtime_response", nil, nil)
 		return
 	}
-	call := &liveCall{id: allocatedID, owner: owner, lease: lease}
+	call := &liveCall{id: allocatedID, owner: owner, lease: lease, secretPrincipal: secretPrincipal}
 	if errCommit := r.commitWith(func() error { return h.calls.put(call) }); errCommit != nil {
 		if errors.Is(errCommit, errCallIDConflict) {
 			// An upstream duplicate must not hang up a previously established call.

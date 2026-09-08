@@ -39,11 +39,12 @@ func requestCallOwner(c *gin.Context) (callOwner, bool) {
 }
 
 type liveCall struct {
-	id      string
-	owner   callOwner
-	lease   *auth.CodexLiveLease
-	onClose func()
-	once    sync.Once
+	id              string
+	owner           callOwner
+	lease           *auth.CodexLiveLease
+	secretPrincipal string
+	onClose         func()
+	once            sync.Once
 }
 
 func (s *liveCall) close() {
@@ -115,10 +116,14 @@ func (s *callStore) find(id string, owner callOwner) *liveCall {
 }
 
 func (s *callStore) claim(id string, owner callOwner) (*liveCall, bool) {
+	return s.claimForGrant(id, owner, "")
+}
+
+func (s *callStore) claimForGrant(id string, owner callOwner, secretPrincipal string) (*liveCall, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	entry := s.entries[id]
-	if entry == nil || entry.call.owner != owner || entry.call.lease.Context().Err() != nil {
+	if entry == nil || entry.call.owner != owner || (secretPrincipal != "" && entry.call.secretPrincipal != secretPrincipal) || entry.call.lease.Context().Err() != nil {
 		return nil, false
 	}
 	if entry.claimed {
