@@ -75,12 +75,11 @@ func (h *OpenAIAPIHandler) Models() []map[string]any {
 func (h *OpenAIAPIHandler) OpenAIModels(c *gin.Context) {
 	cfg := h.ConfigSnapshot()
 	optimizeMultiAgentV2 := cfg != nil && cfg.CodexOptimizeMultiAgentV2
-	// Filter before shaping either the standard or Codex client catalog response.
-	allModels := h.ModelsForProviderAccess(c, "openai")
 	if _, ok := c.Request.URL.Query()["client_version"]; ok {
-		c.JSON(http.StatusOK, codexClientModelsResponseForClient(allModels, c.Query("client_version"), registry.GetGlobalRegistry().GetModelProviders, optimizeMultiAgentV2))
+		c.JSON(http.StatusOK, codexClientModelsForRequest(c, h.BaseAPIHandler, c.Query("client_version"), optimizeMultiAgentV2))
 		return
 	}
+	allModels := h.ModelsForProviderAccess(c, "openai")
 
 	// Filter to only include the 4 required fields: id, object, created, owned_by
 	filteredModels := make([]map[string]any, len(allModels))

@@ -2,7 +2,6 @@ package openai
 
 import (
 	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
 )
 
@@ -21,8 +20,7 @@ func (h *OpenAIResponsesAPIHandler) prepareCodexMultiAgentV2(c *gin.Context, pay
 	}
 	var modelList string
 	if helps.CodexCollaborationNeedsModelList(payload) {
-		models := h.ModelsForProviderAccess(c, "openai")
-		response := codexClientModelsResponseForClient(models, policy.ClientVersion, registry.GetGlobalRegistry().GetModelProviders, policy.Enabled)
+		response := codexClientModelsForRequest(c, h.BaseAPIHandler, policy.ClientVersion, policy.Enabled)
 		modelList = helps.FormatCodexCollaborationModels(response["models"].([]map[string]any))
 	}
 	return helps.PrepareCodexCollaborationTools(payload, modelList)

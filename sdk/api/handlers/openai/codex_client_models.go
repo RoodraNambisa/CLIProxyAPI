@@ -14,6 +14,7 @@ import (
 )
 
 type codexClientModelProvidersFunc func(string) []string
+type codexClientModelInfoFunc func(string) *registry.ModelInfo
 
 type codexClientModelsPayload struct {
 	Models []map[string]any `json:"models"`
@@ -43,9 +44,9 @@ func CodexClientModelsResponse(models []map[string]any) map[string]any {
 	return codexClientModelsResponse(models, nil)
 }
 
-func codexClientModelsResponse(models []map[string]any, providersForModel codexClientModelProvidersFunc) map[string]any {
+func codexClientModelsResponse(models []map[string]any, providersForModel codexClientModelProvidersFunc, infoForModel ...codexClientModelInfoFunc) map[string]any {
 	return map[string]any{
-		"models": buildCodexClientModels(models, providersForModel),
+		"models": buildCodexClientModels(models, providersForModel, infoForModel...),
 	}
 }
 
@@ -55,8 +56,8 @@ func CodexClientModelsResponseForClient(models []map[string]any, clientVersion s
 	return codexClientModelsResponseForClient(models, clientVersion, nil, false)
 }
 
-func codexClientModelsResponseForClient(models []map[string]any, clientVersion string, providersForModel codexClientModelProvidersFunc, optimizeMultiAgentV2 bool) map[string]any {
-	response := codexClientModelsResponse(models, providersForModel)
+func codexClientModelsResponseForClient(models []map[string]any, clientVersion string, providersForModel codexClientModelProvidersFunc, optimizeMultiAgentV2 bool, infoForModel ...codexClientModelInfoFunc) map[string]any {
+	response := codexClientModelsResponse(models, providersForModel, infoForModel...)
 	if optimizeMultiAgentV2 {
 		for _, model := range response["models"].([]map[string]any) {
 			model["multi_agent_version"] = "v2"
@@ -113,7 +114,7 @@ func supportsExtendedCodexClientReasoning(version string) bool {
 	return major > 0 || minor >= 144
 }
 
-func buildCodexClientModels(models []map[string]any, providersForModel codexClientModelProvidersFunc) []map[string]any {
+func buildCodexClientModels(models []map[string]any, providersForModel codexClientModelProvidersFunc, infoForModel ...codexClientModelInfoFunc) []map[string]any {
 	templates, defaultTemplate, err := loadCodexClientModelTemplates()
 	if err != nil || defaultTemplate == nil {
 		return nil
@@ -139,7 +140,13 @@ func buildCodexClientModels(models []map[string]any, providersForModel codexClie
 		}
 
 		entry := cloneCodexClientModelMap(defaultTemplate)
-		applyCodexClientModelMetadata(entry, id, model)
+		var info *registry.ModelInfo
+		if len(infoForModel) == 0 {
+			info = registry.LookupModelInfo(id)
+		} else if infoForModel[0] != nil {
+			info = infoForModel[0](id)
+		}
+		applyCodexClientModelMetadata(entry, id, model, info)
 		applyCodexClientContextOverride(entry, model)
 		applyCodexClientMaxTokens(entry, model)
 		applyCodexClientSearchToolSupport(entry, id, false, providersForModel)
@@ -290,9 +297,7 @@ func applyCodexClientContextOverride(entry, model map[string]any) {
 	entry["max_context_window"] = int(limit)
 }
 
-func applyCodexClientModelMetadata(entry map[string]any, id string, model map[string]any) {
-	info := registry.LookupModelInfo(id)
-
+func applyCodexClientModelMetadata(entry map[string]any, id string, model map[string]any, info *registry.ModelInfo) {
 	displayName := stringModelValue(model, "display_name")
 	description := stringModelValue(model, "description")
 	contextWindow := intModelValue(model, "context_length")
