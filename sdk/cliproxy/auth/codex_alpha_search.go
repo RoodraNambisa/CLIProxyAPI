@@ -16,10 +16,28 @@ func credentialSupportsExecutionFormat(auth *Auth, format translator.Format) boo
 
 // SupportsCodexAlphaSearch follows the credential source used by the Codex
 // executor. API keys require opt-in even when OAuth-looking metadata is present.
+// Stored OAuth tokens do not authorize search while another auth mode is active.
 // Availability, model access and runtime retirement remain selection concerns.
 func SupportsCodexAlphaSearch(auth *Auth) bool {
 	if auth == nil || !strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
 		return false
+	}
+	for _, key := range []string{"auth_mode", "authMode"} {
+		value, exists := auth.Metadata[key]
+		if !exists || value == nil {
+			continue
+		}
+		mode, ok := value.(string)
+		if !ok {
+			return false
+		}
+		if mode = strings.TrimSpace(mode); mode == "" {
+			continue
+		}
+		if !strings.EqualFold(mode, "oauth") {
+			return false
+		}
+		break
 	}
 	if auth.Attributes["api_key"] != "" {
 		return strings.EqualFold(strings.TrimSpace(auth.Attributes[CodexAlphaSearchAttributeKey]), "true")
