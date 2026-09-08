@@ -32,11 +32,12 @@ type Handler struct {
 	root             context.Context
 	shutdown         context.CancelFunc
 	websocketBaseURL string
+	calls            *callStore
 }
 
 func NewHandler(cfg *config.Config, manager *auth.Manager) *Handler {
 	ctx, cancel := context.WithCancel(context.Background())
-	h := &Handler{manager: manager, root: ctx, shutdown: cancel, websocketBaseURL: "wss://api.openai.com/v1"}
+	h := &Handler{manager: manager, root: ctx, shutdown: cancel, websocketBaseURL: "wss://api.openai.com/v1", calls: newCallStore()}
 	h.UpdateConfig(cfg)
 	return h
 }
@@ -65,13 +66,15 @@ func (h *Handler) Close() {
 		return
 	}
 	h.updateMu.Lock()
-	defer h.updateMu.Unlock()
 	if h.closed {
+		h.updateMu.Unlock()
 		return
 	}
 	h.closed = true
 	h.gate.update(false)
 	h.shutdown()
+	h.updateMu.Unlock()
+	h.calls.close()
 }
 
 type liveRequest struct {
