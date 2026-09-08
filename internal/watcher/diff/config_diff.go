@@ -78,6 +78,9 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	if oldCfg.RequestRetry != newCfg.RequestRetry {
 		changes = append(changes, fmt.Sprintf("request-retry: %d -> %d", oldCfg.RequestRetry, newCfg.RequestRetry))
 	}
+	if !reflect.DeepEqual(oldCfg.OAuthRequestScopedErrors, newCfg.OAuthRequestScopedErrors) {
+		changes = append(changes, "oauth-request-scoped-errors: updated")
+	}
 	if oldCfg.MaxRetryCredentials != newCfg.MaxRetryCredentials {
 		changes = append(changes, fmt.Sprintf("max-retry-credentials: %d -> %d", oldCfg.MaxRetryCredentials, newCfg.MaxRetryCredentials))
 	}
@@ -173,6 +176,9 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 			if !reflect.DeepEqual(o.RequestRetry, n.RequestRetry) {
 				changes = append(changes, fmt.Sprintf("gemini[%d].request-retry: updated", i))
 			}
+			if !reflect.DeepEqual(o.RequestScopedErrors, n.RequestScopedErrors) {
+				changes = append(changes, fmt.Sprintf("gemini[%d].request-scoped-errors: updated", i))
+			}
 			if strings.TrimSpace(o.BaseURL) != strings.TrimSpace(n.BaseURL) {
 				changes = append(changes, fmt.Sprintf("gemini[%d].base-url: %s -> %s", i, strings.TrimSpace(o.BaseURL), strings.TrimSpace(n.BaseURL)))
 			}
@@ -211,6 +217,9 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 			}
 			if !reflect.DeepEqual(o.RequestRetry, n.RequestRetry) {
 				changes = append(changes, fmt.Sprintf("interactions[%d].request-retry: updated", i))
+			}
+			if !reflect.DeepEqual(o.RequestScopedErrors, n.RequestScopedErrors) {
+				changes = append(changes, fmt.Sprintf("interactions[%d].request-scoped-errors: updated", i))
 			}
 			if strings.TrimSpace(o.BaseURL) != strings.TrimSpace(n.BaseURL) {
 				changes = append(changes, fmt.Sprintf("interactions[%d].base-url: %s -> %s", i, strings.TrimSpace(o.BaseURL), strings.TrimSpace(n.BaseURL)))
@@ -252,6 +261,9 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 			}
 			if !reflect.DeepEqual(o.RequestRetry, n.RequestRetry) {
 				changes = append(changes, fmt.Sprintf("claude[%d].request-retry: updated", i))
+			}
+			if !reflect.DeepEqual(o.RequestScopedErrors, n.RequestScopedErrors) {
+				changes = append(changes, fmt.Sprintf("claude[%d].request-scoped-errors: updated", i))
 			}
 			if strings.TrimSpace(o.BaseURL) != strings.TrimSpace(n.BaseURL) {
 				changes = append(changes, fmt.Sprintf("claude[%d].base-url: %s -> %s", i, strings.TrimSpace(o.BaseURL), strings.TrimSpace(n.BaseURL)))
@@ -425,6 +437,9 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 			if !reflect.DeepEqual(o.RequestRetry, n.RequestRetry) {
 				changes = append(changes, fmt.Sprintf("codex[%d].request-retry: updated", i))
 			}
+			if !reflect.DeepEqual(o.RequestScopedErrors, n.RequestScopedErrors) {
+				changes = append(changes, fmt.Sprintf("codex[%d].request-scoped-errors: updated", i))
+			}
 			if strings.TrimSpace(o.BaseURL) != strings.TrimSpace(n.BaseURL) {
 				changes = append(changes, fmt.Sprintf("codex[%d].base-url: %s -> %s", i, strings.TrimSpace(o.BaseURL), strings.TrimSpace(n.BaseURL)))
 			}
@@ -521,6 +536,9 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 			}
 			if !reflect.DeepEqual(o.RequestRetry, n.RequestRetry) {
 				changes = append(changes, fmt.Sprintf("vertex[%d].request-retry: updated", i))
+			}
+			if !reflect.DeepEqual(o.RequestScopedErrors, n.RequestScopedErrors) {
+				changes = append(changes, fmt.Sprintf("vertex[%d].request-scoped-errors: updated", i))
 			}
 			if strings.TrimSpace(o.BaseURL) != strings.TrimSpace(n.BaseURL) {
 				changes = append(changes, fmt.Sprintf("vertex[%d].base-url: %s -> %s", i, strings.TrimSpace(o.BaseURL), strings.TrimSpace(n.BaseURL)))

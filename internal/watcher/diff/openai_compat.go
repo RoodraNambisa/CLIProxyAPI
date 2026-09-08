@@ -79,6 +79,9 @@ func describeOpenAICompatibilityUpdate(oldEntry, newEntry config.OpenAICompatibi
 	if !reflect.DeepEqual(oldEntry.RequestRetry, newEntry.RequestRetry) {
 		details = append(details, "request-retry updated")
 	}
+	if !reflect.DeepEqual(oldEntry.RequestScopedErrors, newEntry.RequestScopedErrors) {
+		details = append(details, "request-scoped-errors updated")
+	}
 	if !equalStringMap(oldEntry.Headers, newEntry.Headers) {
 		details = append(details, "headers updated")
 	}
