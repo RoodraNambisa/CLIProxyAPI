@@ -19,8 +19,11 @@ import (
 )
 
 type handlerRuntime struct {
-	base      *handlers.BaseAPIHandler
-	keepalive time.Duration
+	base          *handlers.BaseAPIHandler
+	keepalive     time.Duration
+	media         *pionMediaRelay
+	mediaError    error
+	mediaProxyURL string
 }
 
 // Handler owns native realtime admission and process lifetime independently
@@ -38,6 +41,7 @@ type Handler struct {
 	callURL          string
 	clientSecrets    *clientSecretStore
 	secretRandom     io.Reader
+	mediaLimiter     mediaSessionLimiter
 }
 
 func NewHandler(cfg *config.Config, manager *auth.Manager) *Handler {
@@ -61,7 +65,13 @@ func (h *Handler) UpdateConfig(cfg *config.Config) {
 	if h.closed {
 		return
 	}
-	h.runtime.Store(&handlerRuntime{base: handlers.NewBaseAPIHandlers(&cfg.SDKConfig, h.manager), keepalive: handlers.StreamingKeepAliveInterval(&cfg.SDKConfig)})
+	runtime := &handlerRuntime{base: handlers.NewBaseAPIHandlers(&cfg.SDKConfig, h.manager), keepalive: handlers.StreamingKeepAliveInterval(&cfg.SDKConfig), mediaProxyURL: cfg.ProxyURL}
+	if cfg.Codex.LiveMediaRelay.Enabled {
+		// Factory construction opens no sockets. Capacity belongs to the handler,
+		// so publishing a new configuration cannot reset active session usage.
+		runtime.media, runtime.mediaError = newPionMediaRelay(cfg.Codex.LiveMediaRelay, &h.mediaLimiter)
+	}
+	h.runtime.Store(runtime)
 	h.gate.update(cfg.Codex.LiveEnabled)
 }
 
