@@ -24,6 +24,31 @@ func isRequestScopedStopError(err error) bool {
 	return errors.As(err, &stop) && stop.IsRequestStop()
 }
 
+func applyRequestScopedActionToResult(action config.RequestScopedErrorAction, matched bool, result *executionResult) {
+	if !matched || result == nil || result.Error == nil {
+		return
+	}
+	result.Error = cloneError(result.Error)
+	result.Error.requestScopedAction = action
+}
+
+func requestScopedActionSuppressesCooldown(err *Error) bool {
+	return err != nil && (err.requestScopedAction == config.RequestScopedActionStop || err.requestScopedAction == config.RequestScopedActionContinue)
+}
+
+func requestScopedActionNeedsFallbackCooldown(err *Error) bool {
+	if err == nil || (err.requestScopedAction != config.RequestScopedActionStopAndCooldown && err.requestScopedAction != config.RequestScopedActionContinueAndCooldown) {
+		return false
+	}
+	// Existing status-specific durations and Retry-After handling remain intact.
+	switch err.HTTPStatus {
+	case 401, 402, 403, 404, 408, 429, 500, 502, 503, 504:
+		return false
+	default:
+		return true
+	}
+}
+
 func requestScopedErrorBody(err error) string {
 	var source interface{ ResponseBody() []byte }
 	if errors.As(err, &source) {

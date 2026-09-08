@@ -144,7 +144,13 @@ func isConnectionLifecycleFailure(err error) bool {
 }
 
 func isCredentialNeutralFailure(err *Error) bool {
-	if err == nil || err.HTTPStatus == http.StatusPaymentRequired || err.HTTPStatus == http.StatusTooManyRequests || isInvalidGrantResultError(err) {
+	if err == nil || isInvalidGrantResultError(err) {
+		return false
+	}
+	if requestScopedActionSuppressesCooldown(err) {
+		return true
+	}
+	if err.HTTPStatus == http.StatusPaymentRequired || err.HTTPStatus == http.StatusTooManyRequests {
 		return false
 	}
 	return isKnownRequestFault(err) || isConnectionLifecycleFailure(err) || isRequestScopedNotFoundResultError(err)

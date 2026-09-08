@@ -8180,6 +8180,12 @@ func (m *Manager) markResult(
 						default:
 							if hasFixedCooldown {
 								state.NextRetryAfter = cooldownTime(now, 0, fixedCooldown, true, disableCooling)
+							} else if requestScopedActionNeedsFallbackCooldown(result.Error) && !disableCooling {
+								delay := time.Minute
+								if result.RetryAfter != nil {
+									delay = *result.RetryAfter
+								}
+								state.NextRetryAfter = now.Add(delay)
 							} else {
 								state.NextRetryAfter = time.Time{}
 							}
@@ -8530,11 +8536,12 @@ func cloneError(err *Error) *Error {
 		return nil
 	}
 	return &Error{
-		Code:       err.Code,
-		Message:    err.Message,
-		Retryable:  err.Retryable,
-		HTTPStatus: err.HTTPStatus,
-		Diagnostic: err.Diagnostic.Clone(),
+		Code:                err.Code,
+		Message:             err.Message,
+		Retryable:           err.Retryable,
+		HTTPStatus:          err.HTTPStatus,
+		Diagnostic:          err.Diagnostic.Clone(),
+		requestScopedAction: err.requestScopedAction,
 	}
 }
 
@@ -9308,6 +9315,12 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 		}
 		if hasFixed {
 			auth.NextRetryAfter = cooldownTime(now, 0, fixed, true, disableCooling)
+		} else if requestScopedActionNeedsFallbackCooldown(resultErr) && !disableCooling {
+			delay := time.Minute
+			if retryAfter != nil {
+				delay = *retryAfter
+			}
+			auth.NextRetryAfter = now.Add(delay)
 		}
 	}
 }

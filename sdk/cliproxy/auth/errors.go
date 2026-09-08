@@ -1,5 +1,7 @@
 package auth
 
+import "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+
 // Error describes an authentication related failure in a provider agnostic format.
 type Error struct {
 	// Code is a short machine readable identifier.
@@ -11,7 +13,8 @@ type Error struct {
 	// HTTPStatus optionally records an HTTP-like status code for the error.
 	HTTPStatus int `json:"http_status,omitempty"`
 	// Diagnostic contains provider-supplied troubleshooting metadata for authenticated management views.
-	Diagnostic *ErrorDiagnostic `json:"diagnostic,omitempty"`
+	Diagnostic          *ErrorDiagnostic `json:"diagnostic,omitempty"`
+	requestScopedAction config.RequestScopedErrorAction
 }
 
 // ErrorDiagnostic contains bounded troubleshooting metadata for authenticated management views.
