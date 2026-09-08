@@ -24,18 +24,19 @@ type handlerRuntime struct {
 // Handler owns native realtime admission and process lifetime independently
 // from the Responses executor's connection and conversation caches.
 type Handler struct {
-	manager  *auth.Manager
-	gate     admissionGate
-	runtime  atomic.Pointer[handlerRuntime]
-	updateMu sync.Mutex
-	closed   bool
-	root     context.Context
-	shutdown context.CancelFunc
+	manager          *auth.Manager
+	gate             admissionGate
+	runtime          atomic.Pointer[handlerRuntime]
+	updateMu         sync.Mutex
+	closed           bool
+	root             context.Context
+	shutdown         context.CancelFunc
+	websocketBaseURL string
 }
 
 func NewHandler(cfg *config.Config, manager *auth.Manager) *Handler {
 	ctx, cancel := context.WithCancel(context.Background())
-	h := &Handler{manager: manager, root: ctx, shutdown: cancel}
+	h := &Handler{manager: manager, root: ctx, shutdown: cancel, websocketBaseURL: "wss://api.openai.com/v1"}
 	h.UpdateConfig(cfg)
 	return h
 }

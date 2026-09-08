@@ -105,6 +105,11 @@ func (l *CodexLiveLease) CloneAuth() *Auth { return l.auth.Clone() }
 
 func (l *CodexLiveLease) Model() string { return l.model }
 
+// WithErrorSource retains the selected provider and priority for response presentation.
+func (l *CodexLiveLease) WithErrorSource(err error) error {
+	return withAuthErrorResponseSource(err, l.auth, "codex")
+}
+
 // CommitUpstream is idempotent and serializes with Close. A rejected setup
 // returns its reservation; an attempted connection keeps its consumed slot.
 func (l *CodexLiveLease) CommitUpstream() error {
