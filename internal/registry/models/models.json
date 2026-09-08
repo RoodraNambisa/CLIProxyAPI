@@ -271,7 +271,16 @@
         "min": 128,
         "max": 32768,
         "dynamic_allowed": true
-      }
+      },
+      "supportedInputModalities": [
+        "text",
+        "image",
+        "audio",
+        "video"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
     },
     {
       "id": "gemini-2.5-flash",
@@ -295,7 +304,16 @@
         "max": 24576,
         "zero_allowed": true,
         "dynamic_allowed": true
-      }
+      },
+      "supportedInputModalities": [
+        "text",
+        "image",
+        "audio",
+        "video"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
     },
     {
       "id": "gemini-2.5-flash-lite",
@@ -319,7 +337,16 @@
         "max": 24576,
         "zero_allowed": true,
         "dynamic_allowed": true
-      }
+      },
+      "supportedInputModalities": [
+        "text",
+        "image",
+        "audio",
+        "video"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
     },
     {
       "id": "gemini-3-pro-preview",
@@ -347,7 +374,16 @@
           "low",
           "high"
         ]
-      }
+      },
+      "supportedInputModalities": [
+        "text",
+        "image",
+        "audio",
+        "video"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
     },
     {
       "id": "gemini-3.1-pro-preview",
@@ -376,7 +412,16 @@
           "medium",
           "high"
         ]
-      }
+      },
+      "supportedInputModalities": [
+        "text",
+        "image",
+        "audio",
+        "video"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
     },
     {
       "id": "gemini-3.1-flash-image-preview",
@@ -404,7 +449,15 @@
           "minimal",
           "high"
         ]
-      }
+      },
+      "supportedInputModalities": [
+        "text",
+        "image"
+      ],
+      "supportedOutputModalities": [
+        "text",
+        "image"
+      ]
     },
     {
       "id": "gemini-3-flash-preview",
@@ -434,7 +487,16 @@
           "medium",
           "high"
         ]
-      }
+      },
+      "supportedInputModalities": [
+        "text",
+        "image",
+        "audio",
+        "video"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
     },
     {
       "id": "gemini-3.1-flash-lite-preview",
@@ -462,7 +524,16 @@
           "minimal",
           "high"
         ]
-      }
+      },
+      "supportedInputModalities": [
+        "text",
+        "image",
+        "audio",
+        "video"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
     },
     {
       "id": "gemini-3-pro-image-preview",
@@ -490,7 +561,15 @@
           "low",
           "high"
         ]
-      }
+      },
+      "supportedInputModalities": [
+        "text",
+        "image"
+      ],
+      "supportedOutputModalities": [
+        "text",
+        "image"
+      ]
     }
   ],
   "vertex": [
@@ -516,7 +595,16 @@
         "min": 128,
         "max": 32768,
         "dynamic_allowed": true
-      }
+      },
+      "supportedInputModalities": [
+        "text",
+        "image",
+        "audio",
+        "video"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
     },
     {
       "id": "gemini-2.5-flash",
@@ -540,7 +628,16 @@
         "max": 24576,
         "zero_allowed": true,
         "dynamic_allowed": true
-      }
+      },
+      "supportedInputModalities": [
+        "text",
+        "image",
+        "audio",
+        "video"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
     },
     {
       "id": "gemini-2.5-flash-lite",
@@ -564,7 +661,16 @@
         "max": 24576,
         "zero_allowed": true,
         "dynamic_allowed": true
-      }
+      },
+      "supportedInputModalities": [
+        "text",
+        "image",
+        "audio",
+        "video"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
     },
     {
       "id": "gemini-3-pro-preview",
@@ -651,7 +757,16 @@
           "medium",
           "high"
         ]
-      }
+      },
+      "supportedInputModalities": [
+        "text",
+        "image",
+        "audio",
+        "video"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
     },
     {
       "id": "gemini-3.1-flash-image-preview",
@@ -751,6 +866,12 @@
       "description": "Imagen 4.0 image generation model",
       "supportedGenerationMethods": [
         "predict"
+      ],
+      "supportedInputModalities": [
+        "text"
+      ],
+      "supportedOutputModalities": [
+        "image"
       ]
     },
     {
@@ -765,6 +886,12 @@
       "description": "Imagen 4.0 Ultra high-quality image generation model",
       "supportedGenerationMethods": [
         "predict"
+      ],
+      "supportedInputModalities": [
+        "text"
+      ],
+      "supportedOutputModalities": [
+        "image"
       ]
     },
     {
@@ -779,6 +906,12 @@
       "description": "Imagen 3.0 image generation model",
       "supportedGenerationMethods": [
         "predict"
+      ],
+      "supportedInputModalities": [
+        "text"
+      ],
+      "supportedOutputModalities": [
+        "image"
       ]
     },
     {
@@ -793,6 +926,12 @@
       "description": "Imagen 3.0 fast image generation model",
       "supportedGenerationMethods": [
         "predict"
+      ],
+      "supportedInputModalities": [
+        "text"
+      ],
+      "supportedOutputModalities": [
+        "image"
       ]
     },
     {
@@ -807,6 +946,12 @@
       "description": "Imagen 4.0 fast image generation model",
       "supportedGenerationMethods": [
         "predict"
+      ],
+      "supportedInputModalities": [
+        "text"
+      ],
+      "supportedOutputModalities": [
+        "image"
       ]
     }
   ],
@@ -833,7 +978,16 @@
         "min": 128,
         "max": 32768,
         "dynamic_allowed": true
-      }
+      },
+      "supportedInputModalities": [
+        "text",
+        "image",
+        "audio",
+        "video"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
     },
     {
       "id": "gemini-2.5-flash",
@@ -857,7 +1011,16 @@
         "max": 24576,
         "zero_allowed": true,
         "dynamic_allowed": true
-      }
+      },
+      "supportedInputModalities": [
+        "text",
+        "image",
+        "audio",
+        "video"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
     },
     {
       "id": "gemini-2.5-flash-lite",
@@ -881,7 +1044,16 @@
         "max": 24576,
         "zero_allowed": true,
         "dynamic_allowed": true
-      }
+      },
+      "supportedInputModalities": [
+        "text",
+        "image",
+        "audio",
+        "video"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
     },
     {
       "id": "gemini-3-pro-preview",
@@ -905,7 +1077,16 @@
         "min": 128,
         "max": 32768,
         "dynamic_allowed": true
-      }
+      },
+      "supportedInputModalities": [
+        "text",
+        "image",
+        "audio",
+        "video"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
     },
     {
       "id": "gemini-3.1-pro-preview",
@@ -929,7 +1110,16 @@
         "min": 128,
         "max": 32768,
         "dynamic_allowed": true
-      }
+      },
+      "supportedInputModalities": [
+        "text",
+        "image",
+        "audio",
+        "video"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
     },
     {
       "id": "gemini-3-flash-preview",
@@ -953,7 +1143,16 @@
         "min": 128,
         "max": 32768,
         "dynamic_allowed": true
-      }
+      },
+      "supportedInputModalities": [
+        "text",
+        "image",
+        "audio",
+        "video"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
     },
     {
       "id": "gemini-3.1-flash-lite-preview",
@@ -983,7 +1182,16 @@
           "medium",
           "high"
         ]
-      }
+      },
+      "supportedInputModalities": [
+        "text",
+        "image",
+        "audio",
+        "video"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
     },
     {
       "id": "gemini-pro-latest",
@@ -1007,7 +1215,16 @@
         "min": 128,
         "max": 32768,
         "dynamic_allowed": true
-      }
+      },
+      "supportedInputModalities": [
+        "text",
+        "image",
+        "audio",
+        "video"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
     },
     {
       "id": "gemini-flash-latest",
@@ -1031,7 +1248,16 @@
         "max": 24576,
         "zero_allowed": true,
         "dynamic_allowed": true
-      }
+      },
+      "supportedInputModalities": [
+        "text",
+        "image",
+        "audio",
+        "video"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
     },
     {
       "id": "gemini-flash-lite-latest",
@@ -1056,7 +1282,16 @@
         "max": 24576,
         "zero_allowed": true,
         "dynamic_allowed": true
-      }
+      },
+      "supportedInputModalities": [
+        "text",
+        "image",
+        "audio",
+        "video"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
     },
     {
       "id": "gemini-2.5-flash-image",
@@ -1075,6 +1310,14 @@
         "countTokens",
         "createCachedContent",
         "batchGenerateContent"
+      ],
+      "supportedInputModalities": [
+        "text",
+        "image"
+      ],
+      "supportedOutputModalities": [
+        "text",
+        "image"
       ]
     }
   ],

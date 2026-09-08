@@ -70,3 +70,45 @@ func TestCodexClientUsesStaticClaudeAndKimiModalities(t *testing.T) {
 		})
 	}
 }
+
+func TestCodexClientFiltersGoogleCatalogModalitiesToItsProtocol(t *testing.T) {
+	for _, tc := range []struct {
+		provider string
+		load     func() []*registry.ModelInfo
+	}{
+		{"gemini", registry.GetGeminiModels},
+		{"vertex", registry.GetGeminiVertexModels},
+		{"aistudio", registry.GetAIStudioModels},
+	} {
+		t.Run(tc.provider, func(t *testing.T) {
+			const id = "gemini-2.5-pro"
+			var info *registry.ModelInfo
+			for _, model := range tc.load() {
+				if model.ID == id {
+					info = model
+					break
+				}
+			}
+			if info == nil {
+				t.Fatal("existing Google model disappeared")
+			}
+			if !reflect.DeepEqual(info.SupportedInputModalities, []string{"text", "image", "audio", "video"}) || !reflect.DeepEqual(info.SupportedOutputModalities, []string{"text"}) {
+				t.Error("Google catalog lost its full modality declaration")
+			}
+			r := registry.GetGlobalRegistry()
+			client := t.Name()
+			r.RegisterClient(client, tc.provider, []*registry.ModelInfo{info})
+			t.Cleanup(func() { r.UnregisterClient(client) })
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Request = httptest.NewRequest(http.MethodGet, "/v1/models?client_version=0.153.4", nil)
+			c.Set("accessMetadata", map[string]string{sdkaccess.MetadataAllowedProviders: tc.provider})
+			(&OpenAIAPIHandler{}).OpenAIModels(c)
+			model := gjson.GetBytes(w.Body.Bytes(), `models.#(slug=="gemini-2.5-pro")`)
+			input := model.Get("input_modalities").Array()
+			if len(input) != 2 || input[0].String() != "text" || input[1].String() != "image" || !model.Get("supports_image_detail_original").Bool() {
+				t.Fatal("Google catalog emitted unsupported Codex input modalities")
+			}
+		})
+	}
+}
