@@ -27,6 +27,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -9633,6 +9634,9 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		if candidate.Provider != provider || candidate.Disabled || m.sessionCleanupPendingLocked(candidate.ID) {
 			continue
 		}
+		if !credentialSupportsExecutionFormat(candidate, opts.SourceFormat) {
+			continue
+		}
 		if pinnedAuthID != "" && candidate.ID != pinnedAuthID {
 			continue
 		}
@@ -9841,6 +9845,9 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 	}
 	for _, candidate := range m.auths {
 		if candidate == nil || candidate.Disabled || m.sessionCleanupPendingLocked(candidate.ID) {
+			continue
+		}
+		if !credentialSupportsExecutionFormat(candidate, opts.SourceFormat) {
 			continue
 		}
 		if pinnedAuthID != "" && candidate.ID != pinnedAuthID {
@@ -10119,6 +10126,9 @@ func disabledImageGenerationToolFallbackEnabled(cfg *internalconfig.Config) bool
 }
 
 func requestHasImageGenerationToolForFallback(req cliproxyexecutor.Request, opts cliproxyexecutor.Options) bool {
+	if opts.SourceFormat == sdktranslator.FormatCodexAlphaSearch {
+		return false
+	}
 	if strings.EqualFold(strings.TrimSpace(opts.SourceFormat.String()), "openai-image") {
 		return false
 	}

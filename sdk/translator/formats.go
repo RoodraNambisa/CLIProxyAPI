@@ -15,10 +15,12 @@ const (
 	FormatClaude         Format = "claude"
 	FormatGemini         Format = "gemini"
 	// FormatGeminiCLI is retained for v6 source compatibility. No translator is registered for it.
-	FormatGeminiCLI    Format = "gemini-cli"
-	FormatCodex        Format = "codex"
-	FormatAntigravity  Format = "antigravity"
-	FormatInteractions Format = "interactions"
+	FormatGeminiCLI Format = "gemini-cli"
+	FormatCodex     Format = "codex"
+	// FormatCodexAlphaSearch selects the native, non-Responses search protocol.
+	FormatCodexAlphaSearch Format = "codex-alpha-search"
+	FormatAntigravity      Format = "antigravity"
+	FormatInteractions     Format = "interactions"
 )
 
 func usesRetiredGeminiCLIFormat(from, to Format) bool {
