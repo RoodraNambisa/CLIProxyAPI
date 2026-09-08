@@ -101,3 +101,47 @@ func TestLCPHistoryCannotRestoreADeletedCredentialInstance(t *testing.T) {
 		t.Fatal("current instance could not commit successful history")
 	}
 }
+
+func TestLCPPreferenceKeepsRPMWeightsAndCandidateFilters(t *testing.T) {
+	for _, across := range []bool{false, true} {
+		t.Run(fmt.Sprint(across), func(t *testing.T) {
+			failover := false
+			s := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{Fallback: &FillFirstSelector{Range: 2}, LCP: true, AcrossPriorities: across, Failover: &failover})
+			t.Cleanup(s.Stop)
+			m := NewManager(nil, s, nil)
+			m.RegisterExecutor(schedulerTestExecutor{})
+			m.SetConfig(&config.Config{Routing: config.RoutingConfig{Strategy: "fill-first", FillFirstRange: 2, FillFirstPerAuthRPM: 2}})
+			for _, id := range []string{"a", "b"} {
+				if _, err := m.Register(WithSkipPersist(t.Context()), &Auth{ID: id, Provider: "test"}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			ctx := affinityCallerContext(t, "caller-a", "test")
+			opts := lcpOptions("branch", false)
+			s.BindSession(ctx, "test", "", opts, "b")
+			pinned := opts
+			pinned.Metadata = map[string]any{core.PinnedAuthMetadataKey: "b"}
+			for range 2 {
+				if auth, _, err := m.pickNext(ctx, "test", "", pinned, nil); err != nil || auth == nil || auth.ID != "b" {
+					t.Fatalf("RPM preparation: %v %v", auth, err)
+				}
+			}
+			if auth, _, err := m.pickNext(ctx, "test", "", opts, nil); err != nil || auth == nil || auth.ID != "a" {
+				t.Fatalf("RPM fallback: %v %v", auth, err)
+			}
+			m.SetConfig(&config.Config{Routing: config.RoutingConfig{PriorityOverrides: []config.RoutingPriorityOverride{{Priority: 0, Strategy: "weighted-round-robin"}}}})
+			b, _ := m.GetByID("b")
+			b.Attributes = map[string]string{"weight": "0"}
+			if _, err := m.Update(WithSkipPersist(t.Context()), b); err != nil {
+				t.Fatal(err)
+			}
+			if auth, _, err := m.pickNext(ctx, "test", "", opts, nil); err != nil || auth == nil || auth.ID != "a" {
+				t.Fatalf("zero weight: %v %v", auth, err)
+			}
+			m.SetConfig(&config.Config{Routing: config.RoutingConfig{Strategy: "round-robin"}})
+			if auth, _, _, err := m.pickNextMixed(ctx, []string{"test"}, "", opts, nil, func(a *Auth) bool { return a.ID != "b" }); err != nil || auth == nil || auth.ID != "a" {
+				t.Fatalf("candidate filter: %v %v", auth, err)
+			}
+		})
+	}
+}
