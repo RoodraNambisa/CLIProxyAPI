@@ -2441,7 +2441,10 @@ func (m *Manager) wrapStreamResult(ctx, resultCtx context.Context, auth *Auth, a
 					result.Error = rerr
 					result.RetryAfter = retryAfterFromError(chunk.Err)
 					result.availabilityNeutral = isResponsesCompactAvailabilityNeutralError(opts, chunk.Err)
+					action, matchedAction := m.matchRequestScopedErrorAction(ctx, auth, opts, chunk.Err)
+					applyRequestScopedActionToResult(action, matchedAction, &result)
 					m.markExecutionResult(resultCtx, result)
+					chunk.Err = wrapRequestScopedAction(chunk.Err, action, matchedAction)
 				}
 			}
 			if !forward {
