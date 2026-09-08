@@ -1359,7 +1359,7 @@ func (m *Manager) setConfigLocked(cfg *internalconfig.Config) {
 	m.mu.Unlock()
 }
 
-func (m *Manager) lookupAPIKeyUpstreamModel(authID, requestedModel string) string {
+func (m *Manager) lookupAPIKeyUpstreamModel(authID, requestedModel string, snapshots ...*apiKeyModelRoutingSnapshot) string {
 	if m == nil {
 		return ""
 	}
@@ -1371,7 +1371,7 @@ func (m *Manager) lookupAPIKeyUpstreamModel(authID, requestedModel string) strin
 	if requestedModel == "" {
 		return ""
 	}
-	table := m.loadAPIKeyModelRouting().aliases
+	table := m.modelRoutingForAttempt(snapshots).aliases
 	if table == nil {
 		return ""
 	}
@@ -1474,7 +1474,7 @@ func rotateStrings(values []string, offset int) []string {
 	return out
 }
 
-func (m *Manager) resolveOpenAICompatUpstreamModelPool(auth *Auth, requestedModel string) []string {
+func (m *Manager) resolveOpenAICompatUpstreamModelPool(auth *Auth, requestedModel string, snapshots ...*apiKeyModelRoutingSnapshot) []string {
 	if m == nil || !isOpenAICompatAPIKeyAuth(auth) {
 		return nil
 	}
@@ -1482,7 +1482,7 @@ func (m *Manager) resolveOpenAICompatUpstreamModelPool(auth *Auth, requestedMode
 	if requestedModel == "" {
 		return nil
 	}
-	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
+	cfg := m.modelRoutingForAttempt(snapshots).config
 	if cfg == nil {
 		cfg = &internalconfig.Config{}
 	}
@@ -1503,17 +1503,18 @@ func preserveRequestedModelSuffix(requestedModel, resolved string) string {
 	return preserveResolvedModelSuffix(resolved, thinking.ParseSuffix(requestedModel))
 }
 
-func (m *Manager) executionModelCandidates(auth *Auth, executionRouteModel string) []string {
+func (m *Manager) executionModelCandidates(auth *Auth, executionRouteModel string, snapshots ...*apiKeyModelRoutingSnapshot) []string {
+	routing := m.modelRoutingForAttempt(snapshots)
 	requestedModel := rewriteModelForAuth(executionRouteModel, auth)
 	requestedModel = m.applyOAuthModelAlias(auth, requestedModel)
-	if pool := m.resolveOpenAICompatUpstreamModelPool(auth, requestedModel); len(pool) > 0 {
+	if pool := m.resolveOpenAICompatUpstreamModelPool(auth, requestedModel, routing); len(pool) > 0 {
 		if len(pool) == 1 {
 			return pool
 		}
 		offset := m.nextModelPoolOffset(openAICompatModelPoolKey(auth, requestedModel), len(pool))
 		return rotateStrings(pool, offset)
 	}
-	resolved := m.applyAPIKeyModelAlias(auth, requestedModel)
+	resolved := m.applyAPIKeyModelAlias(auth, requestedModel, routing)
 	if strings.TrimSpace(resolved) == "" {
 		resolved = requestedModel
 	}
@@ -1580,16 +1581,19 @@ func (m *Manager) preparedExecutionModels(auth *Auth, routeModel string, opts cl
 	return m.filterExecutionModels(auth, routeModel, candidates, pooled), pooled
 }
 
-func (m *Manager) preparedExecutionModelsWithAlias(auth *Auth, routeModel string, opts cliproxyexecutor.Options) ([]string, bool, OAuthModelAliasResult) {
+func (m *Manager) preparedExecutionModelsWithAlias(auth *Auth, routeModel string, opts cliproxyexecutor.Options) ([]string, bool, OAuthModelAliasResult, *apiKeyModelRoutingSnapshot) {
+	routing := m.loadAPIKeyModelRouting()
 	executionRouteModel := effectiveExecutionRouteModel(routeModel, opts)
-	models, pooled := m.preparedExecutionModels(auth, routeModel, opts)
-	return models, pooled, m.resolveExecutionAliasResult(auth, executionRouteModel)
+	candidates := m.executionModelCandidates(auth, executionRouteModel, routing)
+	pooled := len(candidates) > 1
+	models := m.filterExecutionModels(auth, routeModel, candidates, pooled)
+	return models, pooled, m.resolveExecutionAliasResult(auth, executionRouteModel, routing), routing
 }
 
-func (m *Manager) resolveExecutionAliasResult(auth *Auth, executionRouteModel string) OAuthModelAliasResult {
+func (m *Manager) resolveExecutionAliasResult(auth *Auth, executionRouteModel string, snapshots ...*apiKeyModelRoutingSnapshot) OAuthModelAliasResult {
 	requestedModel := rewriteModelForAuth(executionRouteModel, auth)
 	if isAPIKeyAuth(auth) {
-		return m.resolveAPIKeyModelAliasWithResult(auth, requestedModel)
+		return m.resolveAPIKeyModelAliasWithResult(auth, requestedModel, snapshots...)
 	}
 	return m.applyOAuthModelAliasWithResult(auth, requestedModel)
 }
@@ -5725,7 +5729,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		publishErrorResponseSourceMetadata(opts.Metadata, errorResponseSourceForAuth(auth, provider))
 		opts = withSelectedAuthInstanceMetadata(opts, auth)
 
-		models, pooled, aliasResult := m.preparedExecutionModelsWithAlias(auth, routeModel, opts)
+		models, pooled, aliasResult, _ := m.preparedExecutionModelsWithAlias(auth, routeModel, opts)
 		if len(models) == 0 {
 			if strictSessionAffinity {
 				return cliproxyexecutor.Response{}, withAuthErrorResponseSource(newStrictSessionAffinityError("session bound auth has no executable models"), auth, provider)
@@ -6281,7 +6285,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		auth = preparedAuth
 		publishErrorResponseSourceMetadata(opts.Metadata, errorResponseSourceForAuth(auth, provider))
 		opts = withSelectedAuthInstanceMetadata(opts, auth)
-		models, pooled, aliasResult := m.preparedExecutionModelsWithAlias(auth, routeModel, opts)
+		models, pooled, aliasResult, _ := m.preparedExecutionModelsWithAlias(auth, routeModel, opts)
 		if len(models) == 0 {
 			if strictSessionAffinity {
 				return nil, withAuthErrorResponseSource(newStrictSessionAffinityError("session bound auth has no executable models"), auth, provider)
@@ -7178,7 +7182,7 @@ func rewriteModelForAuth(model string, auth *Auth) string {
 	return strings.TrimPrefix(model, needle)
 }
 
-func (m *Manager) applyAPIKeyModelAlias(auth *Auth, requestedModel string) string {
+func (m *Manager) applyAPIKeyModelAlias(auth *Auth, requestedModel string, snapshots ...*apiKeyModelRoutingSnapshot) string {
 	if m == nil || auth == nil {
 		return requestedModel
 	}
@@ -7194,13 +7198,14 @@ func (m *Manager) applyAPIKeyModelAlias(auth *Auth, requestedModel string) strin
 	}
 
 	// Fast path: lookup per-auth mapping table (keyed by auth.ID).
-	if resolved := m.lookupAPIKeyUpstreamModel(auth.ID, requestedModel); resolved != "" {
+	routing := m.modelRoutingForAttempt(snapshots)
+	if resolved := m.lookupAPIKeyUpstreamModel(auth.ID, requestedModel, routing); resolved != "" {
 		return resolved
 	}
 
 	// Slow path: scan config for the matching credential entry and resolve alias.
 	// This acts as a safety net if mappings are stale or auth.ID is missing.
-	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
+	cfg := routing.config
 	if cfg == nil {
 		cfg = &internalconfig.Config{}
 	}
@@ -7229,7 +7234,7 @@ func (m *Manager) applyAPIKeyModelAlias(auth *Auth, requestedModel string) strin
 	return requestedModel
 }
 
-func (m *Manager) resolveAPIKeyModelAliasWithResult(auth *Auth, requestedModel string) OAuthModelAliasResult {
+func (m *Manager) resolveAPIKeyModelAliasWithResult(auth *Auth, requestedModel string, snapshots ...*apiKeyModelRoutingSnapshot) OAuthModelAliasResult {
 	if m == nil || auth == nil {
 		return OAuthModelAliasResult{}
 	}
@@ -7237,7 +7242,7 @@ func (m *Manager) resolveAPIKeyModelAliasWithResult(auth *Auth, requestedModel s
 	if requestedModel == "" {
 		return OAuthModelAliasResult{}
 	}
-	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
+	cfg := m.modelRoutingForAttempt(snapshots).config
 	if cfg == nil {
 		cfg = &internalconfig.Config{}
 	}

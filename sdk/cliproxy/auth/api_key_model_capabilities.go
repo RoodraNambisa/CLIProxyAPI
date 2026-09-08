@@ -37,10 +37,15 @@ func (m *Manager) loadAPIKeyModelRouting() *apiKeyModelRoutingSnapshot {
 	return &apiKeyModelRoutingSnapshot{config: &config.Config{}}
 }
 
-func buildAPIKeyModelRoutingSnapshot(auths map[string]*Auth, cfg *config.Config) *apiKeyModelRoutingSnapshot {
-	if cfg == nil {
-		cfg = &config.Config{}
+func (m *Manager) modelRoutingForAttempt(snapshots []*apiKeyModelRoutingSnapshot) *apiKeyModelRoutingSnapshot {
+	if len(snapshots) > 0 && snapshots[0] != nil {
+		return snapshots[0]
 	}
+	return m.loadAPIKeyModelRouting()
+}
+
+func buildAPIKeyModelRoutingSnapshot(auths map[string]*Auth, cfg *config.Config) *apiKeyModelRoutingSnapshot {
+	cfg = copyAPIKeyModelRoutingConfig(cfg)
 	capabilities := make(apiKeyModelCapabilityTable)
 	for id, auth := range auths {
 		if models := compileAPIKeyModelCapabilitiesForAuth(cfg, auth); len(models) > 0 {
