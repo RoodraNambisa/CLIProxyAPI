@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/json"
 	"fmt"
 	"math"
 	"strings"
@@ -10,6 +11,16 @@ import (
 )
 
 const MaxModelThinkingBudget = math.MaxInt32
+
+// ModelThinkingSignature compares effective declarations without exposing their
+// contents in change logs. A missing declaration remains distinct from an object.
+func ModelThinkingSignature(raw *registry.ThinkingSupport) string {
+	if raw == nil {
+		return ""
+	}
+	encoded, _ := json.Marshal(NormalizeModelThinkingSupport(raw))
+	return string(encoded)
+}
 
 // NormalizeModelThinkingSupport creates a private capability snapshot. Preserve
 // level order because it may determine the provider's lowest allowed effort.

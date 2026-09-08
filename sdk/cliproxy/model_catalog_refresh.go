@@ -14,8 +14,9 @@ import (
 func appendModelCatalogOverrides[T modelEntry](out [][]string, family string, index int, models []T) [][]string {
 	for _, model := range models {
 		label, limit := strings.TrimSpace(model.GetDisplayName()), model.GetMaxContextLength()
-		if label != "" || limit > 0 {
-			out = append(out, []string{family, strconv.Itoa(index), model.GetName(), model.GetAlias(), label, strconv.Itoa(limit)})
+		thinking := config.ModelThinkingSignature(model.GetThinking())
+		if label != "" || limit > 0 || thinking != "" {
+			out = append(out, []string{family, strconv.Itoa(index), model.GetName(), model.GetAlias(), label, strconv.Itoa(limit), thinking})
 		}
 	}
 	return out
