@@ -21,6 +21,14 @@ import (
 )
 
 func TestCodexRequestScopedActionsAcrossWireTransports(t *testing.T) {
+	for _, buffering := range []bool{false, true} {
+		t.Run(fmt.Sprintf("buffering=%t", buffering), func(t *testing.T) {
+			testCodexRequestScopedActionsAcrossWireTransports(t, buffering)
+		})
+	}
+}
+
+func testCodexRequestScopedActionsAcrossWireTransports(t *testing.T, buffering bool) {
 	for _, transport := range []string{"http", "sse", "websocket", "images", "compact"} {
 		for _, action := range []string{"stop", "stop-and-cooldown", "continue", "continue-and-cooldown"} {
 			t.Run(transport+"/"+action, func(t *testing.T) {
@@ -43,6 +51,12 @@ func TestCodexRequestScopedActionsAcrossWireTransports(t *testing.T) {
 						event := codexTestBootstrapCompleted
 						if attempt == 1 {
 							event = failure
+							if buffering {
+								if err := conn.WriteMessage(websocket.TextMessage, []byte(codexTestBootstrapCreated)); err != nil {
+									t.Error(err)
+									return
+								}
+							}
 						}
 						if err := conn.WriteMessage(websocket.TextMessage, []byte(event)); err != nil {
 							t.Error(err)
@@ -67,11 +81,15 @@ func TestCodexRequestScopedActionsAcrossWireTransports(t *testing.T) {
 					event := codexTestBootstrapCompleted
 					if attempt == 1 {
 						event = failure
+						if buffering {
+							_, _ = fmt.Fprintf(w, "data: %s\n\n", codexTestBootstrapCreated)
+						}
 					}
 					_, _ = fmt.Fprintf(w, "data: %s\n\n", event)
 				}))
 				defer server.Close()
 				cfg := &config.Config{SDKConfig: sdkconfig.SDKConfig{ProxyURL: "direct"}}
+				cfg.Codex.StreamBootstrapBuffering = buffering
 				manager := auth.NewManager(nil, &auth.FillFirstSelector{}, nil)
 				manager.SetConfig(cfg)
 				manager.SetRetryConfig(2, 0, 0)
@@ -97,7 +115,7 @@ func TestCodexRequestScopedActionsAcrossWireTransports(t *testing.T) {
 				}
 				manager.RegisterExecutor(executor)
 				ruleStatus := http.StatusServiceUnavailable
-				if transport == "sse" || transport == "websocket" || transport == "images" {
+				if !buffering && (transport == "sse" || transport == "websocket" || transport == "images") {
 					// Without bootstrap buffering, the existing streamed failure
 					// translator uses 500 when this event has no HTTP status.
 					ruleStatus = http.StatusInternalServerError
