@@ -16,6 +16,37 @@ func TestNewConfigSynthesizer(t *testing.T) {
 	}
 }
 
+func TestCodexAlphaSearchConfigProjection(t *testing.T) {
+	cfg := &config.Config{CodexKey: []config.CodexKey{{APIKey: "fixture", BaseURL: "https://example.invalid/v1", ProxyURL: "http://proxy.invalid", Prefix: "tenant", Websockets: true}}}
+	var previous *coreauth.Auth
+	for _, enabled := range []bool{false, true, false} {
+		cfg.CodexKey[0].AlphaSearch = enabled
+		auths, err := NewConfigSynthesizer().Synthesize(&SynthesisContext{Config: cfg, Now: time.Unix(1, 0), IDGenerator: NewStableIDGenerator()})
+		if err != nil || len(auths) != 1 {
+			t.Fatalf("projection failed: %v", err)
+		}
+		current := auths[0]
+		if coreauth.SupportsCodexAlphaSearch(current) != enabled {
+			t.Fatal("runtime capability does not match configuration")
+		}
+		if _, exists := current.Attributes[coreauth.CodexAlphaSearchAttributeKey]; exists != enabled {
+			t.Fatal("disabled capability left a runtime attribute")
+		}
+		if current.Prefix != "tenant" || current.ProxyURL != "http://proxy.invalid" || current.Attributes["websockets"] != "true" {
+			t.Fatal("capability projection changed unrelated attributes")
+		}
+		if previous != nil {
+			if current.ID != previous.ID {
+				t.Fatal("capability change changed credential identity")
+			}
+			if coreauth.SupportsCodexAlphaSearch(previous) == enabled {
+				t.Fatal("new projection mutated the old credential snapshot")
+			}
+		}
+		previous = current
+	}
+}
+
 func TestConfigSynthesizer_Synthesize_NilContext(t *testing.T) {
 	synth := NewConfigSynthesizer()
 	auths, err := synth.Synthesize(nil)

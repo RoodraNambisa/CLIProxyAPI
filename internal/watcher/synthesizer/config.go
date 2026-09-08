@@ -198,6 +198,9 @@ func (s *ConfigSynthesizer) synthesizeCodexKeys(ctx *SynthesisContext) []*coreau
 		if ck.Websockets {
 			attrs["websockets"] = "true"
 		}
+		if ck.AlphaSearch {
+			attrs[coreauth.CodexAlphaSearchAttributeKey] = "true"
+		}
 		if hash := diff.ComputeCodexModelsHash(ck.Models); hash != "" {
 			attrs["models_hash"] = hash
 		}

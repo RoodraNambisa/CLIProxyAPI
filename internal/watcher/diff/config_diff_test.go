@@ -8,6 +8,20 @@ import (
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
 )
 
+func TestCodexAlphaSearchConfigChangeDetails(t *testing.T) {
+	for _, enabled := range []bool{true, false} {
+		oldCfg := &config.Config{CodexKey: []config.CodexKey{{APIKey: "private-fixture", BaseURL: "https://example.invalid", AlphaSearch: !enabled}}}
+		newCfg := &config.Config{CodexKey: []config.CodexKey{{APIKey: "private-fixture", BaseURL: "https://example.invalid", AlphaSearch: enabled}}}
+		changes := BuildConfigChangeDetails(oldCfg, newCfg)
+		if len(changes) != 1 || !strings.Contains(changes[0], "codex[0].alpha-search:") || strings.Contains(changes[0], "private-fixture") {
+			t.Fatalf("unexpected capability change details: %#v", changes)
+		}
+		if got := BuildConfigChangeDetails(newCfg, newCfg); len(got) != 0 {
+			t.Fatal("unchanged configuration produced a change")
+		}
+	}
+}
+
 func TestBuildConfigChangeDetails(t *testing.T) {
 	oldCfg := &config.Config{
 		Port:    8080,
