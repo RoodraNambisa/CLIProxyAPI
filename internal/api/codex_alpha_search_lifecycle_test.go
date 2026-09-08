@@ -214,3 +214,32 @@ func TestCodexAlphaSearchCapabilityUpdateHonorsCredentialRetirement(t *testing.T
 		t.Fatal("later request used disabled search capability")
 	}
 }
+
+func TestCodexAlphaSearchInvalidCredentialEndpointUsesExistingBudget(t *testing.T) {
+	for _, maximum := range []int{0, 1} {
+		var calls atomic.Int32
+		server, ids := newSearchLifecycleFixture(t, func(w http.ResponseWriter, _ *http.Request) {
+			calls.Add(1)
+			_, _ = io.WriteString(w, `{"output":"ok"}`)
+		}, 2, 0, nil)
+		manager := server.handlers.AuthManager
+		manager.SetRetryConfig(0, 0, maximum)
+		broken, _ := manager.GetByID(ids[0])
+		broken.Attributes["base_url"] = "/invalid-relative-endpoint"
+		if _, err := manager.Update(t.Context(), broken); err != nil {
+			t.Fatal(err)
+		}
+		w := httptest.NewRecorder()
+		server.engine.ServeHTTP(w, searchLifecycleRequest(t.Context()))
+		if maximum == 0 && (w.Code != 200 || calls.Load() != 1) {
+			t.Fatal("credential-local endpoint error blocked another eligible credential")
+		}
+		if maximum == 1 && (w.Code < 400 || calls.Load() != 0) {
+			t.Fatal("endpoint fallback exceeded the credential budget")
+		}
+		broken, _ = manager.GetByID(ids[0])
+		if broken.Unavailable || !broken.NextRetryAfter.IsZero() || len(broken.ModelStates) != 0 {
+			t.Fatal("local endpoint error changed upstream credential health")
+		}
+	}
+}

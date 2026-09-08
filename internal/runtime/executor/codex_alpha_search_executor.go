@@ -39,7 +39,7 @@ func (e *CodexExecutor) executeAlphaSearch(ctx context.Context, auth *cliproxyau
 	}
 	endpoint, err := helps.CodexAlphaSearchURL(baseURL, auth.Attributes["api_key"] != "")
 	if err != nil {
-		return resp, statusErr{code: http.StatusBadGateway, msg: err.Error(), skipAuthResult: true}
+		return resp, statusErr{code: http.StatusBadGateway, msg: err.Error(), skipAuthResult: true, retryOtherAuth: true}
 	}
 	model := thinking.ParseSuffix(req.Model)
 	body, err := helps.RewriteCodexAlphaSearchBody(req.Payload, model.ModelName)
