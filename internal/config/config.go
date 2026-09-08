@@ -1772,6 +1772,11 @@ type RoutingConfig struct {
 	// default false. Hot reload affects new requests only.
 	SessionAffinitySubagents bool `yaml:"session-affinity-subagents" json:"session-affinity-subagents"`
 
+	// SessionAffinityLCP uses bounded conversation prefixes as credential
+	// preferences when reliable client identities are absent. Requires
+	// SessionAffinity; default false. Hot reload affects new requests only.
+	SessionAffinityLCP bool `yaml:"session-affinity-lcp" json:"session-affinity-lcp"`
+
 	// SessionAffinityFailover controls whether a session may move to another credential
 	// when the bound credential is unavailable or the request fails. Defaults to true.
 	SessionAffinityFailover *bool `yaml:"session-affinity-failover,omitempty" json:"session-affinity-failover,omitempty"`

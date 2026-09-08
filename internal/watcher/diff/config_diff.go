@@ -151,6 +151,9 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	if oldCfg.Routing.SessionAffinitySubagents != newCfg.Routing.SessionAffinitySubagents {
 		changes = append(changes, fmt.Sprintf("routing.session-affinity-subagents: %t -> %t", oldCfg.Routing.SessionAffinitySubagents, newCfg.Routing.SessionAffinitySubagents))
 	}
+	if oldCfg.Routing.SessionAffinityLCP != newCfg.Routing.SessionAffinityLCP {
+		changes = append(changes, fmt.Sprintf("routing.session-affinity-lcp: %t -> %t", oldCfg.Routing.SessionAffinityLCP, newCfg.Routing.SessionAffinityLCP))
+	}
 
 	// API keys (redacted) and counts
 	if len(oldCfg.APIKeys) != len(newCfg.APIKeys) {

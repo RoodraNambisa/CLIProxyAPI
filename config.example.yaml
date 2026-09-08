@@ -502,6 +502,11 @@ routing:
   # without an existing binding. Requires session-affinity and a trusted caller
   # scope. Boolean only, default false; hot reload affects new requests only.
   session-affinity-subagents: false
+  # Infer a credential preference from a complete shared conversation prefix
+  # when no reliable client session ID exists. Requires session-affinity and a
+  # trusted caller scope; shared system/tool templates alone never match.
+  # Boolean only, default false; hot reload affects new requests only.
+  session-affinity-lcp: false
   # Allow a bound session to move to another credential when the bound credential
   # is unavailable or the request fails. Set false for strict sticky sessions.
   session-affinity-failover: true # default: true
