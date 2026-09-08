@@ -115,7 +115,11 @@ func (e *GeminiExecutor) buildInteractionsBody(ctx context.Context, req cliproxy
 		body, _ = sjson.SetBytes(body, "model", targetName)
 	}
 
-	body, err = applyGeminiInteractionsThinking(body, req.Model)
+	if _, bound := cliproxyauth.ResolvedAPIKeyModelInfo(req); bound {
+		body, err = helps.ApplyRequestThinking(body, req, opts, opts.SourceFormat.String(), sdktranslator.FormatInteractions.String(), "gemini")
+	} else {
+		body, err = applyGeminiInteractionsThinking(body, req.Model)
+	}
 	if err != nil {
 		return nil, err
 	}

@@ -334,7 +334,7 @@ func (e *GeminiVertexExecutor) executeWithServiceAccount(ctx context.Context, au
 			return resp, err
 		}
 
-		body, err = thinking.ApplyThinking(body, req.Model, from.String(), to.String(), e.Identifier())
+		body, err = helps.ApplyRequestThinking(body, req, opts, from.String(), to.String(), e.Identifier())
 		if err != nil {
 			return resp, err
 		}
@@ -471,7 +471,7 @@ func (e *GeminiVertexExecutor) executeWithAPIKey(ctx context.Context, auth *clip
 		return resp, err
 	}
 
-	body, err = thinking.ApplyThinking(body, req.Model, from.String(), to.String(), e.Identifier())
+	body, err = helps.ApplyRequestThinking(body, req, opts, from.String(), to.String(), e.Identifier())
 	if err != nil {
 		return resp, err
 	}
@@ -600,7 +600,7 @@ func (e *GeminiVertexExecutor) executeStreamWithServiceAccount(ctx context.Conte
 		return nil, err
 	}
 
-	body, err = thinking.ApplyThinking(body, req.Model, from.String(), to.String(), e.Identifier())
+	body, err = helps.ApplyRequestThinking(body, req, opts, from.String(), to.String(), e.Identifier())
 	if err != nil {
 		return nil, err
 	}
@@ -792,7 +792,7 @@ func (e *GeminiVertexExecutor) executeStreamWithAPIKey(ctx context.Context, auth
 		return nil, err
 	}
 
-	body, err = thinking.ApplyThinking(body, req.Model, from.String(), to.String(), e.Identifier())
+	body, err = helps.ApplyRequestThinking(body, req, opts, from.String(), to.String(), e.Identifier())
 	if err != nil {
 		return nil, err
 	}
@@ -971,7 +971,7 @@ func (e *GeminiVertexExecutor) countTokensWithServiceAccount(ctx context.Context
 		return cliproxyexecutor.Response{}, err
 	}
 
-	translatedReq, err = thinking.ApplyThinking(translatedReq, req.Model, from.String(), to.String(), e.Identifier())
+	translatedReq, err = helps.ApplyRequestThinking(translatedReq, req, opts, from.String(), to.String(), e.Identifier())
 	if err != nil {
 		return cliproxyexecutor.Response{}, err
 	}
@@ -1068,7 +1068,7 @@ func (e *GeminiVertexExecutor) countTokensWithAPIKey(ctx context.Context, auth *
 		return cliproxyexecutor.Response{}, err
 	}
 
-	translatedReq, err = thinking.ApplyThinking(translatedReq, req.Model, from.String(), to.String(), e.Identifier())
+	translatedReq, err = helps.ApplyRequestThinking(translatedReq, req, opts, from.String(), to.String(), e.Identifier())
 	if err != nil {
 		return cliproxyexecutor.Response{}, err
 	}

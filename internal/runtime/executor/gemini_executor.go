@@ -137,7 +137,7 @@ func (e *GeminiExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		return resp, err
 	}
 
-	body, err = thinking.ApplyThinking(body, req.Model, from.String(), to.String(), e.Identifier())
+	body, err = helps.ApplyRequestThinking(body, req, opts, from.String(), to.String(), e.Identifier())
 	if err != nil {
 		return resp, err
 	}
@@ -264,7 +264,7 @@ func (e *GeminiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		return nil, err
 	}
 
-	body, err = thinking.ApplyThinking(body, req.Model, from.String(), to.String(), e.Identifier())
+	body, err = helps.ApplyRequestThinking(body, req, opts, from.String(), to.String(), e.Identifier())
 	if err != nil {
 		return nil, err
 	}
@@ -439,7 +439,7 @@ func (e *GeminiExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 		return cliproxyexecutor.Response{}, err
 	}
 
-	translatedReq, err = thinking.ApplyThinking(translatedReq, req.Model, from.String(), to.String(), e.Identifier())
+	translatedReq, err = helps.ApplyRequestThinking(translatedReq, req, opts, from.String(), to.String(), e.Identifier())
 	if err != nil {
 		return cliproxyexecutor.Response{}, err
 	}
