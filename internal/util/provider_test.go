@@ -18,6 +18,24 @@ func TestMaskSensitiveHeaderValueMasksManagementKey(t *testing.T) {
 	}
 }
 
+func TestMaskRealtimeCredentialSubprotocolsWithoutChangingNegotiationNames(t *testing.T) {
+	for _, key := range []string{"Sec-WebSocket-Protocol", "sec-websocket-protocol", " SEC-WEBSOCKET-PROTOCOL "} {
+		value := " realtime, openai-insecure-api-key.fixture-secret ,openai-organization.fixture-org, openai-project.fixture-project, safe-v2 "
+		want := " realtime, openai-insecure-api-key.[REDACTED] ,openai-organization.[REDACTED], openai-project.[REDACTED], safe-v2 "
+		if got := MaskSensitiveHeaderValue(key, value); got != want {
+			t.Fatal("Realtime authentication subprotocol was not fully redacted")
+		}
+	}
+	for _, value := range []string{"", "realtime, safe-v2", " openai-insecure-api-key ", "safe.openai-insecure-api-key.fixture"} {
+		if got := MaskSensitiveHeaderValue("Sec-WebSocket-Protocol", value); got != value {
+			t.Fatal("non-credential protocol name changed")
+		}
+	}
+	if got := MaskSensitiveHeaderValue("Sec-WebSocket-Protocol", "OpenAI-Insecure-Api-Key.fixture"); got != "OpenAI-Insecure-Api-Key.[REDACTED]" {
+		t.Fatal("mixed-case credential was exposed in logs")
+	}
+}
+
 func TestMaskSensitiveQueryMasksOAuthCallbackParameters(t *testing.T) {
 	tests := []struct {
 		name string

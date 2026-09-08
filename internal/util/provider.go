@@ -197,6 +197,7 @@ func MaskAuthorizationHeader(value string) string {
 // Behavior by header key (case-insensitive):
 //   - "Authorization": Preserve the auth type prefix (e.g., "Bearer ") and mask only the credential part.
 //   - Headers containing "api-key": Mask the entire value using HideAPIKey.
+//   - "Sec-WebSocket-Protocol": Redact Realtime credentials carried as subprotocols.
 //   - Others: Return the original value unchanged.
 //
 // Parameters:
@@ -208,6 +209,8 @@ func MaskAuthorizationHeader(value string) string {
 func MaskSensitiveHeaderValue(key, value string) string {
 	lowerKey := strings.ToLower(strings.TrimSpace(key))
 	switch {
+	case lowerKey == "sec-websocket-protocol":
+		return maskRealtimeAuthSubprotocols(value)
 	case strings.Contains(lowerKey, "authorization"):
 		return MaskAuthorizationHeader(value)
 	case strings.Contains(lowerKey, "api-key"),
@@ -219,6 +222,27 @@ func MaskSensitiveHeaderValue(key, value string) string {
 	default:
 		return value
 	}
+}
+
+func maskRealtimeAuthSubprotocols(value string) string {
+	parts := strings.Split(value, ",")
+	changed := false
+	for i, part := range parts {
+		protocol := strings.TrimSpace(part)
+		for _, prefix := range []string{"openai-insecure-api-key.", "openai-organization.", "openai-project."} {
+			if !strings.HasPrefix(strings.ToLower(protocol), prefix) {
+				continue
+			}
+			start := strings.Index(part, protocol)
+			parts[i] = part[:start] + protocol[:len(prefix)] + "[REDACTED]" + part[start+len(protocol):]
+			changed = true
+			break
+		}
+	}
+	if !changed {
+		return value
+	}
+	return strings.Join(parts, ",")
 }
 
 // MaskSensitiveQuery masks sensitive query parameters, e.g. auth_token, within the raw query string.
