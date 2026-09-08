@@ -24,6 +24,7 @@ import (
 	managementHandlers "github.com/router-for-me/CLIProxyAPI/v6/internal/api/handlers/management"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/api/middleware"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/cache"
+	codexlive "github.com/router-for-me/CLIProxyAPI/v6/internal/client/codex/live"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/managementasset"
@@ -195,7 +196,8 @@ type Server struct {
 	server *http.Server
 
 	// handlers contains the API handlers for processing requests.
-	handlers *handlers.BaseAPIHandler
+	handlers  *handlers.BaseAPIHandler
+	codexLive *codexlive.Handler
 
 	// cfg holds the current server configuration.
 	configMu sync.RWMutex
@@ -352,6 +354,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	s := &Server{
 		engine:                 engine,
 		handlers:               handlers.NewBaseAPIHandlers(sdkHandlerConfig(cfg), authManager),
+		codexLive:              codexlive.NewHandler(cfg, authManager),
 		cfg:                    cfg,
 		accessManager:          accessManager,
 		requestLogger:          requestLogger,
@@ -507,6 +510,7 @@ func (s *Server) setupRoutes() {
 		v1.POST("/messages/count_tokens", claudeCodeHandlers.ClaudeCountTokens)
 		v1.POST("/interactions", geminiHandlers.Interactions)
 		v1.GET("/responses", openaiResponsesHandlers.ResponsesWebsocket)
+		v1.GET("/realtime", s.codexLive.HandleDirectWebsocket)
 		v1.POST("/responses", openaiResponsesHandlers.Responses)
 		v1.POST("/responses/compact", openaiResponsesHandlers.Compact)
 		v1.POST("/alpha/search", codexSearchHandlers.Search)
@@ -1271,6 +1275,9 @@ func (s *Server) StartListening() (net.Addr, <-chan error, error) {
 //   - error: An error if the server fails to stop
 func (s *Server) Stop(ctx context.Context) error {
 	log.Debug("Stopping API server...")
+	if s.codexLive != nil {
+		s.codexLive.Close()
+	}
 
 	if s.keepAliveEnabled {
 		select {
@@ -1490,6 +1497,11 @@ func (s *Server) updateClients(cfg *config.Config, rollbackOnError bool) error {
 		}
 	} else if previousManagementEnabled && !managementEnabled {
 		log.Info("management routes disabled after secret key removal")
+	}
+
+	// Publish Live admission only after fallible configuration updates complete.
+	if s.codexLive != nil {
+		s.codexLive.UpdateConfig(runtimeCfg)
 	}
 
 	// Count client sources from configuration and auth store.
