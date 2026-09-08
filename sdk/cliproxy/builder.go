@@ -185,6 +185,9 @@ func (b *Builder) Build() (*Service, error) {
 	if errModels := b.cfg.ValidateModelContextLengths(); errModels != nil {
 		return nil, errModels
 	}
+	if errThinking := b.cfg.ValidateModelThinking(); errThinking != nil {
+		return nil, errThinking
+	}
 
 	tokenProvider := b.tokenProvider
 	if tokenProvider == nil {

@@ -754,6 +754,10 @@ func (h *Handler) persistLocked(c *gin.Context) bool {
 		c.JSON(http.StatusBadRequest, gin.H{"error": errModels.Error()})
 		return false
 	}
+	if errThinking := h.cfg.ValidateModelThinking(); errThinking != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errThinking.Error()})
+		return false
+	}
 	previousBody, previousExisted, errPreviousBody := h.readPersistedConfigBodyLocked()
 	if errPreviousBody != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read current config"})
