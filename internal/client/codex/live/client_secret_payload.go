@@ -118,3 +118,23 @@ func clientSecretSessionResponse(a ClientSecretAuthorization) (json.RawMessage, 
 	delete(object, "client_secret")
 	return json.Marshal(object)
 }
+
+// Realtime fixes the model at connection creation. Only mutable native session
+// settings belong in the initialization event sent before client relay starts.
+func clientSecretSessionUpdate(a ClientSecretAuthorization) ([]byte, error) {
+	object, errObject := callJSONObject(a.session, "session")
+	if errObject != nil {
+		return nil, errObject
+	}
+	for _, field := range []string{"model", "id", "object", "expires_at", "client_secret"} {
+		delete(object, field)
+	}
+	session, errJSON := json.Marshal(object)
+	if errJSON != nil {
+		return nil, errJSON
+	}
+	return json.Marshal(struct {
+		Type    string          `json:"type"`
+		Session json.RawMessage `json:"session"`
+	}{"session.update", session})
+}

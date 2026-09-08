@@ -40,6 +40,14 @@ func (h *Handler) HandleDirectWebsocket(c *gin.Context) {
 		return
 	}
 	model := strings.TrimSpace(c.Query("model"))
+	grant, temporary := clientSecretAuthorization(c)
+	if temporary {
+		if model != "" && model != grant.model {
+			r.fail(c, nil, nil, http.StatusForbidden, "Realtime credential is not valid for the requested model", "authentication_error", "realtime_client_secret_scope_mismatch", nil, nil)
+			return
+		}
+		model = grant.model
+	}
 	if model == "" {
 		model = registry.CodexRealtimeModelID
 	}
@@ -99,6 +107,21 @@ func (h *Handler) HandleDirectWebsocket(c *gin.Context) {
 	if errCtx := context.Cause(lease.Context()); errCtx != nil {
 		r.fail(c, errCtx, lease, http.StatusServiceUnavailable, "Realtime credential is no longer available", "server_error", "codex_auth_unavailable", nil, nil)
 		return
+	}
+	if temporary {
+		if errActive := r.active(); errActive != nil {
+			r.fail(c, errActive, nil, http.StatusServiceUnavailable, "Realtime setup is unavailable", "server_error", "realtime_setup_unavailable", nil, nil)
+			return
+		}
+		update, errUpdate := clientSecretSessionUpdate(grant)
+		if errUpdate != nil {
+			r.fail(c, errUpdate, nil, http.StatusInternalServerError, "Failed to prepare realtime session", "server_error", "realtime_session_failed", nil, nil)
+			return
+		}
+		if errWrite := upstream.WriteMessage(websocket.TextMessage, update); errWrite != nil {
+			r.fail(c, errWrite, lease, http.StatusBadGateway, "Failed to initialize realtime session", "api_error", "realtime_upstream_unavailable", nil, nil)
+			return
+		}
 	}
 	if errCommit := r.commit(); errCommit != nil {
 		r.fail(c, errCommit, nil, http.StatusServiceUnavailable, "Realtime setup is unavailable", "server_error", "realtime_setup_unavailable", nil, nil)
