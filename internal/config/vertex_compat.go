@@ -51,6 +51,8 @@ func (k VertexCompatKey) GetBaseURL() string { return k.BaseURL }
 // VertexCompatModel represents a model configuration for Vertex compatibility,
 // including the actual model name and its alias for API routing.
 type VertexCompatModel struct {
+	// DisplayName is an optional catalog label; blank inherits the model label.
+	DisplayName string `yaml:"display-name,omitempty" json:"display-name,omitempty"`
 	// Name is the actual model name used by the external provider.
 	Name string `yaml:"name" json:"name"`
 
@@ -61,9 +63,10 @@ type VertexCompatModel struct {
 	ForceMapping bool `yaml:"force-mapping,omitempty" json:"force-mapping,omitempty"`
 }
 
-func (m VertexCompatModel) GetName() string       { return m.Name }
-func (m VertexCompatModel) GetAlias() string      { return m.Alias }
-func (m VertexCompatModel) GetForceMapping() bool { return m.ForceMapping }
+func (m VertexCompatModel) GetName() string        { return m.Name }
+func (m VertexCompatModel) GetDisplayName() string { return m.DisplayName }
+func (m VertexCompatModel) GetAlias() string       { return m.Alias }
+func (m VertexCompatModel) GetForceMapping() bool  { return m.ForceMapping }
 
 // SanitizeVertexCompatKeys deduplicates and normalizes Vertex-compatible API key credentials.
 func (cfg *Config) SanitizeVertexCompatKeys() {

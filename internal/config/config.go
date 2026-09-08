@@ -1795,6 +1795,8 @@ type RoutingConfig struct {
 // When Fork is true, the alias is added as an additional model in listings while
 // keeping the original model ID available.
 type OAuthModelAlias struct {
+	// DisplayName is an optional catalog label; blank inherits the model label.
+	DisplayName  string `yaml:"display-name,omitempty" json:"display-name,omitempty"`
 	Name         string `yaml:"name" json:"name"`
 	Alias        string `yaml:"alias" json:"alias"`
 	Fork         bool   `yaml:"fork,omitempty" json:"fork,omitempty"`
@@ -1919,6 +1921,8 @@ func (k ClaudeKey) GetBaseURL() string { return k.BaseURL }
 
 // ClaudeModel describes a mapping between an alias and the actual upstream model name.
 type ClaudeModel struct {
+	// DisplayName is an optional catalog label; blank inherits the model label.
+	DisplayName string `yaml:"display-name,omitempty" json:"display-name,omitempty"`
 	// Name is the upstream model identifier used when issuing requests.
 	Name string `yaml:"name" json:"name"`
 
@@ -1929,9 +1933,10 @@ type ClaudeModel struct {
 	ForceMapping bool `yaml:"force-mapping,omitempty" json:"force-mapping,omitempty"`
 }
 
-func (m ClaudeModel) GetName() string       { return m.Name }
-func (m ClaudeModel) GetAlias() string      { return m.Alias }
-func (m ClaudeModel) GetForceMapping() bool { return m.ForceMapping }
+func (m ClaudeModel) GetName() string        { return m.Name }
+func (m ClaudeModel) GetDisplayName() string { return m.DisplayName }
+func (m ClaudeModel) GetAlias() string       { return m.Alias }
+func (m ClaudeModel) GetForceMapping() bool  { return m.ForceMapping }
 
 // CodexKey represents the configuration for a Codex API key,
 // including the API key itself and an optional base URL for the API endpoint.
@@ -1977,6 +1982,8 @@ func (k CodexKey) GetBaseURL() string { return k.BaseURL }
 
 // CodexModel describes a mapping between an alias and the actual upstream model name.
 type CodexModel struct {
+	// DisplayName is an optional catalog label; blank inherits the model label.
+	DisplayName string `yaml:"display-name,omitempty" json:"display-name,omitempty"`
 	// Name is the upstream model identifier used when issuing requests.
 	Name string `yaml:"name" json:"name"`
 
@@ -1987,9 +1994,10 @@ type CodexModel struct {
 	ForceMapping bool `yaml:"force-mapping,omitempty" json:"force-mapping,omitempty"`
 }
 
-func (m CodexModel) GetName() string       { return m.Name }
-func (m CodexModel) GetAlias() string      { return m.Alias }
-func (m CodexModel) GetForceMapping() bool { return m.ForceMapping }
+func (m CodexModel) GetName() string        { return m.Name }
+func (m CodexModel) GetDisplayName() string { return m.DisplayName }
+func (m CodexModel) GetAlias() string       { return m.Alias }
+func (m CodexModel) GetForceMapping() bool  { return m.ForceMapping }
 
 // GeminiKey represents the configuration for a Gemini API key,
 // including optional overrides for upstream base URL, proxy routing, and headers.
@@ -2031,6 +2039,8 @@ func (k GeminiKey) GetBaseURL() string { return k.BaseURL }
 
 // GeminiModel describes a mapping between an alias and the actual upstream model name.
 type GeminiModel struct {
+	// DisplayName is an optional catalog label; blank inherits the model label.
+	DisplayName string `yaml:"display-name,omitempty" json:"display-name,omitempty"`
 	// Name is the upstream model identifier used when issuing requests.
 	Name string `yaml:"name" json:"name"`
 
@@ -2041,9 +2051,10 @@ type GeminiModel struct {
 	ForceMapping bool `yaml:"force-mapping,omitempty" json:"force-mapping,omitempty"`
 }
 
-func (m GeminiModel) GetName() string       { return m.Name }
-func (m GeminiModel) GetAlias() string      { return m.Alias }
-func (m GeminiModel) GetForceMapping() bool { return m.ForceMapping }
+func (m GeminiModel) GetName() string        { return m.Name }
+func (m GeminiModel) GetDisplayName() string { return m.DisplayName }
+func (m GeminiModel) GetAlias() string       { return m.Alias }
+func (m GeminiModel) GetForceMapping() bool  { return m.ForceMapping }
 
 // OpenAICompatibility represents the configuration for OpenAI API compatibility
 // with external providers, allowing model aliases to be routed through OpenAI API format.
@@ -2092,6 +2103,8 @@ type OpenAICompatibilityAPIKey struct {
 // OpenAICompatibilityModel represents a model configuration for OpenAI compatibility,
 // including the actual model name and its alias for API routing.
 type OpenAICompatibilityModel struct {
+	// DisplayName is an optional catalog label; blank inherits the model label.
+	DisplayName string `yaml:"display-name,omitempty" json:"display-name,omitempty"`
 	// Name is the actual model name used by the external provider.
 	Name string `yaml:"name" json:"name"`
 
@@ -2106,9 +2119,10 @@ type OpenAICompatibilityModel struct {
 	Thinking *registry.ThinkingSupport `yaml:"thinking,omitempty" json:"thinking,omitempty"`
 }
 
-func (m OpenAICompatibilityModel) GetName() string       { return m.Name }
-func (m OpenAICompatibilityModel) GetAlias() string      { return m.Alias }
-func (m OpenAICompatibilityModel) GetForceMapping() bool { return m.ForceMapping }
+func (m OpenAICompatibilityModel) GetName() string        { return m.Name }
+func (m OpenAICompatibilityModel) GetDisplayName() string { return m.DisplayName }
+func (m OpenAICompatibilityModel) GetAlias() string       { return m.Alias }
+func (m OpenAICompatibilityModel) GetForceMapping() bool  { return m.ForceMapping }
 
 // LoadConfig reads a YAML configuration file from the given path,
 // unmarshals it into a Config struct, applies environment variable overrides,
@@ -2198,6 +2212,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	}
 	if errRules := validateRequestScopedErrorsYAML(data); errRules != nil {
 		return nil, errRules
+	}
+	if errModels := validateModelDisplayNamesYAML(data); errModels != nil {
+		return nil, errModels
 	}
 	if err = yaml.Unmarshal(data, &cfg); err != nil {
 		if optional {
@@ -2732,7 +2749,7 @@ func (cfg *Config) SanitizeOAuthModelAlias() {
 				continue
 			}
 			seenAlias[aliasKey] = struct{}{}
-			clean = append(clean, OAuthModelAlias{Name: name, Alias: alias, Fork: entry.Fork, ForceMapping: entry.ForceMapping})
+			clean = append(clean, OAuthModelAlias{Name: name, Alias: alias, Fork: entry.Fork, ForceMapping: entry.ForceMapping, DisplayName: strings.TrimSpace(entry.DisplayName)})
 		}
 		if len(clean) > 0 {
 			out[channel] = clean
