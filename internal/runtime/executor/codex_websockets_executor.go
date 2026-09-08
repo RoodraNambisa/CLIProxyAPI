@@ -1113,6 +1113,50 @@ func (e *CodexWebsocketsExecutor) dialCodexWebsocket(ctx context.Context, auth *
 	return conn, resp, err
 }
 
+// DialCodexLiveWebsocket keeps native realtime traffic outside Responses state.
+// Browser credential-bearing subprotocols are never forwarded to the upstream.
+func (e *CodexExecutor) DialCodexLiveWebsocket(ctx context.Context, auth *cliproxyauth.Auth, target string, headers http.Header, protocols []string) (*websocket.Conn, *http.Response, error) {
+	if !cliproxyauth.SupportsCodexLive(auth) {
+		return nil, nil, statusErr{code: http.StatusNotImplemented, msg: "Codex realtime requires standard OAuth", skipAuthResult: true}
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if errCtx := ctx.Err(); errCtx != nil {
+		return nil, nil, errCtx
+	}
+	ctx = contextWithCodexFingerprintPersona(ctx, e.cfg, auth)
+	req, errRequest := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+	if errRequest != nil {
+		return nil, nil, errRequest
+	}
+	req.Header = headers.Clone()
+	if req.Header == nil {
+		req.Header = make(http.Header)
+	}
+	if errPrepare := e.PrepareRequest(req, auth); errPrepare != nil {
+		return nil, nil, errPrepare
+	}
+	for key := range req.Header {
+		if strings.EqualFold(key, "Sec-WebSocket-Protocol") {
+			delete(req.Header, key)
+		}
+	}
+	dialer := newProxyAwareWebsocketDialer(ctx, e.cfg, auth)
+	for _, protocol := range protocols {
+		if protocol == "realtime" {
+			dialer.Subprotocols = []string{"realtime"}
+			break
+		}
+	}
+	conn, resp, errDial := dialer.DialContext(ctx, target, req.Header)
+	helps.ObserveUpstreamWebsocketDial(ctx, resp, errDial)
+	if conn != nil {
+		conn.EnableWriteCompression(false)
+	}
+	return conn, resp, errDial
+}
+
 func writeCodexWebsocketMessage(sess *codexWebsocketSession, conn *websocket.Conn, payload []byte) error {
 	if sess != nil {
 		return sess.writeMessage(conn, websocket.TextMessage, payload)
@@ -2408,6 +2452,13 @@ func (e *CodexAutoExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth
 		return e.wsExec.Execute(ctx, auth, req, opts)
 	}
 	return e.httpExec.Execute(ctx, auth, req, opts)
+}
+
+func (e *CodexAutoExecutor) DialCodexLiveWebsocket(ctx context.Context, auth *cliproxyauth.Auth, target string, headers http.Header, protocols []string) (*websocket.Conn, *http.Response, error) {
+	if e == nil || e.httpExec == nil {
+		return nil, nil, fmt.Errorf("codex auto executor: executor is nil")
+	}
+	return e.httpExec.DialCodexLiveWebsocket(ctx, auth, target, headers, protocols)
 }
 
 func (e *CodexAutoExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {

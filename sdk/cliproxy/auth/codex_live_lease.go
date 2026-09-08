@@ -14,16 +14,17 @@ import (
 // The caller owns the session context and must close the lease when it ends.
 // Selection reserves capacity; CommitUpstream consumes it only when connecting.
 type CodexLiveLease struct {
-	ctx      context.Context
-	auth     *Auth
-	executor ProviderExecutor
-	model    string
-	slot     *core.AuthRequestSlot
-	mu       sync.Mutex
-	closed   bool
-	stop     func() bool
-	release  func() bool
-	cancel   context.CancelFunc
+	ctx                  context.Context
+	auth                 *Auth
+	executor             ProviderExecutor
+	model                string
+	slot                 *core.AuthRequestSlot
+	mu                   sync.Mutex
+	closed               bool
+	websocketDialStarted bool
+	stop                 func() bool
+	release              func() bool
+	cancel               context.CancelFunc
 }
 
 // AcquireCodexLive selects once through the existing routing and model rules.
