@@ -22,6 +22,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
+	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/session"
 )
 
 // RoundRobinSelector provides a simple provider scoped round-robin selection strategy.
@@ -1007,6 +1008,8 @@ type SessionAffinitySelector struct {
 	failover         bool
 	acrossPriorities bool
 	subagents        bool
+	lcp              bool
+	historyMatcher   *session.HistoryMatcher
 }
 
 // SessionAffinityConfig configures the session affinity selector.
@@ -1018,6 +1021,8 @@ type SessionAffinityConfig struct {
 	AcrossPriorities bool
 	// Subagents permits explicit child/fork inheritance. Default: false.
 	Subagents bool
+	// LCP enables bounded shared-prefix preferences. Default: false.
+	LCP bool
 }
 
 // NewSessionAffinitySelector creates a new session-aware selector.
@@ -1040,12 +1045,18 @@ func NewSessionAffinitySelectorWithConfig(cfg SessionAffinityConfig) *SessionAff
 	if cfg.Failover != nil {
 		failover = *cfg.Failover
 	}
+	var historyMatcher *session.HistoryMatcher
+	if cfg.LCP {
+		historyMatcher = session.NewHistoryMatcher(cfg.TTL)
+	}
 	return &SessionAffinitySelector{
 		fallback:         cfg.Fallback,
 		cache:            NewSessionCache(cfg.TTL),
 		failover:         failover,
 		acrossPriorities: cfg.AcrossPriorities,
 		subagents:        cfg.Subagents,
+		lcp:              cfg.LCP,
+		historyMatcher:   historyMatcher,
 	}
 }
 
@@ -1076,7 +1087,7 @@ func (s *SessionAffinitySelector) cachedAuthID(provider, model string, opts clip
 	}
 	primaryID, fallbackID := s.sessionIDs(ctx, opts)
 	if primaryID == "" {
-		return ""
+		return s.historyPreferredAuth(ctx, provider, model, opts)
 	}
 	if authID, ok := s.cache.GetAndRefresh(provider + "::" + primaryID + "::" + canonicalModelKey(model)); ok {
 		return authID
@@ -1115,6 +1126,9 @@ func (s *SessionAffinitySelector) pickWithFallbackDeferredBinding(ctx context.Co
 	entry := selectorLogEntry(ctx)
 	primaryID, fallbackID := s.sessionIDs(ctx, opts)
 	if primaryID == "" {
+		if auth, handled, err := s.pickHistoryPreference(ctx, provider, model, opts, auths, false); handled {
+			return auth, nil, err
+		}
 		entry.Debugf("session-affinity: no session ID extracted, falling back to default selector | provider=%s model=%s", provider, model)
 		auth, err := fallback.Pick(ctx, provider, model, opts, auths)
 		return auth, nil, err
@@ -1202,6 +1216,9 @@ func (s *SessionAffinitySelector) pickWithPreparedFallbackDeferredBinding(ctx co
 	entry := selectorLogEntry(ctx)
 	primaryID, fallbackID := s.sessionIDs(ctx, opts)
 	if primaryID == "" {
+		if auth, handled, err := s.pickHistoryPreference(ctx, provider, model, opts, available, true); handled {
+			return auth, nil, err
+		}
 		entry.Debugf("session-affinity: no session ID extracted, falling back to default selector | provider=%s model=%s", provider, model)
 		auth, err := pickFallback()
 		return auth, nil, err
@@ -1278,6 +1295,9 @@ func (s *SessionAffinitySelector) BindSessionWithRollback(ctx context.Context, p
 	entry := selectorLogEntry(ctx)
 	primaryID, _ := s.sessionIDs(ctx, opts)
 	if primaryID == "" {
+		if namespace, history, ok := s.historyRequest(ctx, provider, model, opts); ok {
+			return s.historyMatcher.BindWithRollback(namespace, *history, authID)
+		}
 		return nil
 	}
 	cacheKey := provider + "::" + primaryID + "::" + canonicalModelKey(model)
@@ -1324,6 +1344,9 @@ func (s *SessionAffinitySelector) Stop() {
 func (s *SessionAffinitySelector) InvalidateAuth(authID string) {
 	if s.cache != nil {
 		s.cache.InvalidateAuth(authID)
+	}
+	if s.historyMatcher != nil {
+		s.historyMatcher.InvalidateAuth(authID)
 	}
 }
 

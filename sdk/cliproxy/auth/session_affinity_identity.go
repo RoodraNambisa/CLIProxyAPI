@@ -90,15 +90,18 @@ func scopedAffinityID(scope, id string) string {
 }
 
 func (s *SessionAffinitySelector) sessionIDs(ctx context.Context, opts core.Options) (string, string) {
-	if s != nil && s.subagents {
-		captured := captureAffinityIdentity(ctx, core.Request{}, opts)
+	if s != nil && (s.subagents || s.lcp) {
+		captured := captureAffinityIdentity(ctx, core.Request{}, opts, s.lcp)
 		if captured.scope != "" {
 			if captured.identity.SessionID == "" {
+				if s.lcp {
+					return "", ""
+				}
 				return scopedAffinityID(captured.scope, captured.legacyPrimary), scopedAffinityID(captured.scope, captured.legacyFallback)
 			}
 			primary := scopedAffinityID(captured.scope, captured.identity.SessionID)
 			parent := ""
-			if captured.identity.IsSubagent || captured.identity.IsFork {
+			if s.subagents && (captured.identity.IsSubagent || captured.identity.IsFork) {
 				parent = scopedAffinityID(captured.scope, captured.identity.ParentSessionID)
 			}
 			return primary, parent
@@ -110,8 +113,11 @@ func (s *SessionAffinitySelector) sessionIDs(ctx context.Context, opts core.Opti
 // An explicit parent is only a preference until the child has a binding of its
 // own. A parent's exhausted capacity must not turn that preference into a lock.
 func (s *SessionAffinitySelector) cachedStrictAuthID(ctx context.Context, provider, model string, opts core.Options) string {
-	if s != nil && s.subagents {
-		captured := captureAffinityIdentity(ctx, core.Request{}, opts)
+	if s != nil && (s.subagents || s.lcp) {
+		captured := captureAffinityIdentity(ctx, core.Request{}, opts, s.lcp)
+		if captured.scope != "" && s.lcp && captured.identity.SessionID == "" {
+			return ""
+		}
 		if captured.scope != "" && captured.identity.ParentSessionID != "" {
 			primary, _ := s.sessionIDs(ctx, opts)
 			authID, _ := s.cache.GetAndRefresh(provider + "::" + primary + "::" + canonicalModelKey(model))
