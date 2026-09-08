@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 )
 
@@ -128,6 +129,7 @@ func buildCodexClientModels(models []map[string]any, providersForModel codexClie
 		if template, ok := templates[id]; ok {
 			entry := cloneCodexClientModelMap(template)
 			applyCodexClientDisplayName(entry, model)
+			applyCodexClientContextOverride(entry, model)
 			applyCodexClientMaxTokens(entry, model)
 			applyCodexClientSearchToolSupport(entry, id, true, providersForModel)
 			sanitizeCodexClientReasoningMetadata(entry)
@@ -138,6 +140,7 @@ func buildCodexClientModels(models []map[string]any, providersForModel codexClie
 
 		entry := cloneCodexClientModelMap(defaultTemplate)
 		applyCodexClientModelMetadata(entry, id, model)
+		applyCodexClientContextOverride(entry, model)
 		applyCodexClientMaxTokens(entry, model)
 		applyCodexClientSearchToolSupport(entry, id, false, providersForModel)
 		sanitizeCodexClientReasoningMetadata(entry)
@@ -259,6 +262,34 @@ func applyCodexClientMaxTokens(entry map[string]any, model map[string]any) {
 	}
 }
 
+func applyCodexClientContextOverride(entry, model map[string]any) {
+	var limit int64
+	switch value := model["max_context_length"].(type) {
+	case int:
+		limit = int64(value)
+	case int64:
+		limit = value
+	case json.Number:
+		parsed, err := value.Int64()
+		if err != nil {
+			return
+		}
+		limit = parsed
+	case float64:
+		if math.IsNaN(value) || math.IsInf(value, 0) || value != math.Trunc(value) || value < 1 || value > config.MaxModelContextLength {
+			return
+		}
+		limit = int64(value)
+	default:
+		return
+	}
+	if limit <= 0 || config.ValidateModelContextLength(limit) != nil {
+		return
+	}
+	entry["context_window"] = int(limit)
+	entry["max_context_window"] = int(limit)
+}
+
 func applyCodexClientModelMetadata(entry map[string]any, id string, model map[string]any) {
 	info := registry.LookupModelInfo(id)
 
@@ -273,7 +304,7 @@ func applyCodexClientModelMetadata(entry map[string]any, id string, model map[st
 		if info.Description != "" {
 			description = info.Description
 		}
-		if info.ContextLength > 0 {
+		if contextWindow <= 0 && info.ContextLength > 0 && info.MaxContextLength == 0 {
 			contextWindow = info.ContextLength
 		}
 		if info.Type == registry.OpenAIImageModelType {
