@@ -220,6 +220,7 @@ func (b *Builder) Build() (*Service, error) {
 		sessionAffinityFailover := true
 		sessionAffinityAcrossPriorities := false
 		sessionAffinitySubagents := false
+		sessionAffinityLCP := false
 		sessionAffinityTTL := time.Hour
 		if b.cfg != nil {
 			strategy = strings.ToLower(strings.TrimSpace(b.cfg.Routing.Strategy))
@@ -228,6 +229,7 @@ func (b *Builder) Build() (*Service, error) {
 			sessionAffinityFailover = routingSessionAffinityFailoverEnabled(b.cfg)
 			sessionAffinityAcrossPriorities = b.cfg.Routing.SessionAffinityAcrossPriorities
 			sessionAffinitySubagents = b.cfg.Routing.SessionAffinity && b.cfg.Routing.SessionAffinitySubagents
+			sessionAffinityLCP = b.cfg.Routing.SessionAffinity && b.cfg.Routing.SessionAffinityLCP
 			if ttlStr := strings.TrimSpace(b.cfg.Routing.SessionAffinityTTL); ttlStr != "" {
 				if parsed, err := time.ParseDuration(ttlStr); err == nil && parsed > 0 {
 					sessionAffinityTTL = parsed
@@ -254,6 +256,7 @@ func (b *Builder) Build() (*Service, error) {
 				Failover:         &sessionAffinityFailover,
 				AcrossPriorities: sessionAffinityAcrossPriorities,
 				Subagents:        sessionAffinitySubagents,
+				LCP:              sessionAffinityLCP,
 			})
 		}
 
