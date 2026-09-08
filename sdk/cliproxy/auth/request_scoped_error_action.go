@@ -24,6 +24,21 @@ func isRequestScopedStopError(err error) bool {
 	return errors.As(err, &stop) && stop.IsRequestStop()
 }
 
+func requestScopedActionFromError(err error) (config.RequestScopedErrorAction, bool) {
+	var handled *requestScopedActionError
+	if errors.As(err, &handled) && handled != nil {
+		return handled.action, true
+	}
+	return "", false
+}
+
+func wrapRequestScopedAction(err error, action config.RequestScopedErrorAction, matched bool) error {
+	if err == nil || !matched {
+		return err
+	}
+	return &requestScopedActionError{error: err, action: action}
+}
+
 func applyRequestScopedActionToResult(action config.RequestScopedErrorAction, matched bool, result *executionResult) {
 	if !matched || result == nil || result.Error == nil {
 		return

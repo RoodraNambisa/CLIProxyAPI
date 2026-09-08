@@ -2555,7 +2555,7 @@ func (m *Manager) executeStreamWithModelPool(ctx, resultCtx context.Context, exe
 		execReq.Model = execModel
 		releaseMu := sync.Mutex{}
 		execOpts := opts
-		replayOpts := cliproxyexecutor.Options{Metadata: opts.Metadata}
+		replayOpts := cliproxyexecutor.Options{Alt: opts.Alt, Metadata: opts.Metadata}
 		unregisterRelease := registerRequestBodyReleaseCallback(ctx, opts, func([]byte) {
 			releaseMu.Lock()
 			defer releaseMu.Unlock()
@@ -2595,9 +2595,12 @@ func (m *Manager) executeStreamWithModelPool(ctx, resultCtx context.Context, exe
 			result.Error = rerr
 			result.RetryAfter = retryAfterFromError(errStream)
 			result.availabilityNeutral = isResponsesCompactAvailabilityNeutralError(opts, errStream)
-			if !skipAuthResultForError(errStream) && !deferUnauthorizedStreamResult(auth, errStream) {
+			action, matchedAction := m.matchRequestScopedErrorAction(ctx, auth, replayOpts, errStream)
+			applyRequestScopedActionToResult(action, matchedAction, &result)
+			if !skipAuthResultForError(errStream) && (matchedAction || !deferUnauthorizedStreamResult(auth, errStream)) {
 				m.markExecutionResult(ctx, result)
 			}
+			errStream = wrapRequestScopedAction(errStream, action, matchedAction)
 			if isResponsesCompactRequestFaultError(opts, errStream) || m.isRequestInvalidError(errStream, ctx) {
 				return nil, errStream
 			}
@@ -2620,6 +2623,8 @@ func (m *Manager) executeStreamWithModelPool(ctx, resultCtx context.Context, exe
 			}
 			bootstrapErr = m.reportProxyFailure(ctx, auth, bootstrapErr)
 			m.projectFailedImageGenerationQuota(ctx, auth, provider, executionResultModelForError(resultModel, bootstrapErr), opts)
+			action, matchedAction := m.matchRequestScopedErrorAction(ctx, auth, replayOpts, bootstrapErr)
+			bootstrapErr = wrapRequestScopedAction(bootstrapErr, action, matchedAction)
 			if isResponsesCompactRequestFaultError(opts, bootstrapErr) || m.isRequestInvalidError(bootstrapErr, ctx) {
 				rerr := &Error{Message: bootstrapErr.Error()}
 				if se, ok := errors.AsType[cliproxyexecutor.StatusError](bootstrapErr); ok && se != nil {
@@ -2630,10 +2635,14 @@ func (m *Manager) executeStreamWithModelPool(ctx, resultCtx context.Context, exe
 				result.Error = rerr
 				result.RetryAfter = retryAfterFromError(bootstrapErr)
 				result.availabilityNeutral = isResponsesCompactAvailabilityNeutralError(opts, bootstrapErr)
-				if !skipAuthResultForError(bootstrapErr) && !deferUnauthorizedStreamResult(auth, bootstrapErr) {
+				applyRequestScopedActionToResult(action, matchedAction, &result)
+				if !skipAuthResultForError(bootstrapErr) && (matchedAction || !deferUnauthorizedStreamResult(auth, bootstrapErr)) {
 					m.markExecutionResult(ctx, result)
 				}
 				discardStreamChunks(ctx, streamResult.Chunks)
+				if matchedAction {
+					return nil, newStreamBootstrapError(bootstrapErr, streamResult.Headers)
+				}
 				return nil, bootstrapErr
 			}
 			if idx < len(execModels)-1 && requestBodyReplayable(ctx, replayOpts) {
@@ -2646,7 +2655,8 @@ func (m *Manager) executeStreamWithModelPool(ctx, resultCtx context.Context, exe
 				result.Error = rerr
 				result.RetryAfter = retryAfterFromError(bootstrapErr)
 				result.availabilityNeutral = isResponsesCompactAvailabilityNeutralError(opts, bootstrapErr)
-				if !skipAuthResultForError(bootstrapErr) && !deferUnauthorizedStreamResult(auth, bootstrapErr) {
+				applyRequestScopedActionToResult(action, matchedAction, &result)
+				if !skipAuthResultForError(bootstrapErr) && (matchedAction || !deferUnauthorizedStreamResult(auth, bootstrapErr)) {
 					m.markExecutionResult(ctx, result)
 				}
 				discardStreamChunks(ctx, streamResult.Chunks)
@@ -2662,7 +2672,8 @@ func (m *Manager) executeStreamWithModelPool(ctx, resultCtx context.Context, exe
 			result.Error = rerr
 			result.RetryAfter = retryAfterFromError(bootstrapErr)
 			result.availabilityNeutral = isResponsesCompactAvailabilityNeutralError(opts, bootstrapErr)
-			if !skipAuthResultForError(bootstrapErr) && !deferUnauthorizedStreamResult(auth, bootstrapErr) {
+			applyRequestScopedActionToResult(action, matchedAction, &result)
+			if !skipAuthResultForError(bootstrapErr) && (matchedAction || !deferUnauthorizedStreamResult(auth, bootstrapErr)) {
 				m.markExecutionResult(ctx, result)
 			}
 			discardStreamChunks(ctx, streamResult.Chunks)
@@ -8877,6 +8888,9 @@ func authHasRefreshCredential(auth *Auth) bool {
 }
 
 func deferUnauthorizedStreamResult(auth *Auth, err error) bool {
+	if _, handled := requestScopedActionFromError(err); handled {
+		return false
+	}
 	if auth == nil || isKnownRequestFault(err) {
 		return false
 	}
@@ -11127,6 +11141,9 @@ func sameAuthRequestRefreshLockIDs(left, right []string) bool {
 // tryRefreshAfterUnauthorized applies the provider-specific recovery policy
 // after an unauthorized response.
 func (m *Manager) tryRefreshAfterUnauthorized(ctx context.Context, executor ProviderExecutor, auth *Auth, execErr error, alreadyTried bool) (*Auth, bool, error) {
+	if _, handled := requestScopedActionFromError(execErr); handled {
+		return auth, false, nil
+	}
 	if m == nil || auth == nil || alreadyTried || execErr == nil || isKnownRequestFault(execErr) {
 		return auth, false, nil
 	}
