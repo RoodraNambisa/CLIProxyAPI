@@ -91,12 +91,12 @@ func TestModelDisplayNameAliasesMergesAndJSONTypes(t *testing.T) {
 		"defaults: &defaults {codex-api-key: [{models: [{display-name: 123}]}]}\n<<: *defaults\n",
 		"defaults: &defaults {oauth-model-alias: {codex: [{display-name: false}]}}\n<<: *defaults\n",
 	} {
-		if err := validateModelDisplayNamesYAML([]byte(body)); err == nil {
+		if err := validateModelCatalogFieldsYAML([]byte(body)); err == nil {
 			t.Fatal("inherited invalid display name was accepted")
 		}
 	}
 	validOverride := "model: &model {display-name: 123}\ncodex-api-key: [{models: [{<<: *model, name: upstream, display-name: valid}]}]\n"
-	if err := validateModelDisplayNamesYAML([]byte(validOverride)); err != nil {
+	if err := validateModelCatalogFieldsYAML([]byte(validOverride)); err != nil {
 		t.Fatal(err)
 	}
 	for _, family := range retryConfigFamilies {

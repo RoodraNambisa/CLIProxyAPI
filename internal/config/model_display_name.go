@@ -6,9 +6,9 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// Validate only the new field before optional-load fallback can hide its type
-// error. Unrelated legacy YAML errors keep their existing startup behavior.
-func validateModelDisplayNamesYAML(data []byte) error {
+// Validate new catalog fields before optional-load fallback can hide type
+// errors. Unrelated legacy YAML errors keep their existing startup behavior.
+func validateModelCatalogFieldsYAML(data []byte) error {
 	var document yaml.Node
 	if err := yaml.Unmarshal(data, &document); err != nil || len(document.Content) == 0 {
 		return nil
@@ -24,7 +24,7 @@ func validateModelDisplayNamesYAML(data []byte) error {
 		}
 		return node
 	}
-	validate := func(models *yaml.Node) error {
+	validate := func(models *yaml.Node, contextLengths bool) error {
 		models = resolve(models)
 		if models == nil || models.Kind != yaml.SequenceNode {
 			return nil
@@ -37,6 +37,27 @@ func validateModelDisplayNamesYAML(data []byte) error {
 			name = resolve(name)
 			if name != nil && name.Tag != "!!null" && (name.Kind != yaml.ScalarNode || name.Tag != "!!str") {
 				return fmt.Errorf("models[%d].display-name must be a string", index)
+			}
+			if !contextLengths {
+				continue
+			}
+			limit, err := credentialYAMLField(model, "max-context-length", make(map[*yaml.Node]bool))
+			if err != nil {
+				return err
+			}
+			limit = resolve(limit)
+			if limit == nil || limit.Tag == "!!null" {
+				continue
+			}
+			if limit.Kind != yaml.ScalarNode || limit.Tag != "!!int" {
+				return fmt.Errorf("models[%d].max-context-length must be an integer", index)
+			}
+			var value int64
+			if err := limit.Decode(&value); err != nil {
+				return fmt.Errorf("models[%d].max-context-length exceeds the signed integer range", index)
+			}
+			if err := ValidateModelContextLength(value); err != nil {
+				return fmt.Errorf("models[%d]: %w", index, err)
 			}
 		}
 		return nil
@@ -55,7 +76,7 @@ func validateModelDisplayNamesYAML(data []byte) error {
 			if err != nil {
 				return err
 			}
-			if err := validate(models); err != nil {
+			if err := validate(models, true); err != nil {
 				return fmt.Errorf("%s: %w", family, err)
 			}
 		}
@@ -71,7 +92,7 @@ func validateModelDisplayNamesYAML(data []byte) error {
 			return nil
 		}
 		for _, rules := range providers {
-			if err := validate(&rules); err != nil {
+			if err := validate(&rules, false); err != nil {
 				return fmt.Errorf("oauth-model-alias: %w", err)
 			}
 		}
