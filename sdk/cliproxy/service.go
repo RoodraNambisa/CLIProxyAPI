@@ -5694,6 +5694,10 @@ func (s *Service) registerModelsForAuthWithState(a *coreauth.Auth, preserveTrans
 						if modelID == "" {
 							modelID = m.Name
 						}
+						displayName := strings.TrimSpace(m.DisplayName)
+						if displayName == "" {
+							displayName = modelID
+						}
 						thinking := m.Thinking
 						if thinking == nil {
 							thinking = &registry.ThinkingSupport{Levels: []string{"low", "medium", "high"}}
@@ -5705,7 +5709,7 @@ func (s *Service) registerModelsForAuthWithState(a *coreauth.Auth, preserveTrans
 							Created:     time.Now().Unix(),
 							OwnedBy:     compat.Name,
 							Type:        "openai-compatibility",
-							DisplayName: modelID,
+							DisplayName: displayName,
 							UserDefined: false,
 							Thinking:    thinking,
 						})
@@ -6551,6 +6555,7 @@ func matchWildcard(pattern, value string) bool {
 type modelEntry interface {
 	GetName() string
 	GetAlias() string
+	GetDisplayName() string
 }
 
 func buildConfigModels[T modelEntry](models []T, ownedBy, modelType string) []*ModelInfo {
@@ -6578,6 +6583,9 @@ func buildConfigModels[T modelEntry](models []T, ownedBy, modelType string) []*M
 		display := name
 		if display == "" {
 			display = alias
+		}
+		if explicit := strings.TrimSpace(model.GetDisplayName()); explicit != "" {
+			display = explicit
 		}
 		info := &ModelInfo{
 			ID:          alias,
@@ -6667,8 +6675,9 @@ func applyOAuthModelAlias(cfg *config.Config, provider, authKind string, models 
 	}
 
 	type aliasEntry struct {
-		alias string
-		fork  bool
+		alias       string
+		displayName string
+		fork        bool
 	}
 
 	forward := make(map[string][]aliasEntry, len(aliases))
@@ -6682,7 +6691,7 @@ func applyOAuthModelAlias(cfg *config.Config, provider, authKind string, models 
 			continue
 		}
 		key := strings.ToLower(name)
-		forward[key] = append(forward[key], aliasEntry{alias: alias, fork: aliases[i].Fork})
+		forward[key] = append(forward[key], aliasEntry{alias: alias, displayName: strings.TrimSpace(aliases[i].DisplayName), fork: aliases[i].Fork})
 	}
 	if len(forward) == 0 {
 		return models
@@ -6740,6 +6749,9 @@ func applyOAuthModelAlias(cfg *config.Config, provider, authKind string, models 
 			clone := *model
 			clone.ID = mappedID
 			clone.UpstreamID = modelInfoUpstreamID(model)
+			if entry.displayName != "" {
+				clone.DisplayName = entry.displayName
+			}
 			if clone.Name != "" {
 				clone.Name = rewriteModelInfoName(clone.Name, id, mappedID)
 			}
