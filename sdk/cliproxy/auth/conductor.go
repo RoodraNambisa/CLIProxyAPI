@@ -6353,9 +6353,13 @@ func (m *Manager) strictSessionAffinityForRequest(ctx context.Context, req clipr
 	if policy := m.selectionPolicy(ctx); policy == nil || !policy.strictAffinity {
 		return false
 	}
-	if selector, ok := m.selectorForContext(ctx).(*SessionAffinitySelector); ok && selector != nil && selector.subagents {
+	if selector, ok := m.selectorForContext(ctx).(*SessionAffinitySelector); ok && selector != nil && (selector.subagents || selector.lcp) {
 		primary, _ := selector.sessionIDs(ctx, opts)
-		return primary != ""
+		if primary != "" {
+			return true
+		}
+		_, _, hasHistory := selector.historyRequest(ctx, "", req.Model, opts)
+		return hasHistory
 	}
 	payload := opts.OriginalRequest
 	if len(payload) == 0 {
@@ -7436,8 +7440,8 @@ func (m *Manager) prepareProviderRequests(
 	opts cliproxyexecutor.Options,
 	operation cliproxyexecutor.RequestOperation,
 ) ([]string, cliproxyexecutor.Options, error) {
-	if selector, ok := m.selectorForContext(ctx).(*SessionAffinitySelector); ok && selector != nil && selector.subagents {
-		opts = withAffinityIdentity(ctx, req, opts)
+	if selector, ok := m.selectorForContext(ctx).(*SessionAffinitySelector); ok && selector != nil && (selector.subagents || selector.lcp) {
+		opts = withAffinityIdentity(ctx, req, opts, selector.lcp)
 	}
 	preparedProviders := make([]string, 0, len(providers))
 	preparedOpts := opts
