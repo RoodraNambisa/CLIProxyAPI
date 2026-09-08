@@ -9083,6 +9083,9 @@ func isRequestInvalidErrorWithRules(err error, rules []internalconfig.NonRetryab
 	if err == nil {
 		return false
 	}
+	if isRequestScopedStopError(err) {
+		return true
+	}
 	if isChatGPTWebUnauthorizedRequestError(err) {
 		return true
 	}
