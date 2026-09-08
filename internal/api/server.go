@@ -510,12 +510,8 @@ func (s *Server) setupRoutes() {
 		v1.POST("/messages/count_tokens", claudeCodeHandlers.ClaudeCountTokens)
 		v1.POST("/interactions", geminiHandlers.Interactions)
 		v1.GET("/responses", openaiResponsesHandlers.ResponsesWebsocket)
-		v1.GET("/realtime", s.codexLive.HandleRealtimeWebsocket)
-		v1.GET("/live/:call_id", s.codexLive.HandleSideband)
-		v1.GET("/realtime/calls/:call_id", s.codexLive.HandleSideband)
-		v1.POST("/live", s.codexLive.HandleCall)
-		v1.POST("/realtime", s.codexLive.HandleCall)
-		v1.POST("/realtime/calls", s.codexLive.HandleCall)
+		v1.POST("/realtime/client_secrets", s.codexLive.CreateClientSecret)
+		v1.POST("/realtime/sessions", s.codexLive.CreateLegacySession)
 		v1.POST("/realtime/calls/:call_id/hangup", s.codexLive.HandleHangup)
 		v1.POST("/realtime/transcription_sessions", s.codexLive.Unsupported("Transcription-only sessions"))
 		v1.GET("/realtime/translations", s.codexLive.Unsupported("Realtime translations"))
@@ -535,6 +531,15 @@ func (s *Server) setupRoutes() {
 		v1.POST("/videos/extensions", openaiHandlers.XAIVideosExtensions)
 		v1.GET("/videos/:request_id", openaiHandlers.XAIVideosRetrieve)
 	}
+
+	// Local temporary credentials are accepted only by native connection routes.
+	liveV1 := s.engine.Group("/v1", s.codexLiveAuthMiddleware(), s.proxyReadinessMiddleware(), s.requestBodyAuditMiddleware())
+	liveV1.GET("/realtime", s.codexLive.HandleRealtimeWebsocket)
+	liveV1.GET("/live/:call_id", s.codexLive.HandleSideband)
+	liveV1.GET("/realtime/calls/:call_id", s.codexLive.HandleSideband)
+	liveV1.POST("/live", s.codexLive.HandleCall)
+	liveV1.POST("/realtime", s.codexLive.HandleCall)
+	liveV1.POST("/realtime/calls", s.codexLive.HandleCall)
 
 	// Codex CLI search alias uses the same authentication and request policies.
 	s.engine.POST("/backend-api/codex/alpha/search", AuthMiddleware(s.accessManager), s.proxyReadinessMiddleware(), s.requestBodyAuditMiddleware(), codexSearchHandlers.Search)
