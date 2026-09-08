@@ -659,6 +659,7 @@ nonstream-keepalive-interval: 0
 #     base-url: "https://www.example.com" # use the custom codex API endpoint
 #     # Boolean, default false. Enable only when this endpoint supports /alpha/search.
 #     # Changes apply to later requests after reload; OAuth search needs no opt-in.
+#     # Credential edits retain the existing retirement and in-flight cancellation rules.
 #     alpha-search: false
 #     headers:
 #       X-Custom-Header: "custom-value"
