@@ -30,6 +30,23 @@ type CodexLiveLease struct {
 // AcquireCodexLive selects once through the existing routing and model rules.
 // It performs no upstream request and adds no retry or cooldown policy.
 func (m *Manager) AcquireCodexLive(ctx context.Context, model string, opts core.Options) (*CodexLiveLease, error) {
+	return m.acquireCodexLive(ctx, nil, model, opts)
+}
+
+// AcquireCodexLiveSession selects using the setup request but retains only the
+// caller-supplied lifetime context. It must not contain a Gin context or body.
+// The owner must close an uncommitted lease on setup failure or cancellation.
+func (m *Manager) AcquireCodexLiveSession(ctx, lifetime context.Context, model string, opts core.Options) (*CodexLiveLease, error) {
+	if lifetime == nil {
+		return nil, &Error{Code: "invalid_request", Message: "realtime session lifetime is required", HTTPStatus: http.StatusBadRequest}
+	}
+	if errCtx := context.Cause(lifetime); errCtx != nil {
+		return nil, errCtx
+	}
+	return m.acquireCodexLive(ctx, lifetime, model, opts)
+}
+
+func (m *Manager) acquireCodexLive(ctx, lifetime context.Context, model string, opts core.Options) (*CodexLiveLease, error) {
 	if m == nil {
 		return nil, &Error{Code: "provider_not_found", Message: "manager unavailable", HTTPStatus: http.StatusServiceUnavailable}
 	}
@@ -38,9 +55,26 @@ func (m *Manager) AcquireCodexLive(ctx context.Context, model string, opts core.
 		return nil, &Error{Code: "invalid_request", Message: "realtime model is required", HTTPStatus: http.StatusBadRequest}
 	}
 	ctx = m.WithRoutingPolicySnapshot(ctx)
-	ctx, _, releaseProducer, errProducer := m.beginResultPersistenceProducer(ctx)
+	producerBase := ctx
+	if lifetime != nil {
+		producerBase = lifetime
+	}
+	producerCtx, producer, releaseProducer, errProducer := m.beginResultPersistenceProducer(producerBase)
 	if errProducer != nil {
 		return nil, errProducer
+	}
+	if lifetime == nil {
+		ctx = producerCtx
+	} else {
+		// The producer's cancellation closure must not retain the setup request.
+		lifetime = producerCtx
+		setupCtx, cancelSetup := context.WithCancelCause(ctx)
+		stopProducer := context.AfterFunc(producerCtx, func() { cancelSetup(context.Cause(producerCtx)) })
+		if errCtx := context.Cause(producerCtx); errCtx != nil {
+			cancelSetup(errCtx)
+		}
+		defer func() { stopProducer(); cancelSetup(nil) }()
+		ctx = context.WithValue(setupCtx, resultPersistenceProducerContextKey{}, producer)
 	}
 	opts = ensureRequestedModelMetadata(opts, model)
 	opts.SourceFormat = translator.FormatCodexLive
@@ -60,7 +94,8 @@ func (m *Manager) AcquireCodexLive(ctx context.Context, model string, opts core.
 	if errProxy != nil {
 		return nil, withAuthErrorResponseSource(errProxy, selected, "codex")
 	}
-	if rt := m.roundTripperFor(resolved); rt != nil {
+	rt := m.roundTripperFor(resolved)
+	if rt != nil {
 		ctx = context.WithValue(ctx, roundTripperContextKey{}, rt)
 		ctx = context.WithValue(ctx, "cliproxy.roundtripper", rt)
 	}
@@ -76,7 +111,13 @@ func (m *Manager) AcquireCodexLive(ctx context.Context, model string, opts core.
 	if len(models) == 0 {
 		return nil, &Error{Code: "auth_not_found", Message: "selected realtime credential has no executable model", HTTPStatus: http.StatusServiceUnavailable}
 	}
-	leaseCtx, cancel := context.WithCancel(ctx)
+	if lifetime == nil {
+		lifetime = ctx
+	} else if rt != nil {
+		lifetime = context.WithValue(lifetime, roundTripperContextKey{}, rt)
+		lifetime = context.WithValue(lifetime, "cliproxy.roundtripper", rt)
+	}
+	leaseCtx, cancel := context.WithCancel(lifetime)
 	runtimeCtx, release, active := m.beginCurrentAuthExecution(leaseCtx, prepared, executor)
 	if !active {
 		cancel()
@@ -92,6 +133,10 @@ func (m *Manager) AcquireCodexLive(ctx context.Context, model string, opts core.
 	lease.stop = context.AfterFunc(runtimeCtx, lease.Close)
 	lease.mu.Unlock()
 	transferred = true
+	if errCtx := context.Cause(ctx); errCtx != nil {
+		lease.Close()
+		return nil, errCtx
+	}
 	if errCtx := context.Cause(runtimeCtx); errCtx != nil {
 		lease.Close()
 		return nil, errCtx
