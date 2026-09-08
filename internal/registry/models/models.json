@@ -13,7 +13,14 @@
         "min": 1024,
         "max": 128000,
         "zero_allowed": true
-      }
+      },
+      "supportedInputModalities": [
+        "text",
+        "image"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
     },
     {
       "id": "claude-sonnet-4-5-20250929",
@@ -28,7 +35,14 @@
         "min": 1024,
         "max": 128000,
         "zero_allowed": true
-      }
+      },
+      "supportedInputModalities": [
+        "text",
+        "image"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
     },
     {
       "id": "claude-sonnet-4-6",
@@ -48,7 +62,14 @@
           "medium",
           "high"
         ]
-      }
+      },
+      "supportedInputModalities": [
+        "text",
+        "image"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
     },
     {
       "id": "claude-opus-4-6",
@@ -70,7 +91,14 @@
           "high",
           "max"
         ]
-      }
+      },
+      "supportedInputModalities": [
+        "text",
+        "image"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
     },
     {
       "id": "claude-opus-4-7",
@@ -93,7 +121,14 @@
           "xhigh",
           "max"
         ]
-      }
+      },
+      "supportedInputModalities": [
+        "text",
+        "image"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
     },
     {
       "id": "claude-opus-4-5-20251101",
@@ -109,7 +144,14 @@
         "min": 1024,
         "max": 128000,
         "zero_allowed": true
-      }
+      },
+      "supportedInputModalities": [
+        "text",
+        "image"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
     },
     {
       "id": "claude-opus-4-1-20250805",
@@ -123,7 +165,14 @@
       "thinking": {
         "min": 1024,
         "max": 128000
-      }
+      },
+      "supportedInputModalities": [
+        "text",
+        "image"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
     },
     {
       "id": "claude-opus-4-20250514",
@@ -137,7 +186,14 @@
       "thinking": {
         "min": 1024,
         "max": 128000
-      }
+      },
+      "supportedInputModalities": [
+        "text",
+        "image"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
     },
     {
       "id": "claude-sonnet-4-20250514",
@@ -151,7 +207,14 @@
       "thinking": {
         "min": 1024,
         "max": 128000
-      }
+      },
+      "supportedInputModalities": [
+        "text",
+        "image"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
     },
     {
       "id": "claude-3-7-sonnet-20250219",
@@ -165,7 +228,14 @@
       "thinking": {
         "min": 1024,
         "max": 128000
-      }
+      },
+      "supportedInputModalities": [
+        "text",
+        "image"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
     },
     {
       "id": "claude-3-5-haiku-20241022",
@@ -1968,7 +2038,13 @@
       "display_name": "Kimi K2",
       "description": "Kimi K2 - Moonshot AI's flagship coding model",
       "context_length": 131072,
-      "max_completion_tokens": 32768
+      "max_completion_tokens": 32768,
+      "supportedInputModalities": [
+        "text"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
     },
     {
       "id": "kimi-k2-thinking",
@@ -1985,7 +2061,13 @@
         "max": 32000,
         "zero_allowed": true,
         "dynamic_allowed": true
-      }
+      },
+      "supportedInputModalities": [
+        "text"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
     },
     {
       "id": "kimi-k2.5",
@@ -2002,7 +2084,15 @@
         "max": 32000,
         "zero_allowed": true,
         "dynamic_allowed": true
-      }
+      },
+      "supportedInputModalities": [
+        "text",
+        "image",
+        "video"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
     },
     {
       "id": "kimi-k2.6",
@@ -2019,7 +2109,15 @@
         "max": 32000,
         "zero_allowed": true,
         "dynamic_allowed": true
-      }
+      },
+      "supportedInputModalities": [
+        "text",
+        "image",
+        "video"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
     }
   ],
   "antigravity": [
