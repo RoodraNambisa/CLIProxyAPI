@@ -227,3 +227,25 @@ func TestCodexAlphaSearchCancellationClosesResponse(t *testing.T) {
 		t.Fatal("cancellation leaked a response reader")
 	}
 }
+
+func TestCodexAlphaSearchThinkingSuffixAndNativeReasoning(t *testing.T) {
+	for _, tc := range []struct{ model, reasoning, wantModel, wantEffort string }{
+		{"gpt-5.5(high)", "low", "gpt-5.5", "high"},
+		{"gpt-6-astra", "ultra", "gpt-6-astra", "ultra"},
+	} {
+		ctx := context.WithValue(t.Context(), "cliproxy.roundtripper", alphaSearchRoundTripper(func(r *http.Request) (*http.Response, error) {
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if gjson.GetBytes(body, "model").String() != tc.wantModel || gjson.GetBytes(body, "reasoning.effort").String() != tc.wantEffort || gjson.GetBytes(body, "reasoning.summary").String() != "auto" {
+				t.Fatal("search lost suffix semantics or native reasoning")
+			}
+			return &http.Response{StatusCode: 200, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{"output":"ok"}`))}, nil
+		}))
+		body := []byte(`{"model":"alias","reasoning":{"effort":"` + tc.reasoning + `","summary":"auto"}}`)
+		if _, err := NewCodexExecutor(&config.Config{}).Execute(ctx, &auth.Auth{Provider: "codex", Metadata: map[string]any{"access_token": "fixture"}}, core.Request{Model: tc.model, Payload: body}, core.Options{SourceFormat: translator.FormatCodexAlphaSearch}); err != nil {
+			t.Fatal(err)
+		}
+	}
+}

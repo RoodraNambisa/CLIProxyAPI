@@ -11,6 +11,7 @@ import (
 	"github.com/gin-gonic/gin"
 	codexauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	core "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	log "github.com/sirupsen/logrus"
@@ -40,13 +41,20 @@ func (e *CodexExecutor) executeAlphaSearch(ctx context.Context, auth *cliproxyau
 	if err != nil {
 		return resp, statusErr{code: http.StatusBadGateway, msg: err.Error(), skipAuthResult: true}
 	}
-	body, err := helps.RewriteCodexAlphaSearchBody(req.Payload, req.Model)
+	model := thinking.ParseSuffix(req.Model)
+	body, err := helps.RewriteCodexAlphaSearchBody(req.Payload, model.ModelName)
 	if err != nil {
 		code := http.StatusBadRequest
 		if len(req.Payload) > helps.CodexAlphaSearchMaxRequestBytes {
 			code = http.StatusRequestEntityTooLarge
 		}
 		return resp, statusErr{code: code, msg: err.Error(), skipAuthResult: true}
+	}
+	if model.HasSuffix {
+		body, err = thinking.ApplyThinking(body, req.Model, "codex", "codex", e.Identifier())
+		if err != nil {
+			return resp, err
+		}
 	}
 	ctx = contextWithCodexFingerprintPersona(ctx, e.cfg, auth)
 	ctx = helps.WithCodexPromptCacheLogRedaction(ctx, helps.SnapshotCodexPromptCacheLog(ctx, req.Payload))
