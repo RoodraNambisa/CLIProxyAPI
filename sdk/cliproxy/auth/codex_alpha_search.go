@@ -11,7 +11,14 @@ const CodexAlphaSearchAttributeKey = "codex_alpha_search"
 // Protocol capabilities are pool membership constraints, evaluated before
 // priority, affinity, cooldown waiting and request-capacity reservations.
 func credentialSupportsExecutionFormat(auth *Auth, format translator.Format) bool {
-	return format != translator.FormatCodexAlphaSearch || SupportsCodexAlphaSearch(auth)
+	switch format {
+	case translator.FormatCodexAlphaSearch:
+		return SupportsCodexAlphaSearch(auth)
+	case translator.FormatCodexLive:
+		return SupportsCodexLive(auth)
+	default:
+		return true
+	}
 }
 
 // SupportsCodexAlphaSearch follows the credential source used by the Codex

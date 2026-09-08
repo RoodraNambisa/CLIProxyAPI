@@ -19,8 +19,10 @@ const (
 	FormatCodex     Format = "codex"
 	// FormatCodexAlphaSearch selects the native, non-Responses search protocol.
 	FormatCodexAlphaSearch Format = "codex-alpha-search"
-	FormatAntigravity      Format = "antigravity"
-	FormatInteractions     Format = "interactions"
+	// FormatCodexLive selects native realtime credentials without Responses conversion.
+	FormatCodexLive    Format = "codex-live"
+	FormatAntigravity  Format = "antigravity"
+	FormatInteractions Format = "interactions"
 )
 
 func usesRetiredGeminiCLIFormat(from, to Format) bool {
