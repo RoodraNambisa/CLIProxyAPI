@@ -22,20 +22,22 @@ import (
 )
 
 type patchAuthFileFieldsRequest struct {
-	Name                 string                `json:"name"`
-	Names                []string              `json:"names"`
-	Fields               json.RawMessage       `json:"fields"`
-	Prefix               *string               `json:"prefix"`
-	ProxyURL             *string               `json:"proxy_url"`
-	Headers              map[string]string     `json:"headers"`
-	Priority             *int                  `json:"priority"`
-	Weight               credentialWeightPatch `json:"weight"`
-	Note                 *string               `json:"note"`
-	UsingAPI             *bool                 `json:"using_api"`
-	Websockets           *bool                 `json:"websockets"`
-	LoginMethod          *string               `json:"login_method"`
-	API798URL            *string               `json:"api798_url"`
-	CodexFingerprintMode *string               `json:"codex_fingerprint_mode"`
+	Name                 string                  `json:"name"`
+	Names                []string                `json:"names"`
+	Fields               json.RawMessage         `json:"fields"`
+	Prefix               *string                 `json:"prefix"`
+	ProxyURL             *string                 `json:"proxy_url"`
+	Headers              map[string]string       `json:"headers"`
+	Priority             *int                    `json:"priority"`
+	Weight               credentialWeightPatch   `json:"weight"`
+	ErrorRules           authFileErrorRulesPatch `json:"request_scoped_errors"`
+	LegacyErrorRules     authFileErrorRulesPatch `json:"request-scoped-errors"`
+	Note                 *string                 `json:"note"`
+	UsingAPI             *bool                   `json:"using_api"`
+	Websockets           *bool                   `json:"websockets"`
+	LoginMethod          *string                 `json:"login_method"`
+	API798URL            *string                 `json:"api798_url"`
+	CodexFingerprintMode *string                 `json:"codex_fingerprint_mode"`
 }
 
 type authFileFieldValues struct {
@@ -47,6 +49,7 @@ type authFileFieldValues struct {
 	prioritySet          bool
 	weight               *int
 	weightSet            bool
+	errorRules           authFileErrorRulesPatch
 	note                 *string
 	usingAPI             *bool
 	websockets           *bool
@@ -116,6 +119,10 @@ func (h *Handler) patchAuthFileFieldsLegacy(c *gin.Context, req *patchAuthFileFi
 		legacyHeaderOps: true,
 		weight:          req.Weight.value,
 		weightSet:       req.Weight.set,
+		errorRules:      req.ErrorRules,
+	}
+	if !values.errorRules.set {
+		values.errorRules = req.LegacyErrorRules
 	}
 	if req.CodexFingerprintMode != nil {
 		mode, ok := codexauth.NormalizeFingerprintMode(*req.CodexFingerprintMode)
@@ -268,6 +275,15 @@ func decodeAuthFileFieldValues(raw json.RawMessage) (authFileFieldValues, error)
 				return authFileFieldValues{}, err
 			}
 			values.weight, values.weightSet = patch.value, patch.set
+		case "request_scoped_errors", "request-scoped-errors":
+			var patch authFileErrorRulesPatch
+			if err := json.Unmarshal(value, &patch); err != nil {
+				return authFileFieldValues{}, err
+			}
+			// Validate both aliases; the canonical key wins even when null.
+			if _, canonical := fields["request_scoped_errors"]; name == "request_scoped_errors" || !canonical {
+				values.errorRules = patch
+			}
 		case "note":
 			var decoded string
 			if err := decodeNonNullAuthField(value, &decoded); err != nil {
@@ -345,13 +361,13 @@ func decodeNonNullAuthField(raw json.RawMessage, target any) error {
 func (v authFileFieldValues) hasFields() bool {
 	return v.prefix != nil || v.proxyURL != nil || v.headersSet || v.prioritySet || v.weightSet || v.note != nil ||
 		v.usingAPI != nil || v.websockets != nil || v.excludedSet || v.disableCooling != nil ||
-		v.loginMethod != nil || v.api798URL != nil || v.codexFingerprintMode != nil
+		v.loginMethod != nil || v.api798URL != nil || v.codexFingerprintMode != nil || v.errorRules.set
 }
 
 func (v authFileFieldValues) hasNonHeaderFields() bool {
 	return v.prefix != nil || v.proxyURL != nil || v.prioritySet || v.weightSet || v.note != nil || v.usingAPI != nil ||
 		v.websockets != nil || v.excludedSet || v.disableCooling != nil || v.loginMethod != nil ||
-		v.api798URL != nil || v.codexFingerprintMode != nil
+		v.api798URL != nil || v.codexFingerprintMode != nil || v.errorRules.set
 }
 
 func validateBatchAuthFileFields(auth *coreauth.Auth, values authFileFieldValues) error {
@@ -513,6 +529,13 @@ func (h *Handler) applyAuthFileFieldValues(auth *coreauth.Auth, values authFileF
 	if values.usingAPI != nil {
 		auth.Metadata["using_api"] = *values.usingAPI
 		auth.Attributes["using_api"] = strconv.FormatBool(*values.usingAPI)
+	}
+	if values.errorRules.set {
+		delete(auth.Metadata, "request_scoped_errors")
+		delete(auth.Metadata, "request-scoped-errors")
+		if values.errorRules.value != nil {
+			auth.Metadata["request_scoped_errors"] = values.errorRules.value
+		}
 	}
 	if values.websockets != nil {
 		auth.Metadata["websockets"] = *values.websockets
