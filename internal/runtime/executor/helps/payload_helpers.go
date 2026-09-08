@@ -26,6 +26,13 @@ func ApplyPayloadConfigWithRequest(cfg *config.Config, model, protocol, _ string
 // against the original payload when provided. requestedModel carries the client-visible
 // model name before alias resolution so payload rules can target aliases precisely.
 func ApplyPayloadConfigWithRoot(cfg *config.Config, model, protocol, root string, payload, original []byte, requestedModel string) []byte {
+	return ApplyPayloadConfigWithFieldObserver(cfg, model, protocol, root, payload, original, requestedModel, nil)
+}
+
+// ApplyPayloadConfigWithFieldObserver reports each successfully applied field,
+// including writes of the same value and explicit filters of absent fields.
+// Observers receive read-only buffer views and must not retain them.
+func ApplyPayloadConfigWithFieldObserver(cfg *config.Config, model, protocol, root string, payload, original []byte, requestedModel string, onFieldApplied func(string, []byte, []byte)) []byte {
 	if cfg == nil || len(payload) == 0 {
 		return payload
 	}
@@ -66,6 +73,9 @@ func ApplyPayloadConfigWithRoot(cfg *config.Config, model, protocol, root string
 			if errSet != nil {
 				continue
 			}
+			if onFieldApplied != nil {
+				onFieldApplied(fullPath, out, updated)
+			}
 			out = updated
 			appliedDefaults[fullPath] = struct{}{}
 		}
@@ -95,6 +105,9 @@ func ApplyPayloadConfigWithRoot(cfg *config.Config, model, protocol, root string
 			if errSet != nil {
 				continue
 			}
+			if onFieldApplied != nil {
+				onFieldApplied(fullPath, out, updated)
+			}
 			out = updated
 			appliedDefaults[fullPath] = struct{}{}
 		}
@@ -113,6 +126,9 @@ func ApplyPayloadConfigWithRoot(cfg *config.Config, model, protocol, root string
 			updated, errSet := sjson.SetBytes(out, fullPath, value)
 			if errSet != nil {
 				continue
+			}
+			if onFieldApplied != nil {
+				onFieldApplied(fullPath, out, updated)
 			}
 			out = updated
 		}
@@ -136,6 +152,9 @@ func ApplyPayloadConfigWithRoot(cfg *config.Config, model, protocol, root string
 			if errSet != nil {
 				continue
 			}
+			if onFieldApplied != nil {
+				onFieldApplied(fullPath, out, updated)
+			}
 			out = updated
 		}
 	}
@@ -153,6 +172,9 @@ func ApplyPayloadConfigWithRoot(cfg *config.Config, model, protocol, root string
 			updated, errDel := sjson.DeleteBytes(out, fullPath)
 			if errDel != nil {
 				continue
+			}
+			if onFieldApplied != nil {
+				onFieldApplied(fullPath, out, updated)
 			}
 			out = updated
 		}
