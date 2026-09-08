@@ -1387,6 +1387,7 @@ func (h *Handler) PatchCodexKey(c *gin.Context) {
 		BaseURL             *string                     `json:"base-url"`
 		ProxyURL            *string                     `json:"proxy-url"`
 		Models              *[]config.CodexModel        `json:"models"`
+		AlphaSearch         *bool                       `json:"alpha-search"`
 		Headers             *map[string]string          `json:"headers"`
 		ExcludedModels      *[]string                   `json:"excluded-models"`
 	}
@@ -1464,6 +1465,9 @@ func (h *Handler) PatchCodexKey(c *gin.Context) {
 	}
 	if body.Value.Models != nil {
 		entry.Models = append([]config.CodexModel(nil), (*body.Value.Models)...)
+	}
+	if body.Value.AlphaSearch != nil {
+		entry.AlphaSearch = *body.Value.AlphaSearch
 	}
 	if body.Value.Headers != nil {
 		entry.Headers = config.NormalizeHeaders(*body.Value.Headers)
