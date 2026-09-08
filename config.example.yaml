@@ -657,6 +657,9 @@ nonstream-keepalive-interval: 0
 #   - api-key: "sk-atSM..."
 #     prefix: "test" # optional: require calls like "test/gpt-5-codex" to target this credential
 #     base-url: "https://www.example.com" # use the custom codex API endpoint
+#     # Boolean, default false. Enable only when this endpoint supports /alpha/search.
+#     # Changes apply to later requests after reload; OAuth search needs no opt-in.
+#     alpha-search: false
 #     headers:
 #       X-Custom-Header: "custom-value"
 #     proxy-url: "socks5://proxy.example.com:1080" # optional: per-key proxy override

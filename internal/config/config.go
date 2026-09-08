@@ -1967,6 +1967,10 @@ type CodexKey struct {
 	// Websockets enables the Responses API websocket transport for this credential.
 	Websockets bool `yaml:"websockets,omitempty" json:"websockets,omitempty"`
 
+	// AlphaSearch explicitly allows this API key to serve the separate search API.
+	// False keeps the credential eligible only for its existing operations.
+	AlphaSearch bool `yaml:"alpha-search,omitempty" json:"alpha-search,omitempty"`
+
 	// ProxyURL overrides the global proxy setting for this API key if provided.
 	ProxyURL string `yaml:"proxy-url" json:"proxy-url"`
 
@@ -2227,6 +2231,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	}
 	if errModels := validateModelCatalogFieldsYAML(data); errModels != nil {
 		return nil, errModels
+	}
+	if errAlphaSearch := validateCodexAlphaSearchYAML(data); errAlphaSearch != nil {
+		return nil, errAlphaSearch
 	}
 	if err = yaml.Unmarshal(data, &cfg); err != nil {
 		if optional {
