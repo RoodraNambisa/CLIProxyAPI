@@ -48,6 +48,8 @@ type ModelInfo struct {
 	SupportedGenerationMethods []string `json:"supportedGenerationMethods,omitempty"`
 	// ContextLength is the context window size
 	ContextLength int `json:"context_length,omitempty"`
+	// MaxContextLength carries an explicit configuration override for client catalogs.
+	MaxContextLength int `json:"-"`
 	// MaxCompletionTokens is the maximum completion tokens
 	MaxCompletionTokens int `json:"max_completion_tokens,omitempty"`
 	// SupportedParameters lists supported parameters
@@ -1291,6 +1293,9 @@ func (r *ModelRegistry) convertModelToMap(model *ModelInfo, handlerType string) 
 		}
 		if model.ContextLength > 0 {
 			result["context_length"] = model.ContextLength
+		}
+		if model.MaxContextLength > 0 {
+			result["max_context_length"] = model.MaxContextLength
 		}
 		if model.MaxCompletionTokens > 0 {
 			result["max_completion_tokens"] = model.MaxCompletionTokens
