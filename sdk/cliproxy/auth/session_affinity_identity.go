@@ -20,9 +20,10 @@ type affinityRequestIdentity struct {
 	identity       session.Identity
 	legacyPrimary  string
 	legacyFallback string
+	history        *session.History
 }
 
-func captureAffinityIdentity(ctx context.Context, req core.Request, opts core.Options) affinityRequestIdentity {
+func captureAffinityIdentity(ctx context.Context, req core.Request, opts core.Options, includeHistory ...bool) affinityRequestIdentity {
 	if captured, ok := opts.Metadata[affinityIdentityMetadataKey].(affinityRequestIdentity); ok {
 		return captured
 	}
@@ -49,7 +50,15 @@ func captureAffinityIdentity(ctx context.Context, req core.Request, opts core.Op
 	executionID, _ := opts.Metadata[core.ExecutionSessionMetadataKey].(string)
 	identity, _ := session.ExtractExplicitIdentity(headers, payload, executionID)
 	captured := affinityRequestIdentity{scope: scope, identity: identity}
-	if identity.SessionID == "" {
+	if len(includeHistory) > 0 && includeHistory[0] && (identity.SessionID == "" || strings.HasPrefix(identity.SessionID, "execution:")) {
+		history := session.FingerprintHistory(opts.SourceFormat, payload)
+		captured.history = &history
+		if history.Usable() {
+			// The execution ID is a transport fallback, not a client-provided
+			// conversation identity. It must not mask complete history evidence.
+			captured.identity = session.Identity{}
+		}
+	} else if identity.SessionID == "" {
 		captured.legacyPrimary, captured.legacyFallback = extractMessageHashIDs(payload)
 	}
 	return captured
@@ -57,11 +66,11 @@ func captureAffinityIdentity(ctx context.Context, req core.Request, opts core.Op
 
 // withAffinityIdentity detaches optional inference inputs before provider
 // preparation, retries, and request-body release. It never mutates caller maps.
-func withAffinityIdentity(ctx context.Context, req core.Request, opts core.Options) core.Options {
+func withAffinityIdentity(ctx context.Context, req core.Request, opts core.Options, includeHistory ...bool) core.Options {
 	if _, ok := opts.Metadata[affinityIdentityMetadataKey].(affinityRequestIdentity); ok {
 		return opts
 	}
-	captured := captureAffinityIdentity(ctx, req, opts)
+	captured := captureAffinityIdentity(ctx, req, opts, includeHistory...)
 	metadata := make(map[string]any, len(opts.Metadata)+1)
 	for key, value := range opts.Metadata {
 		metadata[key] = value
