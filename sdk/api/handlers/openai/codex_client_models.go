@@ -267,7 +267,7 @@ func applyCodexClientModelMetadata(entry map[string]any, id string, model map[st
 	contextWindow := intModelValue(model, "context_length")
 
 	if info != nil {
-		if info.DisplayName != "" {
+		if displayName == "" && info.DisplayName != "" {
 			displayName = info.DisplayName
 		}
 		if info.Description != "" {
