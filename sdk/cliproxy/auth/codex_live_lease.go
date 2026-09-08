@@ -18,6 +18,7 @@ type CodexLiveLease struct {
 	auth                 *Auth
 	executor             ProviderExecutor
 	model                string
+	persistent           bool
 	slot                 *core.AuthRequestSlot
 	mu                   sync.Mutex
 	closed               bool
@@ -47,6 +48,7 @@ func (m *Manager) AcquireCodexLiveSession(ctx, lifetime context.Context, model s
 }
 
 func (m *Manager) acquireCodexLive(ctx, lifetime context.Context, model string, opts core.Options) (*CodexLiveLease, error) {
+	persistent := lifetime != nil
 	if m == nil {
 		return nil, &Error{Code: "provider_not_found", Message: "manager unavailable", HTTPStatus: http.StatusServiceUnavailable}
 	}
@@ -123,7 +125,7 @@ func (m *Manager) acquireCodexLive(ctx, lifetime context.Context, model string, 
 		cancel()
 		return nil, runtimeAuthInstanceRetiredError()
 	}
-	lease := &CodexLiveLease{ctx: runtimeCtx, auth: prepared, executor: executor, model: models[0], slot: opts.AuthRequestSlot, release: release, cancel: cancel}
+	lease := &CodexLiveLease{ctx: runtimeCtx, auth: prepared, executor: executor, model: models[0], persistent: persistent, slot: opts.AuthRequestSlot, release: release, cancel: cancel}
 	lease.release = func() bool {
 		retired := release()
 		releaseProducer()
