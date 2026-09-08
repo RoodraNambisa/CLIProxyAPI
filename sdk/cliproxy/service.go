@@ -5708,7 +5708,7 @@ func (s *Service) registerModelsForAuthWithState(a *coreauth.Auth, preserveTrans
 						if thinking == nil {
 							thinking = &registry.ThinkingSupport{Levels: []string{"low", "medium", "high"}}
 						}
-						ms = append(ms, &ModelInfo{
+						info := &ModelInfo{
 							ID:          modelID,
 							UpstreamID:  strings.TrimSpace(m.Name),
 							Object:      "model",
@@ -5718,7 +5718,9 @@ func (s *Service) registerModelsForAuthWithState(a *coreauth.Auth, preserveTrans
 							DisplayName: displayName,
 							UserDefined: false,
 							Thinking:    thinking,
-						})
+						}
+						applyConfiguredModelContextLength(info, m)
+						ms = append(ms, info)
 					}
 					// Register and return
 					if len(ms) > 0 {
@@ -6562,6 +6564,7 @@ type modelEntry interface {
 	GetName() string
 	GetAlias() string
 	GetDisplayName() string
+	GetMaxContextLength() int
 }
 
 func buildConfigModels[T modelEntry](models []T, ownedBy, modelType string) []*ModelInfo {
@@ -6608,6 +6611,7 @@ func buildConfigModels[T modelEntry](models []T, ownedBy, modelType string) []*M
 				info.Thinking = upstream.Thinking
 			}
 		}
+		applyConfiguredModelContextLength(info, model)
 		out = append(out, info)
 	}
 	return out
