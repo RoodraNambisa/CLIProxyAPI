@@ -168,7 +168,7 @@ func ConvertCodexResponseToGemini(_ context.Context, modelName string, originalR
 		template, _ = sjson.SetBytes(template, "modelVersion", rootResult.Get("response.model").String())
 		template, _ = sjson.SetBytes(template, "responseId", rootResult.Get("response.id").String())
 		params.ResponseID = rootResult.Get("response.id").String()
-	} else if typeStr == "response.reasoning_summary_text.delta" { // Handle reasoning/thinking content delta
+	} else if typeStr == "response.reasoning_summary_text.delta" || typeStr == "response.reasoning_text.delta" { // Handle reasoning/thinking content delta
 		part := []byte(`{"thought":true,"text":""}`)
 		part, _ = sjson.SetBytes(part, "text", rootResult.Get("delta").String())
 		template, _ = sjson.SetRawBytes(template, "candidates.0.content.parts.-1", part)
@@ -297,12 +297,7 @@ func ConvertCodexResponseToGeminiNonStream(_ context.Context, modelName string, 
 					// Flush any pending function calls before adding non-function content
 					flushPendingFunctionCalls()
 
-					// Add thinking content
-					if content := value.Get("content"); content.Exists() {
-						part := []byte(`{"text":"","thought":true}`)
-						part, _ = sjson.SetBytes(part, "text", content.String())
-						template, _ = sjson.SetRawBytes(template, "candidates.0.content.parts.-1", part)
-					}
+					template = appendCodexGeminiReasoningParts(template, value)
 
 				case "message":
 					// Flush any pending function calls before adding non-function content
