@@ -283,15 +283,17 @@ func (e *CodexExecutor) executeOpenAIImageStream(ctx context.Context, auth *clip
 				var frameErr error
 				for _, line := range helps.SplitSSEFrameLines(clientFrame) {
 					payload := helps.JSONPayload(line)
-					if len(payload) == 0 || !helps.IsJSONStreamProtocolError(payload) {
+					if len(payload) == 0 {
 						continue
 					}
 					if terminalErr, ok := codexTerminalStreamError(payload); ok {
 						frameErr = terminalErr
-					} else {
-						frameErr = helps.JSONStreamProtocolError("codex image", payload)
+						break
 					}
-					break
+					if helps.IsJSONStreamProtocolError(payload) {
+						frameErr = helps.JSONStreamProtocolError("codex image", payload)
+						break
+					}
 				}
 				if frameErr != nil {
 					upstreamFrame = codexauth.SanitizeAgentIdentityErrorBody(authMetadata(auth), upstreamFrame)
