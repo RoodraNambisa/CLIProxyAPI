@@ -41,19 +41,23 @@ func ensureResponsesUsageDetailsAt(payload []byte, path string) []byte {
 	if !usage.IsObject() {
 		return payload
 	}
+	usageBody := []byte(usage.Raw)
 	for _, field := range []struct{ parent, leaf string }{
 		{"output_tokens_details", "reasoning_tokens"},
 		{"input_tokens_details", "cached_tokens"},
 	} {
 		details := usage.Get(field.parent)
 		if !details.IsObject() {
-			payload, _ = sjson.SetRawBytes(payload, path+"."+field.parent, []byte(`{"`+field.leaf+`":0}`))
+			usageBody, _ = sjson.SetRawBytes(usageBody, field.parent, []byte(`{"`+field.leaf+`":0}`))
 			continue
 		}
 		value := details.Get(field.leaf)
 		if !value.Exists() || value.Type == gjson.Null {
-			payload, _ = sjson.SetBytes(payload, path+"."+field.parent+"."+field.leaf, 0)
+			usageBody, _ = sjson.SetBytes(usageBody, field.parent+"."+field.leaf, 0)
 		}
+	}
+	if !bytes.Equal(usageBody, []byte(usage.Raw)) {
+		payload, _ = sjson.SetRawBytes(payload, path, usageBody)
 	}
 	return payload
 }

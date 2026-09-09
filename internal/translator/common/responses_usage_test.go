@@ -3,11 +3,26 @@ package common
 import (
 	"bytes"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
+
+func TestResponsesUsageLargeImageRemainsUnchanged(t *testing.T) {
+	result := strings.Repeat("eA==", 1<<18)
+	body := []byte(`{"output":[{"type":"image_generation_call","result":"` + result + `"}],"usage":{"input_tokens":2,"output_tokens":1,"total_tokens":3}}`)
+	original := bytes.Clone(body)
+	out := EnsureResponsesUsageDetails(body)
+	if !bytes.Equal(body, original) || !gjson.ValidBytes(out) || gjson.GetBytes(out, "output.0.result").String() != result || gjson.GetBytes(out, "usage.total_tokens").Int() != 3 {
+		t.Fatal("usage update modified the source, image result or token total")
+	}
+	clear(body)
+	if gjson.GetBytes(out, "output.0.result").String() != result || !gjson.GetBytes(out, "usage.input_tokens_details.cached_tokens").Exists() || !gjson.GetBytes(out, "usage.output_tokens_details.reasoning_tokens").Exists() {
+		t.Fatal("large output lost its content ownership or default counters")
+	}
+}
 
 func TestResponsesUsageDetailsKeepExplicitCountsAndOtherFields(t *testing.T) {
 	for _, path := range []string{"usage", "response.usage"} {
