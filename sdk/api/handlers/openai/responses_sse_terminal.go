@@ -17,6 +17,20 @@ func responsesSSETerminalEvent(eventType string) bool {
 	return responsesWebsocketTerminalEvent(eventType) || eventType == "response.error"
 }
 
+func responsesSSEErrorNeedsNormalization(frame []byte) bool {
+	payload, _ := responsesSSEDataPayload(frame)
+	eventType := gjson.GetBytes(payload, "type").String()
+	if eventType != "error" && eventType != "response.failed" {
+		return true
+	}
+	for _, line := range handlers.SplitSSELines(frame) {
+		if value, ok := bytes.CutPrefix(bytes.TrimSpace(line), []byte("event:")); ok && string(bytes.TrimSpace(value)) != eventType {
+			return true
+		}
+	}
+	return false
+}
+
 func (f *responsesSSEFramer) observeTerminal(frame []byte) {
 	payload, found := responsesSSEDataPayload(frame)
 	if !found || len(bytes.TrimSpace(payload)) == 0 {

@@ -83,6 +83,7 @@ type responsesSSEFramer struct {
 	terminalBeforeData   bool
 	terminalError        *interfaces.ErrorMessage
 	terminalSeen         bool
+	codexClient          bool
 	sawNonTerminalData   bool
 }
 
@@ -286,6 +287,15 @@ func (f *responsesSSEFramer) writeFrame(w io.Writer, frame []byte) {
 	}
 	if !f.passthrough {
 		f.observeTerminal(frame)
+		if f.terminalError != nil && responsesSSEErrorNeedsNormalization(frame) {
+			buildChunk, eventType := handlers.BuildOpenAIResponsesStreamErrorChunk, "error"
+			if f.codexClient {
+				buildChunk, eventType = handlers.BuildOpenAIResponsesStreamFailedChunk, "response.failed"
+			}
+			payload := buildChunk(f.terminalError.StatusCode, f.terminalError.Error.Error(), 0)
+			payload, _ = sjson.SetBytes(payload, "status", f.terminalError.StatusCode)
+			output = []byte(fmt.Sprintf("event: %s\ndata: %s\n\n", eventType, payload))
+		}
 	}
 	if f.rewriteTerminalError != nil {
 		if rewritten, errMsg, ok := f.rewriteTerminalError(output); ok {
@@ -721,7 +731,7 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 		c.Header("Access-Control-Allow-Origin", "*")
 	}
 	trustUpstreamSSE := handlers.StreamingTrustUpstreamSSE(h.Cfg)
-	framer := &responsesSSEFramer{passthrough: trustUpstreamSSE}
+	framer := &responsesSSEFramer{passthrough: trustUpstreamSSE, codexClient: isCodexResponsesClientRequest(c)}
 	if (h.Cfg != nil && len(h.Cfg.ErrorResponseRewrites) > 0) || handlers.ChatGPTWebImageErrorSanitizationEnabled(c) {
 		framer.rewriteTerminalError = func(frame []byte) ([]byte, *interfaces.ErrorMessage, bool) {
 			return h.rewriteResponsesSSETerminalErrorFrameForContext(c, frame)

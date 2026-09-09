@@ -1167,6 +1167,13 @@ func rewriteResponsesWebsocketTerminalErrorPayload(payload []byte, errMsg *inter
 			updated, errSet = sjson.SetRawBytes(updated, "response.error", errorBody)
 		case wsEventTypeError:
 			updated, errSet = sjson.SetRawBytes(updated, "error", errorBody)
+			// Flat error fields are mirrors of the replaced error, not metadata.
+			// Retaining them would expose the original message beside the rewrite.
+			for _, field := range []string{"message", "code", "param"} {
+				if errSet == nil {
+					updated, errSet = sjson.DeleteBytes(updated, field)
+				}
+			}
 		}
 		if errSet != nil {
 			return nil, errSet
