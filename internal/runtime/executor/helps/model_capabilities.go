@@ -21,7 +21,7 @@ func ApplyRequestThinking(body []byte, req core.Request, opts core.Options, from
 	}
 	summary := thinking.SummaryConfig{}
 	if !authority.Summary {
-		summary = translatedRequestSummaryConfig(body, req.Payload, original, req.Model, fromFormat, toFormat)
+		summary = RequestSummaryConfig(body, req, opts, fromFormat, toFormat)
 	}
 	if info, ok := cliproxyauth.ResolvedAPIKeyModelInfo(req); ok {
 		var source []byte

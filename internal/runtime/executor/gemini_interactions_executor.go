@@ -101,7 +101,10 @@ func geminiInteractionsPayloadConfigSource(ctx context.Context, cfg *config.Conf
 	return translateGeminiInteractionsRequestBody(ctx, cfg, model, source, opts, stream)
 }
 
-func applyGeminiInteractionsThinking(body []byte, model string) ([]byte, error) {
+func applyGeminiInteractionsThinking(body []byte, model string, summary ...thinking.SummaryConfig) ([]byte, error) {
+	if len(summary) > 0 {
+		return thinking.ApplyThinkingWithSummary(body, model, sdktranslator.FormatInteractions.String(), sdktranslator.FormatInteractions.String(), "gemini", summary[0])
+	}
 	return thinking.ApplyThinking(body, model, sdktranslator.FormatInteractions.String(), sdktranslator.FormatInteractions.String(), "gemini")
 }
 
@@ -118,7 +121,8 @@ func (e *GeminiExecutor) buildInteractionsBody(ctx context.Context, req cliproxy
 	if _, bound := cliproxyauth.ResolvedAPIKeyModelInfo(req); bound {
 		body, err = helps.ApplyRequestThinking(body, req, opts, opts.SourceFormat.String(), sdktranslator.FormatInteractions.String(), "gemini")
 	} else {
-		body, err = applyGeminiInteractionsThinking(body, req.Model)
+		summary := helps.RequestSummaryConfig(body, req, opts, opts.SourceFormat.String(), sdktranslator.FormatInteractions.String())
+		body, err = applyGeminiInteractionsThinking(body, req.Model, summary)
 	}
 	if err != nil {
 		return nil, err

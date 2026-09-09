@@ -4,8 +4,19 @@ import (
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
+	core "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
 )
+
+// RequestSummaryConfig resolves visibility independently from provider-specific
+// effort normalization, without retaining or copying the source payloads.
+func RequestSummaryConfig(body []byte, req core.Request, opts core.Options, fromFormat, toFormat string) thinking.SummaryConfig {
+	original := opts.OriginalRequest
+	if len(original) == 0 {
+		original = req.Payload
+	}
+	return translatedRequestSummaryConfig(body, req.Payload, original, req.Model, fromFormat, toFormat)
+}
 
 // ApplyThinkingWithSourcePayload retains visibility that could not be expressed
 // until the model-aware pass, while respecting normalized target fields.
