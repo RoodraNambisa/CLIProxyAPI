@@ -17,7 +17,7 @@ import (
 )
 
 func TestStructuredStreamPolicyRefusalDoesNotRetryOrCoolCredentials(t *testing.T) {
-	for _, provider := range []string{"claude", "policy-compat"} {
+	for _, provider := range []string{"claude", "policy-compat", "event-compat", "multiline-compat"} {
 		for _, code := range []string{"misalignment_policy_violation", "cyber_policy", "content_policy_violation"} {
 			for _, field := range []string{"code", "type"} {
 				for _, preamble := range []bool{false, true} {
@@ -37,7 +37,14 @@ func TestStructuredStreamPolicyRefusalDoesNotRetryOrCoolCredentials(t *testing.T
 								}
 								_, _ = io.WriteString(w, "data: "+prefix+"\n\n")
 							}
-							_, _ = fmt.Fprintf(w, "data: "+`{"type":"error","error":{"message":"request denied",%q:%q}}`+"\n\n", field, code)
+							switch provider {
+							case "event-compat":
+								_, _ = fmt.Fprintf(w, "event: error\ndata: "+`{"message":"request denied",%q:%q}`+"\n\n", field, code)
+							case "multiline-compat":
+								_, _ = fmt.Fprintf(w, "data: {\"type\":\"error\",\ndata: "+`"error":{"message":"request denied",%q:%q}}`+"\n\n", field, code)
+							default:
+								_, _ = fmt.Fprintf(w, "data: "+`{"type":"error","error":{"message":"request denied",%q:%q}}`+"\n\n", field, code)
+							}
 						}))
 						defer server.Close()
 						cfg := &config.Config{SDKConfig: sdkconfig.SDKConfig{ProxyURL: "direct"}}
