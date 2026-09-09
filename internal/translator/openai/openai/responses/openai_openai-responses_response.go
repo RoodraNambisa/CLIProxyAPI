@@ -407,7 +407,7 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponses(ctx context.Context, 
 				}
 
 				// reasoning_content (OpenAI reasoning incremental text)
-				if rc := delta.Get("reasoning_content"); rc.Exists() && rc.String() != "" {
+				if rc := responsesReasoningText(delta); rc != "" {
 					// On first appearance, add reasoning item and part
 					if st.ReasoningID == "" {
 						st.ReasoningID = fmt.Sprintf("rs_%s_%d", st.ResponseID, idx)
@@ -424,17 +424,17 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponses(ctx context.Context, 
 						out = append(out, emitRespEvent("response.reasoning_summary_part.added", part))
 					}
 					// Append incremental text to reasoning buffer
-					st.ReasoningBuf.WriteString(rc.String())
+					st.ReasoningBuf.WriteString(rc)
 					msg := []byte(`{"type":"response.reasoning_summary_text.delta","sequence_number":0,"item_id":"","output_index":0,"summary_index":0,"delta":""}`)
 					msg, _ = sjson.SetBytes(msg, "sequence_number", nextSeq())
 					msg, _ = sjson.SetBytes(msg, "item_id", st.ReasoningID)
 					msg, _ = sjson.SetBytes(msg, "output_index", st.ReasoningIndex)
-					msg, _ = sjson.SetBytes(msg, "delta", rc.String())
+					msg, _ = sjson.SetBytes(msg, "delta", rc)
 					out = append(out, emitRespEvent("response.reasoning_summary_text.delta", msg))
 				}
 
 				// tool calls
-				if tcs := delta.Get("tool_calls"); tcs.Exists() && tcs.IsArray() {
+				if tcs := delta.Get("tool_calls"); tcs.IsArray() && len(tcs.Array()) > 0 {
 					if st.ReasoningID != "" {
 						stopReasoning(st.ReasoningBuf.String())
 						st.ReasoningBuf.Reset()
@@ -657,7 +657,7 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStream(_ context.Co
 	// Build output list from choices[...]
 	outputsWrapper := []byte(`{"arr":[]}`)
 	// Detect and capture reasoning content if present
-	rcText := gjson.GetBytes(rawJSON, "choices.0.message.reasoning_content").String()
+	rcText := responsesReasoningText(root.Get("choices.0.message"))
 	includeReasoning := rcText != ""
 	if !includeReasoning && len(requestRawJSON) > 0 {
 		includeReasoning = gjson.GetBytes(requestRawJSON, "reasoning").Exists()
