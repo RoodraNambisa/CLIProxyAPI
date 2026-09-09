@@ -910,7 +910,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	if auth != nil {
 		replayAuthID = auth.ID
 	}
-	replayNamespace := helps.ReasoningReplayNamespace(ctx, e.Identifier(), replayAuthID)
+	replayNamespace := helps.ReasoningReplayNamespace(ctx, e.Identifier(), replayAuthID, auth.RuntimeInstanceID())
 	body, replayScope := helps.ApplyCodexReasoningReplay(ctx, from.String(), replayNamespace, baseModel, originalPayload, body, req.Metadata, opts.Metadata, opts.Headers)
 	reporter.SetRequestServiceTierFromPayload(body)
 	imageRequest := cliproxyauth.PayloadHasImageGenerationTool(body)
@@ -1271,7 +1271,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	if auth != nil {
 		replayAuthID = auth.ID
 	}
-	replayNamespace := helps.ReasoningReplayNamespace(ctx, e.Identifier(), replayAuthID)
+	replayNamespace := helps.ReasoningReplayNamespace(ctx, e.Identifier(), replayAuthID, auth.RuntimeInstanceID())
 	body, replayScope := helps.ApplyCodexReasoningReplay(ctx, from.String(), replayNamespace, baseModel, originalPayload, body, req.Metadata, opts.Metadata, opts.Headers)
 	reporter.SetRequestServiceTierFromPayload(body)
 	imageRequest := cliproxyauth.PayloadHasImageGenerationTool(body)

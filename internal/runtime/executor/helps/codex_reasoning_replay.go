@@ -60,14 +60,18 @@ var codexReasoningReplayStore = struct {
 
 // ReasoningReplayNamespace isolates process-local replay state by downstream
 // access identity and selected upstream credential without retaining secrets.
-func ReasoningReplayNamespace(ctx context.Context, provider, authID string) string {
+func ReasoningReplayNamespace(ctx context.Context, provider, authID string, instanceIDs ...string) string {
 	provider = strings.ToLower(strings.TrimSpace(provider))
 	authID = strings.TrimSpace(authID)
 	apiKey := strings.TrimSpace(APIKeyFromContext(ctx))
 	if authID == "" && apiKey == "" {
 		return ""
 	}
-	sum := sha256.Sum256([]byte(provider + "\x00" + authID + "\x00" + apiKey))
+	identity := provider + "\x00" + authID + "\x00" + apiKey
+	if len(instanceIDs) > 0 && instanceIDs[0] != "" {
+		identity += "\x00instance\x00" + instanceIDs[0]
+	}
+	sum := sha256.Sum256([]byte(identity))
 	return hex.EncodeToString(sum[:16])
 }
 

@@ -2,13 +2,30 @@ package helps
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"net/http"
 	"testing"
 	"time"
 
 	"github.com/tidwall/gjson"
 )
+
+func TestReasoningReplayNamespaceOptionalInstanceBoundary(t *testing.T) {
+	legacyHash := sha256.Sum256([]byte("codex\x00credential\x00"))
+	legacy := ReasoningReplayNamespace(t.Context(), "codex", "credential")
+	if legacy != hex.EncodeToString(legacyHash[:16]) || legacy != ReasoningReplayNamespace(t.Context(), "codex", "credential", "") {
+		t.Fatal("callers without an instance lost the existing namespace")
+	}
+	first := ReasoningReplayNamespace(t.Context(), "codex", "credential", "instance-a")
+	if first == legacy || first == ReasoningReplayNamespace(t.Context(), "codex", "credential", "instance-b") || first != ReasoningReplayNamespace(t.Context(), "codex", "credential", "instance-a") {
+		t.Fatal("instance boundary is not isolated and stable")
+	}
+	if ReasoningReplayNamespace(t.Context(), "codex", "", "instance-a") != "" {
+		t.Fatal("instance alone replaced the required access boundary")
+	}
+}
 
 func TestSanitizeCodexReasoningEncryptedContent(t *testing.T) {
 	valid := testCodexReasoningSignature()
