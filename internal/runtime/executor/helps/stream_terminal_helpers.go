@@ -10,15 +10,28 @@ import (
 )
 
 type streamProtocolError struct {
-	provider string
-	message  string
+	provider   string
+	message    string
+	body       string
+	structured string
+	status     int
 }
 
 func (e streamProtocolError) Error() string {
+	if e.structured != "" {
+		return e.structured
+	}
 	return fmt.Sprintf("%s stream protocol error: %s", e.provider, e.message)
 }
 
-func (streamProtocolError) StatusCode() int { return http.StatusBadGateway }
+func (e streamProtocolError) StatusCode() int {
+	if e.status != 0 {
+		return e.status
+	}
+	return http.StatusBadGateway
+}
+
+func (e streamProtocolError) ResponseBody() []byte { return []byte(e.body) }
 
 // IncompleteStreamError reports an upstream stream that closed without a
 // protocol-defined successful terminal event.
@@ -59,7 +72,36 @@ func JSONStreamProtocolError(provider string, payload []byte) error {
 	if message == "" {
 		message = "upstream reported an error event"
 	}
-	return streamProtocolError{provider: provider, message: message}
+	result := streamProtocolError{provider: provider, message: message, body: string(payload)}
+	if gjson.ValidBytes(payload) {
+		root := gjson.ParseBytes(payload)
+		for _, path := range []string{"error.status_code", "error.http_status", "error.status", "response.error.status_code", "response.error.http_status", "response.error.status", "status_code", "http_status", "status", "error.code", "response.error.code", "code"} {
+			value := root.Get(path)
+			status := value.Int()
+			if value.Type == gjson.Number && status >= 400 && status <= 599 && value.Float() == float64(status) {
+				result.status = int(status)
+				break
+			}
+		}
+		node := root.Get("error")
+		if !node.IsObject() {
+			node = root.Get("response.error")
+		}
+		if !node.IsObject() && root.Get("type").String() == "error" {
+			node = root
+		}
+		if node.IsObject() {
+			code, kind := node.Get("code"), node.Get("type")
+			hasCode := (code.Type == gjson.String && strings.TrimSpace(code.String()) != "") || code.Type == gjson.Number
+			hasType := kind.Type == gjson.String && strings.TrimSpace(kind.String()) != "" && kind.String() != "error"
+			if hasCode || hasType || result.status != 0 {
+				// Keep structured semantics for both the SDK classifier and public errors.
+				// Rules separately receive the exact original envelope through ResponseBody.
+				result.structured = `{"error":` + node.Raw + `}`
+			}
+		}
+	}
+	return result
 }
 
 // IsOpenAIStreamTerminal reports whether line is the explicit OpenAI SSE terminator.
