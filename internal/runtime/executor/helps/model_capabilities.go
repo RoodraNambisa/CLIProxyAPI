@@ -19,7 +19,7 @@ func ApplyRequestThinking(body []byte, req core.Request, opts core.Options, from
 				source = req.Payload
 			}
 		}
-		return thinking.ApplyThinkingWithModelInfo(body, source, req.Model, fromFormat, toFormat, provider, info)
+		return thinking.ApplyThinkingWithModelInfoAndSummary(body, source, req.Model, fromFormat, toFormat, provider, info, thinking.ExtractSummaryConfig(body, toFormat))
 	}
 	return thinking.ApplyThinking(body, req.Model, fromFormat, toFormat, provider)
 }
