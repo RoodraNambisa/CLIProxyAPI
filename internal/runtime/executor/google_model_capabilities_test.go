@@ -19,20 +19,21 @@ import (
 	"github.com/tidwall/gjson"
 )
 
-func googleCapabilityManager(t *testing.T, provider, baseURL string, levels []string) *coreauth.Manager {
+func googleCapabilityManager(t *testing.T, provider, baseURL string, levels []string, isCompat ...bool) *coreauth.Manager {
 	t.Helper()
 	support := &registry.ThinkingSupport{Levels: levels}
+	compat := len(isCompat) > 0 && isCompat[0]
 	cfg := &config.Config{SDKConfig: sdkconfig.SDKConfig{ProxyURL: "direct"}}
 	var executor coreauth.ProviderExecutor
 	switch provider {
 	case "vertex":
-		cfg.VertexCompatAPIKey = []config.VertexCompatKey{{APIKey: "fixture", BaseURL: baseURL, Models: []config.VertexCompatModel{{Name: "gemini-capability-private", Alias: "bound-google", Thinking: support}}}}
+		cfg.VertexCompatAPIKey = []config.VertexCompatKey{{APIKey: "fixture", BaseURL: baseURL, Models: []config.VertexCompatModel{{Name: "gemini-capability-private", Alias: "bound-google", IsCompat: compat, Thinking: support}}}}
 		executor = NewGeminiVertexExecutor(cfg)
 	case "gemini-interactions":
-		cfg.InteractionsKey = []config.GeminiKey{{APIKey: "fixture", BaseURL: baseURL, Models: []config.GeminiModel{{Name: "gemini-capability-private", Alias: "bound-google", Thinking: support}}}}
+		cfg.InteractionsKey = []config.GeminiKey{{APIKey: "fixture", BaseURL: baseURL, Models: []config.GeminiModel{{Name: "gemini-capability-private", Alias: "bound-google", IsCompat: compat, Thinking: support}}}}
 		executor = NewGeminiInteractionsExecutor(cfg)
 	default:
-		cfg.GeminiKey = []config.GeminiKey{{APIKey: "fixture", BaseURL: baseURL, Models: []config.GeminiModel{{Name: "gemini-capability-private", Alias: "bound-google", Thinking: support}}}}
+		cfg.GeminiKey = []config.GeminiKey{{APIKey: "fixture", BaseURL: baseURL, Models: []config.GeminiModel{{Name: "gemini-capability-private", Alias: "bound-google", IsCompat: compat, Thinking: support}}}}
 		executor = NewGeminiExecutor(cfg)
 	}
 	manager := coreauth.NewManager(nil, nil, nil)

@@ -2,11 +2,70 @@ package helps
 
 import (
 	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
 	"testing"
 
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
 	"github.com/tidwall/gjson"
 )
+
+func TestGoogleModelCompatibilityThinkingRolesAndText(t *testing.T) {
+	for _, target := range []translator.Format{translator.FormatGemini, translator.FormatInteractions} {
+		for _, compat := range []bool{false, true} {
+			for _, role := range []string{"assistant", "user", "system", "model"} {
+				for _, content := range []struct{ raw, text string }{{`""`, ""}, {`"thought"`, "thought"}, {`{"text":"wrapped"}`, "wrapped"}} {
+					raw := []byte(fmt.Sprintf(`{"messages":[{"role":%q,"content":[{"type":"text","text":"before"},{"type":"thinking","thinking":%s,"signature":"opaque"},{"type":"text","text":"after"}]}]}`, role, content.raw))
+					got := TranslateRequestWithAPIKeyModelCompatibility(translator.FormatClaude, target, "gemini-2.5-pro", raw, false, compat)
+					found, text := false, ""
+					if target == translator.FormatGemini {
+						for _, message := range gjson.GetBytes(got, "contents").Array() {
+							for _, part := range message.Get("parts").Array() {
+								if part.Get("thought").Bool() {
+									found, text = true, part.Get("text").String()
+									if part.Get("thoughtSignature").String() != "opaque" {
+										t.Fatal("Google compatibility changed the opaque signature")
+									}
+								}
+							}
+						}
+					} else {
+						for _, step := range gjson.GetBytes(got, "input").Array() {
+							if step.Get("type").String() == "thought" {
+								found, text = true, step.Get("content.0.text").String()
+							}
+						}
+					}
+					want := role == "assistant" && (compat || (target == translator.FormatInteractions && content.text != ""))
+					if found != want || (found && text != content.text) {
+						t.Fatalf("thinking role/text mismatch: target=%s compat=%t role=%s", target, compat, role)
+					}
+				}
+			}
+		}
+	}
+}
+
+func TestModelCompatibilityDoesNotBypassOpaqueHistoryOrCancellation(t *testing.T) {
+	cfg := &config.Config{Codex: config.CodexConfig{OptimizeMultiAgentV2: true}}
+	headers := http.Header{"User-Agent": {"codex_cli_rs/0.153.4"}}
+	raw := []byte(`{"input":[{"type":"agent_message","content":[{"type":"encrypted_content","encrypted_content":"opaque-fixture"}]}]}`)
+	for _, target := range []translator.Format{translator.FormatGemini, translator.FormatInteractions, translator.FormatClaude} {
+		for _, compat := range []bool{false, true} {
+			if _, err := TranslateRequestWithCodexMultiAgentV2(t.Context(), headers, cfg, translator.FormatOpenAIResponse, target, "fixture", raw, false, compat); err == nil {
+				t.Fatal("compatibility bypassed the encrypted history guard")
+			}
+			ctx, cancel := context.WithCancel(t.Context())
+			cancel()
+			if _, err := TranslateRequestWithCodexMultiAgentV2(ctx, headers, cfg, translator.FormatOpenAIResponse, target, "fixture", raw, false, compat); !errors.Is(err, context.Canceled) {
+				t.Fatal("compatibility lost cancellation precedence")
+			}
+		}
+	}
+}
 
 func TestModelCompatibilityCodexSummaryAndUnsignedThinking(t *testing.T) {
 	raw := []byte(`{"thinking":{"type":"enabled","display":"omitted","budget_tokens":1024},"messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"","signature":""},{"type":"text","text":"answer"}]}]}`)

@@ -10,12 +10,12 @@ import (
 
 // TranslateRequestWithCodexMultiAgentV2 adapts plaintext collaboration history
 // before translating Responses to another protocol. Native ciphertext is opaque.
-func TranslateRequestWithCodexMultiAgentV2(ctx context.Context, headers http.Header, cfg *config.Config, from, to sdktranslator.Format, model string, payload []byte, stream bool) ([]byte, error) {
+func TranslateRequestWithCodexMultiAgentV2(ctx context.Context, headers http.Header, cfg *config.Config, from, to sdktranslator.Format, model string, payload []byte, stream bool, isCompat ...bool) ([]byte, error) {
 	payload, errNormalize := NormalizeCodexMultiAgentRequest(ctx, headers, cfg, from, to, payload)
 	if errNormalize != nil {
 		return nil, errNormalize
 	}
-	return sdktranslator.TranslateRequest(from, to, model, payload, stream), nil
+	return TranslateRequestWithAPIKeyModelCompatibility(from, to, model, payload, stream, len(isCompat) > 0 && isCompat[0]), nil
 }
 
 // NormalizeCodexMultiAgentRequest keeps source and target semantics separate

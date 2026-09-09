@@ -86,19 +86,19 @@ func applyGeminiInteractionsHeaders(req *http.Request, auth *cliproxyauth.Auth, 
 	}
 }
 
-func translateGeminiInteractionsRequestBody(ctx context.Context, cfg *config.Config, model string, payload []byte, opts cliproxyexecutor.Options, stream bool) ([]byte, error) {
+func translateGeminiInteractionsRequestBody(ctx context.Context, cfg *config.Config, model string, payload []byte, opts cliproxyexecutor.Options, stream bool, isCompat ...bool) ([]byte, error) {
 	if opts.SourceFormat == "" || opts.SourceFormat == sdktranslator.FormatInteractions {
 		return bytes.Clone(payload), nil
 	}
-	return helps.TranslateRequestWithCodexMultiAgentV2(ctx, opts.Headers, cfg, opts.SourceFormat, sdktranslator.FormatInteractions, model, payload, stream)
+	return helps.TranslateRequestWithCodexMultiAgentV2(ctx, opts.Headers, cfg, opts.SourceFormat, sdktranslator.FormatInteractions, model, payload, stream, isCompat...)
 }
 
-func geminiInteractionsPayloadConfigSource(ctx context.Context, cfg *config.Config, model string, payload []byte, opts cliproxyexecutor.Options, stream bool) ([]byte, error) {
+func geminiInteractionsPayloadConfigSource(ctx context.Context, cfg *config.Config, model string, payload []byte, opts cliproxyexecutor.Options, stream bool, isCompat ...bool) ([]byte, error) {
 	source := opts.OriginalRequest
 	if len(source) == 0 {
 		source = payload
 	}
-	return translateGeminiInteractionsRequestBody(ctx, cfg, model, source, opts, stream)
+	return translateGeminiInteractionsRequestBody(ctx, cfg, model, source, opts, stream, isCompat...)
 }
 
 func applyGeminiInteractionsThinking(body []byte, model string, summary ...thinking.SummaryConfig) ([]byte, error) {
@@ -110,7 +110,8 @@ func applyGeminiInteractionsThinking(body []byte, model string, summary ...think
 
 func (e *GeminiExecutor) buildInteractionsBody(ctx context.Context, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, stream bool) ([]byte, error) {
 	targetName := thinking.ParseSuffix(req.Model).ModelName
-	body, err := translateGeminiInteractionsRequestBody(ctx, e.cfg, targetName, req.Payload, opts, stream)
+	isCompat := helps.APIKeyModelIsCompat(req)
+	body, err := translateGeminiInteractionsRequestBody(ctx, e.cfg, targetName, req.Payload, opts, stream, isCompat)
 	if err != nil {
 		return nil, err
 	}
@@ -128,7 +129,7 @@ func (e *GeminiExecutor) buildInteractionsBody(ctx context.Context, req cliproxy
 		return nil, err
 	}
 
-	originalTranslated, err := geminiInteractionsPayloadConfigSource(ctx, e.cfg, targetName, req.Payload, opts, stream)
+	originalTranslated, err := geminiInteractionsPayloadConfigSource(ctx, e.cfg, targetName, req.Payload, opts, stream, isCompat)
 	if err != nil {
 		return nil, err
 	}

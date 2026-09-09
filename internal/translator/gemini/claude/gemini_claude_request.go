@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/translator/gemini/common"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	"github.com/tidwall/gjson"
@@ -29,7 +30,17 @@ const geminiClaudeThoughtSignature = "skip_thought_signature_validator"
 //
 // Returns:
 //   - []byte: The transformed request in Gemini format.
-func ConvertClaudeRequestToGemini(modelName string, inputRawJSON []byte, _ bool) []byte {
+func ConvertClaudeRequestToGemini(modelName string, inputRawJSON []byte, stream bool) []byte {
+	return convertClaudeRequestToGemini(modelName, inputRawJSON, stream, false)
+}
+
+// ConvertClaudeRequestToGeminiWithCompat retains assistant thinking and opaque
+// signatures for explicitly configured compatibility endpoints.
+func ConvertClaudeRequestToGeminiWithCompat(modelName string, inputRawJSON []byte, stream bool) []byte {
+	return convertClaudeRequestToGemini(modelName, inputRawJSON, stream, true)
+}
+
+func convertClaudeRequestToGemini(modelName string, inputRawJSON []byte, _ bool, preserveThinking bool) []byte {
 	rawJSON := inputRawJSON
 	// Build output Gemini request JSON
 	out := []byte(`{"contents":[]}`)
@@ -77,6 +88,15 @@ func ConvertClaudeRequestToGemini(modelName string, inputRawJSON []byte, _ bool)
 			if contentsResult.IsArray() {
 				contentsResult.ForEach(func(_, contentResult gjson.Result) bool {
 					switch contentResult.Get("type").String() {
+					case "thinking":
+						signature := contentResult.Get("signature")
+						if !preserveThinking || roleResult.String() != "assistant" || (signature.Exists() && signature.Type != gjson.String) {
+							return true
+						}
+						part := []byte(`{"text":"","thought":true,"thoughtSignature":""}`)
+						part, _ = sjson.SetBytes(part, "text", thinking.GetThinkingText(contentResult))
+						part, _ = sjson.SetBytes(part, "thoughtSignature", signature.String())
+						contentJSON, _ = sjson.SetRawBytes(contentJSON, "parts.-1", part)
 					case "text":
 						part := []byte(`{"text":""}`)
 						part, _ = sjson.SetBytes(part, "text", contentResult.Get("text").String())

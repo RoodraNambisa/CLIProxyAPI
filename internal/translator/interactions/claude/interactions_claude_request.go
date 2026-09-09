@@ -3,11 +3,22 @@ package claude
 import (
 	"strings"
 
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
 
 func ConvertClaudeRequestToInteractions(modelName string, inputRawJSON []byte, stream bool) []byte {
+	return convertClaudeRequestToInteractions(modelName, inputRawJSON, stream, false)
+}
+
+// ConvertClaudeRequestToInteractionsWithCompat also retains empty assistant
+// thought steps for explicitly configured compatibility endpoints.
+func ConvertClaudeRequestToInteractionsWithCompat(modelName string, inputRawJSON []byte, stream bool) []byte {
+	return convertClaudeRequestToInteractions(modelName, inputRawJSON, stream, true)
+}
+
+func convertClaudeRequestToInteractions(modelName string, inputRawJSON []byte, stream, preserveEmptyThinking bool) []byte {
 	root := gjson.ParseBytes(inputRawJSON)
 	out := []byte(`{"model":"","input":[]}`)
 	out, _ = sjson.SetBytes(out, "model", firstNonEmpty(modelName, root.Get("model").String()))
@@ -16,7 +27,7 @@ func ConvertClaudeRequestToInteractions(modelName string, inputRawJSON []byte, s
 	}
 	out = copyClaudeSystemToInteractions(out, root)
 	out = copyClaudeGenerationConfigToInteractions(out, root)
-	out = appendClaudeMessagesToInteractions(out, root.Get("messages"))
+	out = appendClaudeMessagesToInteractions(out, root.Get("messages"), preserveEmptyThinking)
 	out = copyClaudeToolsToInteractions(out, root)
 	return out
 }
@@ -111,18 +122,18 @@ func copyClaudeToolChoiceToInteractions(out []byte, toolChoice gjson.Result) []b
 	return out
 }
 
-func appendClaudeMessagesToInteractions(out []byte, messages gjson.Result) []byte {
+func appendClaudeMessagesToInteractions(out []byte, messages gjson.Result, preserveEmptyThinking bool) []byte {
 	if !messages.Exists() || !messages.IsArray() {
 		return out
 	}
 	messages.ForEach(func(_, message gjson.Result) bool {
-		out = appendClaudeMessageToInteractions(out, message)
+		out = appendClaudeMessageToInteractions(out, message, preserveEmptyThinking)
 		return true
 	})
 	return out
 }
 
-func appendClaudeMessageToInteractions(out []byte, message gjson.Result) []byte {
+func appendClaudeMessageToInteractions(out []byte, message gjson.Result, preserveEmptyThinking bool) []byte {
 	role := strings.ToLower(strings.TrimSpace(message.Get("role").String()))
 	defaultStepType := "user_input"
 	if role == "assistant" {
@@ -160,8 +171,11 @@ func appendClaudeMessageToInteractions(out []byte, message gjson.Result) []byte 
 				stepContent, _ = sjson.SetRawBytes(stepContent, "-1", contentPart)
 			}
 		case "thinking":
+			if role != "assistant" {
+				return true
+			}
 			flushContent()
-			if text := part.Get("thinking").String(); text != "" {
+			if text := thinking.GetThinkingText(part); text != "" || preserveEmptyThinking {
 				step := []byte(`{"type":"thought","content":[{"type":"text","text":""}]}`)
 				step, _ = sjson.SetBytes(step, "content.0.text", text)
 				out, _ = sjson.SetRawBytes(out, "input.-1", step)
