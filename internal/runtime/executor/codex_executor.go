@@ -114,7 +114,7 @@ func codexTerminalStreamError(eventData []byte) (statusErr, bool) {
 		case "cancelled", "canceled":
 			return codexResponseCancelledError(), true
 		}
-		if responseError := gjson.GetBytes(eventData, "response.error"); responseError.Exists() && strings.TrimSpace(responseError.Raw) != "null" {
+		if helps.CodexTerminalErrorNode(eventData).Exists() {
 			return codexResponseFailedError(eventData), true
 		}
 	case "error":
@@ -143,8 +143,7 @@ func isCodexSuccessfulCompletion(payload []byte) bool {
 	if status != "" && status != "completed" {
 		return false
 	}
-	responseError := gjson.GetBytes(payload, "response.error")
-	return !responseError.Exists() || strings.TrimSpace(responseError.Raw) == "null"
+	return !helps.CodexTerminalErrorNode(payload).Exists()
 }
 
 func isCodexCompletionType(eventType string) bool {
@@ -169,23 +168,31 @@ func codexSSEEventCompletion(line []byte) bool {
 }
 
 func codexResponseFailedError(eventData []byte) statusErr {
-	code := strings.TrimSpace(gjson.GetBytes(eventData, "response.error.code").String())
-	message := strings.TrimSpace(gjson.GetBytes(eventData, "response.error.message").String())
+	node := helps.CodexTerminalErrorNode(eventData)
+	code := strings.TrimSpace(node.Get("code").String())
+	errType := strings.TrimSpace(node.Get("type").String())
+	status := codexStreamErrorStatus(code, codexStreamErrorStatus(errType, http.StatusInternalServerError))
+	if explicitStatus := helps.CodexTerminalHTTPStatus(eventData); explicitStatus != 0 {
+		status = explicitStatus
+	}
+	message := strings.TrimSpace(node.Get("message").String())
+	if message == "" && node.Type == gjson.String {
+		message = strings.TrimSpace(node.String())
+	}
 	if message == "" {
 		message = "response failed"
 	}
 	if code == "" {
 		code = "server_error"
 	}
-	errType := strings.TrimSpace(gjson.GetBytes(eventData, "response.error.type").String())
 	if errType == "" {
 		errType = codexStreamErrorType(code)
 	}
-	return codexStreamStatusErr(codexStreamErrorStatus(code, http.StatusInternalServerError), message, code, errType, nil)
+	return codexStreamStatusErr(status, message, code, errType, nil)
 }
 
 func codexResponseIncompleteError(eventData []byte) statusErr {
-	if cliproxyauth.IsPolicyRefusalError(statusErr{code: http.StatusBadGateway, msg: string(eventData)}) {
+	if helps.CodexTerminalErrorNode(eventData).Exists() || helps.CodexTerminalHTTPStatus(eventData) != 0 {
 		return codexResponseFailedError(eventData)
 	}
 	reason := strings.TrimSpace(gjson.GetBytes(eventData, "response.incomplete_details.reason").String())
@@ -230,13 +237,17 @@ func codexStreamErrorEventError(eventData []byte) statusErr {
 		code = "stream_error"
 	}
 	errType := strings.TrimSpace(gjson.GetBytes(eventData, "error.type").String())
+	status := codexStreamErrorStatus(code, codexStreamErrorStatus(errType, http.StatusInternalServerError))
+	if explicitStatus := helps.CodexTerminalHTTPStatus(eventData); explicitStatus != 0 {
+		status = explicitStatus
+	}
 	var param *gjson.Result
 	if paramResult := gjson.GetBytes(eventData, "error.param"); paramResult.Exists() {
 		param = &paramResult
 	} else if paramResult := gjson.GetBytes(eventData, "param"); paramResult.Exists() {
 		param = &paramResult
 	}
-	return codexStreamStatusErr(codexStreamErrorStatus(code, http.StatusInternalServerError), message, code, errType, param)
+	return codexStreamStatusErr(status, message, code, errType, param)
 }
 
 func codexStreamErrorStatus(code string, fallback int) int {
@@ -245,7 +256,7 @@ func codexStreamErrorStatus(code string, fallback int) int {
 		return http.StatusUnauthorized
 	case "permission_error", "permission_denied", "forbidden":
 		return http.StatusForbidden
-	case "rate_limit_exceeded", "quota_exceeded", "insufficient_quota":
+	case "rate_limit_exceeded", "rate_limit_error", "quota_exceeded", "insufficient_quota":
 		return http.StatusTooManyRequests
 	case "not_found", "model_not_found":
 		return http.StatusNotFound

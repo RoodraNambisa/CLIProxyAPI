@@ -1691,11 +1691,8 @@ func parseCodexWebsocketError(payload []byte) (error, bool) {
 	if strings.TrimSpace(gjson.GetBytes(payload, "type").String()) != "error" {
 		return nil, false
 	}
-	status := int(gjson.GetBytes(payload, "status").Int())
+	status := helps.CodexTerminalHTTPStatus(payload)
 	if status == 0 {
-		status = int(gjson.GetBytes(payload, "status_code").Int())
-	}
-	if status <= 0 {
 		return nil, false
 	}
 
