@@ -86,6 +86,25 @@ func TestApplyCodexReasoningReplayAlignsSanitizedToolCallID(t *testing.T) {
 	}
 }
 
+func TestApplyCodexReasoningReplayPreservesImplicitInstructionOrder(t *testing.T) {
+	resetCodexReasoningReplayStoreForTest()
+	t.Cleanup(resetCodexReasoningReplayStoreForTest)
+	scope := CodexReasoningReplayScope{namespace: "tenant-a", modelName: "gpt-5", sessionKey: "execution:session-1"}
+	completed := []byte(`{"response":{"output":[{"type":"reasoning","encrypted_content":"` + testCodexReasoningSignature() + `"}]}}`)
+	if !CacheCodexReasoningReplayFromCompleted(scope, completed) {
+		t.Fatal("expected reasoning to be cached")
+	}
+	const original = `{"input":[{"role":"system","content":"system"},{"role":"developer","content":"developer"},{"role":"user","content":"next"}]}`
+	body := []byte(original)
+	got, _ := ApplyCodexReasoningReplay(context.Background(), "claude", "tenant-a", "gpt-5", nil, body, nil, map[string]any{"execution_session_id": "session-1"}, nil)
+	if gjson.GetBytes(got, "input.0.content").String() != "system" || gjson.GetBytes(got, "input.1.content").String() != "developer" || gjson.GetBytes(got, "input.2.type").String() != "reasoning" || gjson.GetBytes(got, "input.3.content").String() != "next" {
+		t.Fatalf("unexpected replay order: %s", got)
+	}
+	if string(body) != original {
+		t.Fatal("replay mutated the source request")
+	}
+}
+
 func TestClearCodexReasoningReplayOnInvalidSignature(t *testing.T) {
 	resetCodexReasoningReplayStoreForTest()
 	scope := CodexReasoningReplayScope{namespace: "tenant-a", modelName: "gpt-5", sessionKey: "session-1"}
@@ -174,6 +193,39 @@ func testCodexReasoningSignature() string {
 	decoded := make([]byte, 73)
 	decoded[0] = 0x80
 	return base64.RawURLEncoding.EncodeToString(decoded)
+}
+
+func TestCodexReasoningReplayInsertIndexRecognizesImplicitMessages(t *testing.T) {
+	cases := []struct {
+		name   string
+		input  string
+		replay string
+		want   int
+	}{
+		{"empty", `[]`, `[]`, 0},
+		{"implicit instructions", `[{"role":"system"},{"role":" DEVELOPER "},{"role":"user"}]`, `[]`, 2},
+		{"instructions only", `[{"role":"system"},{"role":"developer"}]`, `[]`, 2},
+		{"implicit assistant", `[{"role":"user"},{"role":" ASSISTANT "},{"role":"user"}]`, `[]`, 1},
+		{"last assistant", `[{"type":"message","role":"assistant"},{"role":"user"},{"role":"assistant"},{"role":"user"}]`, `[]`, 2},
+		{"explicit message", `[{"type":" message ","role":" SYSTEM "},{"type":"message","role":"user"}]`, `[]`, 1},
+		{"nonmessage role ignored", `[{"role":"system"},{"type":"reasoning","role":"assistant"},{"role":"user"}]`, `[]`, 1},
+		{"nonmessage system ignored", `[{"type":"function_call","role":"system"},{"role":"user"}]`, `[]`, 0},
+		{"empty role", `[{"role":"system"},{"type":"message","role":" "}]`, `[]`, 1},
+		{"function output precedence", `[{"role":"assistant"},{"type":"function_call_output","call_id":"call_1"},{"role":"assistant"}]`, `[{"type":"function_call","call_id":"call:1"}]`, 1},
+		{"custom output precedence", `[{"role":"assistant"},{"type":"custom_tool_call_output","call_id":"call_1"},{"role":"assistant"}]`, `[{"type":"custom_tool_call","call_id":"call_1"}]`, 1},
+		{"unmatched output", `[{"role":"user"},{"role":"assistant"},{"type":"function_call_output","call_id":"other"}]`, `[{"type":"function_call","call_id":"call_1"}]`, 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var replay [][]byte
+			for _, item := range gjson.Parse(tc.replay).Array() {
+				replay = append(replay, []byte(item.Raw))
+			}
+			if got := codexReasoningReplayInsertIndex(gjson.Parse(tc.input).Array(), replay); got != tc.want {
+				t.Fatalf("insert index = %d, want %d", got, tc.want)
+			}
+		})
+	}
 }
 
 func resetCodexReasoningReplayStoreForTest() {
