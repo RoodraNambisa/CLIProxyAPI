@@ -45,6 +45,10 @@ func IncompleteStreamError(provider string) error {
 
 // JSONStreamProtocolError preserves the upstream error message from an SSE payload.
 func JSONStreamProtocolError(provider string, payload []byte) error {
+	return jsonStreamProtocolError(provider, payload, false)
+}
+
+func jsonStreamProtocolError(provider string, payload []byte, rootError bool) error {
 	provider = strings.TrimSpace(provider)
 	if provider == "" {
 		provider = "upstream"
@@ -87,7 +91,7 @@ func JSONStreamProtocolError(provider string, payload []byte) error {
 		if !node.IsObject() {
 			node = root.Get("response.error")
 		}
-		if !node.IsObject() && root.Get("type").String() == "error" {
+		if !node.IsObject() && (rootError || root.Get("type").String() == "error") {
 			node = root
 		}
 		if node.IsObject() {
