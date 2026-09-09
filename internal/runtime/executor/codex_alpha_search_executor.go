@@ -58,7 +58,7 @@ func (e *CodexExecutor) executeAlphaSearch(ctx context.Context, auth *cliproxyau
 	}
 	ctx = contextWithCodexFingerprintPersona(ctx, e.cfg, auth)
 	ctx = helps.WithCodexPromptCacheLogRedaction(ctx, helps.SnapshotCodexPromptCacheLog(ctx, req.Payload))
-	reporter := helps.NewUsageReporter(ctx, e.Identifier(), model.ModelName, auth)
+	reporter := helps.NewUsageReporter(ctx, e.Identifier(), model.ModelName, auth, false)
 	defer reporter.TrackFailure(ctx, &err)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {

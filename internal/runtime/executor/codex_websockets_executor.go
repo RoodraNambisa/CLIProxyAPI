@@ -279,7 +279,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		baseURL = "https://chatgpt.com/backend-api/codex"
 	}
 
-	reporter := helps.NewUsageReporter(ctx, e.Identifier(), baseModel, auth)
+	reporter := helps.NewUsageReporter(ctx, e.Identifier(), baseModel, auth, false)
 	defer reporter.TrackFailure(ctx, &err)
 
 	from := opts.SourceFormat
@@ -631,7 +631,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		baseURL = "https://chatgpt.com/backend-api/codex"
 	}
 
-	reporter := helps.NewUsageReporter(ctx, e.Identifier(), baseModel, auth)
+	reporter := helps.NewUsageReporter(ctx, e.Identifier(), baseModel, auth, true)
 	defer reporter.TrackFailure(ctx, &err)
 
 	from := opts.SourceFormat

@@ -80,7 +80,7 @@ func TestClaudeUsageMatchesActualResponseAcrossTransports(t *testing.T) {
 					if correction {
 						want.InputTokens, want.CachedTokens, want.ReasoningTokens, want.TotalTokens = 6, 0, 0, 9
 					}
-					if len(records) != 1 || records[0].Failed || records[0].Detail != want {
+					if len(records) != 1 || records[0].Failed || records[0].Detail != want || records[0].Stream != stream {
 						t.Fatal("usage sink lost start counts, later output, or explicit zero corrections")
 					}
 				})

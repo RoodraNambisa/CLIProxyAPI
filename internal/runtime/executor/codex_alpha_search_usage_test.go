@@ -63,7 +63,7 @@ func TestCodexAlphaSearchUsageKeepsBaseModelAndReportedErrorTokens(t *testing.T)
 				t.Fatal("search did not publish exactly one final usage record")
 			}
 			record := records[0]
-			if record.Model != "gpt-5.5" || record.Failed != (tc.status >= 400) {
+			if record.Model != "gpt-5.5" || record.Failed != (tc.status >= 400) || record.Stream {
 				t.Fatal("search usage lost base model or outcome")
 			}
 			want := usage.Detail{}
