@@ -22,20 +22,22 @@ import (
 
 func TestCodexRequestScopedActionsAcrossWireTransports(t *testing.T) {
 	for _, buffering := range []bool{false, true} {
-		t.Run(fmt.Sprintf("buffering=%t", buffering), func(t *testing.T) {
-			testCodexRequestScopedActionsAcrossWireTransports(t, buffering)
-		})
+		for _, detail := range []bool{false, true} {
+			t.Run(fmt.Sprintf("buffering=%t/detail=%t", buffering, detail), func(t *testing.T) {
+				testCodexRequestScopedActionsAcrossWireTransports(t, buffering, detail)
+			})
+		}
 	}
 }
 
-func testCodexRequestScopedActionsAcrossWireTransports(t *testing.T, buffering bool) {
+func testCodexRequestScopedActionsAcrossWireTransports(t *testing.T, buffering, detail bool) {
 	for _, transport := range []string{"http", "sse", "websocket", "images", "compact"} {
 		for _, action := range []string{"stop", "stop-and-cooldown", "continue", "continue-and-cooldown"} {
 			t.Run(transport+"/"+action, func(t *testing.T) {
 				var calls atomic.Int64
 				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 					attempt := calls.Add(1)
-					failure := `{"type":"response.failed","response":{"error":{"type":"service_unavailable_error","code":"server_is_overloaded","message":"rule-fixture"}}}`
+					failure := `{"type":"response.failed","response":{"error":{"type":"service_unavailable_error","code":"server_is_overloaded","message":"rule-fixture","diagnostic":"rule-detail"}}}`
 					if transport == "websocket" {
 						upgrader := websocket.Upgrader{}
 						conn, err := upgrader.Upgrade(w, r, nil)
@@ -69,7 +71,7 @@ func testCodexRequestScopedActionsAcrossWireTransports(t *testing.T, buffering b
 					if attempt == 1 && (transport == "http" || transport == "compact") {
 						w.Header().Set("Content-Type", "application/json")
 						w.WriteHeader(http.StatusServiceUnavailable)
-						_, _ = io.WriteString(w, `{"error":{"code":"server_is_overloaded","message":"rule-fixture"}}`)
+						_, _ = io.WriteString(w, `{"error":{"code":"server_is_overloaded","message":"rule-fixture","diagnostic":"rule-detail"}}`)
 						return
 					}
 					if transport == "compact" {
@@ -122,7 +124,11 @@ func testCodexRequestScopedActionsAcrossWireTransports(t *testing.T, buffering b
 				}
 				for range 2 {
 					id := uuid.NewString()
-					credential := &auth.Auth{ID: id, Provider: "codex", Attributes: map[string]string{"api_key": "fixture", "base_url": server.URL}, Metadata: map[string]any{"request_scoped_errors": []config.RequestScopedErrorRule{{Status: ruleStatus, Match: []string{"rule-fixture"}, Action: action}}}}
+					match := "rule-fixture"
+					if detail {
+						match = "rule-detail"
+					}
+					credential := &auth.Auth{ID: id, Provider: "codex", Attributes: map[string]string{"api_key": "fixture", "base_url": server.URL}, Metadata: map[string]any{"request_scoped_errors": []config.RequestScopedErrorRule{{Status: ruleStatus, Match: []string{match}, Action: action}}}}
 					if _, err := manager.Register(auth.WithSkipPersist(t.Context()), credential); err != nil {
 						t.Fatal(err)
 					}

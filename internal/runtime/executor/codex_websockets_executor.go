@@ -570,6 +570,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 				terminalErr = sanitizedTerminalErr
 			} else {
 				terminalErr.msg = string(payload)
+				terminalErr.responseBody = string(clientPayload)
 			}
 			helps.RecordAPIWebsocketError(ctx, e.cfg, "upstream_response_error", terminalErr)
 			return resp, terminalErr
@@ -1048,6 +1049,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 					terminalErr = sanitizedTerminalErr
 				} else {
 					terminalErr.msg = string(payload)
+					terminalErr.responseBody = string(clientPayload)
 				}
 				terminateReason = "upstream_response_error"
 				terminateErr = terminalErr
@@ -1650,9 +1652,11 @@ func codexWebsocketErrorWithSanitizedMessage(original error, payload []byte) err
 	switch typed := original.(type) {
 	case statusErrWithHeaders:
 		typed.statusErr.msg = string(payload)
+		typed.statusErr.responseBody = ""
 		return typed
 	case statusErr:
 		typed.msg = string(payload)
+		typed.responseBody = ""
 		return typed
 	default:
 		return fmt.Errorf("codex websocket upstream error: %s", payload)
@@ -1699,6 +1703,7 @@ func parseCodexWebsocketError(payload []byte) (error, bool) {
 	out := buildCodexWebsocketErrorPayload(payload, status)
 	headers := parseCodexWebsocketErrorHeaders(payload)
 	statusError := newCodexWebsocketStatusErr(status, out)
+	statusError.responseBody = string(payload)
 	if retryAfter := parseCodexRetryAfter(status, out, time.Now()); retryAfter != nil {
 		statusError.retryAfter = retryAfter
 	} else if isCodexWebsocketConnectionLimitError(payload) {

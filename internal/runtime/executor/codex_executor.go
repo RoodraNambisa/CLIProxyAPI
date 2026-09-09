@@ -98,7 +98,12 @@ func patchCodexCompletedOutput(eventData []byte, outputItemsByIndex map[int64][]
 	return completedDataPatched
 }
 
-func codexTerminalStreamError(eventData []byte) (statusErr, bool) {
+func codexTerminalStreamError(eventData []byte) (result statusErr, terminal bool) {
+	defer func() {
+		if terminal {
+			result.responseBody = string(eventData)
+		}
+	}()
 	eventType := gjson.GetBytes(eventData, "type").String()
 	switch eventType {
 	case "response.failed":
@@ -995,6 +1000,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 					eventErr = sanitizedEventErr
 				} else {
 					eventErr.msg = string(bytes.TrimSpace(line))
+					eventErr.responseBody = string(clientEventData)
 				}
 				terminalErr = &eventErr
 				terminalEvent = bytes.Clone(clientEventData)
@@ -1424,6 +1430,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 						terminalErr = sanitizedTerminalErr
 					} else {
 						terminalErr.msg = string(bytes.TrimSpace(line))
+						terminalErr.responseBody = string(clientData)
 					}
 					helps.AppendAPIResponseChunk(ctx, e.cfg, line)
 					helps.ClearCodexReasoningReplayOnInvalidSignature(replayScope, terminalErr.code, clientData)
@@ -2611,8 +2618,12 @@ func newCodexStatusErr(statusCode int, body []byte) statusErr {
 		errCode = http.StatusTooManyRequests
 	}
 	requestScopedContextError := isCodexContextTooLargeRequestError(errCode, body)
+	originalBody := body
 	body = classifyCodexStatusError(errCode, body)
 	err := statusErr{code: errCode, msg: string(body)}
+	if !bytes.Equal(originalBody, body) {
+		err.responseBody = string(originalBody)
+	}
 	if requestScopedContextError {
 		err.skipAuthResult = true
 	}

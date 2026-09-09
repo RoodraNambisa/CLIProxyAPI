@@ -474,6 +474,7 @@ func (e *OpenAICompatExecutor) overrideModel(payload []byte, model string) []byt
 type statusErr struct {
 	code           int
 	msg            string
+	responseBody   string
 	retryAfter     *time.Duration
 	skipAuthResult bool
 	retryOtherAuth bool
@@ -485,7 +486,13 @@ func (e statusErr) Error() string {
 	}
 	return fmt.Sprintf("status %d", e.code)
 }
-func (e statusErr) StatusCode() int            { return e.code }
+func (e statusErr) StatusCode() int { return e.code }
+func (e statusErr) ResponseBody() []byte {
+	if e.responseBody != "" {
+		return []byte(e.responseBody)
+	}
+	return []byte(e.msg)
+}
 func (e statusErr) RetryAfter() *time.Duration { return e.retryAfter }
 func (e statusErr) SkipAuthResult() bool       { return e.skipAuthResult }
 func (e statusErr) RetryOtherAuth() bool       { return e.retryOtherAuth }
