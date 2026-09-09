@@ -456,6 +456,10 @@ type StreamForwardOptions struct {
 	// after headers have already been committed. It should not flush.
 	WriteTerminalError func(errMsg *interfaces.ErrorMessage)
 
+	// CloseError validates a clean data-channel close before WriteDone. The
+	// returned error retains its status, headers, and any presentation metadata.
+	CloseError func() *interfaces.ErrorMessage
+
 	// WriteDone optionally writes a terminal marker when the upstream data channel closes
 	// without an error (e.g. OpenAI's `[DONE]`). It should not flush.
 	WriteDone func()
@@ -625,6 +629,9 @@ func (h *BaseAPIHandler) ForwardStream(c *gin.Context, flusher http.Flusher, can
 						}
 					default:
 					}
+				}
+				if terminalErr == nil && opts.CloseError != nil {
+					terminalErr = opts.CloseError()
 				}
 				if terminalErr != nil {
 					writeTerminalError(terminalErr)
