@@ -61,6 +61,29 @@ func TestOpenAICompatibilityAlreadyPreservesAssistantThinking(t *testing.T) {
 	}
 }
 
+func TestClaudeCompatibilityPreservesOnlyAssistantReasoningStrings(t *testing.T) {
+	for _, role := range []string{"user", "assistant", "system"} {
+		for _, value := range []string{`"kept"`, `""`, `"  "`, "false", "2", "null", `{"text":"object"}`} {
+			for _, compat := range []bool{false, true} {
+				raw := []byte(fmt.Sprintf(`{"messages":[{"role":%q,"content":"answer","reasoning_content":%s}]}`, role, value))
+				got := TranslateRequestWithAPIKeyModelCompatibility(translator.FormatOpenAI, translator.FormatClaude, "claude-fixture", raw, false, compat)
+				part := gjson.GetBytes(got, "messages.0.content.0")
+				want := compat && role == "assistant" && value == `"kept"`
+				if (part.Get("type").String() == "thinking") != want {
+					t.Fatal("compatibility reinterpreted reasoning role or type")
+				}
+			}
+		}
+	}
+	raw := []byte(`{"messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"","signature":"opaque-native"}]}]}`)
+	for _, compat := range []bool{false, true} {
+		got := TranslateRequestWithAPIKeyModelCompatibility(translator.FormatClaude, translator.FormatClaude, "claude-fixture", raw, false, compat)
+		if gjson.GetBytes(got, "messages.0.content.0.signature").String() != "opaque-native" {
+			t.Fatal("native Claude signature preservation gained an opt-in requirement")
+		}
+	}
+}
+
 func TestModelCompatibilityDoesNotBypassOpaqueHistoryOrCancellation(t *testing.T) {
 	cfg := &config.Config{Codex: config.CodexConfig{OptimizeMultiAgentV2: true}}
 	headers := http.Header{"User-Agent": {"codex_cli_rs/0.153.4"}}
