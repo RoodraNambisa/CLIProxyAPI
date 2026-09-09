@@ -186,6 +186,7 @@ type RequestDetail struct {
 	Tokens                  TokenStats `json:"tokens"`
 	Failed                  bool       `json:"failed"`
 	Stream                  bool       `json:"stream,omitempty"`
+	Generate                *bool      `json:"generate,omitempty"`
 	Auxiliary               bool       `json:"auxiliary,omitempty"`
 	FailureStage            string     `json:"failure_stage,omitempty"`
 	ErrorCode               string     `json:"error_code,omitempty"`
@@ -313,6 +314,7 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 		Tokens:                  detail,
 		Failed:                  failed,
 		Stream:                  record.Stream,
+		Generate:                cloneGenerateFlag(record.Generate),
 		Auxiliary:               record.Auxiliary,
 		FailureStage:            strings.TrimSpace(record.FailureStage),
 		ErrorCode:               strings.TrimSpace(record.ErrorCode),
@@ -561,7 +563,15 @@ func (s *RequestStatistics) snapshotLocked() StatisticsSnapshot {
 
 func publicRequestDetail(detail RequestDetail) RequestDetail {
 	detail.internalID = 0
+	detail.Generate = cloneGenerateFlag(detail.Generate)
 	return detail
+}
+
+func cloneGenerateFlag(value *bool) *bool {
+	if value == nil {
+		return nil
+	}
+	return coreusage.GenerateFlag(*value)
 }
 
 type MergeResult struct {
@@ -1387,6 +1397,7 @@ func subtractUsageAggregate(totalRequests, successCount, failureCount, totalToke
 }
 
 func (s *RequestStatistics) recordImported(apiName, modelName string, stats *apiStats, detail RequestDetail, now time.Time) {
+	detail.Generate = cloneGenerateFlag(detail.Generate)
 	apiName = s.internStringLocked(apiName)
 	modelName = s.internStringLocked(modelName)
 	detail.Source = s.internStringLocked(detail.Source)
