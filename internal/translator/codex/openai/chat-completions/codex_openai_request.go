@@ -68,7 +68,7 @@ func ConvertOpenAIRequestToCodex(modelName string, inputRawJSON []byte, stream b
 	out, _ = sjson.SetBytes(out, "model", modelName)
 
 	originalToolNameMap, customToolNames := codexOpenAIToolNames(rawJSON)
-	customCallIDs := make(map[string]bool)
+	var toolBatch codexOpenAIToolBatch
 
 	// Extract system instructions from first system message (string or text object)
 	messages := gjson.GetBytes(rawJSON, "messages")
@@ -100,14 +100,17 @@ func ConvertOpenAIRequestToCodex(modelName string, inputRawJSON []byte, stream b
 
 			switch role {
 			case "tool":
-				// Handle tool response messages as top-level function_call_output objects
-				toolCallID := m.Get("tool_call_id").String()
+				// A result must identify one unconsumed call in the current batch.
+				toolCallID, custom, matched := toolBatch.consume(m.Get("tool_call_id").String())
+				if !matched {
+					continue
+				}
 				content := m.Get("content").String()
 
 				// Preserve the result type recorded for its paired tool call.
 				funcOutput := []byte(`{}`)
 				outputType := "function_call_output"
-				if customCallIDs[toolCallID] {
+				if custom {
 					outputType = "custom_tool_call_output"
 				}
 				funcOutput, _ = sjson.SetBytes(funcOutput, "type", outputType)
@@ -116,6 +119,7 @@ func ConvertOpenAIRequestToCodex(modelName string, inputRawJSON []byte, stream b
 				inputItems = append(inputItems, funcOutput)
 
 			default:
+				toolBatch = codexOpenAIToolBatch{}
 				// Handle regular messages
 				msg := []byte(`{}`)
 				msg, _ = sjson.SetBytes(msg, "type", "message")
@@ -194,14 +198,17 @@ func ConvertOpenAIRequestToCodex(modelName string, inputRawJSON []byte, stream b
 					toolCalls := m.Get("tool_calls")
 					if toolCalls.Exists() && toolCalls.IsArray() {
 						toolCallsArr := toolCalls.Array()
+						toolBatch.begin(toolCallsArr)
 						for j := 0; j < len(toolCallsArr); j++ {
 							tc := toolCallsArr[j]
 							name, input, custom, valid := codexOpenAIReplayToolCall(tc, customToolNames)
 							if !valid {
 								continue
 							}
-							callID := tc.Get("id").String()
-							customCallIDs[callID] = custom
+							callID, accepted := toolBatch.add(tc.Get("id").String(), custom, i, j)
+							if !accepted {
+								continue
+							}
 							if short, ok := originalToolNameMap[name]; ok {
 								name = short
 							} else {

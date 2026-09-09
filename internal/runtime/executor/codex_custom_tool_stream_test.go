@@ -30,6 +30,16 @@ func TestCodexCustomToolStreamsKeepNamesAndInputAcrossBodyRelease(t *testing.T) 
 						namePath = "tools.0.custom.name"
 					}
 					payload, _ = sjson.SetBytes(payload, namePath, originalName)
+					payload, _ = sjson.SetRawBytes(payload, "messages.-1", []byte(`{"role":"assistant","tool_calls":[{"type":"custom","custom":{"input":"history input"}}]}`))
+					payload, _ = sjson.SetBytes(payload, "messages.1.tool_calls.0.custom.name", originalName)
+					if !native {
+						payload, _ = sjson.SetBytes(payload, "messages.1.tool_calls.0.type", "function")
+						payload, _ = sjson.SetBytes(payload, "messages.1.tool_calls.0.function.name", originalName)
+						payload, _ = sjson.SetBytes(payload, "messages.1.tool_calls.0.function.arguments", "history input")
+						payload, _ = sjson.DeleteBytes(payload, "messages.1.tool_calls.0.custom")
+					}
+					payload, _ = sjson.SetRawBytes(payload, "messages.-1", []byte(`{"role":"tool","content":"history output"}`))
+					payload, _ = sjson.SetRawBytes(payload, "messages.-1", []byte(`{"role":"tool","content":"duplicate"}`))
 					ctrl := core.NewRequestBodyReleaseController(int64(len(payload)), []byte("<released>"))
 					server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 						var body []byte
@@ -55,6 +65,10 @@ func TestCodexCustomToolStreamsKeepNamesAndInputAcrossBodyRelease(t *testing.T) 
 						name := gjson.GetBytes(body, "tools.0.name").String()
 						if name == "" || len(name) > 64 || name == originalName {
 							t.Error("upstream custom name was not normalized")
+							return
+						}
+						if gjson.GetBytes(body, "input.#").Int() != 3 || gjson.GetBytes(body, "input.1.type").String() != "custom_tool_call" || gjson.GetBytes(body, "input.1.call_id").String() != "call_missing_1_0" || gjson.GetBytes(body, "input.1.input").String() != "history input" || gjson.GetBytes(body, "input.2.type").String() != "custom_tool_call_output" || gjson.GetBytes(body, "input.2.call_id").String() != "call_missing_1_0" || gjson.GetBytes(body, "input.2.output").String() != "history output" {
+							t.Error("custom history IDs were not paired exactly once before dispatch")
 							return
 						}
 						if release {
