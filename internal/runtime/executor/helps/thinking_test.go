@@ -1,16 +1,41 @@
 package helps_test
 
 import (
+	"bytes"
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
 	_ "github.com/router-for-me/CLIProxyAPI/v6/internal/thinking/provider/claude"
 	_ "github.com/router-for-me/CLIProxyAPI/v6/internal/thinking/provider/gemini"
 	_ "github.com/router-for-me/CLIProxyAPI/v6/internal/thinking/provider/openai"
 	_ "github.com/router-for-me/CLIProxyAPI/v6/internal/translator"
+	core "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
 	"github.com/tidwall/gjson"
 )
+
+func TestRequestSummarySharedSourcesPreserveResolution(t *testing.T) {
+	for _, from := range []string{"codex", "openai-response"} {
+		for _, raw := range []string{`{}`, `{"reasoning":{"summary":"auto"}}`, `{"reasoning":{"summary":null}}`} {
+			source := []byte(raw)
+			for _, original := range [][]byte{source, bytes.Clone(source)} {
+				for _, target := range [][]byte{source, []byte(`{}`)} {
+					want := thinking.ExtractSummaryConfig(target, "codex")
+					got := helps.RequestSummaryConfig(target, core.Request{Payload: source}, core.Options{OriginalRequest: original}, from, "codex")
+					if got != want {
+						t.Fatalf("shared source changed target priority or restored a removed native field: got=%+v want=%+v", got, want)
+					}
+				}
+			}
+		}
+	}
+	original := []byte(`{"reasoning":{"summary":"detailed"}}`)
+	got := helps.RequestSummaryConfig([]byte(`{}`), core.Request{Payload: original[:1]}, core.Options{OriginalRequest: original}, "openai-response", "codex")
+	if got.Mode != thinking.SummaryEnabled || got.Detail != "detailed" {
+		t.Fatal("different-length slices sharing a start lost the original fallback")
+	}
+}
 
 func TestThinkingSourceSummaryRespectsFinalTargetAndOriginalFallback(t *testing.T) {
 	for _, tc := range []struct{ name, from, to, current, original, target, provider, path, want string }{

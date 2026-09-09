@@ -39,15 +39,20 @@ func translatedRequestSummaryConfig(body, currentSource, originalSource []byte, 
 		return thinking.SummaryConfig{}
 	}
 
-	target := thinking.ExtractExplicitSummaryConfig(body, toFormat)
+	var target thinking.SummaryConfig
 	if sameWireFormat {
 		target = thinking.ExtractSummaryConfig(body, toFormat)
+	} else {
+		target = thinking.ExtractExplicitSummaryConfig(body, toFormat)
 	}
 	if target.Mode != thinking.SummaryUnspecified {
 		return target
 	}
 	current := thinking.ExtractSummaryConfig(currentSource, fromFormat)
 	if current.Mode == thinking.SummaryUnspecified {
+		if len(currentSource) == len(originalSource) && (len(currentSource) == 0 || &currentSource[0] == &originalSource[0]) {
+			return current
+		}
 		return thinking.ExtractSummaryConfig(originalSource, fromFormat)
 	}
 	if sameWireFormat {
