@@ -45,12 +45,12 @@ func TestCodexUsageStreamModeThroughDirectExecutors(t *testing.T) {
 					_, _ = io.Copy(io.Discard, r.Body)
 					if mode == "image" {
 						w.Header().Set("Content-Type", "application/json")
-						_, _ = io.WriteString(w, `{"data":[],"usage":{"input_tokens":2,"output_tokens":1,"total_tokens":3}}`)
+						_, _ = io.WriteString(w, `{"data":[{"b64_json":"fixture"}],"usage":{"input_tokens":2,"output_tokens":1,"total_tokens":3}}`)
 						return
 					}
 					w.Header().Set("Content-Type", "text/event-stream")
 					if mode == "image-stream" {
-						_, _ = io.WriteString(w, "data: {\"type\":\"image_generation.completed\",\"usage\":{\"input_tokens\":2,\"output_tokens\":1,\"total_tokens\":3}}\n\ndata: [DONE]\n\n")
+						_, _ = io.WriteString(w, "data: {\"type\":\"image_generation.partial_image\",\"b64_json\":\"fixture\"}\n\ndata: {\"type\":\"image_generation.completed\",\"usage\":{\"input_tokens\":2,\"output_tokens\":1,\"total_tokens\":3}}\n\ndata: [DONE]\n\n")
 						return
 					}
 					_, _ = fmt.Fprintf(w, "data: %s\n\n", terminal)
@@ -96,6 +96,9 @@ func TestCodexUsageStreamModeThroughDirectExecutors(t *testing.T) {
 				collector.mu.Unlock()
 				if len(records) != 1 || records[0].Stream != want || records[0].Failed || records[0].Detail.TotalTokens != 3 {
 					t.Fatal("direct executor lost its logical mode or altered token accounting")
+				}
+				if strings.HasPrefix(mode, "image") && (records[0].FirstPacketLatency <= 0 || records[0].TTFT < records[0].FirstPacketLatency) {
+					t.Fatal("native image content lost its packet or content timing")
 				}
 			})
 		}

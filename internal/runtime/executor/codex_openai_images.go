@@ -131,7 +131,7 @@ func (e *CodexExecutor) executeOpenAIImage(ctx context.Context, auth *cliproxyau
 	recordCodexOpenAIImageRequest(ctx, e, auth, url, httpReq.Header.Clone(), upstreamBody)
 	upstreamBody = nil
 
-	httpResp, err := helps.DoUpstreamHTTPRequest(e.newCodexHTTPClient(ctx, auth, true), httpReq)
+	httpResp, err := helps.DoUpstreamHTTPRequest(reporter.TrackHTTPClient(e.newCodexHTTPClient(ctx, auth, true)), httpReq)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return resp, err
@@ -161,6 +161,7 @@ func (e *CodexExecutor) executeOpenAIImage(ctx context.Context, auth *cliproxyau
 		return resp, err
 	}
 	helps.AppendAPIResponseChunk(ctx, e.cfg, upstreamData)
+	reporter.ObserveTokenEvent(helps.IsOpenAIImageTokenEvent(upstreamData))
 	reporter.Publish(ctx, helps.ParseOpenAIUsage(upstreamData))
 	reporter.EnsurePublished(ctx)
 	clientData := applyCodexIdentityExposeResponsePayload(upstreamData, identityState)
@@ -210,7 +211,7 @@ func (e *CodexExecutor) executeOpenAIImageStream(ctx context.Context, auth *clip
 	recordCodexOpenAIImageRequest(ctx, e, auth, url, httpReq.Header.Clone(), upstreamBody)
 	upstreamBody = nil
 
-	httpResp, err := helps.DoUpstreamHTTPRequest(e.newCodexHTTPClient(ctx, auth, true), httpReq)
+	httpResp, err := helps.DoUpstreamHTTPRequest(reporter.TrackHTTPClient(e.newCodexHTTPClient(ctx, auth, true)), httpReq)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return nil, err
@@ -315,6 +316,9 @@ func (e *CodexExecutor) executeOpenAIImageStream(ctx context.Context, auth *clip
 				helps.AppendAPIResponseChunk(ctx, e.cfg, upstreamFrame)
 				terminal := false
 				for _, event := range events {
+					if !reporter.IsTTFTSet() {
+						reporter.ObserveTokenEvent(helps.IsOpenAIImageTokenEvent(event.Data))
+					}
 					streamUsage.ObserveOpenAIStream(event.Data)
 					terminal = terminal || helps.IsOpenAIStreamTerminal(event.Data) || isCodexSuccessfulCompletion(event.Data) || helps.IsCodexPartialResponse(event.Data)
 				}
