@@ -82,3 +82,35 @@ func TestClaudeResponsesCarriersReachHTTPAndSSEClients(t *testing.T) {
 		})
 	}
 }
+
+func TestClaudeResponsesIncompleteNonStreamReachesClient(t *testing.T) {
+	for _, custom := range []bool{false, true} {
+		t.Run(fmt.Sprintf("custom=%t", custom), func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = io.WriteString(w, `data: {"type":"message_start","message":{"id":"limited","usage":{"input_tokens":2}}}
+data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"partial","name":"tool"}}
+data: {"type":"content_block_stop","index":0}
+data: {"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":3}}
+data: {"type":"message_stop"}
+`)
+			}))
+			t.Cleanup(server.Close)
+			manager := claudeCompatibilityManager(t, server.URL, false)
+			kind, field := "function", "arguments"
+			if custom {
+				kind, field = "custom", "input"
+			}
+			raw := []byte(`{"model":"bound-claude","input":"question","tools":[{"type":"` + kind + `","name":"tool"}]}`)
+			response, err := manager.Execute(t.Context(), []string{"claude"}, core.Request{Model: "bound-claude", Payload: raw}, core.Options{SourceFormat: translator.FormatOpenAIResponse, OriginalRequest: raw})
+			if err != nil {
+				t.Fatal(err)
+			}
+			result := gjson.ParseBytes(response.Payload)
+			if result.Get("status").String() != "incomplete" || result.Get("incomplete_details.reason").String() != "max_output_tokens" ||
+				result.Get("output.0.status").String() != "incomplete" || result.Get("output.0."+field).String() != "" || result.Get("usage.output_tokens").Int() != 3 {
+				t.Fatal("actual HTTP response lost the incomplete tool state or usage")
+			}
+		})
+	}
+}

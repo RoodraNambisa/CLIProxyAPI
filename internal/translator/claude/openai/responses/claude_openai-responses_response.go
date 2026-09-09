@@ -580,6 +580,7 @@ func ConvertClaudeResponseToOpenAIResponsesNonStream(_ context.Context, _ string
 		inputTokens  int64
 		outputTokens int64
 		completed    bool
+		stopReason   string
 	)
 	textBlocks := make(map[int]*claudeResponsesTextBlock)
 	reasoningBlocks := make(map[int]*claudeResponsesTextBlock)
@@ -616,6 +617,7 @@ func ConvertClaudeResponseToOpenAIResponsesNonStream(_ context.Context, _ string
 				toolCalls = make(map[int]*toolState)
 				reasoningBlocks = make(map[int]*claudeResponsesTextBlock)
 				completed = false
+				stopReason = ""
 				inputTokens, outputTokens = 0, 0
 				responseID = msg.Get("id").String()
 				createdAt = time.Now().Unix()
@@ -698,6 +700,9 @@ func ConvertClaudeResponseToOpenAIResponsesNonStream(_ context.Context, _ string
 			}
 
 		case "message_delta":
+			if reason := root.Get("delta.stop_reason"); reason.Type == gjson.String && reason.String() != "" {
+				stopReason = reason.String()
+			}
 			if usage := root.Get("usage"); usage.Exists() {
 				outputTokens = usage.Get("output_tokens").Int()
 			}
@@ -707,8 +712,13 @@ func ConvertClaudeResponseToOpenAIResponsesNonStream(_ context.Context, _ string
 	}
 
 	// Populate base fields
+	_, responseStatus, incompleteDetails := claudeResponsesTerminalState(stopReason)
 	out, _ = sjson.SetBytes(out, "id", responseID)
 	out, _ = sjson.SetBytes(out, "created_at", createdAt)
+	out, _ = sjson.SetBytes(out, "status", responseStatus)
+	if len(incompleteDetails) > 0 {
+		out, _ = sjson.SetRawBytes(out, "incomplete_details", incompleteDetails)
+	}
 
 	// Inject request echo fields as top-level (similar to streaming variant)
 	reqBytes := pickRequestJSON(originalRequestRawJSON, requestRawJSON)
@@ -786,12 +796,22 @@ func ConvertClaudeResponseToOpenAIResponsesNonStream(_ context.Context, _ string
 	for index, block := range textBlocks {
 		outputItems[index] = claudeResponsesTextItem(block)
 	}
+	lastIndex := -1
+	for index := range outputItems {
+		lastIndex = max(lastIndex, index)
+	}
+	for index := range toolCalls {
+		lastIndex = max(lastIndex, index)
+	}
 	for index, call := range toolCalls {
-		args := call.args.String()
-		if args == "" {
-			args = "{}"
+		status := "completed"
+		if index == lastIndex {
+			status = responseStatus
 		}
-		outputItems[index] = buildClaudeResponsesToolItem(toolIdentities, call.name, call.id, args, "completed")
+		outputItems[index] = buildClaudeResponsesToolItem(toolIdentities, call.name, call.id, call.args.String(), status)
+	}
+	if responseStatus == "incomplete" && lastIndex >= 0 {
+		outputItems[lastIndex], _ = sjson.SetBytes(outputItems[lastIndex], "status", responseStatus)
 	}
 	if len(outputItems) > 0 {
 		out, _ = sjson.SetRawBytes(out, "output", claudeResponsesOrderedOutput(outputItems))
