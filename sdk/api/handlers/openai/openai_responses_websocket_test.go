@@ -1556,6 +1556,11 @@ func TestResponsesWebsocketPrewarmHandledLocallyForSSEUpstream(t *testing.T) {
 	if gjson.GetBytes(completedPayload, "response.usage.total_tokens").Int() != 0 {
 		t.Fatalf("prewarm total tokens = %d, want 0", gjson.GetBytes(completedPayload, "response.usage.total_tokens").Int())
 	}
+	for _, field := range []string{"input_tokens_details.cached_tokens", "output_tokens_details.reasoning_tokens"} {
+		if gjson.GetBytes(completedPayload, "response.usage."+field).Raw != "0" {
+			t.Fatal("local prewarm omitted a required usage detail")
+		}
+	}
 
 	secondRequest := fmt.Sprintf(`{"type":"response.create","previous_response_id":%q,"input":[{"type":"message","id":"msg-1"}]}`, prewarmResponseID)
 	errWrite = conn.WriteMessage(websocket.TextMessage, []byte(secondRequest))
