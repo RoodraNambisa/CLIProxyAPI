@@ -27,6 +27,7 @@ type UsageReporter struct {
 	apiKey               string
 	source               string
 	requestServiceTier   string
+	stream               bool
 	requestedAt          time.Time
 	mu                   sync.Mutex
 	published            bool
@@ -50,15 +51,21 @@ type usageExecutor interface {
 }
 
 // NewExecutorUsageReporter constructs a reporter from a provider executor.
-func NewExecutorUsageReporter(ctx context.Context, executor usageExecutor, model string, auth *cliproxyauth.Auth) *UsageReporter {
+func NewExecutorUsageReporter(ctx context.Context, executor usageExecutor, model string, auth *cliproxyauth.Auth, stream ...bool) *UsageReporter {
 	provider := ""
 	if executor != nil {
 		provider = executor.Identifier()
 	}
-	return NewUsageReporter(ctx, provider, model, auth)
+	return NewUsageReporter(ctx, provider, model, auth, stream...)
 }
 
-func NewUsageReporter(ctx context.Context, provider, model string, auth *cliproxyauth.Auth) *UsageReporter {
+// NewUsageReporter snapshots usage metadata. The optional stream argument is
+// an entry-point fallback. An existing client
+// mode in ctx takes precedence over the transport used by an executor.
+func NewUsageReporter(ctx context.Context, provider, model string, auth *cliproxyauth.Auth, stream ...bool) *UsageReporter {
+	if len(stream) > 0 {
+		ctx = usage.WithStreamDefault(ctx, stream[0])
+	}
 	apiKey := APIKeyFromContext(ctx)
 	reporter := &UsageReporter{
 		provider:            provider,
@@ -67,6 +74,7 @@ func NewUsageReporter(ctx context.Context, provider, model string, auth *cliprox
 		apiKey:              apiKey,
 		source:              resolveUsageSource(auth, apiKey),
 		requestServiceTier:  usage.ServiceTierFromContext(ctx),
+		stream:              usage.StreamFromContext(ctx),
 		requestUsageOutcome: cliproxyexecutor.RequestUsageOutcomeFromContext(ctx),
 		requestUsageAttempt: cliproxyexecutor.RequestUsageAttemptFromContext(ctx),
 	}
@@ -357,6 +365,7 @@ func (r *UsageReporter) buildRecordForModel(model string, detail usage.Detail, f
 		AuthID:              r.authID,
 		AuthIndex:           r.authIndex,
 		RequestServiceTier:  r.requestServiceTier,
+		Stream:              r.stream,
 		ResponseServiceTier: strings.TrimSpace(detail.ResponseServiceTier),
 		RequestedAt:         r.requestedAt,
 		Latency:             r.latency(),

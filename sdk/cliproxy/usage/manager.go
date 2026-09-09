@@ -26,6 +26,8 @@ type Record struct {
 	RequestedAt         time.Time
 	Latency             time.Duration
 	Failed              bool
+	// Stream describes the logical client response mode, independently of the upstream transport.
+	Stream bool
 	// Auxiliary marks a secondary model token/cost allocation for the same
 	// downstream request. Auxiliary records do not represent another request.
 	Auxiliary               bool
