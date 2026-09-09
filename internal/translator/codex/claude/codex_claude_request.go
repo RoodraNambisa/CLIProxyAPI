@@ -12,6 +12,7 @@ import (
 
 	sigcompat "github.com/router-for-me/CLIProxyAPI/v6/internal/signature"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
+	translatorcommon "github.com/router-for-me/CLIProxyAPI/v6/internal/translator/common"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -89,10 +90,31 @@ func convertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool, 
 	messagesResult := rootResult.Get("messages")
 	if messagesResult.IsArray() {
 		messageResults := messagesResult.Array()
+		var pendingToolUseIDs []string
+		var pendingReminders [][]byte
+		flushReminders := func() {
+			for _, reminder := range pendingReminders {
+				template, _ = sjson.SetRawBytes(template, "input.-1", reminder)
+			}
+			pendingReminders = nil
+		}
 
 		for i := 0; i < len(messageResults); i++ {
 			messageResult := messageResults[i]
 			messageRole := messageResult.Get("role").String()
+			if messageRole == "system" {
+				if text, ok := translatorcommon.ClaudeMessageSystemReminderText(messageResult.Get("content")); ok {
+					reminder := []byte(`{"type":"message","role":"user","content":[{"type":"input_text","text":""}]}`)
+					reminder, _ = sjson.SetBytes(reminder, "content.0.text", text)
+					pendingReminders = append(pendingReminders, reminder)
+					if len(pendingToolUseIDs) == 0 {
+						flushReminders()
+					}
+				}
+				continue
+			}
+			previousToolUseIDs := pendingToolUseIDs
+			pendingToolUseIDs = nil
 
 			newMessage := func() []byte {
 				msg := []byte(`{"type":"message","role":"","content":[]}`)
@@ -134,9 +156,20 @@ func convertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool, 
 			messageContentsResult := messageResult.Get("content")
 			if messageContentsResult.IsArray() {
 				messageContentResults := messageContentsResult.Array()
+				aligned := false
+				if messageRole == "user" {
+					messageContentResults, aligned = alignCodexClaudeToolResults(messageContentResults, previousToolUseIDs)
+				}
+				if !aligned {
+					flushReminders()
+				}
 				for j := 0; j < len(messageContentResults); j++ {
 					messageContentResult := messageContentResults[j]
 					contentType := messageContentResult.Get("type").String()
+					if contentType != "tool_result" && len(pendingReminders) > 0 {
+						flushMessage()
+						flushReminders()
+					}
 
 					switch contentType {
 					case "thinking":
@@ -195,6 +228,9 @@ func convertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool, 
 						hasContent = true
 					case "tool_use":
 						flushMessage()
+						if messageRole == "assistant" {
+							pendingToolUseIDs = append(pendingToolUseIDs, messageContentResult.Get("id").String())
+						}
 						functionCallMessage := []byte(`{"type":"function_call"}`)
 						functionCallMessage, _ = sjson.SetBytes(functionCallMessage, "call_id", messageContentResult.Get("id").String())
 						{
@@ -263,11 +299,13 @@ func convertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool, 
 				}
 				flushMessage()
 			} else if messageContentsResult.Type == gjson.String {
+				flushReminders()
 				appendTextContent(messageContentsResult.String())
 				flushMessage()
 			}
+			flushReminders()
 		}
-
+		flushReminders()
 	}
 
 	// Convert tools declarations to the expected format for the Codex API.
