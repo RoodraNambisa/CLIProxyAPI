@@ -109,6 +109,9 @@ func codexTerminalStreamError(eventData []byte) (statusErr, bool) {
 		}
 		return codexResponseIncompleteError(eventData), true
 	case "response.completed", "response.done":
+		if helps.CodexTerminalErrorNode(eventData).Exists() || helps.CodexTerminalHTTPStatus(eventData) != 0 {
+			return codexResponseFailedError(eventData), true
+		}
 		switch strings.ToLower(strings.TrimSpace(gjson.GetBytes(eventData, "response.status").String())) {
 		case "failed":
 			return codexResponseFailedError(eventData), true
@@ -119,9 +122,6 @@ func codexTerminalStreamError(eventData []byte) (statusErr, bool) {
 			return codexResponseIncompleteError(eventData), true
 		case "cancelled", "canceled":
 			return codexResponseCancelledError(), true
-		}
-		if helps.CodexTerminalErrorNode(eventData).Exists() || helps.CodexTerminalHTTPStatus(eventData) != 0 {
-			return codexResponseFailedError(eventData), true
 		}
 	case "error":
 		return codexStreamErrorEventError(eventData), true

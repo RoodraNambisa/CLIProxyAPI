@@ -66,9 +66,13 @@ func TestCodexTerminalTopLevelErrorIsNeverCompleted(t *testing.T) {
 func TestCodexTerminal429SurvivesEveryTransport(t *testing.T) {
 	for _, websocketTransport := range []bool{false, true} {
 		for _, stream := range []bool{false, true} {
-			for _, event := range []string{"response.failed", "response.incomplete", "error"} {
+			for _, event := range []string{"response.failed", "response.incomplete", "response.completed", "response.done", "error"} {
 				t.Run(fmt.Sprintf("ws=%t/stream=%t/%s", websocketTransport, stream, event), func(t *testing.T) {
-					payload := []byte(fmt.Sprintf(`{"type":%q,"status":429,"response":{"status":"incomplete","error":null,"incomplete_details":{"reason":"max_tokens"}},"error":{"code":"misalignment_policy_violation","message":"failed"}}`, event))
+					responseStatus := "incomplete"
+					if event == "response.completed" || event == "response.done" {
+						responseStatus = "cancelled"
+					}
+					payload := []byte(fmt.Sprintf(`{"type":%q,"status":429,"response":{"status":%q,"error":null,"incomplete_details":{"reason":"max_tokens"}},"error":{"code":"misalignment_policy_violation","message":"failed"}}`, event, responseStatus))
 					server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 						if websocketTransport {
 							upgrader := websocket.Upgrader{}
