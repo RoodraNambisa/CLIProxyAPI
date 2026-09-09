@@ -575,9 +575,8 @@ func hasOpenAIStyleUsageTokenFields(usageNode gjson.Result) bool {
 		usageNode.Get("output_tokens").Exists() ||
 		usageNode.Get("total_tokens").Exists() ||
 		usageNode.Get("prompt_tokens_details.cached_tokens").Exists() ||
-		usageNode.Get("prompt_tokens_details.cached_creation_tokens").Exists() ||
+		openAIUsageCacheCreationNode(usageNode).Exists() ||
 		usageNode.Get("input_tokens_details.cached_tokens").Exists() ||
-		usageNode.Get("input_tokens_details.cache_write_tokens").Exists() ||
 		usageNode.Get("completion_tokens_details.reasoning_tokens").Exists() ||
 		usageNode.Get("output_tokens_details.reasoning_tokens").Exists()
 }
@@ -603,10 +602,7 @@ func parseOpenAIStyleUsageNode(usageNode gjson.Result) usage.Detail {
 	if cached.Exists() {
 		detail.CachedTokens = cached.Int()
 	}
-	cacheCreation := usageNode.Get("input_tokens_details.cache_write_tokens")
-	if !cacheCreation.Exists() {
-		cacheCreation = usageNode.Get("prompt_tokens_details.cached_creation_tokens")
-	}
+	cacheCreation := openAIUsageCacheCreationNode(usageNode)
 	if cacheCreation.Exists() {
 		detail.CacheCreationTokens = cacheCreation.Int()
 	}
@@ -639,6 +635,22 @@ func ParseOpenAIStreamUsage(line []byte) (usage.Detail, bool) {
 	detail := parseOpenAIStyleUsageNode(usageNode)
 	detail.ResponseServiceTier = responseServiceTier
 	return detail, true
+}
+
+func openAIUsageCacheCreationNode(node gjson.Result) gjson.Result {
+	// Keep the existing local aliases first when an upstream sends conflicting fields.
+	for _, path := range []string{
+		"input_tokens_details.cache_write_tokens",
+		"prompt_tokens_details.cached_creation_tokens",
+		"input_tokens_details.cache_creation_tokens",
+		"prompt_tokens_details.cache_creation_tokens",
+		"prompt_tokens_details.cache_write_tokens",
+	} {
+		if value := node.Get(path); value.Exists() {
+			return value
+		}
+	}
+	return gjson.Result{}
 }
 
 func ParseClaudeUsage(data []byte) usage.Detail {
@@ -682,7 +694,7 @@ func parseInteractionsUsageDetail(node gjson.Result) usage.Detail {
 		ReasoningTokens:     reasoningTokens,
 		TotalTokens:         firstInteractionsUsageNode(node, "total_tokens", "totalTokenCount").Int(),
 		CachedTokens:        cachedTokens,
-		CacheCreationTokens: firstInteractionsUsageNode(node, "cache_creation_tokens", "cacheCreationTokens").Int(),
+		CacheCreationTokens: firstInteractionsUsageNode(node, "cache_creation_tokens", "cacheCreationTokens", "cache_write_tokens", "cacheWriteTokens").Int(),
 	}
 	if detail.TotalTokens == 0 {
 		detail.TotalTokens = sumUsageTokens(detail.InputTokens, detail.OutputTokens)
