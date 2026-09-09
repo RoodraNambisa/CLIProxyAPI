@@ -31,16 +31,18 @@ func TestOpenAICompatResponsesReasoningFallbackAndEmptyTools(t *testing.T) {
 					}
 					if !stream {
 						w.Header().Set("Content-Type", "application/json")
-						_, _ = io.WriteString(w, `{"id":"fallback","choices":[{"message":{"reasoning":"first second","content":"answer","tool_calls":[]},"finish_reason":"stop"}]}`)
+						_, _ = io.WriteString(w, `{"id":"fallback","choices":[{"message":{"reasoning":"first second","content":"answer","tool_calls":[]},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":4,"total_tokens":6,"completion_tokens_details":{"reasoning_tokens":3}}}`)
 						return
 					}
 					w.Header().Set("Content-Type", "text/event-stream")
 					for _, delta := range []string{`{"reasoning":"first","tool_calls":[]}`, `{"reasoning":" second","tool_calls":[]}`, `{"content":"answer","tool_calls":[]}`, `{}`} {
 						finish := "null"
+						usageField := ""
 						if delta == `{}` {
 							finish = `"stop"`
+							usageField = `,"usage":{"prompt_tokens":2,"completion_tokens":4,"total_tokens":6,"completion_tokens_details":{"reasoning_tokens":3}}`
 						}
-						_, _ = io.WriteString(w, `data: {"id":"fallback","object":"chat.completion.chunk","choices":[{"index":0,"delta":`+delta+`,"finish_reason":`+finish+`}]}`+"\n\n")
+						_, _ = io.WriteString(w, `data: {"id":"fallback","object":"chat.completion.chunk","choices":[{"index":0,"delta":`+delta+`,"finish_reason":`+finish+`}]`+usageField+`}`+"\n\n")
 					}
 					_, _ = io.WriteString(w, "data: [DONE]\n\n")
 				}))
@@ -80,6 +82,9 @@ func TestOpenAICompatResponsesReasoningFallbackAndEmptyTools(t *testing.T) {
 				}
 				if result.Get("output.#").Int() != 2 || result.Get("output.0.summary.0.text").String() != "first second" || result.Get("output.1.content.0.text").String() != "answer" || controller.Released() != release {
 					t.Fatal("actual response lost reasoning continuity or release behavior")
+				}
+				if result.Get("usage.output_tokens_details.reasoning_tokens").Int() != 3 || result.Get("usage.input_tokens_details.cached_tokens").Type != gjson.Number || result.Get("usage.total_tokens").Int() != 6 {
+					t.Fatal("actual Responses output lost standard usage details")
 				}
 			})
 		}
