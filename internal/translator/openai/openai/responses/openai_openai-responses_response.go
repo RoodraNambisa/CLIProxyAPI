@@ -563,7 +563,17 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStream(_ context.Co
 	root := gjson.ParseBytes(rawJSON)
 
 	// Basic response scaffold
-	resp := []byte(`{"id":"","object":"response","created_at":0,"status":"completed","background":false,"error":null,"incomplete_details":null}`)
+	resp := []byte(`{"id":"","object":"response","created_at":0,"status":"completed","background":false,"error":null,"incomplete_details":null,"output":[]}`)
+	if choices := root.Get("choices"); choices.IsArray() {
+		choices.ForEach(func(_, choice gjson.Result) bool {
+			if reason := responsesIncompleteReason(choice.Get("finish_reason").String()); reason != "" {
+				resp, _ = sjson.SetBytes(resp, "status", "incomplete")
+				resp, _ = sjson.SetBytes(resp, "incomplete_details.reason", reason)
+				return false
+			}
+			return true
+		})
+	}
 
 	// id: use provider id if present, otherwise synthesize
 	id := root.Get("id").String()
@@ -669,6 +679,7 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStream(_ context.Co
 		}
 		// Prefer summary_text from reasoning_content; encrypted_content is optional
 		reasoningItem := []byte(`{"id":"","type":"reasoning","encrypted_content":"","summary":[]}`)
+		reasoningItem, _ = sjson.SetBytes(reasoningItem, "status", responsesItemStatus(root.Get("choices.0.finish_reason").String()))
 		reasoningItem, _ = sjson.SetBytes(reasoningItem, "id", fmt.Sprintf("rs_%s", rid))
 		if rcText != "" {
 			reasoningItem, _ = sjson.SetBytes(reasoningItem, "summary.0.type", "summary_text")
@@ -680,12 +691,14 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStream(_ context.Co
 	if choices := root.Get("choices"); choices.Exists() && choices.IsArray() {
 		choices.ForEach(func(_, choice gjson.Result) bool {
 			msg := choice.Get("message")
+			itemStatus := responsesItemStatus(choice.Get("finish_reason").String())
 			if msg.Exists() {
 				// Text message part
 				if c := msg.Get("content"); c.Exists() && c.String() != "" {
 					item := []byte(`{"id":"","type":"message","status":"completed","content":[{"type":"output_text","annotations":[],"logprobs":[],"text":""}],"role":"assistant"}`)
 					item, _ = sjson.SetBytes(item, "id", fmt.Sprintf("msg_%s_%d", id, int(choice.Get("index").Int())))
 					item, _ = sjson.SetBytes(item, "content.0.text", c.String())
+					item, _ = sjson.SetBytes(item, "status", itemStatus)
 					outputsWrapper, _ = sjson.SetRawBytes(outputsWrapper, "arr.-1", item)
 				}
 
@@ -695,7 +708,7 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStream(_ context.Co
 						callID := tc.Get("id").String()
 						name := tc.Get("function.name").String()
 						args := tc.Get("function.arguments").String()
-						item := buildResponsesToolItem(toolIdentities, name, callID, args, "completed")
+						item := buildResponsesToolItem(toolIdentities, name, callID, args, itemStatus)
 						outputsWrapper, _ = sjson.SetRawBytes(outputsWrapper, "arr.-1", item)
 						return true
 					})
