@@ -183,6 +183,7 @@ type RequestDetail struct {
 	ResponseServiceTier     string     `json:"response_service_tier,omitempty"`
 	Tokens                  TokenStats `json:"tokens"`
 	Failed                  bool       `json:"failed"`
+	Stream                  bool       `json:"stream,omitempty"`
 	Auxiliary               bool       `json:"auxiliary,omitempty"`
 	FailureStage            string     `json:"failure_stage,omitempty"`
 	ErrorCode               string     `json:"error_code,omitempty"`
@@ -307,6 +308,7 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 		ResponseServiceTier:     strings.TrimSpace(record.ResponseServiceTier),
 		Tokens:                  detail,
 		Failed:                  failed,
+		Stream:                  record.Stream,
 		Auxiliary:               record.Auxiliary,
 		FailureStage:            strings.TrimSpace(record.FailureStage),
 		ErrorCode:               strings.TrimSpace(record.ErrorCode),
