@@ -290,7 +290,7 @@ func TestCodexExecutorExecute_ResponseDoneFailedReturnsTerminalError(t *testing.
 	}
 }
 
-func TestCodexExecutorExecute_ResponseIncompleteReturnsTerminalError(t *testing.T) {
+func TestCodexExecutorExecute_ResponseIncompleteReturnsPartialResult(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = w.Write([]byte(`data: {"type":"response.incomplete","response":{"id":"resp_1","status":"incomplete","error":null,"incomplete_details":{"reason":"max_tokens"},"output":[]}}` + "\n\n"))
@@ -303,32 +303,18 @@ func TestCodexExecutorExecute_ResponseIncompleteReturnsTerminalError(t *testing.
 		"api_key":  "test",
 	}}
 
-	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+	response, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
 		Model:   "gpt-5.4-mini",
 		Payload: []byte(`{"model":"gpt-5.4-mini","input":"Say ok"}`),
 	}, cliproxyexecutor.Options{
 		SourceFormat: sdktranslator.FromString("openai-response"),
 		Stream:       false,
 	})
-	if err == nil {
-		t.Fatal("Execute error = nil, want response.incomplete error")
+	if err != nil {
+		t.Fatal(err)
 	}
-	status, ok := err.(interface{ StatusCode() int })
-	if !ok {
-		t.Fatalf("Execute error type = %T, want StatusCode", err)
-	}
-	if got := status.StatusCode(); got != http.StatusBadGateway {
-		t.Fatalf("StatusCode = %d, want %d; err=%v", got, http.StatusBadGateway, err)
-	}
-	if strings.Contains(err.Error(), "response.completed") {
-		t.Fatalf("error should not mention missing response.completed: %v", err)
-	}
-	if !strings.Contains(err.Error(), "response incomplete: max_tokens") {
-		t.Fatalf("error = %v, want incomplete reason", err)
-	}
-	skipper, ok := err.(interface{ SkipAuthResult() bool })
-	if !ok || !skipper.SkipAuthResult() {
-		t.Fatalf("SkipAuthResult = %v, want true", ok)
+	if gjson.GetBytes(response.Payload, "status").String() != "incomplete" || gjson.GetBytes(response.Payload, "incomplete_details.reason").String() != "max_tokens" {
+		t.Fatal("partial terminal status or reason was lost")
 	}
 }
 

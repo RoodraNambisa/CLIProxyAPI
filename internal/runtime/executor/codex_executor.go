@@ -104,17 +104,23 @@ func codexTerminalStreamError(eventData []byte) (statusErr, bool) {
 	case "response.failed":
 		return codexResponseFailedError(eventData), true
 	case "response.incomplete":
+		if helps.IsCodexPartialResponse(eventData) {
+			return statusErr{}, false
+		}
 		return codexResponseIncompleteError(eventData), true
 	case "response.completed", "response.done":
 		switch strings.ToLower(strings.TrimSpace(gjson.GetBytes(eventData, "response.status").String())) {
 		case "failed":
 			return codexResponseFailedError(eventData), true
 		case "incomplete":
+			if helps.IsCodexPartialResponse(eventData) {
+				return statusErr{}, false
+			}
 			return codexResponseIncompleteError(eventData), true
 		case "cancelled", "canceled":
 			return codexResponseCancelledError(), true
 		}
-		if helps.CodexTerminalErrorNode(eventData).Exists() {
+		if helps.CodexTerminalErrorNode(eventData).Exists() || helps.CodexTerminalHTTPStatus(eventData) != 0 {
 			return codexResponseFailedError(eventData), true
 		}
 	case "error":
@@ -126,6 +132,14 @@ func codexTerminalStreamError(eventData []byte) (statusErr, bool) {
 }
 
 func normalizeCodexCompletion(payload []byte) []byte {
+	if helps.IsCodexPartialResponse(payload) {
+		if gjson.GetBytes(payload, "type").String() != "response.incomplete" {
+			if updated, err := sjson.SetBytes(payload, "type", "response.incomplete"); err == nil {
+				return updated
+			}
+		}
+		return payload
+	}
 	if strings.TrimSpace(gjson.GetBytes(payload, "type").String()) == "response.done" && isCodexSuccessfulCompletion(payload) {
 		updated, err := sjson.SetBytes(payload, "type", "response.completed")
 		if err == nil && len(updated) > 0 {
@@ -143,7 +157,7 @@ func isCodexSuccessfulCompletion(payload []byte) bool {
 	if status != "" && status != "completed" {
 		return false
 	}
-	return !helps.CodexTerminalErrorNode(payload).Exists()
+	return !helps.CodexTerminalErrorNode(payload).Exists() && helps.CodexTerminalHTTPStatus(payload) == 0
 }
 
 func isCodexCompletionType(eventType string) bool {
@@ -156,7 +170,8 @@ func codexSSEDataCompletion(line []byte) bool {
 	if !bytes.HasPrefix(line, dataTag) {
 		return false
 	}
-	return isCodexSuccessfulCompletion(bytes.TrimSpace(line[len(dataTag):]))
+	payload := bytes.TrimSpace(line[len(dataTag):])
+	return isCodexSuccessfulCompletion(payload) || helps.IsCodexPartialResponse(payload)
 }
 
 func codexSSEEventCompletion(line []byte) bool {
@@ -164,7 +179,8 @@ func codexSSEEventCompletion(line []byte) bool {
 	if !bytes.HasPrefix(line, []byte("event:")) {
 		return false
 	}
-	return isCodexCompletionType(string(bytes.TrimSpace(line[len("event:"):])))
+	kind := string(bytes.TrimSpace(line[len("event:"):]))
+	return isCodexCompletionType(kind) || kind == "response.incomplete"
 }
 
 func codexResponseFailedError(eventData []byte) statusErr {
@@ -986,7 +1002,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 			}
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
 			eventData = normalizeCodexCompletion(eventData)
-			if gjson.GetBytes(eventData, "type").String() != "response.completed" {
+			if !isCodexSuccessfulCompletion(eventData) && !helps.IsCodexPartialResponse(eventData) {
 				return true
 			}
 			completedEvent = bytes.Clone(eventData)
@@ -1015,7 +1031,9 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		completedEvent = nil
 		outputItemsByIndex = nil
 		outputItemsFallback = nil
-		helps.CacheCodexReasoningReplayFromCompleted(replayScope, completedData)
+		if isCodexSuccessfulCompletion(completedData) {
+			helps.CacheCodexReasoningReplayFromCompleted(replayScope, completedData)
+		}
 
 		var param any
 		clientCompletedData := applyCodexIdentityExposeResponsePayload(completedData, identityState)
@@ -1382,7 +1400,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 						return false, false
 					}
 					publishCodexStreamUsage(reporter, streamBody.Bytes(), data)
-					terminal = isCodexSuccessfulCompletion(data)
+					terminal = isCodexSuccessfulCompletion(data) || helps.IsCodexPartialResponse(data)
 				}
 			}
 			return emit(cliproxyexecutor.StreamChunk{Payload: frame}), terminal
@@ -1396,7 +1414,8 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 			clientLine := applyCodexIdentityExposeResponsePayload(line, identityState)
 			if bytes.HasPrefix(clientLine, dataTag) {
 				clientData := bytes.TrimSpace(clientLine[len(dataTag):])
-				if originalTerminalErr, ok := codexTerminalStreamError(clientData); ok {
+				// Multi-line trusted frames are classified after their data fields are joined.
+				if originalTerminalErr, ok := codexTerminalStreamError(clientData); ok && (!trustUpstreamSSE || gjson.ValidBytes(clientData)) {
 					line = codexauth.SanitizeAgentIdentityErrorBody(authMetadata(auth), line)
 					clientLine = applyCodexIdentityExposeResponsePayload(line, identityState)
 					clientData = bytes.TrimSpace(clientLine[len(dataTag):])
@@ -1458,17 +1477,18 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 				trimmedClientLine := bytes.TrimSpace(clientLine)
 				if bytes.HasPrefix(trimmedClientLine, dataTag) {
 					data := bytes.TrimSpace(trimmedClientLine[len(dataTag):])
-					terminal = isCodexSuccessfulCompletion(data)
+					terminal = isCodexSuccessfulCompletion(data) || helps.IsCodexPartialResponse(data)
 					switch gjson.GetBytes(data, "type").String() {
 					case "response.output_item.done":
 						collectCodexOutputItemDone(data, outputItemsByIndex, &outputItemsFallback)
-					case "response.completed":
+					case "response.completed", "response.incomplete":
+						publishCodexStreamUsage(reporter, streamBody.Bytes(), data)
 						data = patchCodexCompletedOutput(data, outputItemsByIndex, outputItemsFallback)
 						clientLine = append([]byte("data: "), data...)
 					}
 					if len(pendingImageCompletionEvent) > 0 {
 						if terminal {
-							pendingEvent := append([]byte(nil), pendingImageCompletionEvent...)
+							pendingEvent := []byte("event: " + gjson.GetBytes(data, "type").String())
 							pendingEvent = append(pendingEvent, '\n')
 							if !emit(cliproxyexecutor.StreamChunk{Payload: pendingEvent}) {
 								return
@@ -1502,24 +1522,27 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 
 			if bytes.HasPrefix(line, dataTag) {
 				data := bytes.TrimSpace(line[5:])
-				terminal = isCodexSuccessfulCompletion(data)
+				terminal = isCodexSuccessfulCompletion(data) || helps.IsCodexPartialResponse(data)
 				if terminal {
 					data = normalizeCodexCompletion(data)
 				}
 				switch gjson.GetBytes(data, "type").String() {
 				case "response.output_item.done":
 					collectCodexOutputItemDone(data, outputItemsByIndex, &outputItemsFallback)
-				case "response.completed":
+				case "response.completed", "response.incomplete":
 					if detail, ok := helps.ParseCodexUsage(data); ok {
 						reporter.Observe(detail)
 					}
 					observeCodexImageToolUsage(reporter, streamBody.Bytes(), data)
 					data = patchCodexCompletedOutput(data, outputItemsByIndex, outputItemsFallback)
-					helps.CacheCodexReasoningReplayFromCompleted(replayScope, data)
+					if isCodexSuccessfulCompletion(data) {
+						helps.CacheCodexReasoningReplayFromCompleted(replayScope, data)
+					}
 					translatedLine = append([]byte("data: "), data...)
 				}
 				if len(pendingTranslatedCompletionEvent) > 0 {
 					if terminal {
+						pendingTranslatedCompletionEvent = []byte("event: " + gjson.GetBytes(data, "type").String())
 						eventChunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, streamOriginalPayload.Bytes(), streamBody.Bytes(), pendingTranslatedCompletionEvent, &param)
 						for i := range eventChunks {
 							if !emit(cliproxyexecutor.StreamChunk{Payload: eventChunks[i]}) {
@@ -1615,7 +1638,7 @@ func normalizeCodexSSEPassThroughLine(line []byte) []byte {
 		return line
 	}
 	data := bytes.TrimSpace(trimmed[len(dataTag):])
-	if !isCodexSuccessfulCompletion(data) {
+	if !isCodexSuccessfulCompletion(data) && !helps.IsCodexPartialResponse(data) {
 		return line
 	}
 	return append([]byte("data: "), normalizeCodexCompletion(data)...)
@@ -2707,7 +2730,7 @@ func observeCodexImageToolUsage(reporter *helps.UsageReporter, body []byte, comp
 }
 
 func publishCodexStreamUsage(reporter *helps.UsageReporter, body []byte, data []byte) {
-	if !isCodexCompletionType(gjson.GetBytes(data, "type").String()) {
+	if !isCodexSuccessfulCompletion(data) && !helps.IsCodexPartialResponse(data) {
 		return
 	}
 	if detail, ok := helps.ParseCodexUsage(data); ok {

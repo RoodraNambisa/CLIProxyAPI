@@ -585,7 +585,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		if eventType == "response.output_item.done" {
 			helps.CollectCodexOutputIdentity(payload, outputIdentities)
 		}
-		if eventType == "response.completed" {
+		if isCodexSuccessfulCompletion(payload) || helps.IsCodexPartialResponse(payload) {
 			payload = helps.HydrateCodexOutputItemIDs(payload, outputIdentities)
 			clientPayload = applyCodexIdentityExposeResponsePayload(payload, identityState)
 			if detail, ok := helps.ParseCodexUsage(payload); ok {
@@ -594,7 +594,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 			var param any
 			clientPayload = multiAgentResponse.Rewrite(clientPayload)
 			out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, originalRef.Bytes(), clientBodyRef.Bytes(), clientPayload, &param)
-			if ctx.Err() == nil {
+			if ctx.Err() == nil && isCodexSuccessfulCompletion(payload) {
 				sess.commitMultiAgentResponseForConn(conn, multiAgentResponse)
 			}
 			resp = cliproxyexecutor.Response{Payload: out, Headers: codexSuccessfulResponseHeaders(auth, upstreamHeaders)}
@@ -1064,7 +1064,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				helps.ReleaseRequestBodyAfterStreamEstablished(ctx, opts)
 				streamEstablished = true
 			}
-			if eventType == "response.completed" || eventType == "response.done" {
+			if isCodexSuccessfulCompletion(payload) || helps.IsCodexPartialResponse(payload) {
 				if repairOutputIDs {
 					payload = helps.HydrateCodexOutputItemIDs(payload, outputIdentities)
 					clientPayload = applyCodexIdentityExposeResponsePayload(payload, identityState)
@@ -1086,8 +1086,8 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 					return
 				}
 			}
-			if isCodexSuccessfulCompletion(payload) {
-				if ctx.Err() == nil {
+			if isCodexSuccessfulCompletion(payload) || helps.IsCodexPartialResponse(payload) {
+				if ctx.Err() == nil && isCodexSuccessfulCompletion(payload) {
 					sess.commitMultiAgentResponseForConn(conn, multiAgentResponse)
 				}
 				reporter.EnsurePublished(ctx)
