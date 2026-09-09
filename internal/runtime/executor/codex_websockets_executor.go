@@ -317,6 +317,13 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	body = e.codexPreparedSessionIdentity(ctx, req, opts).ResponsesLite.ApplyBody(body, true)
 	multiAgentDeclaresTools := helps.CodexMultiAgentDeclaresTools(body)
 	body, multiAgentResponse := helps.OptimizeCodexMultiAgentV2Request(body, e.codexPreparedSessionIdentity(ctx, req, opts).MultiAgentV2, helps.APIKeyModelIsCompat(req))
+	replayAuthID := ""
+	if auth != nil {
+		replayAuthID = auth.ID
+	}
+	replayNamespace := helps.ReasoningReplayNamespace(ctx, e.Identifier(), replayAuthID, auth.RuntimeInstanceID())
+	body, replayScope := helps.ApplyCodexReasoningReplay(ctx, from.String(), replayNamespace, baseModel, originalPayload, body, req.Metadata, opts.Metadata, opts.Headers)
+	replayOutput := helps.NewCodexReasoningReplayCollector(replayScope)
 	if strings.TrimSpace(gjson.GetBytes(body, "previous_response_id").String()) != "" {
 		ctx = cliproxyexecutor.WithRequiredUpstreamWebsocket(ctx)
 	}
@@ -548,6 +555,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		normalizedPayload := normalizeCodexCompletion(payload)
 		clientPayload := applyCodexIdentityExposeResponsePayload(normalizedPayload, identityState)
 		if originalWSErr, ok := parseCodexWebsocketError(clientPayload); ok {
+			helps.ClearCodexReasoningReplayOnInvalidSignature(replayScope, helps.CodexTerminalHTTPStatus(clientPayload), clientPayload)
 			payload = codexauth.SanitizeAgentIdentityErrorBody(authMetadata(auth), payload)
 			helps.AppendAPIWebsocketResponse(ctx, e.cfg, payload)
 			normalizedPayload = normalizeCodexCompletion(payload)
@@ -563,6 +571,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 			return resp, wsErr
 		}
 		if originalTerminalErr, ok := codexTerminalStreamError(clientPayload); ok {
+			helps.ClearCodexReasoningReplayOnInvalidSignature(replayScope, originalTerminalErr.code, clientPayload)
 			payload = codexauth.SanitizeAgentIdentityErrorBody(authMetadata(auth), payload)
 			helps.AppendAPIWebsocketResponse(ctx, e.cfg, payload)
 			normalizedPayload = normalizeCodexCompletion(payload)
@@ -579,6 +588,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		}
 		helps.AppendAPIWebsocketResponse(ctx, e.cfg, payload)
 		payload = normalizedPayload
+		replayOutput.Observe(payload)
 
 		eventType := gjson.GetBytes(payload, "type").String()
 		if !streamEstablished && eventType != "" && eventType != "error" {
@@ -603,6 +613,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 			}
 			if ctx.Err() == nil && isCodexSuccessfulCompletion(payload) {
 				sess.commitMultiAgentResponseForConn(conn, multiAgentResponse)
+				replayOutput.Commit(ctx, payload)
 			}
 			resp = cliproxyexecutor.Response{Payload: out, Headers: codexSuccessfulResponseHeaders(auth, upstreamHeaders)}
 			return resp, nil
@@ -669,6 +680,13 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	body = e.codexPreparedSessionIdentity(ctx, req, opts).ResponsesLite.ApplyBody(body, true)
 	multiAgentDeclaresTools := helps.CodexMultiAgentDeclaresTools(body)
 	body, multiAgentResponse := helps.OptimizeCodexMultiAgentV2Request(body, e.codexPreparedSessionIdentity(ctx, req, opts).MultiAgentV2, helps.APIKeyModelIsCompat(req))
+	replayAuthID := ""
+	if auth != nil {
+		replayAuthID = auth.ID
+	}
+	replayNamespace := helps.ReasoningReplayNamespace(ctx, e.Identifier(), replayAuthID, auth.RuntimeInstanceID())
+	body, replayScope := helps.ApplyCodexReasoningReplay(ctx, from.String(), replayNamespace, baseModel, userPayload, body, req.Metadata, opts.Metadata, opts.Headers)
+	replayOutput := helps.NewCodexReasoningReplayCollector(replayScope)
 	if strings.TrimSpace(gjson.GetBytes(body, "previous_response_id").String()) != "" {
 		ctx = cliproxyexecutor.WithRequiredUpstreamWebsocket(ctx)
 	}
@@ -1032,6 +1050,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			normalizedPayload := normalizeCodexCompletion(payload)
 			clientPayload := applyCodexIdentityExposeResponsePayload(normalizedPayload, identityState)
 			if originalWSErr, ok := parseCodexWebsocketError(clientPayload); ok {
+				helps.ClearCodexReasoningReplayOnInvalidSignature(replayScope, helps.CodexTerminalHTTPStatus(clientPayload), clientPayload)
 				payload = codexauth.SanitizeAgentIdentityErrorBody(authMetadata(auth), payload)
 				helps.AppendAPIWebsocketResponse(ctx, e.cfg, payload)
 				normalizedPayload = normalizeCodexCompletion(payload)
@@ -1051,6 +1070,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				return
 			}
 			if originalTerminalErr, ok := codexTerminalStreamError(clientPayload); ok {
+				helps.ClearCodexReasoningReplayOnInvalidSignature(replayScope, originalTerminalErr.code, clientPayload)
 				payload = codexauth.SanitizeAgentIdentityErrorBody(authMetadata(auth), payload)
 				helps.AppendAPIWebsocketResponse(ctx, e.cfg, payload)
 				normalizedPayload = normalizeCodexCompletion(payload)
@@ -1071,6 +1091,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			}
 			helps.AppendAPIWebsocketResponse(ctx, e.cfg, payload)
 			payload = normalizedPayload
+			replayOutput.Observe(payload)
 
 			eventType := gjson.GetBytes(payload, "type").String()
 			if !streamEstablished && eventType != "" && eventType != "error" {
@@ -1111,7 +1132,11 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 					if !send(cliproxyexecutor.SuccessfulStreamTerminalChunk()) {
 						terminateReason = "context_done"
 						terminateErr = ctx.Err()
+						return
 					}
+				}
+				if isCodexSuccessfulCompletion(payload) {
+					replayOutput.Commit(ctx, payload)
 				}
 				return
 			}

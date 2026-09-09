@@ -37,13 +37,17 @@ func TestCodexExecutorExecuteStreamClearsRejectedReasoningReplay(t *testing.T) {
 	namespace := helps.ReasoningReplayNamespace(ctx, "codex", auth.ID)
 	body := []byte(`{"input":[{"type":"function_call_output","call_id":"call_1","output":"ok"}]}`)
 	metadata := map[string]any{cliproxyexecutor.ExecutionSessionMetadataKey: "session-1"}
-	_, scope := helps.ApplyCodexReasoningReplay(ctx, "claude", namespace, "gpt-5.4-mini", nil, body, nil, metadata, nil)
+	_, scope := helps.ApplyCodexReasoningReplay(ctx, "claude", namespace, "gpt-5.4-mini", nil, []byte(`{"input":[]}`), nil, metadata, nil)
 	signatureBytes := make([]byte, 73)
 	signatureBytes[0] = 0x80
 	signature := base64.RawURLEncoding.EncodeToString(signatureBytes)
 	completed := []byte(`{"response":{"output":[{"type":"reasoning","encrypted_content":"` + signature + `"},{"type":"function_call","call_id":"call_1","name":"lookup","arguments":"{}"}]}}`)
 	if !helps.CacheCodexReasoningReplayFromCompleted(scope, completed) {
 		t.Fatal("failed to seed replay cache")
+	}
+	before, _ := helps.ApplyCodexReasoningReplay(ctx, "claude", namespace, "gpt-5.4-mini", nil, body, nil, metadata, nil)
+	if gjson.GetBytes(before, "input.0.type").String() != "reasoning" {
+		t.Fatal("seeded history does not match the replay query")
 	}
 
 	executor := NewCodexExecutor(&config.Config{})

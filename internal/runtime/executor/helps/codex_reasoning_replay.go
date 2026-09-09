@@ -277,6 +277,9 @@ func codexReasoningReplayScopeFromRequest(ctx context.Context, sourceFormat, rep
 	if !strings.EqualFold(strings.TrimSpace(sourceFormat), "claude") {
 		return CodexReasoningReplayScope{}
 	}
+	if strings.TrimSpace(gjson.GetBytes(body, "previous_response_id").String()) != "" {
+		return CodexReasoningReplayScope{}
+	}
 	sessionKey := codexReplayMetadataString(optionsMetadata, "execution_session_id")
 	if sessionKey == "" {
 		sessionKey = codexReplayMetadataString(requestMetadata, "execution_session_id")
