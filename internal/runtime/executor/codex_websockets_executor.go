@@ -598,6 +598,9 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 			var param any
 			clientPayload = multiAgentResponse.Rewrite(clientPayload)
 			out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, originalRef.Bytes(), clientBodyRef.Bytes(), clientPayload, &param)
+			if from == sdktranslator.FormatOpenAIResponse {
+				out = helps.EnsureResponsesUsageDetails(out)
+			}
 			if ctx.Err() == nil && isCodexSuccessfulCompletion(payload) {
 				sess.commitMultiAgentResponseForConn(conn, multiAgentResponse)
 			}
@@ -1087,6 +1090,9 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			}
 
 			clientPayload = multiAgentResponse.Rewrite(clientPayload)
+			if from == sdktranslator.FormatOpenAIResponse && !metadataBool(opts.Metadata, cliproxyexecutor.TrustUpstreamSSEMetadataKey) {
+				clientPayload = helps.EnsureResponsesUsageDetails(clientPayload)
+			}
 			line := encodeCodexWebsocketAsSSE(clientPayload)
 			chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, originalRef.Bytes(), clientBodyRef.Bytes(), line, &param)
 			for i := range chunks {

@@ -1066,6 +1066,9 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		clientCompletedData := applyCodexIdentityExposeResponsePayload(completedData, identityState)
 		clientCompletedData = multiAgentResponse.Rewrite(clientCompletedData)
 		out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, originalRef.Bytes(), bodyRef.Bytes(), clientCompletedData, &param)
+		if from == sdktranslator.FormatOpenAIResponse {
+			out = helps.EnsureResponsesUsageDetails(out)
+		}
 		resp = cliproxyexecutor.Response{Payload: out, Headers: codexSuccessfulResponseHeaders(auth, httpResp.Header)}
 		return resp, nil
 	}
@@ -1193,6 +1196,9 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	clientData := applyCodexIdentityExposeResponsePayload(upstreamData, identityState)
 	clientData = multiAgentResponse.Rewrite(clientData)
 	out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, originalRef.Bytes(), bodyRef.Bytes(), clientData, &param)
+	if from == sdktranslator.FormatOpenAIResponse {
+		out = helps.EnsureResponsesUsageDetails(out)
+	}
 	resp = cliproxyexecutor.Response{Payload: out, Headers: codexSuccessfulResponseHeaders(auth, httpResp.Header)}
 	return resp, nil
 }
@@ -1506,6 +1512,9 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 					continue
 				}
 				clientLine = normalizeCodexSSEPassThroughLine(clientLine)
+				if from == sdktranslator.FormatOpenAIResponse {
+					clientLine = helps.EnsureResponsesUsageDetails(clientLine)
+				}
 				terminal := false
 				trimmedClientLine := bytes.TrimSpace(clientLine)
 				if bytes.HasPrefix(trimmedClientLine, dataTag) {
@@ -1595,7 +1604,11 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 			translatedLine = applyCodexIdentityExposeResponsePayload(translatedLine, identityState)
 			chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, streamOriginalPayload.Bytes(), streamBody.Bytes(), translatedLine, &param)
 			for i := range chunks {
-				if !emit(cliproxyexecutor.StreamChunk{Payload: chunks[i]}) {
+				chunkPayload := chunks[i]
+				if from == sdktranslator.FormatOpenAIResponse {
+					chunkPayload = helps.EnsureResponsesUsageDetails(chunkPayload)
+				}
+				if !emit(cliproxyexecutor.StreamChunk{Payload: chunkPayload}) {
 					return
 				}
 			}
