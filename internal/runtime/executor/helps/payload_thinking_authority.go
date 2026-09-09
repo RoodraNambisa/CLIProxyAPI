@@ -7,24 +7,43 @@ import (
 	"github.com/tidwall/gjson"
 )
 
-// ApplyPayloadConfigWithThinkingAuthority preserves the existing rule order and
-// reports whether an OpenAI effort field was explicitly controlled by a rule.
-func ApplyPayloadConfigWithThinkingAuthority(cfg *config.Config, model, protocol, root string, payload, original []byte, requestedModel string) ([]byte, bool) {
+// PayloadThinkingAuthority distinguishes the two field roles owned by rules.
+type PayloadThinkingAuthority struct {
+	Effort  bool
+	Summary bool
+}
+
+// ApplyPayloadConfigWithThinkingAuthority reports which canonical output fields
+// were controlled by rules, including same-value writes and absent-field filters.
+func ApplyPayloadConfigWithThinkingAuthority(cfg *config.Config, model, protocol, root string, payload, original []byte, requestedModel string) ([]byte, PayloadThinkingAuthority) {
 	field := ""
+	summaryFields := []string{"reasoning.summary", "reasoning.generate_summary"}
 	switch strings.ToLower(strings.TrimSpace(protocol)) {
 	case "openai":
 		field = "reasoning_effort"
+		summaryFields = append(summaryFields, "reasoning.exclude", "include_reasoning")
 	case "codex", "openai-response":
 		field = "reasoning.effort"
 	}
 	if field == "" {
-		return ApplyPayloadConfigWithRoot(cfg, model, protocol, root, payload, original, requestedModel), false
+		return ApplyPayloadConfigWithRoot(cfg, model, protocol, root, payload, original, requestedModel), PayloadThinkingAuthority{}
 	}
 	field = buildPayloadPath(root, field)
-	controlled := false
+	for i := range summaryFields {
+		summaryFields[i] = buildPayloadPath(root, summaryFields[i])
+	}
+	controlled := PayloadThinkingAuthority{}
 	body := ApplyPayloadConfigWithFieldObserver(cfg, model, protocol, root, payload, original, requestedModel, func(path string, before, after []byte) {
-		if !controlled {
-			controlled = payloadRuleControlsField(path, field, before, after)
+		if !controlled.Effort {
+			controlled.Effort = payloadRuleControlsField(path, field, before, after)
+		}
+		if !controlled.Summary {
+			for _, summaryField := range summaryFields {
+				if payloadRuleControlsField(path, summaryField, before, after) {
+					controlled.Summary = true
+					break
+				}
+			}
 		}
 	})
 	return body, controlled

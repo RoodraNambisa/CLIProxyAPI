@@ -40,8 +40,41 @@ func TestPayloadThinkingAuthorityUsesActualFieldRole(t *testing.T) {
 			}
 			body := []byte(tc.body)
 			out, got := ApplyPayloadConfigWithThinkingAuthority(cfg, "upstream", tc.protocol, "", body, body, "")
-			if got != tc.want || !bytes.Equal(out, ApplyPayloadConfigWithRoot(cfg, "upstream", tc.protocol, "", body, body, "")) {
-				t.Fatalf("thinking authority = %t, want %t", got, tc.want)
+			if got.Effort != tc.want || !bytes.Equal(out, ApplyPayloadConfigWithRoot(cfg, "upstream", tc.protocol, "", body, body, "")) {
+				t.Fatalf("thinking authority = %t, want %t", got.Effort, tc.want)
+			}
+		})
+	}
+}
+
+func TestPayloadThinkingAuthoritySeparatesSummaryFromEffort(t *testing.T) {
+	for _, tc := range []struct {
+		name, protocol, body, path string
+		value                      any
+		filter                     bool
+		want                       PayloadThinkingAuthority
+	}{
+		{"absent exclusion filter", "openai", `{}`, "reasoning.exclude", nil, true, PayloadThinkingAuthority{Summary: true}},
+		{"absent include filter", "openai", `{}`, "include_reasoning", nil, true, PayloadThinkingAuthority{Summary: true}},
+		{"absent summary filter", "openai-response", `{}`, "reasoning.summary", nil, true, PayloadThinkingAuthority{Summary: true}},
+		{"summary same value", "openai-response", `{"reasoning":{"summary":"auto"}}`, "reasoning.summary", "auto", false, PayloadThinkingAuthority{Summary: true}},
+		{"effort only", "openai-response", `{}`, "reasoning.effort", "high", false, PayloadThinkingAuthority{Effort: true}},
+		{"parent controls both", "openai-response", `{}`, "reasoning", map[string]any{"effort": "high"}, false, PayloadThinkingAuthority{Effort: true, Summary: true}},
+		{"chat effort independent", "openai", `{}`, "reasoning_effort", "high", false, PayloadThinkingAuthority{Effort: true}},
+		{"business JSON independent", "openai-response", `{}`, "tools.0.parameters.reasoning.summary", "auto", false, PayloadThinkingAuthority{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			models := []config.PayloadModelRule{{Name: "upstream"}}
+			cfg := &config.Config{}
+			if tc.filter {
+				cfg.Payload.Filter = []config.PayloadFilterRule{{Models: models, Params: []string{tc.path}}}
+			} else {
+				cfg.Payload.Override = []config.PayloadRule{{Models: models, Params: map[string]any{tc.path: tc.value}}}
+			}
+			body := []byte(tc.body)
+			_, got := ApplyPayloadConfigWithThinkingAuthority(cfg, "upstream", tc.protocol, "", body, body, "")
+			if got != tc.want {
+				t.Fatalf("authority=%+v want=%+v", got, tc.want)
 			}
 		})
 	}

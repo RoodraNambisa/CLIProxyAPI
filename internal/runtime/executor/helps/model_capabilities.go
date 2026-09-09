@@ -8,18 +8,27 @@ import (
 
 // ApplyRequestThinking uses the selected credential's declaration when bound by
 // the manager. Direct executor calls retain the existing registry lookup path.
-// A true payloadAuthority makes applied rules authoritative over source-body
-// intent; the model suffix still has its existing precedence.
-func ApplyRequestThinking(body []byte, req core.Request, opts core.Options, fromFormat, toFormat, provider string, payloadAuthority ...bool) ([]byte, error) {
+// Applied payload rules remain authoritative over the field roles they own;
+// the model suffix still has its existing precedence over effort.
+func ApplyRequestThinking(body []byte, req core.Request, opts core.Options, fromFormat, toFormat, provider string, payloadAuthority ...PayloadThinkingAuthority) ([]byte, error) {
+	original := opts.OriginalRequest
+	if len(original) == 0 {
+		original = req.Payload
+	}
+	var authority PayloadThinkingAuthority
+	if len(payloadAuthority) > 0 {
+		authority = payloadAuthority[0]
+	}
+	summary := thinking.SummaryConfig{}
+	if !authority.Summary {
+		summary = translatedRequestSummaryConfig(body, req.Payload, original, req.Model, fromFormat, toFormat)
+	}
 	if info, ok := cliproxyauth.ResolvedAPIKeyModelInfo(req); ok {
 		var source []byte
-		if len(payloadAuthority) == 0 || !payloadAuthority[0] {
-			source = opts.OriginalRequest
-			if len(source) == 0 {
-				source = req.Payload
-			}
+		if !authority.Effort {
+			source = original
 		}
-		return thinking.ApplyThinkingWithModelInfoAndSummary(body, source, req.Model, fromFormat, toFormat, provider, info, thinking.ExtractSummaryConfig(body, toFormat))
+		return thinking.ApplyThinkingWithModelInfoAndSummary(body, source, req.Model, fromFormat, toFormat, provider, info, summary)
 	}
-	return thinking.ApplyThinking(body, req.Model, fromFormat, toFormat, provider)
+	return thinking.ApplyThinkingWithSummary(body, req.Model, fromFormat, toFormat, provider, summary)
 }

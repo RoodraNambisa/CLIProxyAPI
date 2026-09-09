@@ -19,17 +19,21 @@ import (
 	"github.com/tidwall/gjson"
 )
 
-func compatCapabilityManager(t *testing.T, baseURL string, rules config.PayloadConfig, levels []string) *coreauth.Manager {
+func compatCapabilityManager(t *testing.T, baseURL string, rules config.PayloadConfig, levels []string, providers ...string) *coreauth.Manager {
 	t.Helper()
-	cfg := &config.Config{SDKConfig: sdkconfig.SDKConfig{ProxyURL: "direct"}, Payload: rules, OpenAICompatibility: []config.OpenAICompatibility{{Name: "capability-compat", BaseURL: baseURL, Models: []config.OpenAICompatibilityModel{{Name: "private-compat", Alias: "bound-compat", Thinking: &registry.ThinkingSupport{Levels: levels}}}}}}
+	provider := "capability-compat"
+	if len(providers) > 0 {
+		provider = providers[0]
+	}
+	cfg := &config.Config{SDKConfig: sdkconfig.SDKConfig{ProxyURL: "direct"}, Payload: rules, OpenAICompatibility: []config.OpenAICompatibility{{Name: provider, BaseURL: baseURL, Models: []config.OpenAICompatibilityModel{{Name: "private-compat", Alias: "bound-compat", Thinking: &registry.ThinkingSupport{Levels: levels}}}}}}
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.SetConfig(cfg)
-	manager.RegisterExecutor(NewOpenAICompatExecutor("capability-compat", cfg))
-	if _, errRegister := manager.Register(coreauth.WithSkipPersist(t.Context()), &coreauth.Auth{ID: t.Name(), Provider: "capability-compat", Attributes: map[string]string{"api_key": "fixture", "base_url": baseURL, "compat_name": "capability-compat"}}); errRegister != nil {
+	manager.RegisterExecutor(NewOpenAICompatExecutor(provider, cfg))
+	if _, errRegister := manager.Register(coreauth.WithSkipPersist(t.Context()), &coreauth.Auth{ID: t.Name(), Provider: provider, Attributes: map[string]string{"api_key": "fixture", "base_url": baseURL, "compat_name": provider}}); errRegister != nil {
 		t.Fatal(errRegister)
 	}
 	reg := registry.GetGlobalRegistry()
-	reg.RegisterClient(t.Name(), "capability-compat", []*registry.ModelInfo{{ID: "bound-compat"}, {ID: "private-compat", Type: "openai", Thinking: &registry.ThinkingSupport{Levels: []string{"low"}}}})
+	reg.RegisterClient(t.Name(), provider, []*registry.ModelInfo{{ID: "bound-compat"}, {ID: "private-compat", Type: "openai", Thinking: &registry.ThinkingSupport{Levels: []string{"low"}}}})
 	t.Cleanup(func() { reg.UnregisterClient(t.Name()) })
 	return manager
 }
