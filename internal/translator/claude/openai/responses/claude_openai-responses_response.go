@@ -34,9 +34,11 @@ type claudeToResponsesState struct {
 }
 
 type claudeResponsesTextBlock struct {
-	ID   string
-	Text strings.Builder
-	Done bool
+	ID        string
+	Text      strings.Builder
+	Done      bool
+	Signature strings.Builder
+	Redacted  bool
 }
 
 var dataTag = []byte("data:")
@@ -77,10 +79,7 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 		return out
 	}
 	idx := int(root.Get("index").Int())
-	toolEvent := ev == "content_block_start" && root.Get("content_block.type").String() == "tool_use" ||
-		ev == "content_block_delta" && root.Get("delta.type").String() == "input_json_delta" ||
-		ev == "content_block_stop" && len(st.FuncCallIDs) > 0
-	if toolEvent || root.Get("index").Exists() && strings.HasPrefix(ev, "content_block_") {
+	if claudeResponsesRequiresBlockIndex(root, len(st.FuncCallIDs) > 0, st.ReasoningBlocks[0] != nil) {
 		var valid bool
 		idx, valid = claudeResponsesBlockIndex(root.Get("index"))
 		if !valid {
@@ -173,21 +172,28 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 			// record function metadata for aggregation
 			st.FuncCallIDs[idx] = callID
 			st.FuncNames[idx] = name
-		} else if typ == "thinking" {
+		} else if typ == "thinking" || typ == "redacted_thinking" {
 			// start reasoning item
-			block := &claudeResponsesTextBlock{ID: fmt.Sprintf("rs_%s_%d", st.ResponseID, idx)}
+			block := newClaudeResponsesReasoningBlock(fmt.Sprintf("rs_%s_%d", st.ResponseID, idx), cb)
 			st.ReasoningBlocks[idx] = block
 			item := []byte(`{"type":"response.output_item.added","sequence_number":0,"output_index":0,"item":{"id":"","type":"reasoning","status":"in_progress","summary":[]}}`)
 			item, _ = sjson.SetBytes(item, "sequence_number", nextSeq())
 			item, _ = sjson.SetBytes(item, "output_index", idx)
 			item, _ = sjson.SetBytes(item, "item.id", block.ID)
+			item, _ = sjson.SetBytes(item, "item.encrypted_content", block.Signature.String())
 			out = append(out, emitEvent("response.output_item.added", item))
+			if block.Redacted {
+				break
+			}
 			// add a summary part placeholder
 			part := []byte(`{"type":"response.reasoning_summary_part.added","sequence_number":0,"item_id":"","output_index":0,"summary_index":0,"part":{"type":"summary_text","text":""}}`)
 			part, _ = sjson.SetBytes(part, "sequence_number", nextSeq())
 			part, _ = sjson.SetBytes(part, "item_id", block.ID)
 			part, _ = sjson.SetBytes(part, "output_index", idx)
 			out = append(out, emitEvent("response.reasoning_summary_part.added", part))
+			if block.Text.Len() > 0 {
+				out = append(out, claudeResponsesReasoningDelta(block, idx, block.Text.String(), nextSeq()))
+			}
 		}
 	case "content_block_delta":
 		d := root.Get("delta")
@@ -237,15 +243,16 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 				out = append(out, emitEvent("response.function_call_arguments.delta", msg))
 			}
 		} else if dt == "thinking_delta" {
-			if block := st.ReasoningBlocks[idx]; block != nil && !block.Done {
-				if t := d.Get("thinking"); t.Exists() {
+			if block := st.ReasoningBlocks[idx]; block != nil && !block.Done && !block.Redacted {
+				if t := d.Get("thinking"); t.Type == gjson.String {
 					block.Text.WriteString(t.String())
-					msg := []byte(`{"type":"response.reasoning_summary_text.delta","sequence_number":0,"item_id":"","output_index":0,"summary_index":0,"delta":""}`)
-					msg, _ = sjson.SetBytes(msg, "sequence_number", nextSeq())
-					msg, _ = sjson.SetBytes(msg, "item_id", block.ID)
-					msg, _ = sjson.SetBytes(msg, "output_index", idx)
-					msg, _ = sjson.SetBytes(msg, "delta", t.String())
-					out = append(out, emitEvent("response.reasoning_summary_text.delta", msg))
+					out = append(out, claudeResponsesReasoningDelta(block, idx, t.String(), nextSeq()))
+				}
+			}
+		} else if dt == "signature_delta" {
+			if block := st.ReasoningBlocks[idx]; block != nil && !block.Done && !block.Redacted {
+				if signature := d.Get("signature"); signature.Type == gjson.String {
+					block.Signature.WriteString(signature.String())
 				}
 			}
 		}
@@ -312,19 +319,21 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 			st.FuncDone[idx] = true
 		} else if block := st.ReasoningBlocks[idx]; block != nil && !block.Done {
 			block.Done = true
-			full := block.Text.String()
-			textDone := []byte(`{"type":"response.reasoning_summary_text.done","sequence_number":0,"item_id":"","output_index":0,"summary_index":0,"text":""}`)
-			textDone, _ = sjson.SetBytes(textDone, "sequence_number", nextSeq())
-			textDone, _ = sjson.SetBytes(textDone, "item_id", block.ID)
-			textDone, _ = sjson.SetBytes(textDone, "output_index", idx)
-			textDone, _ = sjson.SetBytes(textDone, "text", full)
-			out = append(out, emitEvent("response.reasoning_summary_text.done", textDone))
-			partDone := []byte(`{"type":"response.reasoning_summary_part.done","sequence_number":0,"item_id":"","output_index":0,"summary_index":0,"part":{"type":"summary_text","text":""}}`)
-			partDone, _ = sjson.SetBytes(partDone, "sequence_number", nextSeq())
-			partDone, _ = sjson.SetBytes(partDone, "item_id", block.ID)
-			partDone, _ = sjson.SetBytes(partDone, "output_index", idx)
-			partDone, _ = sjson.SetBytes(partDone, "part.text", full)
-			out = append(out, emitEvent("response.reasoning_summary_part.done", partDone))
+			if !block.Redacted {
+				full := block.Text.String()
+				textDone := []byte(`{"type":"response.reasoning_summary_text.done","sequence_number":0,"item_id":"","output_index":0,"summary_index":0,"text":""}`)
+				textDone, _ = sjson.SetBytes(textDone, "sequence_number", nextSeq())
+				textDone, _ = sjson.SetBytes(textDone, "item_id", block.ID)
+				textDone, _ = sjson.SetBytes(textDone, "output_index", idx)
+				textDone, _ = sjson.SetBytes(textDone, "text", full)
+				out = append(out, emitEvent("response.reasoning_summary_text.done", textDone))
+				partDone := []byte(`{"type":"response.reasoning_summary_part.done","sequence_number":0,"item_id":"","output_index":0,"summary_index":0,"part":{"type":"summary_text","text":""}}`)
+				partDone, _ = sjson.SetBytes(partDone, "sequence_number", nextSeq())
+				partDone, _ = sjson.SetBytes(partDone, "item_id", block.ID)
+				partDone, _ = sjson.SetBytes(partDone, "output_index", idx)
+				partDone, _ = sjson.SetBytes(partDone, "part.text", full)
+				out = append(out, emitEvent("response.reasoning_summary_part.done", partDone))
+			}
 			itemDone := []byte(`{"type":"response.output_item.done"}`)
 			itemDone, _ = sjson.SetBytes(itemDone, "sequence_number", nextSeq())
 			itemDone, _ = sjson.SetBytes(itemDone, "output_index", idx)
@@ -495,7 +504,20 @@ func claudeResponsesReasoningItem(block *claudeResponsesTextBlock) []byte {
 	item := []byte(`{"id":"","type":"reasoning","status":"completed","summary":[{"type":"summary_text","text":""}]}`)
 	item, _ = sjson.SetBytes(item, "id", block.ID)
 	item, _ = sjson.SetBytes(item, "summary.0.text", block.Text.String())
+	item, _ = sjson.SetBytes(item, "encrypted_content", block.Signature.String())
+	if block.Redacted {
+		item, _ = sjson.SetRawBytes(item, "summary", []byte("[]"))
+	}
 	return item
+}
+
+func claudeResponsesReasoningDelta(block *claudeResponsesTextBlock, index int, text string, sequence int) []byte {
+	event := []byte(`{"type":"response.reasoning_summary_text.delta","sequence_number":0,"item_id":"","output_index":0,"summary_index":0,"delta":""}`)
+	event, _ = sjson.SetBytes(event, "sequence_number", sequence)
+	event, _ = sjson.SetBytes(event, "item_id", block.ID)
+	event, _ = sjson.SetBytes(event, "output_index", index)
+	event, _ = sjson.SetBytes(event, "delta", text)
+	return emitEvent("response.reasoning_summary_text.delta", event)
 }
 
 func claudeResponsesOrderedOutput(items map[int][]byte) []byte {
@@ -569,10 +591,7 @@ func ConvertClaudeResponseToOpenAIResponsesNonStream(_ context.Context, _ string
 			continue
 		}
 		idx := int(root.Get("index").Int())
-		toolEvent := ev == "content_block_start" && root.Get("content_block.type").String() == "tool_use" ||
-			ev == "content_block_delta" && root.Get("delta.type").String() == "input_json_delta" ||
-			ev == "content_block_stop" && len(toolCalls) > 0
-		if toolEvent || root.Get("index").Exists() && strings.HasPrefix(ev, "content_block_") {
+		if claudeResponsesRequiresBlockIndex(root, len(toolCalls) > 0, reasoningBlocks[0] != nil) {
 			var valid bool
 			idx, valid = claudeResponsesBlockIndex(root.Get("index"))
 			if !valid {
@@ -612,8 +631,8 @@ func ConvertClaudeResponseToOpenAIResponsesNonStream(_ context.Context, _ string
 				if toolCalls[idx] == nil && callID != "" {
 					toolCalls[idx] = &toolState{id: callID, name: cb.Get("name").String()}
 				}
-			case "thinking":
-				reasoningBlocks[idx] = &claudeResponsesTextBlock{ID: fmt.Sprintf("rs_%s_%d", responseID, idx)}
+			case "thinking", "redacted_thinking":
+				reasoningBlocks[idx] = newClaudeResponsesReasoningBlock(fmt.Sprintf("rs_%s_%d", responseID, idx), cb)
 			}
 
 		case "content_block_delta":
@@ -644,9 +663,15 @@ func ConvertClaudeResponseToOpenAIResponsesNonStream(_ context.Context, _ string
 					}
 				}
 			case "thinking_delta":
-				if block := reasoningBlocks[idx]; block != nil && !block.Done {
-					if t := d.Get("thinking"); t.Exists() {
+				if block := reasoningBlocks[idx]; block != nil && !block.Done && !block.Redacted {
+					if t := d.Get("thinking"); t.Type == gjson.String {
 						block.Text.WriteString(t.String())
+					}
+				}
+			case "signature_delta":
+				if block := reasoningBlocks[idx]; block != nil && !block.Done && !block.Redacted {
+					if signature := d.Get("signature"); signature.Type == gjson.String {
+						block.Signature.WriteString(signature.String())
 					}
 				}
 			}
