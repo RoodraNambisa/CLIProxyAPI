@@ -89,7 +89,7 @@ func TestClaudeResponsesIncompleteReachesClient(t *testing.T) {
 			t.Run(fmt.Sprintf("custom=%t/stream=%t", custom, stream), func(t *testing.T) {
 				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 					w.Header().Set("Content-Type", "text/event-stream")
-					_, _ = io.WriteString(w, `data: {"type":"message_start","message":{"id":"limited","usage":{"input_tokens":2}}}
+					_, _ = io.WriteString(w, `data: {"type":"message_start","message":{"id":"limited","usage":{"input_tokens":2,"cache_read_input_tokens":4,"cache_creation_input_tokens":5}}}
 data: {"type":"content_block_start","index":7,"content_block":{"type":"tool_use","id":"partial","name":"tool"}}
 data: {"type":"content_block_stop","index":7}
 data: {"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":3}}
@@ -141,6 +141,9 @@ data: {"type":"message_stop"}
 				if result.Get("status").String() != "incomplete" || result.Get("incomplete_details.reason").String() != "max_output_tokens" ||
 					result.Get("output.0.status").String() != "incomplete" || result.Get("output.0."+field).String() != "" || result.Get("usage.output_tokens").Int() != 3 {
 					t.Fatal("actual HTTP response lost the incomplete tool state or usage")
+				}
+				if result.Get("usage.input_tokens").Int() != 11 || result.Get("usage.input_tokens_details.cached_tokens").Int() != 4 || result.Get("usage.input_tokens_details.cache_write_tokens").Int() != 5 || result.Get("usage.total_tokens").Int() != 14 || !result.Get("usage.output_tokens_details.reasoning_tokens").Exists() {
+					t.Fatal("actual response lost cache usage or the zero reasoning detail")
 				}
 			})
 		}

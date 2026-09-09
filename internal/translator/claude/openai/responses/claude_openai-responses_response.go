@@ -30,9 +30,7 @@ type claudeToResponsesState struct {
 	ToolIdentities  map[string]claudeResponsesToolIdentity
 	ReasoningBlocks map[int]*claudeResponsesTextBlock
 	// usage aggregation
-	InputTokens  int64
-	OutputTokens int64
-	UsageSeen    bool
+	Usage translatorcommon.ClaudeUsage
 }
 
 type claudeResponsesTextBlock struct {
@@ -108,19 +106,8 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 			st.FuncNames = make(map[int]string)
 			st.FuncCallIDs = make(map[int]string)
 			st.FuncDone = make(map[int]bool)
-			st.InputTokens = 0
-			st.OutputTokens = 0
-			st.UsageSeen = false
-			if usage := msg.Get("usage"); usage.Exists() {
-				if v := usage.Get("input_tokens"); v.Exists() {
-					st.InputTokens = v.Int()
-					st.UsageSeen = true
-				}
-				if v := usage.Get("output_tokens"); v.Exists() {
-					st.OutputTokens = v.Int()
-					st.UsageSeen = true
-				}
-			}
+			st.Usage = translatorcommon.ClaudeUsage{}
+			st.Usage.Merge(msg.Get("usage"))
 			// response.created
 			created := []byte(`{"type":"response.created","sequence_number":0,"response":{"id":"","object":"response","created_at":0,"status":"in_progress","background":false,"error":null,"output":[]}}`)
 			created, _ = sjson.SetBytes(created, "sequence_number", nextSeq())
@@ -285,16 +272,7 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 		if reason := root.Get("delta.stop_reason"); reason.Type == gjson.String && reason.String() != "" {
 			st.StopReason = reason.String()
 		}
-		if usage := root.Get("usage"); usage.Exists() {
-			if v := usage.Get("output_tokens"); v.Exists() {
-				st.OutputTokens = v.Int()
-				st.UsageSeen = true
-			}
-			if v := usage.Get("input_tokens"); v.Exists() {
-				st.InputTokens = v.Int()
-				st.UsageSeen = true
-			}
-		}
+		st.Usage.Merge(root.Get("usage"))
 	case "message_stop":
 		eventType, responseStatus, incompleteDetails := claudeResponsesTerminalState(st.StopReason)
 		for _, index := range st.pendingBlockIndexes() {
@@ -405,19 +383,8 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 			completed, _ = sjson.SetRawBytes(completed, "response.output", claudeResponsesOrderedOutput(outputItems, st.OutputIndexes.Blocks))
 		}
 
-		reasoningTokens := int64(reasoningBytes / 4)
-		usagePresent := st.UsageSeen || reasoningTokens > 0
-		if usagePresent {
-			completed, _ = sjson.SetBytes(completed, "response.usage.input_tokens", st.InputTokens)
-			completed, _ = sjson.SetBytes(completed, "response.usage.input_tokens_details.cached_tokens", 0)
-			completed, _ = sjson.SetBytes(completed, "response.usage.output_tokens", st.OutputTokens)
-			if reasoningTokens > 0 {
-				completed, _ = sjson.SetBytes(completed, "response.usage.output_tokens_details.reasoning_tokens", reasoningTokens)
-			}
-			total := st.InputTokens + st.OutputTokens
-			if total > 0 || st.UsageSeen {
-				completed, _ = sjson.SetBytes(completed, "response.usage.total_tokens", total)
-			}
+		if st.Usage.HasUsage || reasoningBytes/4 > 0 {
+			completed, _ = sjson.SetRawBytes(completed, "response.usage", claudeResponsesUsage(st.Usage, reasoningBytes))
 		}
 		out = append(out, emitEvent(eventType, completed))
 	}
@@ -504,8 +471,7 @@ func ConvertClaudeResponseToOpenAIResponsesNonStream(_ context.Context, _ string
 	var (
 		responseID    string
 		createdAt     int64
-		inputTokens   int64
-		outputTokens  int64
+		usageTokens   translatorcommon.ClaudeUsage
 		completed     bool
 		stopReason    string
 		outputIndexes claudeResponsesOutputIndexes
@@ -547,12 +513,10 @@ func ConvertClaudeResponseToOpenAIResponsesNonStream(_ context.Context, _ string
 				completed = false
 				stopReason = ""
 				outputIndexes = claudeResponsesOutputIndexes{}
-				inputTokens, outputTokens = 0, 0
+				usageTokens = translatorcommon.ClaudeUsage{}
 				responseID = msg.Get("id").String()
 				createdAt = time.Now().Unix()
-				if usage := msg.Get("usage"); usage.Exists() {
-					inputTokens = usage.Get("input_tokens").Int()
-				}
+				usageTokens.Merge(msg.Get("usage"))
 			}
 
 		case "content_block_start":
@@ -636,9 +600,7 @@ func ConvertClaudeResponseToOpenAIResponsesNonStream(_ context.Context, _ string
 			if reason := root.Get("delta.stop_reason"); reason.Type == gjson.String && reason.String() != "" {
 				stopReason = reason.String()
 			}
-			if usage := root.Get("usage"); usage.Exists() {
-				outputTokens = usage.Get("output_tokens").Int()
-			}
+			usageTokens.Merge(root.Get("usage"))
 		case "message_stop":
 			completed = true
 		}
@@ -744,18 +706,7 @@ func ConvertClaudeResponseToOpenAIResponsesNonStream(_ context.Context, _ string
 		out, _ = sjson.SetRawBytes(out, "output", claudeResponsesOrderedOutput(outputItems, outputIndexes.Blocks))
 	}
 
-	// Usage
-	total := inputTokens + outputTokens
-	out, _ = sjson.SetBytes(out, "usage.input_tokens", inputTokens)
-	out, _ = sjson.SetBytes(out, "usage.output_tokens", outputTokens)
-	out, _ = sjson.SetBytes(out, "usage.total_tokens", total)
-	if reasoningBytes > 0 {
-		// Rough estimate similar to chat completions
-		reasoningTokens := int64(reasoningBytes / 4)
-		if reasoningTokens > 0 {
-			out, _ = sjson.SetBytes(out, "usage.output_tokens_details.reasoning_tokens", reasoningTokens)
-		}
-	}
+	out, _ = sjson.SetRawBytes(out, "usage", claudeResponsesUsage(usageTokens, reasoningBytes))
 
 	return out
 }
