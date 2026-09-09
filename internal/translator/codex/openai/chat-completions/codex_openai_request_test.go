@@ -1,10 +1,41 @@
 package chat_completions
 
 import (
+	"bytes"
+	"encoding/json"
+	"fmt"
 	"testing"
 
 	"github.com/tidwall/gjson"
 )
+
+func TestCodexInputArrayLongHistoryRetainsEveryMessage(t *testing.T) {
+	messages := make([]map[string]string, 1000)
+	for index := range messages {
+		role := "user"
+		if index%2 == 1 {
+			role = "assistant"
+		}
+		messages[index] = map[string]string{"role": role, "content": fmt.Sprintf("turn %d: 中文 \\\"", index)}
+	}
+	request, err := json.Marshal(map[string]any{"messages": messages})
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := bytes.Clone(request)
+	for _, stream := range []bool{false, true} {
+		out := ConvertOpenAIRequestToCodex("gpt-5.4-mini", request, stream)
+		items := gjson.GetBytes(out, "input").Array()
+		if len(items) != len(messages) || !gjson.ValidBytes(out) || !bytes.Equal(request, original) {
+			t.Fatal("long history changed its input, item count or JSON validity")
+		}
+		for index, item := range items {
+			if item.Get("role").String() != messages[index]["role"] || item.Get("content.0.text").String() != messages[index]["content"] {
+				t.Fatalf("history message %d changed role, content or order", index)
+			}
+		}
+	}
+}
 
 // Basic tool-call: system + user + assistant(tool_calls, no content) + tool result.
 // Expects developer msg + user msg + function_call + function_call_output.

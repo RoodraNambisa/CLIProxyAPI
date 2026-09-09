@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 
+	translatorcommon "github.com/router-for-me/CLIProxyAPI/v6/internal/translator/common"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -89,8 +90,10 @@ func ConvertOpenAIRequestToCodex(modelName string, inputRawJSON []byte, stream b
 
 	// Build input from messages, handling all message types including tool calls
 	out, _ = sjson.SetRawBytes(out, "input", []byte(`[]`))
+	var inputItems [][]byte
 	if messages.IsArray() {
 		arr := messages.Array()
+		inputItems = make([][]byte, 0, len(arr))
 		for i := 0; i < len(arr); i++ {
 			m := arr[i]
 			role := m.Get("role").String()
@@ -110,7 +113,7 @@ func ConvertOpenAIRequestToCodex(modelName string, inputRawJSON []byte, stream b
 				funcOutput, _ = sjson.SetBytes(funcOutput, "type", outputType)
 				funcOutput, _ = sjson.SetBytes(funcOutput, "call_id", toolCallID)
 				funcOutput, _ = sjson.SetBytes(funcOutput, "output", content)
-				out, _ = sjson.SetRawBytes(out, "input.-1", funcOutput)
+				inputItems = append(inputItems, funcOutput)
 
 			default:
 				// Handle regular messages
@@ -183,7 +186,7 @@ func ConvertOpenAIRequestToCodex(modelName string, inputRawJSON []byte, stream b
 				// are present — Responses API needs function_call items
 				// directly, otherwise call_id matching fails (#2132).
 				if role != "assistant" || len(gjson.GetBytes(msg, "content").Array()) > 0 {
-					out, _ = sjson.SetRawBytes(out, "input.-1", msg)
+					inputItems = append(inputItems, msg)
 				}
 
 				// Handle tool calls for assistant messages as separate top-level objects
@@ -213,13 +216,15 @@ func ConvertOpenAIRequestToCodex(modelName string, inputRawJSON []byte, stream b
 							call, _ = sjson.SetBytes(call, "call_id", callID)
 							call, _ = sjson.SetBytes(call, "name", name)
 							call, _ = sjson.SetBytes(call, inputField, input)
-							out, _ = sjson.SetRawBytes(out, "input.-1", call)
+							inputItems = append(inputItems, call)
 						}
 					}
 				}
 			}
 		}
 	}
+
+	out = translatorcommon.SetRawArrayItems(out, "input", inputItems)
 
 	// Map response_format and text settings to Responses API text.format
 	rf := gjson.GetBytes(rawJSON, "response_format")
