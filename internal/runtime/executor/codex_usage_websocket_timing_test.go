@@ -19,7 +19,7 @@ import (
 func TestCodexWebsocketUsageContentAndBootstrapTiming(t *testing.T) {
 	for _, stream := range []bool{false, true} {
 		for _, buffering := range []bool{false, true} {
-			for _, result := range []string{"content", "empty", "failure", "overload", "no-usage"} {
+			for _, result := range []string{"content", "empty", "failure", "overload", "no-usage", "binary"} {
 				t.Run(fmt.Sprintf("stream=%t/buffering=%t/%s", stream, buffering, result), func(t *testing.T) {
 					collector := &alphaUsageCollector{authID: t.Name()}
 					usage.RegisterPlugin(collector)
@@ -49,7 +49,11 @@ func TestCodexWebsocketUsageContentAndBootstrapTiming(t *testing.T) {
 						case "no-usage":
 							terminal = `{"type":"response.completed","response":{"id":"fixture","status":"completed","output":[]}}`
 						}
-						_ = conn.WriteMessage(websocket.TextMessage, []byte(terminal))
+						messageType := websocket.TextMessage
+						if result == "binary" {
+							messageType = websocket.BinaryMessage
+						}
+						_ = conn.WriteMessage(messageType, []byte(terminal))
 						_, _, _ = conn.ReadMessage()
 					}))
 					defer server.Close()
@@ -73,7 +77,7 @@ func TestCodexWebsocketUsageContentAndBootstrapTiming(t *testing.T) {
 					} else {
 						_, executionErr = executor.Execute(ctx, auth, req, opts)
 					}
-					failure := result == "failure" || result == "overload"
+					failure := result == "failure" || result == "overload" || result == "binary"
 					if (executionErr != nil) != failure {
 						t.Fatalf("unexpected execution result: %v", executionErr)
 					}
