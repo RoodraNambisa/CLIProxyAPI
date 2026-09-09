@@ -41,6 +41,14 @@ func validateModelCatalogFieldsYAML(data []byte) error {
 			if !contextLengths {
 				continue
 			}
+			compat, err := credentialYAMLField(model, "is-compat", make(map[*yaml.Node]bool))
+			if err != nil {
+				return err
+			}
+			compat = resolve(compat)
+			if compat != nil && compat.Tag != "!!null" && (compat.Kind != yaml.ScalarNode || compat.Tag != "!!bool") {
+				return fmt.Errorf("models[%d].is-compat must be a boolean", index)
+			}
 			thinking, err := credentialYAMLField(model, "thinking", make(map[*yaml.Node]bool))
 			if err != nil {
 				return err

@@ -42,7 +42,7 @@ func SummarizeGeminiModels(models []config.GeminiModel) GeminiModelsSummary {
 			if name == "" && alias == "" {
 				continue
 			}
-			out(strings.ToLower(name) + "|" + strings.ToLower(alias) + "|" + strconv.Quote(strings.TrimSpace(model.DisplayName)) + "|" + strconv.Itoa(model.MaxContextLength) + "|" + config.ModelThinkingSignature(model.Thinking))
+			out(strings.ToLower(name) + "|" + strings.ToLower(alias) + "|" + strconv.Quote(strings.TrimSpace(model.DisplayName)) + "|" + strconv.Itoa(model.MaxContextLength) + "|" + config.ModelThinkingSignature(model.Thinking) + "|" + strconv.FormatBool(model.IsCompat))
 		}
 	})
 	return GeminiModelsSummary{
@@ -63,7 +63,7 @@ func SummarizeClaudeModels(models []config.ClaudeModel) ClaudeModelsSummary {
 			if name == "" && alias == "" {
 				continue
 			}
-			out(strings.ToLower(name) + "|" + strings.ToLower(alias) + "|" + strconv.Quote(strings.TrimSpace(model.DisplayName)) + "|" + strconv.Itoa(model.MaxContextLength) + "|" + config.ModelThinkingSignature(model.Thinking))
+			out(strings.ToLower(name) + "|" + strings.ToLower(alias) + "|" + strconv.Quote(strings.TrimSpace(model.DisplayName)) + "|" + strconv.Itoa(model.MaxContextLength) + "|" + config.ModelThinkingSignature(model.Thinking) + "|" + strconv.FormatBool(model.IsCompat))
 		}
 	})
 	return ClaudeModelsSummary{
@@ -84,7 +84,7 @@ func SummarizeCodexModels(models []config.CodexModel) CodexModelsSummary {
 			if name == "" && alias == "" {
 				continue
 			}
-			out(strings.ToLower(name) + "|" + strings.ToLower(alias) + "|" + strconv.Quote(strings.TrimSpace(model.DisplayName)) + "|" + strconv.Itoa(model.MaxContextLength) + "|" + config.ModelThinkingSignature(model.Thinking))
+			out(strings.ToLower(name) + "|" + strings.ToLower(alias) + "|" + strconv.Quote(strings.TrimSpace(model.DisplayName)) + "|" + strconv.Itoa(model.MaxContextLength) + "|" + config.ModelThinkingSignature(model.Thinking) + "|" + strconv.FormatBool(model.IsCompat))
 		}
 	})
 	return CodexModelsSummary{
@@ -108,7 +108,7 @@ func SummarizeVertexModels(models []config.VertexCompatModel) VertexModelsSummar
 		if alias != "" {
 			name = alias
 		}
-		names = append(names, name+"|"+strconv.Quote(strings.TrimSpace(model.DisplayName))+"|"+strconv.Itoa(model.MaxContextLength)+"|"+config.ModelThinkingSignature(model.Thinking))
+		names = append(names, name+"|"+strconv.Quote(strings.TrimSpace(model.DisplayName))+"|"+strconv.Itoa(model.MaxContextLength)+"|"+config.ModelThinkingSignature(model.Thinking)+"|"+strconv.FormatBool(model.IsCompat))
 	}
 	if len(names) == 0 {
 		return VertexModelsSummary{}

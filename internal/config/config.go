@@ -1925,6 +1925,8 @@ func (k ClaudeKey) GetBaseURL() string { return k.BaseURL }
 
 // ClaudeModel describes a mapping between an alias and the actual upstream model name.
 type ClaudeModel struct {
+	// IsCompat preserves compatibility-only thinking blocks; false keeps native validation.
+	IsCompat bool `yaml:"is-compat,omitempty" json:"is-compat,omitempty"`
 	// Thinking overrides the model's declared reasoning capability; nil inherits.
 	Thinking *registry.ThinkingSupport `yaml:"thinking,omitempty" json:"thinking,omitempty"`
 	// MaxContextLength overrides the advertised window; zero inherits the catalog.
@@ -1942,6 +1944,7 @@ type ClaudeModel struct {
 }
 
 func (m ClaudeModel) GetName() string                        { return m.Name }
+func (m ClaudeModel) GetIsCompat() bool                      { return m.IsCompat }
 func (m ClaudeModel) GetDisplayName() string                 { return m.DisplayName }
 func (m ClaudeModel) GetMaxContextLength() int               { return m.MaxContextLength }
 func (m ClaudeModel) GetAlias() string                       { return m.Alias }
@@ -1996,6 +1999,8 @@ func (k CodexKey) GetBaseURL() string { return k.BaseURL }
 
 // CodexModel describes a mapping between an alias and the actual upstream model name.
 type CodexModel struct {
+	// IsCompat preserves compatibility-only thinking blocks; false keeps native validation.
+	IsCompat bool `yaml:"is-compat,omitempty" json:"is-compat,omitempty"`
 	// Thinking overrides the model's declared reasoning capability; nil inherits.
 	Thinking *registry.ThinkingSupport `yaml:"thinking,omitempty" json:"thinking,omitempty"`
 	// MaxContextLength overrides the advertised window; zero inherits the catalog.
@@ -2013,6 +2018,7 @@ type CodexModel struct {
 }
 
 func (m CodexModel) GetName() string                        { return m.Name }
+func (m CodexModel) GetIsCompat() bool                      { return m.IsCompat }
 func (m CodexModel) GetDisplayName() string                 { return m.DisplayName }
 func (m CodexModel) GetMaxContextLength() int               { return m.MaxContextLength }
 func (m CodexModel) GetAlias() string                       { return m.Alias }
@@ -2059,6 +2065,8 @@ func (k GeminiKey) GetBaseURL() string { return k.BaseURL }
 
 // GeminiModel describes a mapping between an alias and the actual upstream model name.
 type GeminiModel struct {
+	// IsCompat preserves compatibility-only thinking blocks; false keeps native validation.
+	IsCompat bool `yaml:"is-compat,omitempty" json:"is-compat,omitempty"`
 	// Thinking overrides the model's declared reasoning capability; nil inherits.
 	Thinking *registry.ThinkingSupport `yaml:"thinking,omitempty" json:"thinking,omitempty"`
 	// MaxContextLength overrides the advertised window; zero inherits the catalog.
@@ -2076,6 +2084,7 @@ type GeminiModel struct {
 }
 
 func (m GeminiModel) GetName() string                        { return m.Name }
+func (m GeminiModel) GetIsCompat() bool                      { return m.IsCompat }
 func (m GeminiModel) GetDisplayName() string                 { return m.DisplayName }
 func (m GeminiModel) GetMaxContextLength() int               { return m.MaxContextLength }
 func (m GeminiModel) GetAlias() string                       { return m.Alias }
@@ -2129,6 +2138,8 @@ type OpenAICompatibilityAPIKey struct {
 // OpenAICompatibilityModel represents a model configuration for OpenAI compatibility,
 // including the actual model name and its alias for API routing.
 type OpenAICompatibilityModel struct {
+	// IsCompat preserves compatibility-only thinking blocks; false keeps native validation.
+	IsCompat bool `yaml:"is-compat,omitempty" json:"is-compat,omitempty"`
 	// MaxContextLength overrides the advertised window; zero inherits the catalog.
 	MaxContextLength int `yaml:"max-context-length,omitempty" json:"max-context-length,omitempty"`
 	// DisplayName is an optional catalog label; blank inherits the model label.
@@ -2148,6 +2159,7 @@ type OpenAICompatibilityModel struct {
 }
 
 func (m OpenAICompatibilityModel) GetName() string                        { return m.Name }
+func (m OpenAICompatibilityModel) GetIsCompat() bool                      { return m.IsCompat }
 func (m OpenAICompatibilityModel) GetDisplayName() string                 { return m.DisplayName }
 func (m OpenAICompatibilityModel) GetMaxContextLength() int               { return m.MaxContextLength }
 func (m OpenAICompatibilityModel) GetAlias() string                       { return m.Alias }

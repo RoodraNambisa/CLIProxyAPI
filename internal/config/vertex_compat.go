@@ -55,6 +55,8 @@ func (k VertexCompatKey) GetBaseURL() string { return k.BaseURL }
 // VertexCompatModel represents a model configuration for Vertex compatibility,
 // including the actual model name and its alias for API routing.
 type VertexCompatModel struct {
+	// IsCompat preserves compatibility-only thinking blocks; false keeps native validation.
+	IsCompat bool `yaml:"is-compat,omitempty" json:"is-compat,omitempty"`
 	// Thinking overrides the model's declared reasoning capability; nil inherits.
 	Thinking *registry.ThinkingSupport `yaml:"thinking,omitempty" json:"thinking,omitempty"`
 	// MaxContextLength overrides the advertised window; zero inherits the catalog.
@@ -72,6 +74,7 @@ type VertexCompatModel struct {
 }
 
 func (m VertexCompatModel) GetName() string                        { return m.Name }
+func (m VertexCompatModel) GetIsCompat() bool                      { return m.IsCompat }
 func (m VertexCompatModel) GetDisplayName() string                 { return m.DisplayName }
 func (m VertexCompatModel) GetMaxContextLength() int               { return m.MaxContextLength }
 func (m VertexCompatModel) GetAlias() string                       { return m.Alias }

@@ -658,8 +658,12 @@ nonstream-keepalive-interval: 0
 # Budgets require 0 <= min <= max <= 2147483647; 0/0 declares no budget range.
 # Valid levels: none, minimal, low, medium, high, xhigh, max, auto. Empty lists
 # are allowed; names are normalized only in runtime snapshots. Invalid types,
-# ranges or levels reject saves. Changes affect later requests, not in-flight
-# retries; this declaration cannot add reasoning capabilities to an upstream.
+# ranges or levels reject saves; declarations cannot add upstream capabilities.
+# is-compat: optional boolean, default false (null also disables); other types are rejected.
+# Applies to API-key model mappings for Codex, Claude, Gemini, Interactions, Vertex and OpenAI compatibility.
+# Preserves compatibility thinking/signature blocks. Codex agent_message conversion also requires optimize-multi-agent-v2.
+# Thinking and compatibility changes apply to new credential attempts;
+# existing attempts retain their selected model snapshot.
 # API key entries also accept request-scoped-errors with the rule format above.
 # For OpenAI compatibility, put the rules on the provider entry.
 # codex-api-key:
