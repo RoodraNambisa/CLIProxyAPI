@@ -52,21 +52,20 @@ func convertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool, 
 
 	rootResult := gjson.ParseBytes(rawJSON)
 	template, _ = sjson.SetBytes(template, "model", modelName)
+	inputItems := make([][]byte, 0, 16)
 
 	// Process system messages and convert them to input content format.
 	systemsResult := rootResult.Get("system")
 	if systemsResult.Exists() {
-		message := []byte(`{"type":"message","role":"developer","content":[]}`)
-		contentIndex := 0
+		contentItems := make([][]byte, 0, 2)
 
 		appendSystemText := func(text string) {
 			if text == "" || strings.HasPrefix(text, "x-anthropic-billing-header: ") {
 				return
 			}
 
-			message, _ = sjson.SetBytes(message, fmt.Sprintf("content.%d.type", contentIndex), "input_text")
-			message, _ = sjson.SetBytes(message, fmt.Sprintf("content.%d.text", contentIndex), text)
-			contentIndex++
+			part, _ := sjson.SetBytes([]byte(`{"type":"input_text"}`), "text", text)
+			contentItems = append(contentItems, part)
 		}
 
 		if systemsResult.Type == gjson.String {
@@ -81,8 +80,9 @@ func convertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool, 
 			}
 		}
 
-		if contentIndex > 0 {
-			template, _ = sjson.SetRawBytes(template, "input.-1", message)
+		if len(contentItems) > 0 {
+			message := translatorcommon.SetRawArrayItems([]byte(`{"type":"message","role":"developer","content":[]}`), "content", contentItems)
+			inputItems = append(inputItems, message)
 		}
 	}
 
@@ -93,9 +93,7 @@ func convertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool, 
 		var pendingToolUseIDs []string
 		var pendingReminders [][]byte
 		flushReminders := func() {
-			for _, reminder := range pendingReminders {
-				template, _ = sjson.SetRawBytes(template, "input.-1", reminder)
-			}
+			inputItems = append(inputItems, pendingReminders...)
 			pendingReminders = nil
 		}
 
@@ -116,22 +114,14 @@ func convertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool, 
 			previousToolUseIDs := pendingToolUseIDs
 			pendingToolUseIDs = nil
 
-			newMessage := func() []byte {
-				msg := []byte(`{"type":"message","role":"","content":[]}`)
-				msg, _ = sjson.SetBytes(msg, "role", messageRole)
-				return msg
-			}
-
-			message := newMessage()
-			contentIndex := 0
-			hasContent := false
+			contentItems := make([][]byte, 0, 4)
 
 			flushMessage := func() {
-				if hasContent {
-					template, _ = sjson.SetRawBytes(template, "input.-1", message)
-					message = newMessage()
-					contentIndex = 0
-					hasContent = false
+				if len(contentItems) > 0 {
+					message, _ := sjson.SetBytes([]byte(`{"type":"message","role":"","content":[]}`), "role", messageRole)
+					message = translatorcommon.SetRawArrayItems(message, "content", contentItems)
+					inputItems = append(inputItems, message)
+					contentItems = contentItems[:0]
 				}
 			}
 
@@ -140,17 +130,14 @@ func convertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool, 
 				if messageRole == "assistant" {
 					partType = "output_text"
 				}
-				message, _ = sjson.SetBytes(message, fmt.Sprintf("content.%d.type", contentIndex), partType)
-				message, _ = sjson.SetBytes(message, fmt.Sprintf("content.%d.text", contentIndex), text)
-				contentIndex++
-				hasContent = true
+				part, _ := sjson.SetBytes([]byte(`{}`), "type", partType)
+				part, _ = sjson.SetBytes(part, "text", text)
+				contentItems = append(contentItems, part)
 			}
 
 			appendImageContent := func(dataURL string) {
-				message, _ = sjson.SetBytes(message, fmt.Sprintf("content.%d.type", contentIndex), "input_image")
-				message, _ = sjson.SetBytes(message, fmt.Sprintf("content.%d.image_url", contentIndex), dataURL)
-				contentIndex++
-				hasContent = true
+				part, _ := sjson.SetBytes([]byte(`{"type":"input_image"}`), "image_url", dataURL)
+				contentItems = append(contentItems, part)
 			}
 
 			messageContentsResult := messageResult.Get("content")
@@ -187,7 +174,7 @@ func convertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool, 
 						flushMessage()
 						reasoning := []byte(`{"type":"reasoning","summary":[],"content":null}`)
 						reasoning, _ = sjson.SetBytes(reasoning, "encrypted_content", signature)
-						template, _ = sjson.SetRawBytes(template, "input.-1", reasoning)
+						inputItems = append(inputItems, reasoning)
 					case "text":
 						appendTextContent(messageContentResult.Get("text").String())
 					case "image":
@@ -223,9 +210,7 @@ func convertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool, 
 						}
 						file := []byte(`{"type":"input_file","filename":"document.pdf","file_data":""}`)
 						file, _ = sjson.SetBytes(file, "file_data", "data:application/pdf;base64,"+data.Str)
-						message, _ = sjson.SetRawBytes(message, fmt.Sprintf("content.%d", contentIndex), file)
-						contentIndex++
-						hasContent = true
+						contentItems = append(contentItems, file)
 					case "tool_use":
 						flushMessage()
 						if messageRole == "assistant" {
@@ -244,7 +229,7 @@ func convertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool, 
 							functionCallMessage, _ = sjson.SetBytes(functionCallMessage, "name", name)
 						}
 						functionCallMessage, _ = sjson.SetBytes(functionCallMessage, "arguments", messageContentResult.Get("input").Raw)
-						template, _ = sjson.SetRawBytes(template, "input.-1", functionCallMessage)
+						inputItems = append(inputItems, functionCallMessage)
 					case "tool_result":
 						flushMessage()
 						functionCallOutputMessage := []byte(`{"type":"function_call_output"}`)
@@ -252,9 +237,8 @@ func convertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool, 
 
 						contentResult := messageContentResult.Get("content")
 						if contentResult.IsArray() {
-							toolResultContentIndex := 0
-							toolResultContent := []byte(`[]`)
 							contentResults := contentResult.Array()
+							toolResultItems := make([][]byte, 0, len(contentResults))
 							for k := 0; k < len(contentResults); k++ {
 								toolResultContentType := contentResults[k].Get("type").String()
 								if toolResultContentType == "image" {
@@ -274,19 +258,18 @@ func convertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool, 
 											}
 											dataURL := fmt.Sprintf("data:%s;base64,%s", mediaType, data)
 
-											toolResultContent, _ = sjson.SetBytes(toolResultContent, fmt.Sprintf("%d.type", toolResultContentIndex), "input_image")
-											toolResultContent, _ = sjson.SetBytes(toolResultContent, fmt.Sprintf("%d.image_url", toolResultContentIndex), dataURL)
-											toolResultContentIndex++
+											part, _ := sjson.SetBytes([]byte(`{"type":"input_image"}`), "image_url", dataURL)
+											toolResultItems = append(toolResultItems, part)
 										}
 									}
 								} else if toolResultContentType == "text" {
-									toolResultContent, _ = sjson.SetBytes(toolResultContent, fmt.Sprintf("%d.type", toolResultContentIndex), "input_text")
-									toolResultContent, _ = sjson.SetBytes(toolResultContent, fmt.Sprintf("%d.text", toolResultContentIndex), contentResults[k].Get("text").String())
-									toolResultContentIndex++
+									part, _ := sjson.SetBytes([]byte(`{"type":"input_text"}`), "text", contentResults[k].Get("text").String())
+									toolResultItems = append(toolResultItems, part)
 								}
 							}
-							if toolResultContentIndex > 0 {
-								functionCallOutputMessage, _ = sjson.SetRawBytes(functionCallOutputMessage, "output", toolResultContent)
+							if len(toolResultItems) > 0 {
+								functionCallOutputMessage, _ = sjson.SetRawBytes(functionCallOutputMessage, "output", []byte(`[]`))
+								functionCallOutputMessage = translatorcommon.SetRawArrayItems(functionCallOutputMessage, "output", toolResultItems)
 							} else {
 								functionCallOutputMessage, _ = sjson.SetBytes(functionCallOutputMessage, "output", messageContentResult.Get("content").String())
 							}
@@ -294,7 +277,7 @@ func convertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool, 
 							functionCallOutputMessage, _ = sjson.SetBytes(functionCallOutputMessage, "output", messageContentResult.Get("content").String())
 						}
 
-						template, _ = sjson.SetRawBytes(template, "input.-1", functionCallOutputMessage)
+						inputItems = append(inputItems, functionCallOutputMessage)
 					}
 				}
 				flushMessage()
@@ -314,6 +297,7 @@ func convertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool, 
 		template, _ = sjson.SetRawBytes(template, "tools", []byte(`[]`))
 		template, _ = sjson.SetBytes(template, "tool_choice", `auto`)
 		toolResults := toolsResult.Array()
+		toolItems := make([][]byte, 0, len(toolResults))
 		// Build short name map from declared tools
 		var names []string
 		for i := 0; i < len(toolResults); i++ {
@@ -328,7 +312,7 @@ func convertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool, 
 			// Special handling: map Claude web search tool to Codex web_search
 			if toolResult.Get("type").String() == "web_search_20250305" {
 				// Replace the tool content entirely with {"type":"web_search"}
-				template, _ = sjson.SetRawBytes(template, "tools.-1", []byte(`{"type":"web_search"}`))
+				toolItems = append(toolItems, []byte(`{"type":"web_search"}`))
 				continue
 			}
 			tool := []byte(toolResult.Raw)
@@ -349,8 +333,9 @@ func convertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool, 
 			tool, _ = sjson.DeleteBytes(tool, "cache_control")
 			tool, _ = sjson.DeleteBytes(tool, "defer_loading")
 			tool, _ = sjson.SetBytes(tool, "strict", false)
-			template, _ = sjson.SetRawBytes(template, "tools.-1", tool)
+			toolItems = append(toolItems, tool)
 		}
+		template = translatorcommon.SetRawArrayItems(template, "tools", toolItems)
 	}
 
 	// Default to parallel tool calls unless tool_choice explicitly disables them.
@@ -414,7 +399,7 @@ func convertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool, 
 		template, _ = sjson.SetRawBytes(template, "text.format", translated)
 	}
 
-	return template
+	return translatorcommon.SetRawArrayItems(template, "input", inputItems)
 }
 
 // shortenNameIfNeeded applies a simple shortening rule for a single name.
