@@ -177,14 +177,11 @@ func ConvertCodexResponseToOpenAI(_ context.Context, modelName string, originalR
 
 		template, _ = sjson.SetBytes(template, "choices.0.delta.role", "assistant")
 		template, _ = sjson.SetRawBytes(template, "choices.0.delta.images.-1", imagePayload)
-	} else if dataType == "response.completed" {
+	} else if dataType == "response.completed" || dataType == "response.incomplete" {
 		p.terminalEmitted = true
-		finishReason := "stop"
-		if (*param).(*ConvertCliToOpenAIParams).FunctionCallIndex != -1 {
-			finishReason = "tool_calls"
-		}
+		finishReason, nativeFinishReason := codexOpenAIFinishReason(rootResult, p.FunctionCallIndex != -1)
 		template, _ = sjson.SetBytes(template, "choices.0.finish_reason", finishReason)
-		template, _ = sjson.SetBytes(template, "choices.0.native_finish_reason", finishReason)
+		template, _ = sjson.SetBytes(template, "choices.0.native_finish_reason", nativeFinishReason)
 	} else if dataType == "response.output_item.done" {
 		itemResult := rootResult.Get("item")
 		if !itemResult.Exists() {
@@ -250,8 +247,9 @@ func ConvertCodexResponseToOpenAI(_ context.Context, modelName string, originalR
 //   - []byte: An OpenAI-compatible JSON response containing all message content and metadata
 func ConvertCodexResponseToOpenAINonStream(_ context.Context, _ string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, _ *any) []byte {
 	rootResult := gjson.ParseBytes(rawJSON)
-	// Verify this is a response.completed event
-	if rootResult.Get("type").String() != "response.completed" {
+	// Only terminal response payloads can form a non-stream result.
+	responseType := rootResult.Get("type").String()
+	if responseType != "response.completed" && responseType != "response.incomplete" {
 		return []byte{}
 	}
 
@@ -386,17 +384,12 @@ func ConvertCodexResponseToOpenAINonStream(_ context.Context, _ string, original
 		}
 	}
 
-	// Extract and set the finish reason based on status
-	if statusResult := responseResult.Get("status"); statusResult.Exists() {
-		status := statusResult.String()
-		if status == "completed" {
-			finishReason := "stop"
-			if len(toolCalls) > 0 {
-				finishReason = "tool_calls"
-			}
-			template, _ = sjson.SetBytes(template, "choices.0.finish_reason", finishReason)
-			template, _ = sjson.SetBytes(template, "choices.0.native_finish_reason", finishReason)
-		}
+	// A partial response keeps its native stop reason even when it contains tools.
+	status := responseResult.Get("status").String()
+	if status == "completed" || status == "incomplete" || responseType == "response.incomplete" {
+		finishReason, nativeFinishReason := codexOpenAIFinishReason(rootResult, len(toolCalls) > 0)
+		template, _ = sjson.SetBytes(template, "choices.0.finish_reason", finishReason)
+		template, _ = sjson.SetBytes(template, "choices.0.native_finish_reason", nativeFinishReason)
 	}
 
 	return template
