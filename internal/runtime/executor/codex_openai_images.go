@@ -268,6 +268,24 @@ func (e *CodexExecutor) executeOpenAIImageStream(ctx context.Context, auth *clip
 		var streamUsage helps.StreamUsageBuffer
 		markerRequested := metadataBool(opts.Metadata, cliproxyexecutor.StreamTerminalMarkerMetadataKey)
 		terminalSeen := false
+		classifyFrame := func(events []helps.OpenAIStreamEvent) error {
+			for _, event := range events {
+				payload := event.Data
+				if event.Err != nil {
+					var source interface{ ResponseBody() []byte }
+					if errors.As(event.Err, &source) {
+						payload = source.ResponseBody()
+					}
+				}
+				if terminalErr, ok := codexTerminalStreamError(payload); ok {
+					return terminalErr
+				}
+				if event.Err != nil {
+					return event.Err
+				}
+			}
+			return nil
+		}
 		for {
 			bytesRead, readErr := httpResp.Body.Read(readBuffer)
 			frames, frameErr := frameBuffer.Feed(readBuffer[:bytesRead], errors.Is(readErr, io.EOF))
@@ -280,30 +298,13 @@ func (e *CodexExecutor) executeOpenAIImageStream(ctx context.Context, auth *clip
 			for _, frame := range frames {
 				upstreamFrame := applyCodexIdentityConfuseResponsePayload(frame, identityState)
 				clientFrame := applyCodexIdentityExposeResponsePayload(upstreamFrame, identityState)
-				var frameErr error
-				for _, line := range helps.SplitSSEFrameLines(clientFrame) {
-					payload := helps.JSONPayload(line)
-					if len(payload) == 0 {
-						continue
-					}
-					if terminalErr, ok := codexTerminalStreamError(payload); ok {
-						frameErr = terminalErr
-						break
-					}
-					if helps.IsJSONStreamProtocolError(payload) {
-						frameErr = helps.JSONStreamProtocolError("codex image", payload)
-						break
-					}
-				}
+				events := helps.ParseOpenAIStreamFrame(clientFrame)
+				frameErr := classifyFrame(events)
 				if frameErr != nil {
 					upstreamFrame = codexauth.SanitizeAgentIdentityErrorBody(authMetadata(auth), upstreamFrame)
 					sanitizedClientFrame := applyCodexIdentityExposeResponsePayload(upstreamFrame, identityState)
-					for _, line := range helps.SplitSSEFrameLines(sanitizedClientFrame) {
-						payload := helps.JSONPayload(line)
-						if terminalErr, ok := codexTerminalStreamError(payload); ok {
-							frameErr = terminalErr
-							break
-						}
+					if sanitizedErr := classifyFrame(helps.ParseOpenAIStreamFrame(sanitizedClientFrame)); sanitizedErr != nil {
+						frameErr = sanitizedErr
 					}
 					helps.AppendAPIResponseChunk(ctx, e.cfg, upstreamFrame)
 					helps.RecordAPIResponseError(ctx, e.cfg, frameErr)
@@ -313,9 +314,9 @@ func (e *CodexExecutor) executeOpenAIImageStream(ctx context.Context, auth *clip
 				}
 				helps.AppendAPIResponseChunk(ctx, e.cfg, upstreamFrame)
 				terminal := false
-				for _, line := range helps.SplitSSEFrameLines(clientFrame) {
-					streamUsage.ObserveOpenAIStream(line)
-					terminal = terminal || helps.IsOpenAIStreamTerminal(line) || codexSSEDataCompletion(line)
+				for _, event := range events {
+					streamUsage.ObserveOpenAIStream(event.Data)
+					terminal = terminal || helps.IsOpenAIStreamTerminal(event.Data) || isCodexSuccessfulCompletion(event.Data) || helps.IsCodexPartialResponse(event.Data)
 				}
 				terminalSeen = terminalSeen || terminal
 				if !emitCodexOpenAIImageStreamChunk(ctx, out, cliproxyexecutor.StreamChunk{Payload: clientFrame}) {
