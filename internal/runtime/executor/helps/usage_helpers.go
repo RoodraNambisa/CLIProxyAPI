@@ -27,6 +27,7 @@ type UsageReporter struct {
 	source               string
 	requestServiceTier   string
 	stream               bool
+	generate             bool
 	requestedAt          time.Time
 	timing               usageResponseTiming
 	mu                   sync.Mutex
@@ -75,6 +76,7 @@ func NewUsageReporter(ctx context.Context, provider, model string, auth *cliprox
 		source:              resolveUsageSource(auth, apiKey),
 		requestServiceTier:  usage.ServiceTierFromContext(ctx),
 		stream:              usage.StreamFromContext(ctx),
+		generate:            usage.GenerateFromContext(ctx),
 		requestUsageOutcome: cliproxyexecutor.RequestUsageOutcomeFromContext(ctx),
 		requestUsageAttempt: cliproxyexecutor.RequestUsageAttemptFromContext(ctx),
 	}
@@ -339,14 +341,14 @@ func (r *UsageReporter) EnsurePublished(ctx context.Context) {
 
 func (r *UsageReporter) buildRecord(detail usage.Detail, failed bool) usage.Record {
 	if r == nil {
-		return usage.Record{Detail: detail, Failed: failed}
+		return usage.Record{Detail: detail, Failed: failed, Generate: usage.GenerateFlag(true)}
 	}
 	return r.buildRecordForModel(r.model, detail, failed)
 }
 
 func (r *UsageReporter) buildRecordForModel(model string, detail usage.Detail, failed bool) usage.Record {
 	if r == nil {
-		return usage.Record{Model: model, Detail: detail, Failed: failed}
+		return usage.Record{Model: model, Detail: detail, Failed: failed, Generate: usage.GenerateFlag(true)}
 	}
 	ttft, firstPacket := r.responseTimings()
 	record := usage.Record{
@@ -358,6 +360,7 @@ func (r *UsageReporter) buildRecordForModel(model string, detail usage.Detail, f
 		AuthIndex:           r.authIndex,
 		RequestServiceTier:  r.requestServiceTier,
 		Stream:              r.stream,
+		Generate:            usage.GenerateFlag(r.generate),
 		ResponseServiceTier: strings.TrimSpace(detail.ResponseServiceTier),
 		RequestedAt:         r.requestedAt,
 		Latency:             r.latency(),

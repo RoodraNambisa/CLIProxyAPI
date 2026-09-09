@@ -31,6 +31,8 @@ type Record struct {
 	Failed             bool
 	// Stream describes the logical client response mode, independently of the upstream transport.
 	Stream bool
+	// Generate is false for explicit prewarm requests; nil retains the legacy true default.
+	Generate *bool
 	// Auxiliary marks a secondary model token/cost allocation for the same
 	// downstream request. Auxiliary records do not represent another request.
 	Auxiliary               bool
@@ -173,6 +175,8 @@ func (m *Manager) Publish(ctx context.Context, record Record) {
 	if m == nil {
 		return
 	}
+	// Own the optional field before handing the record to the asynchronous queue.
+	record.Generate = GenerateFlag(GenerateEnabled(record.Generate))
 	// ensure worker is running even if Start was not called explicitly
 	m.Start(context.Background())
 	m.mu.Lock()
