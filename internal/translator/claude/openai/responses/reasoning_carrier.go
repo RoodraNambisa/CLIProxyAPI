@@ -3,12 +3,62 @@ package responses
 import (
 	"strings"
 
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/signature"
 	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
 
 // ClaudeResponsesRedactedThinkingPrefix carries an opaque Claude redacted block
 // through Responses without treating its data as readable reasoning text.
 const ClaudeResponsesRedactedThinkingPrefix = "claude-redacted-thinking:"
+
+func claudeResponsesReplayReasoning(item gjson.Result, isCompat bool) []byte {
+	if role := item.Get("role"); role.Exists() && role.String() != "assistant" {
+		return nil
+	}
+	encrypted := item.Get("encrypted_content")
+	if encrypted.Exists() && encrypted.Type != gjson.String {
+		return nil
+	}
+	opaque := encrypted.String()
+	if data, redacted := strings.CutPrefix(opaque, ClaudeResponsesRedactedThinkingPrefix); redacted {
+		if data == "" {
+			return nil
+		}
+		part, _ := sjson.SetBytes([]byte(`{"type":"redacted_thinking","data":""}`), "data", data)
+		return part
+	}
+	native, ok := signature.CompatibleSignatureForProvider(signature.SignatureProviderClaude, opaque)
+	if !ok {
+		if !isCompat {
+			return nil
+		}
+		native = opaque
+	}
+	text := claudeResponsesReasoningPartsText(item.Get("summary"))
+	if text == "" {
+		text = claudeResponsesReasoningPartsText(item.Get("content"))
+	}
+	part, _ := sjson.SetBytes([]byte(`{"type":"thinking","thinking":"","signature":""}`), "thinking", text)
+	part, _ = sjson.SetBytes(part, "signature", native)
+	return part
+}
+
+func claudeResponsesReasoningPartsText(parts gjson.Result) string {
+	if !parts.IsArray() {
+		return ""
+	}
+	var text strings.Builder
+	parts.ForEach(func(_, part gjson.Result) bool {
+		if value := part.Get("text"); value.Type == gjson.String {
+			text.WriteString(value.String())
+		} else if part.Type == gjson.String {
+			text.WriteString(part.String())
+		}
+		return true
+	})
+	return text.String()
+}
 
 func claudeResponsesRequiresBlockIndex(root gjson.Result, hasTools, reasoningAtZero bool) bool {
 	event := root.Get("type").String()

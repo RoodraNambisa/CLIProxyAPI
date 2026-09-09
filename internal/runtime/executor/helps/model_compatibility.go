@@ -3,6 +3,7 @@ package helps
 import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
 	chatclaude "github.com/router-for-me/CLIProxyAPI/v6/internal/translator/claude/openai/chat-completions"
+	responsesclaude "github.com/router-for-me/CLIProxyAPI/v6/internal/translator/claude/openai/responses"
 	codexclaude "github.com/router-for-me/CLIProxyAPI/v6/internal/translator/codex/claude"
 	geminiclaude "github.com/router-for-me/CLIProxyAPI/v6/internal/translator/gemini/claude"
 	interactionsclaude "github.com/router-for-me/CLIProxyAPI/v6/internal/translator/interactions/claude"
@@ -25,6 +26,8 @@ func TranslateRequestWithAPIKeyModelCompatibility(from, to sdktranslator.Format,
 		translated = interactionsclaude.ConvertClaudeRequestToInteractionsWithCompat(model, payload, stream)
 	case from == sdktranslator.FormatOpenAI && to == sdktranslator.FormatClaude:
 		translated = chatclaude.ConvertOpenAIRequestToClaudeWithCompat(model, payload, stream)
+	case from == sdktranslator.FormatOpenAIResponse && to == sdktranslator.FormatClaude:
+		translated = responsesclaude.ConvertOpenAIResponsesRequestToClaudeWithCompat(model, payload, stream)
 	default:
 		return sdktranslator.TranslateRequest(from, to, model, payload, stream)
 	}

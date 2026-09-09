@@ -131,3 +131,58 @@ func TestClaudeModelCompatibilityPreservesChatThinkingAcrossOperations(t *testin
 		}
 	}
 }
+
+func TestClaudeModelCompatibilityReplaysResponsesAcrossOperations(t *testing.T) {
+	const native = "CAISFwoVCBAqAQEyDmNsYXVkZS1maXh0dXJlGAE="
+	for _, operation := range []string{"execute", "stream", "count"} {
+		for _, compat := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/compat=%t", operation, compat), func(t *testing.T) {
+				captured := make(chan bool, 2)
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					body, err := io.ReadAll(r.Body)
+					if err != nil {
+						t.Error(err)
+						return
+					}
+					parts := gjson.GetBytes(body, "messages.1.content").Array()
+					wantLength := 4
+					if compat {
+						wantLength++
+					}
+					valid := gjson.GetBytes(body, "messages.#").Int() == 3 && len(parts) == wantLength
+					if valid {
+						valid = parts[0].Get("signature").String() == native && parts[0].Get("thinking").String() == "native" &&
+							parts[1].Get("text").String() == "answer" && parts[len(parts)-2].Get("data").String() == " opaque data " &&
+							parts[len(parts)-1].Get("id").String() == "paired" && parts[len(parts)-1].Get("name").String() == "lookup" &&
+							gjson.GetBytes(body, "messages.2.content.0.tool_use_id").String() == "paired"
+						if compat {
+							valid = valid && parts[2].Get("thinking").String() == "unsigned" && parts[2].Get("signature").Raw == `""`
+						}
+					}
+					captured <- valid
+					responseKind := "stream"
+					if operation == "count" {
+						responseKind = "count"
+					}
+					writeClaudeCompatibilityFixture(w, responseKind)
+				}))
+				t.Cleanup(server.Close)
+				manager := claudeCompatibilityManager(t, server.URL, compat)
+				raw := []byte(fmt.Sprintf(`{"input":[{"role":"user","content":"question"},{"type":"reasoning","encrypted_content":%q,"summary":[{"text":"native"}]},{"role":"assistant","content":"answer"},{"type":"reasoning","summary":[{"text":"unsigned"}]},{"type":"reasoning","encrypted_content":"claude-redacted-thinking: opaque data "},{"type":"function_call","name":"lookup","call_id":"paired","arguments":"{}"},{"type":"function_call_output","call_id":"paired","output":"done"}]}`, native))
+				before := bytes.Clone(raw)
+				runClaudeCompatibilityRequest(t, manager, operation, raw, translator.FormatOpenAIResponse)
+				select {
+				case valid := <-captured:
+					if !valid {
+						t.Fatal("Responses replay lost a signature or ignored the selected model policy")
+					}
+				default:
+					t.Fatal("Responses request did not reach the local upstream")
+				}
+				if !bytes.Equal(raw, before) {
+					t.Fatal("Responses replay mutated the original request")
+				}
+			})
+		}
+	}
+}
