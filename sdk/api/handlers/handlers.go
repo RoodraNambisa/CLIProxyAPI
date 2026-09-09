@@ -1084,6 +1084,7 @@ func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType
 		return nil, nil, errMsg
 	}
 	reqMeta := requestExecutionMetadata(ctx)
+	setGenerateMetadata(reqMeta, rawJSON)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = normalizedModel
 	ctx, _ = h.attachRequestBodyRelease(ctx, rawJSON, reqMeta, providersContainChatGPTWeb(providers))
 	payload := rawJSON
@@ -1137,6 +1138,7 @@ func (h *BaseAPIHandler) ExecuteWithProvidersAndExecutionModel(ctx context.Conte
 		return nil, nil, errRestricted
 	}
 	reqMeta := requestExecutionMetadata(ctx)
+	setGenerateMetadata(reqMeta, rawJSON)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = normalizedRouteModel
 	if normalizedExecutionModel := strings.TrimSpace(executionModelName); normalizedExecutionModel != "" && normalizedExecutionModel != normalizedRouteModel {
 		reqMeta[coreexecutor.ExecutionModelOverrideMetadataKey] = normalizedExecutionModel
@@ -1214,6 +1216,7 @@ func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handle
 		return nil, nil, errMsg
 	}
 	reqMeta := requestExecutionMetadata(ctx)
+	setGenerateMetadata(reqMeta, rawJSON)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = normalizedModel
 	ctx, _ = h.attachRequestBodyRelease(ctx, rawJSON, reqMeta, providersContainChatGPTWeb(providers))
 	payload := rawJSON
@@ -1278,6 +1281,7 @@ func (h *BaseAPIHandler) executeStreamWithResolvedProviders(ctx context.Context,
 		ctx = h.AuthManager.WithRequestRetryBudgetForProviders(ctx, providers, StreamingBootstrapRetries(h.Cfg))
 	}
 	reqMeta := requestExecutionMetadata(ctx)
+	setGenerateMetadata(reqMeta, rawJSON)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = normalizedRouteModel
 	if normalizedExecutionModel := strings.TrimSpace(executionModelName); normalizedExecutionModel != "" && normalizedExecutionModel != normalizedRouteModel {
 		reqMeta[coreexecutor.ExecutionModelOverrideMetadataKey] = normalizedExecutionModel
