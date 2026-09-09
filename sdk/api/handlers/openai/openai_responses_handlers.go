@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -28,6 +29,8 @@ import (
 )
 
 const responsesSSEMaxPendingBytes = 50 << 20
+
+var errInvalidResponsesSSEData = errors.New("invalid upstream Responses SSE data JSON")
 
 type responsesSSEFrameLimitError struct {
 	limit int
@@ -179,6 +182,9 @@ func (f *responsesSSEFramer) Err() error {
 }
 
 func (f *responsesSSEFramer) Flush(w io.Writer) {
+	if f.err != nil {
+		return
+	}
 	if f.passthrough && f.rewriteTerminalError == nil {
 		if len(f.pending) > 0 {
 			_, _ = w.Write(f.pending)
@@ -194,7 +200,13 @@ func (f *responsesSSEFramer) Flush(w io.Writer) {
 		return
 	}
 	if !responsesSSECanEmitAtEOF(f.pending) {
-		f.pending = f.pending[:0]
+		pending := f.pending
+		f.pending = nil
+		if f.passthrough {
+			_, _ = w.Write(pending)
+		} else if payload, found := responsesSSEDataPayload(pending); found && len(bytes.TrimSpace(payload)) > 0 {
+			f.err = errInvalidResponsesSSEData
+		}
 		return
 	}
 	f.writeFrame(w, f.pending)
@@ -251,6 +263,13 @@ func (f *responsesSSEFramer) imagePassthroughEnabled() bool {
 }
 
 func (f *responsesSSEFramer) writeFrame(w io.Writer, frame []byte) {
+	if !f.passthrough {
+		payload, found := responsesSSEDataPayload(frame)
+		if found && len(bytes.TrimSpace(payload)) > 0 && !bytes.Equal(bytes.TrimSpace(payload), []byte("[DONE]")) && !json.Valid(payload) {
+			f.err = errInvalidResponsesSSEData
+			return
+		}
+	}
 	output := frame
 	if !f.imagePassthroughEnabled() && !f.passthrough {
 		output = f.repairFrame(frame)

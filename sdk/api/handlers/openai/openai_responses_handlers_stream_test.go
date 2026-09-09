@@ -1028,7 +1028,7 @@ func TestResponsesSSENeedsLineBreakSkipsChunksThatAlreadyStartWithNewline(t *tes
 	}
 }
 
-func TestForwardResponsesStreamDropsIncompleteTrailingDataChunkOnFlush(t *testing.T) {
+func TestForwardResponsesStreamReportsIncompleteTrailingDataChunkOnFlush(t *testing.T) {
 	h, recorder, c, flusher := newResponsesStreamTestHandler(t)
 
 	data := make(chan []byte, 1)
@@ -1037,9 +1037,10 @@ func TestForwardResponsesStreamDropsIncompleteTrailingDataChunkOnFlush(t *testin
 	close(data)
 	close(errs)
 
-	h.forwardResponsesStream(c, flusher, func(error) {}, data, errs, nil)
+	var canceled error
+	h.forwardResponsesStream(c, flusher, func(err error) { canceled = err }, data, errs, nil)
 
-	if got := recorder.Body.String(); got != "\n" {
-		t.Fatalf("expected incomplete trailing data to be dropped on flush.\nGot: %q", got)
+	if got := recorder.Body.String(); canceled == nil || !strings.Contains(got, "invalid upstream Responses SSE data JSON") || strings.Contains(got, `{"type":"response.created"`) {
+		t.Fatalf("expected malformed trailing data to fail without being delivered; canceled=%v", canceled)
 	}
 }
