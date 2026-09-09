@@ -504,9 +504,9 @@ func (e statusErr) Headers() http.Header {
 	if delay < 0 {
 		delay = 0
 	}
-	seconds := int64(0)
-	if delay > 0 {
-		seconds = int64((delay + time.Second - 1) / time.Second)
+	seconds := int64(delay / time.Second)
+	if delay%time.Second != 0 {
+		seconds++
 	}
 	return http.Header{"Retry-After": []string{fmt.Sprintf("%d", seconds)}}
 }

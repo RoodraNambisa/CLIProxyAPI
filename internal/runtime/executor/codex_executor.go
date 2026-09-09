@@ -99,12 +99,19 @@ func patchCodexCompletedOutput(eventData []byte, outputItemsByIndex map[int64][]
 }
 
 func codexTerminalStreamError(eventData []byte) (result statusErr, terminal bool) {
+	eventType := gjson.GetBytes(eventData, "type").String()
 	defer func() {
 		if terminal {
 			result.responseBody = string(eventData)
+			if result.code == http.StatusTooManyRequests {
+				body := eventData
+				if eventType != "error" {
+					body = helps.CodexBootstrapErrorBody(eventData)
+				}
+				result.retryAfter = parseCodexRetryAfter(result.code, body, time.Now())
+			}
 		}
 	}()
-	eventType := gjson.GetBytes(eventData, "type").String()
 	switch eventType {
 	case "response.failed":
 		return codexResponseFailedError(eventData), true
@@ -193,6 +200,9 @@ func codexResponseFailedError(eventData []byte) statusErr {
 	code := strings.TrimSpace(node.Get("code").String())
 	errType := strings.TrimSpace(node.Get("type").String())
 	status := codexStreamErrorStatus(code, codexStreamErrorStatus(errType, http.StatusInternalServerError))
+	if strings.EqualFold(code, "server_error") || strings.EqualFold(code, "internal_server_error") {
+		status = codexStreamErrorStatus(errType, status)
+	}
 	if explicitStatus := helps.CodexTerminalHTTPStatus(eventData); explicitStatus != 0 {
 		status = explicitStatus
 	}
@@ -209,7 +219,11 @@ func codexResponseFailedError(eventData []byte) statusErr {
 	if errType == "" {
 		errType = codexStreamErrorType(code)
 	}
-	return codexStreamStatusErr(status, message, code, errType, nil)
+	var param *gjson.Result
+	if value := node.Get("param"); value.Exists() {
+		param = &value
+	}
+	return codexStreamStatusErr(status, message, code, errType, param)
 }
 
 func codexResponseIncompleteError(eventData []byte) statusErr {
@@ -259,6 +273,9 @@ func codexStreamErrorEventError(eventData []byte) statusErr {
 	}
 	errType := strings.TrimSpace(gjson.GetBytes(eventData, "error.type").String())
 	status := codexStreamErrorStatus(code, codexStreamErrorStatus(errType, http.StatusInternalServerError))
+	if strings.EqualFold(code, "server_error") || strings.EqualFold(code, "internal_server_error") {
+		status = codexStreamErrorStatus(errType, status)
+	}
 	if explicitStatus := helps.CodexTerminalHTTPStatus(eventData); explicitStatus != 0 {
 		status = explicitStatus
 	}
@@ -277,7 +294,7 @@ func codexStreamErrorStatus(code string, fallback int) int {
 		return http.StatusUnauthorized
 	case "permission_error", "permission_denied", "forbidden":
 		return http.StatusForbidden
-	case "rate_limit_exceeded", "rate_limit_error", "quota_exceeded", "insufficient_quota":
+	case "rate_limit_exceeded", "rate_limit_error", "quota_exceeded", "insufficient_quota", "usage_limit_reached":
 		return http.StatusTooManyRequests
 	case "not_found", "model_not_found":
 		return http.StatusNotFound
@@ -298,7 +315,7 @@ func codexStreamErrorType(code string) string {
 		return "authentication_error"
 	case "permission_error", "permission_denied", "forbidden":
 		return "permission_error"
-	case "rate_limit_exceeded", "quota_exceeded", "insufficient_quota":
+	case "rate_limit_exceeded", "quota_exceeded", "insufficient_quota", "usage_limit_reached":
 		return "rate_limit_error"
 	case "server_error", "internal_server_error", "overloaded", "service_unavailable":
 		return "server_error"
@@ -3000,7 +3017,7 @@ func isCodexModelCapacityError(errorBody []byte) bool {
 }
 
 func parseCodexRetryAfter(statusCode int, errorBody []byte, now time.Time) *time.Duration {
-	if statusCode != http.StatusTooManyRequests || len(errorBody) == 0 {
+	if statusCode != http.StatusTooManyRequests || !gjson.ValidBytes(errorBody) {
 		return nil
 	}
 	if strings.TrimSpace(gjson.GetBytes(errorBody, "error.type").String()) != "usage_limit_reached" {
@@ -3014,6 +3031,10 @@ func parseCodexRetryAfter(statusCode int, errorBody []byte, now time.Time) *time
 		}
 	}
 	if resetsInSeconds := gjson.GetBytes(errorBody, "error.resets_in_seconds").Int(); resetsInSeconds > 0 {
+		const maxDuration = time.Duration(1<<63 - 1)
+		if resetsInSeconds > int64(maxDuration/time.Second) {
+			return nil
+		}
 		retryAfter := time.Duration(resetsInSeconds) * time.Second
 		return &retryAfter
 	}
