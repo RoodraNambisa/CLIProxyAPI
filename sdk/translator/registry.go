@@ -4,6 +4,7 @@ import (
 	"context"
 	"sync"
 
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -65,7 +66,9 @@ func (r *Registry) TranslateRequestChecked(from, to Format, model string, rawJSO
 
 	if byTarget, ok := r.requests[from]; ok {
 		if fn, isOk := byTarget[to]; isOk && fn != nil {
-			return fn(model, rawJSON, stream), nil
+			summary := thinking.ExtractSummaryConfig(rawJSON, from.String())
+			body := fn(model, rawJSON, stream)
+			return thinking.ApplySummaryConfigForModel(body, to.String(), model, summary), nil
 		}
 	}
 	if model != "" && gjson.GetBytes(rawJSON, "model").String() != model {
@@ -76,6 +79,16 @@ func (r *Registry) TranslateRequestChecked(from, to Format, model string, rawJSO
 		}
 	}
 	return rawJSON, nil
+}
+
+// HasRequestTransformer reports whether a supported request conversion exists.
+func (r *Registry) HasRequestTransformer(from, to Format) bool {
+	if usesRetiredGeminiCLIFormat(from, to) {
+		return false
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.requests[from][to] != nil
 }
 
 // HasResponseTransformer indicates whether a response translator exists.
@@ -162,6 +175,11 @@ func TranslateRequest(from, to Format, model string, rawJSON []byte, stream bool
 // TranslateRequestChecked is the error-returning counterpart to TranslateRequest.
 func TranslateRequestChecked(from, to Format, model string, rawJSON []byte, stream bool) ([]byte, error) {
 	return defaultRegistry.TranslateRequestChecked(from, to, model, rawJSON, stream)
+}
+
+// HasRequestTransformer inspects the default registry.
+func HasRequestTransformer(from, to Format) bool {
+	return defaultRegistry.HasRequestTransformer(from, to)
 }
 
 // HasResponseTransformer inspects the default registry.
