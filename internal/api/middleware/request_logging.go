@@ -134,9 +134,9 @@ func captureRequestInfo(c *gin.Context, captureBody bool, releaseCfg config.Requ
 	method := c.Request.Method
 
 	// Capture headers
-	headers := make(map[string][]string)
-	for key, values := range c.Request.Header {
-		headers[key] = values
+	headers := c.Request.Header.Clone()
+	if headers == nil {
+		headers = make(http.Header)
 	}
 
 	// Capture request body
