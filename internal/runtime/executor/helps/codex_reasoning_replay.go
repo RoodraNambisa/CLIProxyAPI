@@ -44,6 +44,7 @@ func (s CodexReasoningReplayScope) valid() bool {
 
 type codexReasoningReplayEntry struct {
 	items     [][]byte
+	turns     []codexReasoningReplayTurn
 	timestamp time.Time
 	size      int64
 }
@@ -689,6 +690,12 @@ func setCodexReasoningReplayItems(scope CodexReasoningReplayScope, items [][]byt
 	cloned := cloneCodexReplayItems(items)
 	now := time.Now()
 	codexReasoningReplayStore.Lock()
+	publishCodexReasoningReplayEntryLocked(key, codexReasoningReplayEntry{items: cloned, size: size}, now)
+	codexReasoningReplayStore.Unlock()
+	return true
+}
+
+func publishCodexReasoningReplayEntryLocked(key string, entry codexReasoningReplayEntry, now time.Time) {
 	if codexReasoningReplayStore.lastPurge.IsZero() || now.Sub(codexReasoningReplayStore.lastPurge) >= codexReasoningReplayPurgeInterval {
 		purgeExpiredCodexReasoningReplayLocked(now)
 		codexReasoningReplayStore.lastPurge = now
@@ -696,15 +703,14 @@ func setCodexReasoningReplayItems(scope CodexReasoningReplayScope, items [][]byt
 	if previous, ok := codexReasoningReplayStore.entries[key]; ok {
 		codexReasoningReplayStore.totalBytes -= previous.size
 	}
-	codexReasoningReplayStore.entries[key] = codexReasoningReplayEntry{items: cloned, timestamp: now, size: size}
-	codexReasoningReplayStore.totalBytes += size
+	entry.timestamp = now
+	codexReasoningReplayStore.entries[key] = entry
+	codexReasoningReplayStore.totalBytes += entry.size
 	overEntries := len(codexReasoningReplayStore.entries) - CodexReasoningReplayCacheMaxEntries
 	overBytes := codexReasoningReplayStore.totalBytes - CodexReasoningReplayCacheMaxTotalBytes
 	if overEntries > 0 || overBytes > 0 {
 		evictOldestCodexReasoningReplayLocked(overEntries, overBytes)
 	}
-	codexReasoningReplayStore.Unlock()
-	return true
 }
 
 func getCodexReasoningReplayItems(scope CodexReasoningReplayScope) ([][]byte, bool) {
