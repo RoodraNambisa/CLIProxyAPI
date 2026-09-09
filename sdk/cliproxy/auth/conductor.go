@@ -4497,6 +4497,7 @@ func authFilePathQuarantined(auth *Auth, authDir string) bool {
 // It supports multiple providers for the same model and round-robins the starting provider per model.
 func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (response cliproxyexecutor.Response, err error) {
 	ctx = coreusage.WithStreamDefault(ctx, false)
+	ctx = contextWithGenerateMetadata(ctx, opts)
 	ctx = m.WithRoutingPolicySnapshot(ctx)
 	ctx, upstreamErrors := withUpstreamErrorHistory(ctx)
 	var releaseProducer func()
@@ -4591,6 +4592,7 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 // It supports multiple providers for the same model and round-robins the starting provider per model.
 func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (response cliproxyexecutor.Response, err error) {
 	ctx = coreusage.WithStreamDefault(ctx, false)
+	ctx = contextWithGenerateMetadata(ctx, opts)
 	ctx = m.WithRoutingPolicySnapshot(ctx)
 	ctx, upstreamErrors := withUpstreamErrorHistory(ctx)
 	var releaseProducer func()
@@ -4678,6 +4680,7 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 // It supports multiple providers for the same model and round-robins the starting provider per model.
 func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (result *cliproxyexecutor.StreamResult, err error) {
 	ctx = coreusage.WithStreamDefault(ctx, true)
+	ctx = contextWithGenerateMetadata(ctx, opts)
 	ctx = m.WithRoutingPolicySnapshot(ctx)
 	ctx, upstreamErrors := withUpstreamErrorHistory(ctx)
 	var producer *resultPersistenceProducer

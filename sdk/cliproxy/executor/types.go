@@ -131,6 +131,9 @@ func ProviderPreparedRequest(opts Options, provider string) (any, bool) {
 // RequestedModelMetadataKey stores the client-requested model name in Options.Metadata.
 const RequestedModelMetadataKey = "requested_model"
 
+// GenerateMetadataKey records explicit client generation intent for usage sinks.
+const GenerateMetadataKey = "generate"
+
 // RequestPathMetadataKey stores the inbound HTTP request path in Options.Metadata.
 const RequestPathMetadataKey = "request_path"
 
