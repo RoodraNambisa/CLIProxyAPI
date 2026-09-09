@@ -97,10 +97,8 @@ func copyInteractionsReasoningToAntigravity(out []byte, root gjson.Result) []byt
 	if effort != "" {
 		if effort == "auto" {
 			out, _ = sjson.SetBytes(out, "request.generationConfig.thinkingConfig.thinkingBudget", -1)
-			out, _ = sjson.SetBytes(out, "request.generationConfig.thinkingConfig.includeThoughts", true)
 		} else {
 			out, _ = sjson.SetBytes(out, "request.generationConfig.thinkingConfig.thinkingLevel", effort)
-			out, _ = sjson.SetBytes(out, "request.generationConfig.thinkingConfig.includeThoughts", effort != "none")
 		}
 	}
 	if summary := reasoning.Get("summary"); summary.Exists() {
@@ -631,20 +629,17 @@ func antigravityInputAudioMimeType(format string) string {
 }
 
 func antigravityThinkingSummariesIncludeThoughts(summary gjson.Result) (bool, bool) {
-	switch summary.Type {
-	case gjson.True:
-		return true, true
-	case gjson.False:
-		return false, true
-	case gjson.String:
-		switch strings.ToLower(strings.TrimSpace(summary.String())) {
-		case "", "none", "off", "false", "disabled":
-			return false, true
-		default:
-			return true, true
-		}
+	if summary.Type != gjson.String {
+		return false, false
 	}
-	return false, false
+	switch strings.ToLower(strings.TrimSpace(summary.String())) {
+	case "auto":
+		return true, true
+	case "none":
+		return false, true
+	default:
+		return false, false
+	}
 }
 
 func convertSnakeCaseKeysToCamelCaseForAntigravity(raw []byte) []byte {
