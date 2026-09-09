@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"unsafe"
 
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -64,10 +65,16 @@ func (snapshot CodexResponsesLiteSnapshot) ApplyBody(body []byte, websocket bool
 
 // HasCodexToolDeclarations includes the in-history declaration channel used by Lite.
 func HasCodexToolDeclarations(body []byte) bool {
-	if tools := gjson.GetBytes(body, "tools"); tools.IsArray() && len(tools.Array()) > 0 {
+	if len(body) == 0 {
+		return false
+	}
+	// The read-only view and all parsed results stay within this call. Only the
+	// boolean escapes, so releasing the caller's body cannot retain an alias.
+	bodyJSON := unsafe.String(unsafe.SliceData(body), len(body))
+	if tools := gjson.Get(bodyJSON, "tools"); tools.IsArray() && len(tools.Array()) > 0 {
 		return true
 	}
-	for _, item := range gjson.GetBytes(body, "input").Array() {
+	for _, item := range gjson.Get(bodyJSON, "input").Array() {
 		if item.Get("type").String() == "additional_tools" && item.Get("tools").IsArray() && len(item.Get("tools").Array()) > 0 {
 			return true
 		}
