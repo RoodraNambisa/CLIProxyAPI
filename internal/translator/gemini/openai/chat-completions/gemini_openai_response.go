@@ -105,7 +105,7 @@ func ConvertGeminiResponseToOpenAI(_ context.Context, _ string, originalRequestR
 		if totalTokenCountResult := usageResult.Get("totalTokenCount"); totalTokenCountResult.Exists() {
 			baseTemplate, _ = sjson.SetBytes(baseTemplate, "usage.total_tokens", totalTokenCountResult.Int())
 		}
-		promptTokenCount := usageResult.Get("promptTokenCount").Int()
+		promptTokenCount := translatorcommon.GeminiInputTokens(usageResult)
 		thoughtsTokenCount := usageResult.Get("thoughtsTokenCount").Int()
 		baseTemplate, _ = sjson.SetBytes(baseTemplate, "usage.prompt_tokens", promptTokenCount)
 		if thoughtsTokenCount > 0 {
@@ -298,7 +298,7 @@ func ConvertGeminiResponseToOpenAINonStream(_ context.Context, _ string, origina
 		if totalTokenCountResult := usageResult.Get("totalTokenCount"); totalTokenCountResult.Exists() {
 			template, _ = sjson.SetBytes(template, "usage.total_tokens", totalTokenCountResult.Int())
 		}
-		promptTokenCount := usageResult.Get("promptTokenCount").Int()
+		promptTokenCount := translatorcommon.GeminiInputTokens(usageResult)
 		thoughtsTokenCount := usageResult.Get("thoughtsTokenCount").Int()
 		cachedTokenCount := usageResult.Get("cachedContentTokenCount").Int()
 		template, _ = sjson.SetBytes(template, "usage.prompt_tokens", promptTokenCount)
