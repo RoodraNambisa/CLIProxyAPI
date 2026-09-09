@@ -27,6 +27,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
+	coreusage "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
@@ -4495,6 +4496,7 @@ func authFilePathQuarantined(auth *Auth, authDir string) bool {
 // Execute performs a non-streaming execution using the configured selector and executor.
 // It supports multiple providers for the same model and round-robins the starting provider per model.
 func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (response cliproxyexecutor.Response, err error) {
+	ctx = coreusage.WithStreamDefault(ctx, false)
 	ctx = m.WithRoutingPolicySnapshot(ctx)
 	ctx, upstreamErrors := withUpstreamErrorHistory(ctx)
 	var releaseProducer func()
@@ -4588,6 +4590,7 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 // ExecuteCount performs a non-streaming execution using the configured selector and executor.
 // It supports multiple providers for the same model and round-robins the starting provider per model.
 func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (response cliproxyexecutor.Response, err error) {
+	ctx = coreusage.WithStreamDefault(ctx, false)
 	ctx = m.WithRoutingPolicySnapshot(ctx)
 	ctx, upstreamErrors := withUpstreamErrorHistory(ctx)
 	var releaseProducer func()
@@ -4674,6 +4677,7 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 // ExecuteStream performs a streaming execution using the configured selector and executor.
 // It supports multiple providers for the same model and round-robins the starting provider per model.
 func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (result *cliproxyexecutor.StreamResult, err error) {
+	ctx = coreusage.WithStreamDefault(ctx, true)
 	ctx = m.WithRoutingPolicySnapshot(ctx)
 	ctx, upstreamErrors := withUpstreamErrorHistory(ctx)
 	var producer *resultPersistenceProducer
