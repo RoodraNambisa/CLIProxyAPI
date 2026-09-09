@@ -1166,7 +1166,7 @@ func (s *SessionAffinitySelector) pickWithFallbackDeferredBinding(ctx context.Co
 			return nil, nil, err
 		}
 		auth, err := fallback.Pick(ctx, provider, model, opts, available)
-		if err != nil {
+		if err != nil || auth == nil {
 			return nil, nil, err
 		}
 		bind := s.deferSelectionBinding(cacheKey, auth.ID)
@@ -1188,7 +1188,7 @@ func (s *SessionAffinitySelector) pickWithFallbackDeferredBinding(ctx context.Co
 	}
 
 	auth, err := fallback.Pick(ctx, provider, model, opts, available)
-	if err != nil {
+	if err != nil || auth == nil {
 		return nil, nil, err
 	}
 	bind := s.deferSelectionBinding(cacheKey, auth.ID)
@@ -1242,7 +1242,7 @@ func (s *SessionAffinitySelector) pickWithPreparedFallbackDeferredBinding(ctx co
 			return nil, nil, err
 		}
 		auth, err := pickFallback()
-		if err != nil {
+		if err != nil || auth == nil {
 			return nil, nil, err
 		}
 		bind := s.deferSelectionBinding(cacheKey, auth.ID)
@@ -1264,7 +1264,7 @@ func (s *SessionAffinitySelector) pickWithPreparedFallbackDeferredBinding(ctx co
 	}
 
 	auth, err := pickFallback()
-	if err != nil {
+	if err != nil || auth == nil {
 		return nil, nil, err
 	}
 	bind := s.deferSelectionBinding(cacheKey, auth.ID)
