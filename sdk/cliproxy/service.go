@@ -6579,6 +6579,7 @@ type modelEntry interface {
 	GetDisplayName() string
 	GetMaxContextLength() int
 	GetThinking() *registry.ThinkingSupport
+	GetIsCompat() bool
 }
 
 func buildConfigModels[T modelEntry](models []T, ownedBy, modelType string) []*ModelInfo {

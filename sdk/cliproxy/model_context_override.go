@@ -10,6 +10,7 @@ func applyConfiguredModelCatalogMetadata(info *ModelInfo, model modelEntry) {
 	if info == nil {
 		return
 	}
+	info.IsCompat = model.GetIsCompat()
 	// Inherit the actual upstream model's catalog, never another alias/client.
 	if upstream := registry.LookupStaticModelInfo(thinking.ParseSuffix(info.UpstreamID).ModelName); upstream != nil {
 		info.ContextLength = upstream.ContextLength

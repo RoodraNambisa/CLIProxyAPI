@@ -151,6 +151,7 @@ func compileConfiguredModelCapabilities[T interface {
 	GetName() string
 	GetAlias() string
 	GetThinking() *registry.ThinkingSupport
+	GetIsCompat() bool
 }](out map[string][]apiKeyModelCapabilityRoute, models []T, modelType string) {
 	for _, model := range models {
 		name, alias := strings.TrimSpace(model.GetName()), strings.TrimSpace(model.GetAlias())
@@ -163,7 +164,7 @@ func compileConfiguredModelCapabilities[T interface {
 		if name == "" {
 			continue
 		}
-		info := &registry.ModelInfo{ID: name, UpstreamID: name, Type: modelType, UserDefined: true}
+		info := &registry.ModelInfo{ID: name, UpstreamID: name, Type: modelType, UserDefined: true, IsCompat: model.GetIsCompat()}
 		if upstream := registry.LookupStaticModelInfo(thinking.ParseSuffix(name).ModelName); upstream != nil {
 			info.Thinking = config.NormalizeModelThinkingSupport(upstream.Thinking)
 		}

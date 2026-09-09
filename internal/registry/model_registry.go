@@ -24,6 +24,8 @@ type ModelInfo struct {
 	ID string `json:"id"`
 	// UpstreamID preserves the provider model ID before aliases and prefixes.
 	UpstreamID string `json:"-"`
+	// IsCompat is a local API-key model policy, never a public catalog capability.
+	IsCompat bool `json:"-"`
 	// Object type for the model (typically "model")
 	Object string `json:"object"`
 	// Created timestamp when the model was created

@@ -9,7 +9,7 @@ import (
 )
 
 func modelRoutingFixture(level string) *config.Config {
-	return &config.Config{CodexKey: []config.CodexKey{{APIKey: "fixture", Models: []config.CodexModel{{Name: level, Alias: "local", Thinking: &registry.ThinkingSupport{Levels: []string{level}}}}}}}
+	return &config.Config{CodexKey: []config.CodexKey{{APIKey: "fixture", Models: []config.CodexModel{{Name: level, Alias: "local", IsCompat: level == "high", Thinking: &registry.ThinkingSupport{Levels: []string{level}}}}}}}
 }
 
 func TestAPIKeyModelRoutingPublishesCoherentSnapshots(t *testing.T) {
@@ -23,7 +23,7 @@ func TestAPIKeyModelRoutingPublishesCoherentSnapshots(t *testing.T) {
 	check := func(snapshot *apiKeyModelRoutingSnapshot) {
 		name := snapshot.config.CodexKey[0].Models[0].Name
 		info, ok := lookupAPIKeyModelCapability(snapshot, auth, "local", name)
-		if !ok || snapshot.aliases[auth.ID]["local"] != name || info.Thinking.Levels[0] != name {
+		if !ok || snapshot.aliases[auth.ID]["local"] != name || info.Thinking.Levels[0] != name || info.IsCompat != (name == "high") {
 			t.Error("alias, config and capabilities came from different publications")
 		}
 	}

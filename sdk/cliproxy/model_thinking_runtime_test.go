@@ -22,7 +22,8 @@ func TestModelThinkingHotReloadPreservesCredentialLifecycle(t *testing.T) {
 		t.Run(tc.family, func(t *testing.T) {
 			makeConfig := func(support *registry.ThinkingSupport) *config.Config {
 				thinking, _ := json.Marshal(support)
-				body := fmt.Sprintf(`{"%s":[{"api-key":"fixture","name":"thinking-compat","base-url":"https://example.test","models":[{"name":"%s","alias":"thinking-live-alias","thinking":%s}]}]}`, tc.family, tc.upstream, thinking)
+				isCompat := support != nil && len(support.Levels) > 0 && support.Levels[0] == " HIGH "
+				body := fmt.Sprintf(`{"%s":[{"api-key":"fixture","name":"thinking-compat","base-url":"https://example.test","models":[{"name":"%s","alias":"thinking-live-alias","thinking":%s,"is-compat":%t}]}]}`, tc.family, tc.upstream, thinking, isCompat)
 				var cfg config.Config
 				if err := json.Unmarshal([]byte(body), &cfg); err != nil {
 					t.Fatal(err)
@@ -55,7 +56,7 @@ func TestModelThinkingHotReloadPreservesCredentialLifecycle(t *testing.T) {
 				return nil
 			}
 			before := get()
-			if !reflect.DeepEqual(before.Thinking, initial) {
+			if !reflect.DeepEqual(before.Thinking, initial) || before.IsCompat {
 				t.Fatal("initial thinking declaration missing")
 			}
 			r.SuspendClientModel(installed.ID, "thinking-live-alias", "fixture")
@@ -75,7 +76,7 @@ func TestModelThinkingHotReloadPreservesCredentialLifecycle(t *testing.T) {
 						want = &registry.ThinkingSupport{Levels: []string{"low", "medium", "high"}}
 					}
 				}
-				if !reflect.DeepEqual(get().Thinking, want) {
+				if !reflect.DeepEqual(get().Thinking, want) || get().IsCompat != (support != nil) {
 					t.Fatal("thinking update did not refresh the catalog")
 				}
 				current, _ := manager.GetByID(installed.ID)
@@ -88,7 +89,7 @@ func TestModelThinkingHotReloadPreservesCredentialLifecycle(t *testing.T) {
 					}
 				}
 			}
-			if !reflect.DeepEqual(before.Thinking, initial) {
+			if !reflect.DeepEqual(before.Thinking, initial) || before.IsCompat {
 				t.Fatal("old thinking snapshot changed")
 			}
 			cancelled, cancel := context.WithCancel(t.Context())
