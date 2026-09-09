@@ -29,6 +29,7 @@ type UsageReporter struct {
 	requestServiceTier   string
 	stream               bool
 	requestedAt          time.Time
+	timing               usageResponseTiming
 	mu                   sync.Mutex
 	published            bool
 	observedDetail       usage.Detail
@@ -197,11 +198,6 @@ func (r *UsageReporter) SetTranslatedReasoningEffort(_ []byte, _ string) {}
 // tracked by the reporter's request timestamp in v6.
 func (r *UsageReporter) TrackHTTPClient(client *http.Client) *http.Client { return client }
 
-// StartResponseTTFT and MarkFirstResponseByte preserve the executor hook shape;
-// v6 usage records do not expose TTFT yet.
-func (r *UsageReporter) StartResponseTTFT()     {}
-func (r *UsageReporter) MarkFirstResponseByte() {}
-
 func (r *UsageReporter) PublishAdditionalModel(ctx context.Context, model string, detail usage.Detail) {
 	record, ok := r.buildAdditionalModelRecord(model, detail)
 	if !ok {
@@ -357,6 +353,7 @@ func (r *UsageReporter) buildRecordForModel(model string, detail usage.Detail, f
 	if r == nil {
 		return usage.Record{Model: model, Detail: detail, Failed: failed}
 	}
+	ttft, firstPacket := r.responseTimings()
 	record := usage.Record{
 		Provider:            r.provider,
 		Model:               model,
@@ -369,6 +366,8 @@ func (r *UsageReporter) buildRecordForModel(model string, detail usage.Detail, f
 		ResponseServiceTier: strings.TrimSpace(detail.ResponseServiceTier),
 		RequestedAt:         r.requestedAt,
 		Latency:             r.latency(),
+		TTFT:                ttft,
+		FirstPacketLatency:  firstPacket,
 		Failed:              failed,
 		Detail:              detail,
 	}

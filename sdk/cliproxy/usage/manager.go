@@ -25,7 +25,10 @@ type Record struct {
 	ResponseServiceTier string
 	RequestedAt         time.Time
 	Latency             time.Duration
-	Failed              bool
+	// TTFT measures actual model content; FirstPacketLatency is recorded separately.
+	TTFT               time.Duration
+	FirstPacketLatency time.Duration
+	Failed             bool
 	// Stream describes the logical client response mode, independently of the upstream transport.
 	Stream bool
 	// Auxiliary marks a secondary model token/cost allocation for the same
