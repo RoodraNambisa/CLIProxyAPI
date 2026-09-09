@@ -39,10 +39,13 @@ func TestCodexClaudeAgentReplayIsolatedAtHTTPDispatch(t *testing.T) {
 			defer upstream.Close()
 			executor := NewCodexExecutor(&config.Config{})
 			credential := &auth.Auth{ID: t.Name() + ":" + uuid.NewString(), Provider: "codex", Attributes: map[string]string{"api_key": "fixture", "base_url": upstream.URL}}
-			for _, agent := range []string{"worker-a", "worker-b", "worker-a"} {
+			for index, agent := range []string{"worker-a", "worker-b", "worker-a"} {
 				headers := http.Header{"X-Claude-Code-Session-Id": {t.Name()}, "X-Claude-Code-Agent-Id": {agent}}
 				options := core.Options{SourceFormat: translator.FormatClaude, Stream: stream, Headers: headers, Metadata: map[string]any{core.ExecutionSessionMetadataKey: t.Name()}}
 				request := core.Request{Model: "gpt-5.4-mini", Payload: []byte(`{"messages":[{"role":"user","content":"continue"}]}`)}
+				if index == 2 {
+					request.Payload = []byte(`{"messages":[{"role":"user","content":"continue"},{"role":"assistant","content":"answer"},{"role":"user","content":"followup"}]}`)
+				}
 				if !stream {
 					if _, err := executor.Execute(t.Context(), credential, request, options); err != nil {
 						t.Fatal(err)

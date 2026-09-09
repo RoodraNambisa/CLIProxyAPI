@@ -1058,16 +1058,15 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		completedEvent = nil
 		outputItemsByIndex = nil
 		outputItemsFallback = nil
-		if isCodexSuccessfulCompletion(completedData) {
-			helps.CacheCodexReasoningReplayFromCompleted(replayScope, completedData)
-		}
-
 		var param any
 		clientCompletedData := applyCodexIdentityExposeResponsePayload(completedData, identityState)
 		clientCompletedData = multiAgentResponse.Rewrite(clientCompletedData)
 		out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, originalRef.Bytes(), bodyRef.Bytes(), clientCompletedData, &param)
 		if from == sdktranslator.FormatOpenAIResponse {
 			out = helps.EnsureResponsesUsageDetails(out)
+		}
+		if isCodexSuccessfulCompletion(completedData) {
+			helps.CacheCodexReasoningReplayFromCompleted(replayScope, completedData, ctx)
 		}
 		resp = cliproxyexecutor.Response{Payload: out, Headers: codexSuccessfulResponseHeaders(auth, httpResp.Header)}
 		return resp, nil
@@ -1406,11 +1405,12 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 				return true
 			}
 		}
-		emitSuccessfulTerminal := func() {
+		emitSuccessfulTerminal := func() bool {
 			reporter.EnsurePublished(ctx)
 			if metadataBool(opts.Metadata, cliproxyexecutor.StreamTerminalMarkerMetadataKey) {
-				_ = emit(cliproxyexecutor.SuccessfulStreamTerminalChunk())
+				return emit(cliproxyexecutor.SuccessfulStreamTerminalChunk())
 			}
+			return true
 		}
 		flushTrustedFrame := func() (bool, bool) {
 			if len(bytes.TrimSpace(trustedFrame)) == 0 {
@@ -1561,6 +1561,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 			}
 			translatedLine := bytes.Clone(line)
 			terminal := false
+			var completedReplay []byte
 
 			if bytes.HasPrefix(line, dataTag) {
 				data := bytes.TrimSpace(line[5:])
@@ -1578,7 +1579,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 					observeCodexImageToolUsage(reporter, streamBody.Bytes(), data)
 					data = patchCodexCompletedOutput(data, outputItemsByIndex, outputItemsFallback)
 					if isCodexSuccessfulCompletion(data) {
-						helps.CacheCodexReasoningReplayFromCompleted(replayScope, data)
+						completedReplay = data
 					}
 					translatedLine = append([]byte("data: "), data...)
 				}
@@ -1613,7 +1614,9 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 				}
 			}
 			if terminal && scanner.Err() == nil {
-				emitSuccessfulTerminal()
+				if emitSuccessfulTerminal() && len(completedReplay) > 0 {
+					helps.CacheCodexReasoningReplayFromCompleted(replayScope, completedReplay, ctx)
+				}
 				return
 			}
 		}

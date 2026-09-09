@@ -12,8 +12,8 @@ import (
 
 func reasoningTurnItem(tag byte) []byte {
 	signature := make([]byte, 73)
-	signature[0], signature[1] = 0x80, tag
-	return fmt.Appendf(nil, `{"type":"reasoning","encrypted_content":%q}`, base64.RawURLEncoding.EncodeToString(signature))
+	signature[0], signature[72] = 0x80, tag
+	return fmt.Appendf(nil, `{"type":"reasoning","summary":[],"content":null,"encrypted_content":%q}`, base64.RawURLEncoding.EncodeToString(signature))
 }
 
 func matchedReplayTurn(input []gjson.Result, position int, tag byte) codexReasoningReplayTurn {

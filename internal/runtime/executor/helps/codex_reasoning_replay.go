@@ -33,9 +33,11 @@ var codexClaudeCodeSessionSuffixPattern = regexp.MustCompile(`_session_([a-fA-F0
 
 // CodexReasoningReplayScope identifies one model/session replay boundary.
 type CodexReasoningReplayScope struct {
-	namespace  string
-	modelName  string
-	sessionKey string
+	namespace        string
+	modelName        string
+	sessionKey       string
+	requestPrefix    [sha256.Size]byte
+	hasRequestPrefix bool
 }
 
 func (s CodexReasoningReplayScope) valid() bool {
@@ -153,6 +155,15 @@ func ApplyCodexReasoningReplay(ctx context.Context, sourceFormat, replayNamespac
 	if !scope.valid() {
 		return body, scope
 	}
+	if input := gjson.GetBytes(body, "input"); input.IsArray() {
+		items := input.Array()
+		prefixes, fingerprint := codexReplayPrefixIndexes(items)
+		scope.requestPrefix, scope.hasRequestPrefix = fingerprint, true
+		if turns := getCodexReasoningReplayTurns(scope); len(turns) > 0 {
+			updated, _ := insertCodexReasoningReplayTurns(body, items, prefixes, turns)
+			return updated, scope
+		}
+	}
 	items, ok := getCodexReasoningReplayItems(scope)
 	if !ok {
 		return body, scope
@@ -170,25 +181,59 @@ func ApplyCodexReasoningReplay(ctx context.Context, sourceFormat, replayNamespac
 
 // CacheCodexReasoningReplayFromCompleted stores replayable output items from a
 // terminal Responses event.
-func CacheCodexReasoningReplayFromCompleted(scope CodexReasoningReplayScope, completedData []byte) bool {
-	if !scope.valid() {
+func CacheCodexReasoningReplayFromCompleted(scope CodexReasoningReplayScope, completedData []byte, contexts ...context.Context) bool {
+	if !scope.valid() || !gjson.ValidBytes(completedData) {
 		return false
+	}
+	for _, ctx := range contexts {
+		if ctx != nil && ctx.Err() != nil {
+			return false
+		}
+	}
+	root := gjson.ParseBytes(completedData)
+	if kind := root.Get("type").String(); kind != "" && kind != "response.completed" && kind != "response.done" {
+		return false
+	}
+	if status := root.Get("response.status").String(); status != "" && status != "completed" {
+		return false
+	}
+	for _, path := range []string{"error", "response.error"} {
+		if failure := root.Get(path); failure.Exists() && failure.Type != gjson.Null {
+			return false
+		}
 	}
 	output := gjson.GetBytes(completedData, "response.output")
 	if !output.IsArray() {
 		return false
 	}
 	items := make([][]byte, 0, len(output.Array()))
+	turn := codexReasoningReplayTurn{prefix: scope.requestPrefix}
 	for _, item := range output.Array() {
 		switch strings.TrimSpace(item.Get("type").String()) {
 		case "reasoning", "function_call", "custom_tool_call":
 			items = append(items, []byte(item.Raw))
+		case "message":
+			if turn.assistant == ([sha256.Size]byte{}) {
+				turn.assistant, _ = codexReplayAssistantFingerprint(item)
+			}
 		}
 	}
 	normalized := normalizeCodexReasoningReplayItems(items)
 	if len(normalized) == 0 {
-		deleteCodexReasoningReplay(scope)
+		if !scope.hasRequestPrefix {
+			deleteCodexReasoningReplay(scope)
+		}
 		return false
+	}
+	if scope.hasRequestPrefix {
+		turn.items = normalized
+		for _, raw := range normalized {
+			item := gjson.ParseBytes(raw)
+			if item.Get("type").String() != "reasoning" {
+				turn.callIDs = append(turn.callIDs, item.Get("call_id").String())
+			}
+		}
+		return appendCodexReasoningReplayTurn(scope, turn, contexts...)
 	}
 	return setCodexReasoningReplayItems(scope, normalized)
 }

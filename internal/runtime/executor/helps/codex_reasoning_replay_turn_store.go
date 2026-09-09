@@ -1,6 +1,7 @@
 package helps
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"strings"
@@ -30,7 +31,7 @@ func cloneCodexReasoningReplayTurn(turn codexReasoningReplayTurn) codexReasoning
 
 // The caller supplies normalized replay items. Storage owns all bytes and keeps
 // the existing per-entry and process-wide budgets across legacy and turn caches.
-func appendCodexReasoningReplayTurn(scope CodexReasoningReplayScope, turn codexReasoningReplayTurn) bool {
+func appendCodexReasoningReplayTurn(scope CodexReasoningReplayScope, turn codexReasoningReplayTurn, contexts ...context.Context) bool {
 	key := codexReasoningReplayKey(scope)
 	if key == "" || len(turn.items) == 0 {
 		return false
@@ -56,6 +57,11 @@ func appendCodexReasoningReplayTurn(scope CodexReasoningReplayScope, turn codexR
 	now := time.Now()
 	codexReasoningReplayStore.Lock()
 	defer codexReasoningReplayStore.Unlock()
+	for _, ctx := range contexts {
+		if ctx != nil && ctx.Err() != nil {
+			return false
+		}
+	}
 	previous := codexReasoningReplayStore.entries[key]
 	var turns []codexReasoningReplayTurn
 	var size int64

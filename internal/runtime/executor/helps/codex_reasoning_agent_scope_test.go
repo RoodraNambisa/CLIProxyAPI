@@ -19,7 +19,7 @@ func TestCodexReasoningReplaySeparatesExplicitClaudeAgents(t *testing.T) {
 				t.Cleanup(resetCodexReasoningReplayStoreForTest)
 				body := []byte(`{"prompt_cache_key":"shared-cache","input":[{"role":"user","content":"next"}]}`)
 				metadata := map[string]any{"execution_session_id": transportID}
-				apply := func(agent string) ([]byte, CodexReasoningReplayScope) {
+				apply := func(agent string, history bool) ([]byte, CodexReasoningReplayScope) {
 					ctx := t.Context()
 					headers := http.Header{}
 					original := []byte(`{"messages":[]}`)
@@ -41,17 +41,21 @@ func TestCodexReasoningReplaySeparatesExplicitClaudeAgents(t *testing.T) {
 					} else {
 						original = []byte(fmt.Sprintf(`{"metadata":{"user_id":%q},"messages":[]}`, fmt.Sprintf(`{"session_id":"session-a","agent_id":%q}`, agent)))
 					}
-					return ApplyCodexReasoningReplay(ctx, "claude", "tenant:credential", "gpt-5", original, body, nil, metadata, headers)
+					request := body
+					if history {
+						request = []byte(`{"prompt_cache_key":"shared-cache","input":[{"role":"user","content":"next"},{"role":"assistant","content":"answer"},{"role":"user","content":"followup"}]}`)
+					}
+					return ApplyCodexReasoningReplay(ctx, "claude", "tenant:credential", "gpt-5", original, request, nil, metadata, headers)
 				}
-				_, workerScope := apply("worker-a")
-				completed := []byte(`{"response":{"output":[{"type":"reasoning","encrypted_content":"` + testCodexReasoningSignature() + `"}]}}`)
+				_, workerScope := apply("worker-a", false)
+				completed := []byte(`{"response":{"output":[{"type":"reasoning","encrypted_content":"` + testCodexReasoningSignature() + `"},{"type":"message","role":"assistant","content":"answer"}]}}`)
 				if !CacheCodexReasoningReplayFromCompleted(workerScope, completed) {
 					t.Fatal("failed to cache agent reasoning")
 				}
 				for _, agent := range []string{"worker-a", "worker-b", "main", ""} {
-					out, scope := apply(agent)
+					out, scope := apply(agent, true)
 					gotReplay := gjson.GetBytes(out, `input.#(type=="reasoning")`).Exists()
-					if gotReplay != (agent == "worker-a") || (scope == workerScope) != (agent == "worker-a") {
+					if gotReplay != (agent == "worker-a") || (codexReasoningReplayKey(scope) == codexReasoningReplayKey(workerScope)) != (agent == "worker-a") {
 						t.Errorf("agent %q reused another agent's replay: %t", agent, gotReplay)
 					}
 					if gjson.GetBytes(out, "prompt_cache_key").String() != "shared-cache" {

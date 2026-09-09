@@ -26,11 +26,11 @@ func TestCodexPartialResponsePreservesCommittedReasoningReplay(t *testing.T) {
 			namespace := helps.ReasoningReplayNamespace(ctx, "codex", auth.ID)
 			metadata := map[string]any{core.ExecutionSessionMetadataKey: t.Name()}
 			query := []byte(`{"input":[{"type":"function_call_output","call_id":"pair","output":"result"}]}`)
-			_, scope := helps.ApplyCodexReasoningReplay(ctx, "claude", namespace, "gpt-5.4-mini", nil, query, nil, metadata, nil)
+			_, scope := helps.ApplyCodexReasoningReplay(ctx, "claude", namespace, "gpt-5.4-mini", nil, []byte(`{"input":[]}`), nil, metadata, nil)
 			signature := make([]byte, 73)
 			signature[0] = 0x80
 			oldSignature := base64.RawURLEncoding.EncodeToString(signature)
-			signature[1] = 1
+			signature[72] = 1
 			newSignature := base64.RawURLEncoding.EncodeToString(signature)
 			old := []byte(`{"response":{"output":[{"type":"reasoning","encrypted_content":"` + oldSignature + `"},{"type":"function_call","call_id":"pair","name":"old","arguments":"{}"}]}}`)
 			if !helps.CacheCodexReasoningReplayFromCompleted(scope, old) {
