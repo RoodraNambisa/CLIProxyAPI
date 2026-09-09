@@ -202,6 +202,10 @@ func (f *responsesSSEFramer) Flush(w io.Writer) {
 }
 
 func writeResponsesStreamError(w io.Writer, errMsg *interfaces.ErrorMessage) {
+	writeResponsesStreamErrorForClient(w, errMsg, false)
+}
+
+func writeResponsesStreamErrorForClient(w io.Writer, errMsg *interfaces.ErrorMessage, codexClient bool) {
 	if w == nil || errMsg == nil {
 		return
 	}
@@ -221,15 +225,21 @@ func writeResponsesStreamError(w io.Writer, errMsg *interfaces.ErrorMessage) {
 		status = handlers.OriginalErrorStatusCode(errMsg)
 		errText = handlers.OriginalErrorText(errMsg)
 	}
-	chunk := handlers.BuildOpenAIResponsesStreamErrorChunk(status, errText, 0)
-	_, _ = fmt.Fprintf(w, "\n\nevent: error\ndata: %s\n\n", string(chunk))
+	buildChunk := handlers.BuildOpenAIResponsesStreamErrorChunk
+	event := "error"
+	if codexClient {
+		buildChunk = handlers.BuildOpenAIResponsesStreamFailedChunk
+		event = "response.failed"
+	}
+	chunk := buildChunk(status, errText, 0)
+	_, _ = fmt.Fprintf(w, "\n\nevent: %s\ndata: %s\n\n", event, string(chunk))
 }
 
 func (h *OpenAIResponsesAPIHandler) writePublicResponsesStreamError(c *gin.Context, w io.Writer, errMsg *interfaces.ErrorMessage) {
 	if h != nil && h.BaseAPIHandler != nil {
 		errMsg = h.ProjectChatGPTWebImageErrorResponse(c, errMsg)
 	}
-	writeResponsesStreamError(w, errMsg)
+	writeResponsesStreamErrorForClient(w, errMsg, isCodexResponsesClientRequest(c))
 }
 
 func (f *responsesSSEFramer) passthroughEnabled() bool {
