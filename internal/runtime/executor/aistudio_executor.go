@@ -580,7 +580,7 @@ func (e *AIStudioExecutor) translateRequest(ctx context.Context, req cliproxyexe
 	if err != nil {
 		return nil, translatedPayload{}, err
 	}
-	payload, err = thinking.ApplyThinking(payload, req.Model, from.String(), to.String(), e.Identifier())
+	payload, err = helps.ApplyThinkingWithSourcePayload(payload, req.Payload, opts.OriginalRequest, req.Model, from.String(), to.String(), e.Identifier())
 	if err != nil {
 		return nil, translatedPayload{}, err
 	}
