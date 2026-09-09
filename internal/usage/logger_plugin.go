@@ -176,6 +176,8 @@ type authModelStats struct {
 type RequestDetail struct {
 	Timestamp               time.Time  `json:"timestamp"`
 	LatencyMs               int64      `json:"latency_ms"`
+	TTFTMs                  int64      `json:"ttft_ms,omitempty"`
+	FirstPacketMs           int64      `json:"first_packet_ms,omitempty"`
 	Source                  string     `json:"source"`
 	ClientIP                string     `json:"client_ip"`
 	AuthIndex               string     `json:"auth_index"`
@@ -301,6 +303,8 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 	requestDetail := RequestDetail{
 		Timestamp:               timestamp,
 		LatencyMs:               normaliseLatency(record.Latency),
+		TTFTMs:                  normaliseLatency(record.TTFT),
+		FirstPacketMs:           normaliseLatency(record.FirstPacketLatency),
 		Source:                  record.Source,
 		ClientIP:                resolveClientIP(ctx),
 		AuthIndex:               record.AuthIndex,
