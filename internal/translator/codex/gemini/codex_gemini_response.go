@@ -25,7 +25,7 @@ type ConvertCodexResponseToGeminiParams struct {
 	Model              string
 	CreatedAt          int64
 	ResponseID         string
-	LastStorageOutput  []byte
+	TerminalEmitted    bool
 	HasOutputTextDelta bool
 	LastImageHashByID  map[string][32]byte
 }
@@ -49,7 +49,6 @@ func ConvertCodexResponseToGemini(_ context.Context, modelName string, originalR
 			Model:              modelName,
 			CreatedAt:          0,
 			ResponseID:         "",
-			LastStorageOutput:  nil,
 			HasOutputTextDelta: false,
 			LastImageHashByID:  make(map[string][32]byte),
 		}
@@ -65,6 +64,9 @@ func ConvertCodexResponseToGemini(_ context.Context, modelName string, originalR
 	typeStr := typeResult.String()
 
 	params := (*param).(*ConvertCodexResponseToGeminiParams)
+	if params.TerminalEmitted {
+		return nil
+	}
 
 	// Base Gemini response template
 	template := []byte(`{"candidates":[{"content":{"role":"model","parts":[]}}],"usageMetadata":{"trafficType":"PROVISIONED_THROUGHPUT"},"modelVersion":"gemini-2.5-pro","createTime":"2025-08-15T02:52:03.884209Z","responseId":"06CeaPH7NaCU48APvNXDyA4"}`)
@@ -158,12 +160,7 @@ func ConvertCodexResponseToGemini(_ context.Context, modelName string, originalR
 			}
 
 			template, _ = sjson.SetRawBytes(template, "candidates.0.content.parts.-1", functionCall)
-			template, _ = sjson.SetBytes(template, "candidates.0.finishReason", "STOP")
-
-			params.LastStorageOutput = append([]byte(nil), template...)
-
-			// Use this return to storage message
-			return [][]byte{}
+			return [][]byte{template}
 		}
 	}
 
@@ -209,7 +206,9 @@ func ConvertCodexResponseToGemini(_ context.Context, modelName string, originalR
 			return [][]byte{template}
 		}
 		return [][]byte{}
-	} else if typeStr == "response.completed" { // Handle response completion with usage metadata
+	} else if typeStr == "response.completed" || typeStr == "response.incomplete" { // Handle terminal usage and the final stop reason.
+		params.TerminalEmitted = true
+		template, _ = sjson.SetBytes(template, "candidates.0.finishReason", codexGeminiFinishReason(rootResult))
 		template, _ = sjson.SetBytes(template, "usageMetadata.promptTokenCount", rootResult.Get("response.usage.input_tokens").Int())
 		template, _ = sjson.SetBytes(template, "usageMetadata.candidatesTokenCount", rootResult.Get("response.usage.output_tokens").Int())
 		totalTokens := rootResult.Get("response.usage.input_tokens").Int() + rootResult.Get("response.usage.output_tokens").Int()
@@ -218,11 +217,6 @@ func ConvertCodexResponseToGemini(_ context.Context, modelName string, originalR
 		return [][]byte{}
 	}
 
-	if len(params.LastStorageOutput) > 0 {
-		stored := append([]byte(nil), params.LastStorageOutput...)
-		params.LastStorageOutput = nil
-		return [][]byte{stored, template}
-	}
 	return [][]byte{template}
 }
 
@@ -242,8 +236,9 @@ func ConvertCodexResponseToGemini(_ context.Context, modelName string, originalR
 func ConvertCodexResponseToGeminiNonStream(_ context.Context, modelName string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, _ *any) []byte {
 	rootResult := gjson.ParseBytes(rawJSON)
 
-	// Verify this is a response.completed event
-	if rootResult.Get("type").String() != "response.completed" {
+	// Only terminal response payloads can form a non-stream result.
+	responseType := rootResult.Get("type").String()
+	if responseType != "response.completed" && responseType != "response.incomplete" {
 		return []byte{}
 	}
 
@@ -252,6 +247,7 @@ func ConvertCodexResponseToGeminiNonStream(_ context.Context, modelName string, 
 
 	// Set model version
 	template, _ = sjson.SetBytes(template, "modelVersion", modelName)
+	template, _ = sjson.SetBytes(template, "candidates.0.finishReason", codexGeminiFinishReason(rootResult))
 
 	// Set response metadata from the completed response
 	responseData := rootResult.Get("response")
@@ -278,7 +274,6 @@ func ConvertCodexResponseToGeminiNonStream(_ context.Context, modelName string, 
 		}
 
 		// Process output content to build parts array
-		hasToolCall := false
 		var pendingFunctionCalls [][]byte
 
 		flushPendingFunctionCalls := func() {
@@ -343,7 +338,6 @@ func ConvertCodexResponseToGeminiNonStream(_ context.Context, modelName string, 
 
 				case "function_call":
 					// Collect function call for potential merging with consecutive ones
-					hasToolCall = true
 					functionCall := []byte(`{"functionCall":{"args":{},"name":""}}`)
 					{
 						n := value.Get("name").String()
@@ -371,14 +365,22 @@ func ConvertCodexResponseToGeminiNonStream(_ context.Context, modelName string, 
 			flushPendingFunctionCalls()
 		}
 
-		// Set finish reason based on whether there were tool calls
-		if hasToolCall {
-			template, _ = sjson.SetBytes(template, "candidates.0.finishReason", "STOP")
-		} else {
-			template, _ = sjson.SetBytes(template, "candidates.0.finishReason", "STOP")
-		}
 	}
 	return template
+}
+
+func codexGeminiFinishReason(event gjson.Result) string {
+	if event.Get("type").String() != "response.incomplete" && !strings.EqualFold(strings.TrimSpace(event.Get("response.status").String()), "incomplete") {
+		return "STOP"
+	}
+	switch strings.ToLower(strings.TrimSpace(event.Get("response.incomplete_details.reason").String())) {
+	case "max_tokens", "max_output_tokens":
+		return "MAX_TOKENS"
+	case "content_filter":
+		return "SAFETY"
+	default:
+		return "OTHER"
+	}
 }
 
 // buildReverseMapFromGeminiOriginal builds a map[short]original from original Gemini request tools.

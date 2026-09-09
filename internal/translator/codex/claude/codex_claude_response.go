@@ -23,6 +23,7 @@ var (
 
 // ConvertCodexResponseToClaudeParams holds parameters for response conversion.
 type ConvertCodexResponseToClaudeParams struct {
+	TerminalEmitted            bool
 	HasToolCall                bool
 	BlockIndex                 int
 	HasReceivedArgumentsDelta  bool
@@ -79,6 +80,9 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
 	output := make([]byte, 0, 512)
 	rootResult := gjson.ParseBytes(rawJSON)
 	params := (*param).(*ConvertCodexResponseToClaudeParams)
+	if params.TerminalEmitted {
+		return nil
+	}
 	if params.ThinkingBlockOpen && params.ThinkingStopPending {
 		switch rootResult.Get("type").String() {
 		case "response.content_part.added", "response.completed", "response.incomplete":
@@ -140,6 +144,7 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
 	} else if typeStr == "response.web_search_call.searching" || typeStr == "response.web_search_call.completed" || typeStr == "response.web_search_call.in_progress" {
 		// Wait for output_item.done, which carries the populated search action.
 	} else if typeStr == "response.completed" || typeStr == "response.incomplete" {
+		params.TerminalEmitted = true
 		template = []byte(`{"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"input_tokens":0,"output_tokens":0}}`)
 		responseData := rootResult.Get("response")
 		output = hydrateOpenCodexFunctionCallFromTerminal(output, params, responseData)
@@ -451,9 +456,6 @@ func ConvertCodexResponseToClaudeNonStream(_ context.Context, _ string, original
 }
 
 func mapCodexStopReasonToClaude(response gjson.Result, hasToolCall bool) string {
-	if hasToolCall {
-		return "tool_use"
-	}
 	stopReason := strings.TrimSpace(response.Get("stop_reason").String())
 	if stopReason == "" {
 		stopReason = strings.TrimSpace(response.Get("incomplete_details.reason").String())
@@ -466,6 +468,9 @@ func mapCodexStopReasonToClaude(response gjson.Result, hasToolCall bool) string 
 	case "content_filter":
 		return "refusal"
 	default:
+		if hasToolCall {
+			return "tool_use"
+		}
 		return "end_turn"
 	}
 }
