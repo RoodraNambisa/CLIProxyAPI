@@ -95,7 +95,8 @@ func (st *oaiToResponsesState) emitToolEvents(key string, final bool, nextSeq fu
 	if !final {
 		return out
 	}
-	if args == "" && !st.FuncItemCustom[key] {
+	status := responsesItemStatus(st.FinishReasons[st.FuncChoices[key]])
+	if args == "" && !st.FuncItemCustom[key] && status == "completed" {
 		args = "{}"
 	}
 	kind, field, prefix, value := "response.function_call_arguments.done", "arguments", "fc_", args
@@ -112,7 +113,7 @@ func (st *oaiToResponsesState) emitToolEvents(key string, final bool, nextSeq fu
 	itemDone := []byte(`{"type":"response.output_item.done","sequence_number":0,"output_index":0}`)
 	itemDone, _ = sjson.SetBytes(itemDone, "sequence_number", nextSeq())
 	itemDone, _ = sjson.SetBytes(itemDone, "output_index", st.FuncOutputIx[key])
-	itemDone, _ = sjson.SetRawBytes(itemDone, "item", buildResponsesToolItem(st.ToolIdentities, st.FuncNames[key], callID, args, "completed"))
+	itemDone, _ = sjson.SetRawBytes(itemDone, "item", buildResponsesToolItem(st.ToolIdentities, st.FuncNames[key], callID, args, status))
 	out = append(out, emitRespEvent("response.output_item.done", itemDone))
 	st.FuncArgsDone[key], st.FuncItemDone[key] = true, true
 	return out
@@ -127,6 +128,7 @@ func (st *oaiToResponsesState) acceptToolCallDelta(choiceIndex, toolIndex int, c
 		return ""
 	}
 	if st.FuncArgsBuf[key] == nil {
+		st.FuncChoices[key] = choiceIndex
 		st.FuncArgsBuf[key] = &strings.Builder{}
 		st.FuncOutputIx[key] = st.NextOutputIx
 		st.NextOutputIx++
