@@ -176,6 +176,17 @@ func convertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 
 	// input array processing
 	if input := root.Get("input"); input.Exists() && input.IsArray() {
+		lastToolResult := make(map[string]gjson.Result)
+		input.ForEach(func(_, item gjson.Result) bool {
+			switch item.Get("type").String() {
+			case "function_call_output", "custom_tool_call_output":
+				if id := item.Get("call_id").String(); id != "" {
+					lastToolResult[id] = item
+				}
+			}
+			return true
+		})
+		emittedToolResults := make(map[string]bool)
 		input.ForEach(func(_, item gjson.Result) bool {
 			if extractedFromSystem && strings.EqualFold(item.Get("role").String(), "system") {
 				return true
@@ -319,10 +330,21 @@ func convertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 			case "function_call_output", "custom_tool_call_output":
 				// Map to user tool_result
 				callID := item.Get("call_id").String()
-				outputStr := item.Get("output").String()
+				targetItem := item
+				if callID != "" {
+					if emittedToolResults[callID] {
+						return true
+					}
+					emittedToolResults[callID] = true
+					targetItem = lastToolResult[callID]
+				}
+				outputStr := targetItem.Get("output").String()
 				toolResult := []byte(`{"type":"tool_result","tool_use_id":"","content":""}`)
 				toolResult, _ = sjson.SetBytes(toolResult, "tool_use_id", callID)
 				toolResult, _ = sjson.SetBytes(toolResult, "content", outputStr)
+				if cache := targetItem.Get("cache_control"); cache.IsObject() {
+					toolResult, _ = sjson.SetRawBytes(toolResult, "cache_control", []byte(cache.Raw))
+				}
 
 				messages.appendParts("user", toolResult)
 			}
