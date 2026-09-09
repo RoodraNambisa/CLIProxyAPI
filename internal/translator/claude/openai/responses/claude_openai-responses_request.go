@@ -329,7 +329,7 @@ func convertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 	} else if input.Type == gjson.String {
 		messages.appendParts("user", claudeResponsesTextPart(input.String()))
 	}
-	out, _ = sjson.SetRawBytes(out, "messages", messages.finish(isCompat))
+	out, _ = sjson.SetRawBytes(out, "messages", messages.finish(modelName, isCompat))
 	if len(systemBlocks) > 0 {
 		out, _ = sjson.SetRawBytes(out, "system", claudeResponsesRawArray(systemBlocks))
 		if gjson.GetBytes(out, "messages.#").Int() == 0 {

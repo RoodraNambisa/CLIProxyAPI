@@ -2,6 +2,7 @@ package responses
 
 import (
 	"bytes"
+	"strings"
 
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -78,8 +79,11 @@ func (b *claudeResponsesRequestTurns) flush() {
 	b.role, b.parts, b.tools = "", nil, nil
 }
 
-func (b *claudeResponsesRequestTurns) finish(isCompat bool) []byte {
+func (b *claudeResponsesRequestTurns) finish(model string, isCompat bool) []byte {
 	hadParts := len(b.parts) > 0 || len(b.tools) > 0
+	if !isCompat && b.role == "assistant" && claudeResponsesRejectsPrefill(model) {
+		b.parts, b.tools = nil, nil
+	}
 	// Native Claude rejects a final assistant block consisting of thinking.
 	// Compatibility models explicitly retain that prefill, including empty blocks.
 	if !isCompat && b.role == "assistant" && len(b.tools) == 0 {
@@ -97,4 +101,9 @@ func (b *claudeResponsesRequestTurns) finish(isCompat bool) []byte {
 		b.flush()
 	}
 	return claudeResponsesRawArray(b.items)
+}
+
+func claudeResponsesRejectsPrefill(model string) bool {
+	model = strings.ToLower(strings.TrimSpace(model))
+	return strings.Contains(model, "fable") || strings.Contains(model, "opus-5") || strings.Contains(model, "sonnet-4-6")
 }

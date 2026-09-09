@@ -17,9 +17,13 @@ import (
 	"github.com/tidwall/gjson"
 )
 
-func claudeCompatibilityManager(t *testing.T, baseURL string, compat bool) *coreauth.Manager {
+func claudeCompatibilityManager(t *testing.T, baseURL string, compat bool, upstreamModels ...string) *coreauth.Manager {
 	t.Helper()
-	cfg := &config.Config{SDKConfig: sdkconfig.SDKConfig{ProxyURL: "direct"}, ClaudeKey: []config.ClaudeKey{{APIKey: "fixture", BaseURL: baseURL, Models: []config.ClaudeModel{{Name: "claude-compat-private", Alias: "bound-claude", IsCompat: compat}}}}}
+	model := "claude-compat-private"
+	if len(upstreamModels) > 0 {
+		model = upstreamModels[0]
+	}
+	cfg := &config.Config{SDKConfig: sdkconfig.SDKConfig{ProxyURL: "direct"}, ClaudeKey: []config.ClaudeKey{{APIKey: "fixture", BaseURL: baseURL, Models: []config.ClaudeModel{{Name: model, Alias: "bound-claude", IsCompat: compat}}}}}
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.SetConfig(cfg)
 	manager.RegisterExecutor(NewClaudeExecutor(cfg))
@@ -181,6 +185,49 @@ func TestClaudeModelCompatibilityReplaysResponsesAcrossOperations(t *testing.T) 
 				}
 				if !bytes.Equal(raw, before) {
 					t.Fatal("Responses replay mutated the original request")
+				}
+			})
+		}
+	}
+}
+
+func TestClaudeResponsesPrefillUsesSelectedUpstreamModel(t *testing.T) {
+	for _, operation := range []string{"execute", "stream", "count"} {
+		for _, compat := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/compat=%t", operation, compat), func(t *testing.T) {
+				captured := make(chan bool, 2)
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					body, err := io.ReadAll(r.Body)
+					if err != nil {
+						t.Error(err)
+						return
+					}
+					messages := gjson.GetBytes(body, "messages").Array()
+					valid := len(messages) > 0 && gjson.GetBytes(body, "model").String() == "claude-sonnet-4-6"
+					if valid {
+						last := messages[len(messages)-1]
+						valid = (last.Get("role").String() == "assistant") == compat
+						if compat {
+							valid = valid && last.Get("content").String() == "prefix"
+						}
+					}
+					captured <- valid
+					responseKind := "stream"
+					if operation == "count" {
+						responseKind = "count"
+					}
+					writeClaudeCompatibilityFixture(w, responseKind)
+				}))
+				t.Cleanup(server.Close)
+				manager := claudeCompatibilityManager(t, server.URL, compat, "claude-sonnet-4-6")
+				runClaudeCompatibilityRequest(t, manager, operation, []byte(`{"input":[{"role":"assistant","content":"prefix"}]}`), translator.FormatOpenAIResponse)
+				select {
+				case valid := <-captured:
+					if !valid {
+						t.Fatal("prefill policy used the public alias or another model's compatibility")
+					}
+				default:
+					t.Fatal("request did not reach the local upstream")
 				}
 			})
 		}
