@@ -319,10 +319,23 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 		var param any
 		var streamUsage helps.StreamUsageBuffer
 		markerRequested := metadataBool(opts.Metadata, cliproxyexecutor.StreamTerminalMarkerMetadataKey)
-		protocolFailed := false
-		var protocolErr error
-		terminalSeen := false
 		translatedTerminalSeen := false
+		sendChunk := func(chunk cliproxyexecutor.StreamChunk) bool {
+			if ctx.Err() != nil {
+				return false
+			}
+			select {
+			case out <- chunk:
+				return true
+			case <-ctx.Done():
+				return false
+			}
+		}
+		failStream := func(streamErr error) {
+			helps.RecordAPIResponseError(ctx, e.cfg, streamErr)
+			reporter.PublishFailure(ctx, streamErr)
+			sendChunk(cliproxyexecutor.StreamChunk{Err: streamErr})
+		}
 		for scanner.Scan() {
 			line := scanner.Bytes()
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
@@ -338,13 +351,7 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 					continue
 				}
 				if bytes.HasPrefix(trimmedLine, []byte("{")) || bytes.HasPrefix(trimmedLine, []byte("[")) {
-					streamErr := statusErr{code: http.StatusBadGateway, msg: string(trimmedLine)}
-					helps.RecordAPIResponseError(ctx, e.cfg, streamErr)
-					reporter.PublishFailure(ctx)
-					select {
-					case out <- cliproxyexecutor.StreamChunk{Err: streamErr}:
-					case <-ctx.Done():
-					}
+					failStream(statusErr{code: http.StatusBadGateway, msg: string(trimmedLine)})
 					return
 				}
 				continue
@@ -352,14 +359,15 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 
 			// OpenAI-compatible streams must use SSE data lines.
 			terminal := helps.IsOpenAIStreamTerminal(trimmedLine)
-			terminalSeen = terminalSeen || terminal
+			if terminal && scanner.Err() != nil {
+				failStream(scanner.Err())
+				return
+			}
 			if !terminal {
 				payload := helps.JSONPayload(trimmedLine)
 				if len(payload) > 0 && helps.IsJSONStreamProtocolError(payload) {
-					protocolFailed = true
-					if protocolErr == nil {
-						protocolErr = helps.JSONStreamProtocolError("openai-compatible", payload)
-					}
+					failStream(helps.JSONStreamProtocolError("openai-compatible", payload))
+					return
 				}
 			}
 			chunks := multiAgentResponse.TranslateStream(ctx, to, from, req.Model, originalRef.Bytes(), translatedRef.Bytes(), bytes.Clone(trimmedLine), &param)
@@ -367,50 +375,27 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 				if from == sdktranslator.FormatOpenAIResponse && !translatedTerminalSeen {
 					translatedTerminalSeen = helps.HasResponsesStreamTerminal(chunks[i])
 				}
-				out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}
+				if !sendChunk(cliproxyexecutor.StreamChunk{Payload: chunks[i]}) {
+					return
+				}
 			}
 			if terminal && from == sdktranslator.FormatOpenAIResponse && !translatedTerminalSeen {
-				streamErr := protocolErr
-				if streamErr == nil {
-					streamErr = helps.IncompleteStreamError("openai-compatible")
-				}
-				helps.RecordAPIResponseError(ctx, e.cfg, streamErr)
-				reporter.PublishFailure(ctx, streamErr)
-				select {
-				case out <- cliproxyexecutor.StreamChunk{Err: streamErr}:
-				case <-ctx.Done():
-				}
+				failStream(helps.IncompleteStreamError("openai-compatible"))
 				return
 			}
-			if markerRequested && terminal && !protocolFailed && scanner.Err() == nil {
+			if terminal {
 				streamUsage.Publish(ctx, reporter)
 				reporter.EnsurePublished(ctx)
-				out <- cliproxyexecutor.SuccessfulStreamTerminalChunk()
+				if markerRequested {
+					sendChunk(cliproxyexecutor.SuccessfulStreamTerminalChunk())
+				}
 				return
 			}
 		}
 		if errScan := scanner.Err(); errScan != nil {
-			helps.RecordAPIResponseError(ctx, e.cfg, errScan)
-			reporter.PublishFailure(ctx)
-			out <- cliproxyexecutor.StreamChunk{Err: errScan}
-		} else if terminalSeen && !protocolFailed {
-			streamUsage.Publish(ctx, reporter)
-			chunks := multiAgentResponse.TranslateStream(ctx, to, from, req.Model, originalRef.Bytes(), translatedRef.Bytes(), []byte("data: [DONE]"), &param)
-			for i := range chunks {
-				out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}
-			}
-			reporter.EnsurePublished(ctx)
-			if markerRequested {
-				out <- cliproxyexecutor.SuccessfulStreamTerminalChunk()
-			}
+			failStream(errScan)
 		} else {
-			streamErr := protocolErr
-			if streamErr == nil {
-				streamErr = helps.IncompleteStreamError("openai-compatible")
-			}
-			helps.RecordAPIResponseError(ctx, e.cfg, streamErr)
-			reporter.PublishFailure(ctx, streamErr)
-			out <- cliproxyexecutor.StreamChunk{Err: streamErr}
+			failStream(helps.IncompleteStreamError("openai-compatible"))
 		}
 	}()
 	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
