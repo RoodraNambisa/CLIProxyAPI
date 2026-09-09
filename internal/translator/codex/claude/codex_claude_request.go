@@ -366,7 +366,12 @@ func convertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool, 
 		}
 		translated := []byte(`{"type":"json_schema","name":"","strict":true,"schema":{}}`)
 		translated, _ = sjson.SetBytes(translated, "name", name)
-		translated, _ = sjson.SetBytes(translated, "strict", format.Get("strict").Type != gjson.False)
+		strict := format.Get("strict")
+		strictEnabled := strict.Type != gjson.False
+		if (!strict.Exists() || strict.Type == gjson.Null) && codexSchemaMissesRequired(format.Get("schema")) {
+			strictEnabled = false
+		}
+		translated, _ = sjson.SetBytes(translated, "strict", strictEnabled)
 		translated, _ = sjson.SetRawBytes(translated, "schema", []byte(format.Get("schema").Raw))
 		template, _ = sjson.SetRawBytes(template, "text.format", translated)
 	}
