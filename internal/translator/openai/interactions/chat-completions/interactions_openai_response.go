@@ -348,8 +348,9 @@ func setInteractionsUsageFromOpenAIChat(out []byte, path string, usage gjson.Res
 		out, _ = sjson.SetBytes(out, path+".total_input_tokens", value.Int())
 	}
 	if value := usage.Get("completion_tokens"); value.Exists() {
-		out, _ = sjson.SetBytes(out, path+".output_tokens", value.Int())
-		out, _ = sjson.SetBytes(out, path+".total_output_tokens", value.Int())
+		output := translatorcommon.InteractionsNonReasoningTokens(value.Int(), usage.Get("completion_tokens_details.reasoning_tokens").Int())
+		out, _ = sjson.SetBytes(out, path+".output_tokens", output)
+		out, _ = sjson.SetBytes(out, path+".total_output_tokens", output)
 	}
 	if value := usage.Get("total_tokens"); value.Exists() {
 		out, _ = sjson.SetBytes(out, path+".total_tokens", value.Int())

@@ -500,12 +500,13 @@ func setCodexInteractionsUsage(out []byte, path string, usage gjson.Result, stre
 	}
 	totalTokens := usage.Get("total_tokens").Int()
 	if totalTokens == 0 {
-		totalTokens = inputTokens + outputTokens
+		totalTokens = translatorcommon.SumPositiveTokenCounts(inputTokens, outputTokens)
 	}
 	reasoningTokens := usage.Get("output_tokens_details.reasoning_tokens").Int()
 	if reasoningTokens == 0 {
 		reasoningTokens = usage.Get("reasoning_tokens").Int()
 	}
+	outputTokens = translatorcommon.InteractionsNonReasoningTokens(outputTokens, reasoningTokens)
 	cachedTokens := usage.Get("input_tokens_details.cached_tokens").Int()
 	if cachedTokens == 0 {
 		cachedTokens = usage.Get("cached_tokens").Int()

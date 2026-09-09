@@ -131,8 +131,8 @@ func TestConvertInteractionsResponseToOpenAIStreamFinishMetadataUsage(t *testing
 	if got := gjson.GetBytes(completed, "usage.prompt_tokens").Int(); got != 2 {
 		t.Fatalf("prompt_tokens = %d, want 2. Payload: %s", got, string(completed))
 	}
-	if got := gjson.GetBytes(completed, "usage.completion_tokens").Int(); got != 6 {
-		t.Fatalf("completion_tokens = %d, want 6. Payload: %s", got, string(completed))
+	if got := gjson.GetBytes(completed, "usage.completion_tokens").Int(); got != 9 {
+		t.Fatalf("completion_tokens = %d, want 9. Payload: %s", got, string(completed))
 	}
 	if got := gjson.GetBytes(completed, "usage.completion_tokens_details.reasoning_tokens").Int(); got != 3 {
 		t.Fatalf("reasoning_tokens = %d, want 3. Payload: %s", got, string(completed))

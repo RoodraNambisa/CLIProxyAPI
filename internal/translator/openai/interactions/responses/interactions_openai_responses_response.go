@@ -401,7 +401,7 @@ func (call *interactionsFunctionCallState) arguments() string {
 }
 
 func responsesCompletedEvent(modelName string, root gjson.Result, st *interactionsToResponsesStreamState) []byte {
-	payload := []byte(`{"type":"response.completed","response":{"id":"","object":"response","status":"completed","model":"","output":[],"usage":{}}}`)
+	payload := []byte(`{"type":"response.completed","response":{"id":"","object":"response","status":"completed","model":"","output":[]}}`)
 	payload, _ = sjson.SetBytes(payload, "sequence_number", nextResponsesSeq(st))
 	interaction := root.Get("interaction")
 	payload, _ = sjson.SetBytes(payload, "response.id", firstNonEmpty(interaction.Get("id").String(), root.Get("id").String()))
@@ -516,10 +516,10 @@ func setResponsesUsageFromInteractions(out []byte, path string, usage gjson.Resu
 	if !usage.Exists() {
 		return out
 	}
-	if v, ok := firstUsageInt(usage, "input_tokens", "total_input_tokens"); ok {
+	if v, ok := translatorcommon.InteractionsInputTokens(usage); ok {
 		out, _ = sjson.SetBytes(out, path+".input_tokens", v)
 	}
-	if v, ok := firstUsageInt(usage, "output_tokens", "total_output_tokens"); ok {
+	if v, ok := translatorcommon.InteractionsOutputTokens(usage); ok {
 		out, _ = sjson.SetBytes(out, path+".output_tokens", v)
 	}
 	if v, ok := firstUsageInt(usage, "total_tokens"); ok {
@@ -531,7 +531,7 @@ func setResponsesUsageFromInteractions(out []byte, path string, usage gjson.Resu
 	if v, ok := firstUsageInt(usage, "reasoning_tokens", "total_thought_tokens"); ok {
 		out, _ = sjson.SetBytes(out, path+".output_tokens_details.reasoning_tokens", v)
 	}
-	return out
+	return translatorcommon.EnsureResponsesUsageDetails(out)
 }
 
 func ConvertOpenAIResponsesResponseToInteractions(ctx context.Context, modelName string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, param *any) [][]byte {
@@ -882,8 +882,9 @@ func setInteractionsUsageFromResponses(out []byte, path string, usage gjson.Resu
 		out, _ = sjson.SetBytes(out, path+".total_input_tokens", v.Int())
 	}
 	if v := usage.Get("output_tokens"); v.Exists() {
-		out, _ = sjson.SetBytes(out, path+".output_tokens", v.Int())
-		out, _ = sjson.SetBytes(out, path+".total_output_tokens", v.Int())
+		output := translatorcommon.InteractionsNonReasoningTokens(v.Int(), usage.Get("output_tokens_details.reasoning_tokens").Int())
+		out, _ = sjson.SetBytes(out, path+".output_tokens", output)
+		out, _ = sjson.SetBytes(out, path+".total_output_tokens", output)
 	}
 	if v := usage.Get("total_tokens"); v.Exists() {
 		out, _ = sjson.SetBytes(out, path+".total_tokens", v.Int())

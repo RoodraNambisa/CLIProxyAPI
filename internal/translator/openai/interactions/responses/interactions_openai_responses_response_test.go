@@ -192,8 +192,8 @@ func TestConvertOpenAIResponsesResponseToInteractionsNonStreamUsageDetails(t *te
 	if got := gjson.GetBytes(out, "usage.input_tokens").Int(); got != 11 {
 		t.Fatalf("usage.input_tokens = %d, want 11. Output: %s", got, string(out))
 	}
-	if got := gjson.GetBytes(out, "usage.output_tokens").Int(); got != 13 {
-		t.Fatalf("usage.output_tokens = %d, want 13. Output: %s", got, string(out))
+	if got := gjson.GetBytes(out, "usage.output_tokens").Int(); got != 6 {
+		t.Fatalf("usage.output_tokens = %d, want 6. Output: %s", got, string(out))
 	}
 	if got := gjson.GetBytes(out, "usage.reasoning_tokens").Int(); got != 7 {
 		t.Fatalf("usage.reasoning_tokens = %d, want 7. Output: %s", got, string(out))
@@ -329,8 +329,8 @@ func TestConvertInteractionsResponseToOpenAIResponsesStreamFinishMetadataUsage(t
 	if got := gjson.GetBytes(payload, "response.usage.input_tokens").Int(); got != 2 {
 		t.Fatalf("input_tokens = %d, want 2. Payload: %s", got, string(payload))
 	}
-	if got := gjson.GetBytes(payload, "response.usage.output_tokens").Int(); got != 6 {
-		t.Fatalf("output_tokens = %d, want 6. Payload: %s", got, string(payload))
+	if got := gjson.GetBytes(payload, "response.usage.output_tokens").Int(); got != 9 {
+		t.Fatalf("output_tokens = %d, want 9. Payload: %s", got, string(payload))
 	}
 	if got := gjson.GetBytes(payload, "response.usage.output_tokens_details.reasoning_tokens").Int(); got != 3 {
 		t.Fatalf("reasoning_tokens = %d, want 3. Payload: %s", got, string(payload))

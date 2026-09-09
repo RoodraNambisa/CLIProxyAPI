@@ -252,10 +252,10 @@ func setOpenAIChatUsageFromInteractions(out []byte, path string, usage gjson.Res
 	if !usage.Exists() {
 		return out
 	}
-	if value, ok := interactionsUsageInt(usage, "input_tokens", "total_input_tokens"); ok {
+	if value, ok := translatorcommon.InteractionsInputTokens(usage); ok {
 		out, _ = sjson.SetBytes(out, path+".prompt_tokens", value)
 	}
-	if value, ok := interactionsUsageInt(usage, "output_tokens", "total_output_tokens"); ok {
+	if value, ok := translatorcommon.InteractionsOutputTokens(usage); ok {
 		out, _ = sjson.SetBytes(out, path+".completion_tokens", value)
 	}
 	if value, ok := interactionsUsageInt(usage, "total_tokens"); ok {
