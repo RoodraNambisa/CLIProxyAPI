@@ -233,6 +233,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	req.Payload = nil
 	opts.OriginalRequest = nil
 	applyClaudeHeaders(httpReq, auth, apiKey, false, extraBetas, e.cfg)
+	helps.ApplyClaudeSummaryBeta(httpReq.Header, bodyForUpstream)
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
 		authID = auth.ID
@@ -437,6 +438,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	req.Payload = nil
 	opts.OriginalRequest = nil
 	applyClaudeHeaders(httpReq, auth, apiKey, true, extraBetas, e.cfg)
+	helps.ApplyClaudeSummaryBeta(httpReq.Header, bodyForUpstream)
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
 		authID = auth.ID
@@ -686,6 +688,7 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 	req.Payload = nil
 	opts.OriginalRequest = nil
 	applyClaudeHeaders(httpReq, auth, apiKey, false, extraBetas, e.cfg)
+	helps.ApplyClaudeSummaryBeta(httpReq.Header, body)
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
 		authID = auth.ID
