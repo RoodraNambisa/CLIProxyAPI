@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	translatorcommon "github.com/router-for-me/CLIProxyAPI/v6/internal/translator/common"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
@@ -31,6 +32,8 @@ type UsageReporter struct {
 	published            bool
 	observedDetail       usage.Detail
 	observed             bool
+	claudeUsage          translatorcommon.ClaudeUsage
+	claudeUsageDone      bool
 	observedAdditional   []observedModelUsage
 	executionDiagnostics *cliproxyexecutor.RequestExecutionDiagnostics
 	requestUsageOutcome  *cliproxyexecutor.RequestUsageOutcome
@@ -633,43 +636,16 @@ func ParseOpenAIStreamUsage(line []byte) (usage.Detail, bool) {
 }
 
 func ParseClaudeUsage(data []byte) usage.Detail {
-	usageNode := gjson.ParseBytes(data).Get("usage")
-	if !usageNode.Exists() {
-		return usage.Detail{}
-	}
-	baseInputTokens := usageNode.Get("input_tokens").Int()
-	cacheReadTokens := usageNode.Get("cache_read_input_tokens").Int()
-	cacheCreationTokens := usageNode.Get("cache_creation_input_tokens").Int()
-	detail := usage.Detail{
-		InputTokens:         sumUsageTokens(baseInputTokens, cacheReadTokens, cacheCreationTokens),
-		OutputTokens:        usageNode.Get("output_tokens").Int(),
-		CachedTokens:        cacheReadTokens,
-		CacheCreationTokens: cacheCreationTokens,
-	}
-	detail.TotalTokens = sumUsageTokens(detail.InputTokens, detail.OutputTokens)
-	return detail
+	var value translatorcommon.ClaudeUsage
+	value.Merge(gjson.ParseBytes(data).Get("usage"))
+	return claudeUsageDetail(value)
 }
 
 func ParseClaudeStreamUsage(line []byte) (usage.Detail, bool) {
-	payload := jsonPayload(line)
-	if len(payload) == 0 || !gjson.ValidBytes(payload) {
-		return usage.Detail{}, false
-	}
-	usageNode := gjson.GetBytes(payload, "usage")
-	if !usageNode.Exists() {
-		return usage.Detail{}, false
-	}
-	baseInputTokens := usageNode.Get("input_tokens").Int()
-	cacheReadTokens := usageNode.Get("cache_read_input_tokens").Int()
-	cacheCreationTokens := usageNode.Get("cache_creation_input_tokens").Int()
-	detail := usage.Detail{
-		InputTokens:         sumUsageTokens(baseInputTokens, cacheReadTokens, cacheCreationTokens),
-		OutputTokens:        usageNode.Get("output_tokens").Int(),
-		CachedTokens:        cacheReadTokens,
-		CacheCreationTokens: cacheCreationTokens,
-	}
-	detail.TotalTokens = sumUsageTokens(detail.InputTokens, detail.OutputTokens)
-	return detail, true
+	node, _ := claudeStreamUsageNode(line)
+	var value translatorcommon.ClaudeUsage
+	valid := value.Merge(node)
+	return claudeUsageDetail(value), valid
 }
 
 func parseGeminiFamilyUsageDetail(node gjson.Result) usage.Detail {

@@ -311,10 +311,9 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	if stream {
 		lines := bytes.Split(data, []byte("\n"))
 		for _, line := range lines {
-			if detail, ok := helps.ParseClaudeStreamUsage(line); ok {
-				reporter.Publish(ctx, detail)
-			}
+			reporter.ObserveClaudeStreamUsage(line)
 		}
+		reporter.EnsurePublished(ctx)
 	} else {
 		reporter.Publish(ctx, helps.ParseClaudeUsage(data))
 	}
@@ -537,9 +536,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				}
 				terminal := helps.IsClaudeStreamTerminal(line)
 				terminalSeen = terminalSeen || terminal
-				if detail, ok := helps.ParseClaudeStreamUsage(line); ok {
-					reporter.Observe(detail)
-				}
+				reporter.ObserveClaudeStreamUsage(line)
 				if isClaudeOAuthToken(apiKey) && !auth.ToolPrefixDisabled() {
 					line = stripClaudeToolPrefixFromStreamLine(line, claudeToolPrefix)
 				}
@@ -600,9 +597,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			}
 			terminal := helps.IsClaudeStreamTerminal(line)
 			terminalSeen = terminalSeen || terminal
-			if detail, ok := helps.ParseClaudeStreamUsage(line); ok {
-				reporter.Observe(detail)
-			}
+			reporter.ObserveClaudeStreamUsage(line)
 			if isClaudeOAuthToken(apiKey) && !auth.ToolPrefixDisabled() {
 				line = stripClaudeToolPrefixFromStreamLine(line, claudeToolPrefix)
 			}
