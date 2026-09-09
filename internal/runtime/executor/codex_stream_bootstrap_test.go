@@ -21,6 +21,8 @@ import (
 	core "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
+	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
 
 const codexTestBootstrapCreated = `{"type":"response.created","response":{"id":"first","output":[]}}`
@@ -59,9 +61,13 @@ func TestCodexBootstrapWireAttemptsRespectExistingBudget(t *testing.T) {
 							return
 						}
 						defer func() { _ = conn.Close() }()
-						if _, _, errRead := conn.ReadMessage(); errRead != nil {
+						_, body, errRead := conn.ReadMessage()
+						if errRead != nil {
 							t.Error(errRead)
 							return
+						}
+						if gjson.GetBytes(body, "reasoning.summary").Exists() {
+							t.Error("retry restored hidden summary")
 						}
 						for _, event := range events {
 							if errWrite := conn.WriteMessage(websocket.TextMessage, []byte(event)); errWrite != nil {
@@ -75,7 +81,14 @@ func TestCodexBootstrapWireAttemptsRespectExistingBudget(t *testing.T) {
 						}
 						return
 					}
-					_, _ = io.Copy(io.Discard, r.Body)
+					body, errRead := io.ReadAll(r.Body)
+					if errRead != nil {
+						t.Error(errRead)
+						return
+					}
+					if transport != "images" && gjson.GetBytes(body, "reasoning.summary").Exists() {
+						t.Error("retry restored hidden summary")
+					}
 					w.Header().Set("Content-Type", "text/event-stream")
 					for _, event := range events {
 						_, _ = fmt.Fprintf(w, "data: %s\n\n", event)
@@ -115,6 +128,9 @@ func TestCodexBootstrapWireAttemptsRespectExistingBudget(t *testing.T) {
 					t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(id) })
 				}
 				req := core.Request{Model: model, Payload: []byte(fmt.Sprintf(`{"model":%q,"input":[],"prompt":"draw"}`, model))}
+				if transport != "images" {
+					req.Payload, _ = sjson.SetBytes(req.Payload, "reasoning.summary", nil)
+				}
 				ctrl := core.NewRequestBodyReleaseController(int64(len(req.Payload)), []byte("released"))
 				ctx = core.WithRequestBodyReleaseController(ctx, ctrl)
 				stream, err := manager.ExecuteStream(ctx, []string{"codex"}, req, opts)
@@ -131,6 +147,9 @@ func TestCodexBootstrapWireAttemptsRespectExistingBudget(t *testing.T) {
 					t.Fatalf("calls=%d success=%t; want calls=%d success=%t", calls.Load(), err == nil, tc.wantCalls, tc.wantSuccess)
 				}
 				if tc.wantSuccess {
+					if transport != "images" && (!ctrl.Released() || ctrl.Replayable()) {
+						t.Fatal("successful summary request did not release replay state")
+					}
 					if strings.Contains(output.String(), `"id":"first"`) || strings.Contains(output.String(), "server_is_overloaded") {
 						t.Fatal("rejected attempt leaked into successful stream")
 					}

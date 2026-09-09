@@ -18,6 +18,7 @@ import (
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
 	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
 
 func TestCodexTransportsUseSelectedModelCapabilities(t *testing.T) {
@@ -38,7 +39,7 @@ func TestCodexTransportsUseSelectedModelCapabilities(t *testing.T) {
 		{"missing-original", "http", false, translator.FormatCodex, "xhigh"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			type requestFields struct{ model, effort, path string }
+			type requestFields struct{ model, effort, path, summary string }
 			observed := make(chan requestFields, 1)
 			completed := []byte(`{"type":"response.completed","response":{"id":"resp_fixture","object":"response","status":"completed","model":"capability-upstream","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`)
 			upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
@@ -56,7 +57,7 @@ func TestCodexTransportsUseSelectedModelCapabilities(t *testing.T) {
 						t.Error(errUpgrade)
 						return
 					}
-					observed <- requestFields{gjson.GetBytes(body, "model").String(), gjson.GetBytes(body, "reasoning.effort").String(), r.URL.Path}
+					observed <- requestFields{gjson.GetBytes(body, "model").String(), gjson.GetBytes(body, "reasoning.effort").String(), r.URL.Path, gjson.GetBytes(body, "reasoning.summary").Raw}
 					if errWrite := conn.WriteMessage(websocket.TextMessage, completed); errWrite != nil {
 						t.Error(errWrite)
 					}
@@ -68,7 +69,7 @@ func TestCodexTransportsUseSelectedModelCapabilities(t *testing.T) {
 					t.Error(errRead)
 					return
 				}
-				observed <- requestFields{gjson.GetBytes(body, "model").String(), gjson.GetBytes(body, "reasoning.effort").String(), r.URL.Path}
+				observed <- requestFields{gjson.GetBytes(body, "model").String(), gjson.GetBytes(body, "reasoning.effort").String(), r.URL.Path, gjson.GetBytes(body, "reasoning.summary").Raw}
 				if tc.transport == "compact" {
 					w.Header().Set("Content-Type", "application/json")
 					_, _ = w.Write([]byte(`{"id":"resp_fixture","object":"response.compaction","output":[]}`))
@@ -101,6 +102,9 @@ func TestCodexTransportsUseSelectedModelCapabilities(t *testing.T) {
 			payload := []byte(fmt.Sprintf(`{"model":"bound-model","input":"fixture","reasoning":{"effort":%q}}`, tc.effort))
 			if tc.source == translator.FormatOpenAI {
 				payload = []byte(fmt.Sprintf(`{"model":"bound-model","messages":[{"role":"user","content":"fixture"}],"reasoning_effort":%q}`, tc.effort))
+				payload, _ = sjson.SetBytes(payload, "include_reasoning", false)
+			} else {
+				payload, _ = sjson.SetBytes(payload, "reasoning.summary", nil)
 			}
 			req := core.Request{Model: "bound-model", Payload: payload}
 			opts := core.Options{SourceFormat: tc.source, OriginalRequest: payload, Metadata: map[string]any{core.ExecutionSessionMetadataKey: t.Name()}}
@@ -132,7 +136,7 @@ func TestCodexTransportsUseSelectedModelCapabilities(t *testing.T) {
 				if tc.transport == "compact" {
 					wantPath += "/compact"
 				}
-				if got.model != "capability-upstream" || got.effort != "xhigh" || got.path != wantPath {
+				if got.model != "capability-upstream" || got.effort != "xhigh" || got.path != wantPath || got.summary != "" {
 					t.Fatalf("selected outbound model fields: %+v", got)
 				}
 			default:

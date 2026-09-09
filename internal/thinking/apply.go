@@ -126,6 +126,11 @@ func applyThinking(body, sourceBody []byte, model, fromFormat, toFormat, provide
 	// 1. Route check: Get provider applier
 	applier := GetProviderApplier(providerFormat)
 	if applier == nil {
+		if providerFormat == "openai-response" {
+			// Legacy compact routes have no effort applier. Normalize their known
+			// summary fields without changing the existing effort passthrough.
+			return ApplySummaryConfig(body, providerFormat, summary), nil
+		}
 		log.WithFields(log.Fields{
 			"provider": providerFormat,
 			"model":    model,

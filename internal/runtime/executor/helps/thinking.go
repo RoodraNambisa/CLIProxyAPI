@@ -32,13 +32,15 @@ func translatedRequestSummaryConfig(body, currentSource, originalSource []byte, 
 	if fromFormat == "" {
 		fromFormat = toFormat
 	}
-	if fromFormat != toFormat && !sdktranslator.HasRequestTransformer(from, to) {
+	sameWireFormat := fromFormat == toFormat ||
+		(fromFormat == "codex" || fromFormat == "openai-response") && (toFormat == "codex" || toFormat == "openai-response")
+	if !sameWireFormat && !sdktranslator.HasRequestTransformer(from, to) {
 		// Fallback bodies retain their source shape and must not gain target fields.
 		return thinking.SummaryConfig{}
 	}
 
 	target := thinking.ExtractExplicitSummaryConfig(body, toFormat)
-	if fromFormat == toFormat {
+	if sameWireFormat {
 		target = thinking.ExtractSummaryConfig(body, toFormat)
 	}
 	if target.Mode != thinking.SummaryUnspecified {
@@ -48,7 +50,7 @@ func translatedRequestSummaryConfig(body, currentSource, originalSource []byte, 
 	if current.Mode == thinking.SummaryUnspecified {
 		return thinking.ExtractSummaryConfig(originalSource, fromFormat)
 	}
-	if fromFormat == toFormat {
+	if sameWireFormat {
 		// An explicit native field was removed by the final request normalizer.
 		return thinking.SummaryConfig{}
 	}
