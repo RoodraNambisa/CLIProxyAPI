@@ -90,8 +90,8 @@ func TestClaudeResponsesIncompleteReachesClient(t *testing.T) {
 				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 					w.Header().Set("Content-Type", "text/event-stream")
 					_, _ = io.WriteString(w, `data: {"type":"message_start","message":{"id":"limited","usage":{"input_tokens":2}}}
-data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"partial","name":"tool"}}
-data: {"type":"content_block_stop","index":0}
+data: {"type":"content_block_start","index":7,"content_block":{"type":"tool_use","id":"partial","name":"tool"}}
+data: {"type":"content_block_stop","index":7}
 data: {"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":3}}
 data: {"type":"message_stop"}
 `)
@@ -120,6 +120,9 @@ data: {"type":"message_stop"}
 								continue
 							}
 							event := gjson.Parse(strings.TrimPrefix(line, "data:"))
+							if index := event.Get("output_index"); index.Exists() && index.Int() != 0 {
+								t.Fatal("stream output index did not match the final array position")
+							}
 							if event.Get("type").String() == "response.completed" {
 								t.Fatal("truncated response reported completion")
 							}

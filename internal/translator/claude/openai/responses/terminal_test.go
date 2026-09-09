@@ -51,11 +51,11 @@ func TestClaudeResponsesNonStreamTerminalStatus(t *testing.T) {
 							if kind == "response.output_item.done" {
 								index := event.Get("output_index").Int()
 								done[index]++
-								if index == 7 && gjson.Get(source, "type").String() != "message_stop" {
+								if index == 1 && gjson.Get(source, "type").String() != "message_stop" {
 									t.Fatal("last output was completed before the stop reason")
 								}
 								position := "0"
-								if index == 7 {
+								if index == 1 {
 									position = "1"
 								}
 								if !reflect.DeepEqual(event.Get("item").Value(), result.Get("output."+position).Value()) {
@@ -71,7 +71,7 @@ func TestClaudeResponsesNonStreamTerminalStatus(t *testing.T) {
 							}
 						}
 					}
-					if terminals != 1 || done[0] != 1 || done[7] != 1 || streamed.Get("status").String() != result.Get("status").String() ||
+					if terminals != 1 || done[0] != 1 || done[1] != 1 || streamed.Get("status").String() != result.Get("status").String() ||
 						!reflect.DeepEqual(streamed.Get("output").Value(), result.Get("output").Value()) ||
 						!reflect.DeepEqual(streamed.Get("incomplete_details").Value(), result.Get("incomplete_details").Value()) {
 						t.Fatal("stream and non-stream terminal results differ or were duplicated")

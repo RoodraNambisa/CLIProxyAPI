@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"sort"
 	"strings"
 	"time"
 
@@ -15,15 +14,15 @@ import (
 )
 
 type claudeToResponsesState struct {
-	Seq             int
-	ResponseID      string
-	CreatedAt       int64
-	TextBlocks      map[int]*claudeResponsesTextBlock
-	Completed       bool
-	ItemDone        map[int]bool
-	LastOutputIndex int
-	StopReason      string
-	FuncArgsBuf     map[int]*strings.Builder // index -> args
+	Seq           int
+	ResponseID    string
+	CreatedAt     int64
+	TextBlocks    map[int]*claudeResponsesTextBlock
+	Completed     bool
+	ItemDone      map[int]bool
+	OutputIndexes claudeResponsesOutputIndexes
+	StopReason    string
+	FuncArgsBuf   map[int]*strings.Builder // index -> args
 	// function call bookkeeping for output aggregation
 	FuncNames       map[int]string // index -> function name
 	FuncCallIDs     map[int]string // index -> call id
@@ -68,7 +67,6 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 		(*param).(*claudeToResponsesState).TextBlocks = make(map[int]*claudeResponsesTextBlock)
 		(*param).(*claudeToResponsesState).ReasoningBlocks = make(map[int]*claudeResponsesTextBlock)
 		(*param).(*claudeToResponsesState).ItemDone = make(map[int]bool)
-		(*param).(*claudeToResponsesState).LastOutputIndex = -1
 	}
 	st := (*param).(*claudeToResponsesState)
 
@@ -104,7 +102,7 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 			st.ReasoningBlocks = make(map[int]*claudeResponsesTextBlock)
 			st.Completed = false
 			st.ItemDone = make(map[int]bool)
-			st.LastOutputIndex = -1
+			st.OutputIndexes = claudeResponsesOutputIndexes{}
 			st.StopReason = ""
 			st.FuncArgsBuf = make(map[int]*strings.Builder)
 			st.FuncNames = make(map[int]string)
@@ -162,13 +160,13 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 			st.TextBlocks[idx] = block
 			item := []byte(`{"type":"response.output_item.added","sequence_number":0,"output_index":0,"item":{"id":"","type":"message","status":"in_progress","content":[],"role":"assistant"}}`)
 			item, _ = sjson.SetBytes(item, "sequence_number", nextSeq())
-			item, _ = sjson.SetBytes(item, "output_index", idx)
+			item, _ = sjson.SetBytes(item, "output_index", st.OutputIndexes.ByBlock[idx])
 			item, _ = sjson.SetBytes(item, "item.id", block.ID)
 			out = append(out, emitEvent("response.output_item.added", item))
 
 			part := []byte(`{"type":"response.content_part.added","sequence_number":0,"item_id":"","output_index":0,"content_index":0,"part":{"type":"output_text","annotations":[],"logprobs":[],"text":""}}`)
 			part, _ = sjson.SetBytes(part, "sequence_number", nextSeq())
-			part, _ = sjson.SetBytes(part, "output_index", idx)
+			part, _ = sjson.SetBytes(part, "output_index", st.OutputIndexes.ByBlock[idx])
 			part, _ = sjson.SetBytes(part, "item_id", block.ID)
 			out = append(out, emitEvent("response.content_part.added", part))
 		} else if typ == "tool_use" {
@@ -183,7 +181,7 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 			name := cb.Get("name").String()
 			item := []byte(`{"type":"response.output_item.added","sequence_number":0,"output_index":0}`)
 			item, _ = sjson.SetBytes(item, "sequence_number", nextSeq())
-			item, _ = sjson.SetBytes(item, "output_index", idx)
+			item, _ = sjson.SetBytes(item, "output_index", st.OutputIndexes.ByBlock[idx])
 			item, _ = sjson.SetRawBytes(item, "item", buildClaudeResponsesToolItem(st.ToolIdentities, name, callID, "", "in_progress"))
 			out = append(out, emitEvent("response.output_item.added", item))
 			if st.FuncArgsBuf[idx] == nil {
@@ -199,7 +197,7 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 			st.ReasoningBlocks[idx] = block
 			item := []byte(`{"type":"response.output_item.added","sequence_number":0,"output_index":0,"item":{"id":"","type":"reasoning","status":"in_progress","summary":[]}}`)
 			item, _ = sjson.SetBytes(item, "sequence_number", nextSeq())
-			item, _ = sjson.SetBytes(item, "output_index", idx)
+			item, _ = sjson.SetBytes(item, "output_index", st.OutputIndexes.ByBlock[idx])
 			item, _ = sjson.SetBytes(item, "item.id", block.ID)
 			item, _ = sjson.SetBytes(item, "item.encrypted_content", block.Signature.String())
 			out = append(out, emitEvent("response.output_item.added", item))
@@ -210,10 +208,10 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 			part := []byte(`{"type":"response.reasoning_summary_part.added","sequence_number":0,"item_id":"","output_index":0,"summary_index":0,"part":{"type":"summary_text","text":""}}`)
 			part, _ = sjson.SetBytes(part, "sequence_number", nextSeq())
 			part, _ = sjson.SetBytes(part, "item_id", block.ID)
-			part, _ = sjson.SetBytes(part, "output_index", idx)
+			part, _ = sjson.SetBytes(part, "output_index", st.OutputIndexes.ByBlock[idx])
 			out = append(out, emitEvent("response.reasoning_summary_part.added", part))
 			if block.Text.Len() > 0 {
-				out = append(out, claudeResponsesReasoningDelta(block, idx, block.Text.String(), nextSeq()))
+				out = append(out, claudeResponsesReasoningDelta(block, st.OutputIndexes.ByBlock[idx], block.Text.String(), nextSeq()))
 			}
 		}
 	case "content_block_delta":
@@ -238,7 +236,7 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 			if t := d.Get("text"); t.Exists() {
 				msg := []byte(`{"type":"response.output_text.delta","sequence_number":0,"item_id":"","output_index":0,"content_index":0,"delta":"","logprobs":[]}`)
 				msg, _ = sjson.SetBytes(msg, "sequence_number", nextSeq())
-				msg, _ = sjson.SetBytes(msg, "output_index", idx)
+				msg, _ = sjson.SetBytes(msg, "output_index", st.OutputIndexes.ByBlock[idx])
 				msg, _ = sjson.SetBytes(msg, "item_id", block.ID)
 				msg, _ = sjson.SetBytes(msg, "delta", t.String())
 				out = append(out, emitEvent("response.output_text.delta", msg))
@@ -260,7 +258,7 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 				msg := []byte(`{"type":"response.function_call_arguments.delta","sequence_number":0,"item_id":"","output_index":0,"delta":""}`)
 				msg, _ = sjson.SetBytes(msg, "sequence_number", nextSeq())
 				msg, _ = sjson.SetBytes(msg, "item_id", fmt.Sprintf("fc_%s", st.FuncCallIDs[idx]))
-				msg, _ = sjson.SetBytes(msg, "output_index", idx)
+				msg, _ = sjson.SetBytes(msg, "output_index", st.OutputIndexes.ByBlock[idx])
 				msg, _ = sjson.SetBytes(msg, "delta", pj.String())
 				out = append(out, emitEvent("response.function_call_arguments.delta", msg))
 			}
@@ -268,7 +266,7 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 			if block := st.ReasoningBlocks[idx]; block != nil && !block.Done && !block.Redacted {
 				if t := d.Get("thinking"); t.Type == gjson.String {
 					block.Text.WriteString(t.String())
-					out = append(out, claudeResponsesReasoningDelta(block, idx, t.String(), nextSeq()))
+					out = append(out, claudeResponsesReasoningDelta(block, st.OutputIndexes.ByBlock[idx], t.String(), nextSeq()))
 				}
 			}
 		} else if dt == "signature_delta" {
@@ -280,7 +278,7 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 		}
 	case "content_block_stop":
 		st.closeBlock(idx)
-		if idx < st.LastOutputIndex {
+		if idx != st.OutputIndexes.lastBlock() {
 			out = append(out, st.finalizeBlock(idx, "completed", nextSeq)...)
 		}
 	case "message_delta":
@@ -301,7 +299,7 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 		eventType, responseStatus, incompleteDetails := claudeResponsesTerminalState(st.StopReason)
 		for _, index := range st.pendingBlockIndexes() {
 			status := "completed"
-			if index == st.LastOutputIndex {
+			if index == st.OutputIndexes.lastBlock() {
 				status = responseStatus
 			}
 			out = append(out, st.finalizeBlock(index, status, nextSeq)...)
@@ -400,11 +398,11 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 		for index := range st.FuncCallIDs {
 			outputItems[index] = st.outputItem(index, "completed")
 		}
-		if st.LastOutputIndex >= 0 {
-			outputItems[st.LastOutputIndex] = st.outputItem(st.LastOutputIndex, responseStatus)
+		if last := st.OutputIndexes.lastBlock(); last >= 0 {
+			outputItems[last] = st.outputItem(last, responseStatus)
 		}
 		if len(outputItems) > 0 {
-			completed, _ = sjson.SetRawBytes(completed, "response.output", claudeResponsesOrderedOutput(outputItems))
+			completed, _ = sjson.SetRawBytes(completed, "response.output", claudeResponsesOrderedOutput(outputItems, st.OutputIndexes.Blocks))
 		}
 
 		reasoningTokens := int64(reasoningBytes / 4)
@@ -429,22 +427,11 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 
 func (st *claudeToResponsesState) pendingBlockIndexes() []int {
 	var indexes []int
-	for index := range st.TextBlocks {
+	for _, index := range st.OutputIndexes.Blocks {
 		if !st.ItemDone[index] {
 			indexes = append(indexes, index)
 		}
 	}
-	for index := range st.ReasoningBlocks {
-		if !st.ItemDone[index] {
-			indexes = append(indexes, index)
-		}
-	}
-	for index := range st.FuncCallIDs {
-		if !st.ItemDone[index] {
-			indexes = append(indexes, index)
-		}
-	}
-	sort.Ints(indexes)
 	return indexes
 }
 
@@ -475,12 +462,7 @@ func claudeResponsesReasoningDelta(block *claudeResponsesTextBlock, index int, t
 	return emitEvent("response.reasoning_summary_text.delta", event)
 }
 
-func claudeResponsesOrderedOutput(items map[int][]byte) []byte {
-	indexes := make([]int, 0, len(items))
-	for index := range items {
-		indexes = append(indexes, index)
-	}
-	sort.Ints(indexes)
+func claudeResponsesOrderedOutput(items map[int][]byte, indexes []int) []byte {
 	out := []byte{'['}
 	for _, index := range indexes {
 		if len(out) > 1 {
@@ -520,12 +502,13 @@ func ConvertClaudeResponseToOpenAIResponsesNonStream(_ context.Context, _ string
 
 	// Aggregation state
 	var (
-		responseID   string
-		createdAt    int64
-		inputTokens  int64
-		outputTokens int64
-		completed    bool
-		stopReason   string
+		responseID    string
+		createdAt     int64
+		inputTokens   int64
+		outputTokens  int64
+		completed     bool
+		stopReason    string
+		outputIndexes claudeResponsesOutputIndexes
 	)
 	textBlocks := make(map[int]*claudeResponsesTextBlock)
 	reasoningBlocks := make(map[int]*claudeResponsesTextBlock)
@@ -563,6 +546,7 @@ func ConvertClaudeResponseToOpenAIResponsesNonStream(_ context.Context, _ string
 				reasoningBlocks = make(map[int]*claudeResponsesTextBlock)
 				completed = false
 				stopReason = ""
+				outputIndexes = claudeResponsesOutputIndexes{}
 				inputTokens, outputTokens = 0, 0
 				responseID = msg.Get("id").String()
 				createdAt = time.Now().Unix()
@@ -582,13 +566,16 @@ func ConvertClaudeResponseToOpenAIResponsesNonStream(_ context.Context, _ string
 			}
 			switch typ {
 			case "text":
+				outputIndexes.add(idx)
 				textBlocks[idx] = &claudeResponsesTextBlock{ID: fmt.Sprintf("msg_%s_%d", responseID, idx)}
 			case "tool_use":
 				callID := cb.Get("id").String()
 				if toolCalls[idx] == nil && callID != "" {
+					outputIndexes.add(idx)
 					toolCalls[idx] = &toolState{id: callID, name: cb.Get("name").String()}
 				}
 			case "thinking", "redacted_thinking":
+				outputIndexes.add(idx)
 				reasoningBlocks[idx] = newClaudeResponsesReasoningBlock(fmt.Sprintf("rs_%s_%d", responseID, idx), cb)
 			}
 
@@ -605,6 +592,7 @@ func ConvertClaudeResponseToOpenAIResponsesNonStream(_ context.Context, _ string
 				}
 				block := textBlocks[idx]
 				if block == nil {
+					outputIndexes.add(idx)
 					block = &claudeResponsesTextBlock{ID: fmt.Sprintf("msg_%s_%d", responseID, idx)}
 					textBlocks[idx] = block
 				}
@@ -741,13 +729,7 @@ func ConvertClaudeResponseToOpenAIResponsesNonStream(_ context.Context, _ string
 	for index, block := range textBlocks {
 		outputItems[index] = claudeResponsesTextItem(block)
 	}
-	lastIndex := -1
-	for index := range outputItems {
-		lastIndex = max(lastIndex, index)
-	}
-	for index := range toolCalls {
-		lastIndex = max(lastIndex, index)
-	}
+	lastIndex := outputIndexes.lastBlock()
 	for index, call := range toolCalls {
 		status := "completed"
 		if index == lastIndex {
@@ -759,7 +741,7 @@ func ConvertClaudeResponseToOpenAIResponsesNonStream(_ context.Context, _ string
 		outputItems[lastIndex], _ = sjson.SetBytes(outputItems[lastIndex], "status", responseStatus)
 	}
 	if len(outputItems) > 0 {
-		out, _ = sjson.SetRawBytes(out, "output", claudeResponsesOrderedOutput(outputItems))
+		out, _ = sjson.SetRawBytes(out, "output", claudeResponsesOrderedOutput(outputItems, outputIndexes.Blocks))
 	}
 
 	// Usage
