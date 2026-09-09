@@ -674,7 +674,7 @@ func ParseClaudeStreamUsage(line []byte) (usage.Detail, bool) {
 func parseGeminiFamilyUsageDetail(node gjson.Result) usage.Detail {
 	reasoningTokens := node.Get("thoughtsTokenCount").Int()
 	detail := usage.Detail{
-		InputTokens:     node.Get("promptTokenCount").Int(),
+		InputTokens:     translatorcommon.GeminiInputTokens(node),
 		OutputTokens:    sumUsageTokens(node.Get("candidatesTokenCount").Int(), reasoningTokens),
 		ReasoningTokens: reasoningTokens,
 		TotalTokens:     node.Get("totalTokenCount").Int(),
@@ -694,7 +694,10 @@ func parseInteractionsUsageDetail(node gjson.Result) usage.Detail {
 	}
 	reasoningTokens := firstInteractionsUsageNode(node, "reasoning_tokens", "thoughtsTokenCount", "total_thought_tokens").Int()
 	detail := usage.Detail{
-		InputTokens:         firstInteractionsUsageNode(node, "input_tokens", "prompt_tokens", "total_input_tokens").Int(),
+		InputTokens: sumUsageTokens(
+			firstInteractionsUsageNode(node, "input_tokens", "prompt_tokens", "total_input_tokens").Int(),
+			firstInteractionsUsageNode(node, "tool_use_tokens", "total_tool_use_tokens", "toolUseTokens", "totalToolUseTokens").Int(),
+		),
 		OutputTokens:        sumUsageTokens(firstInteractionsUsageNode(node, "output_tokens", "completion_tokens", "total_output_tokens").Int(), reasoningTokens),
 		ReasoningTokens:     reasoningTokens,
 		TotalTokens:         firstInteractionsUsageNode(node, "total_tokens", "totalTokenCount").Int(),
