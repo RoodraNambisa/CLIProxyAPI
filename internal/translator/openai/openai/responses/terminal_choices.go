@@ -81,7 +81,7 @@ func (st *oaiToResponsesState) finishMessage(choice int, status string, nextSeq 
 	if buffer := st.MsgTextBuf[choice]; buffer != nil {
 		text = buffer.String()
 	}
-	id := fmt.Sprintf("msg_%s_%d", st.ResponseID, choice)
+	id := st.MsgIDs[choice]
 	index := st.MsgOutputIx[choice]
 	done := []byte(`{"type":"response.output_text.done","content_index":0,"logprobs":[]}`)
 	done, _ = sjson.SetBytes(done, "sequence_number", nextSeq())
@@ -99,7 +99,8 @@ func (st *oaiToResponsesState) finishMessage(choice int, status string, nextSeq 
 	item, _ = sjson.SetBytes(item, "item.id", id)
 	item, _ = sjson.SetBytes(item, "item.status", status)
 	item, _ = sjson.SetBytes(item, "item.content.0.text", text)
-	st.MsgItemDone[choice], st.MsgItemStatus[choice] = true, status
+	st.MsgItemDone[choice] = true
+	st.Messages = append(st.Messages, oaiToResponsesStateMessage{ID: id, Text: text, OutputIndex: index, Status: status})
 	return [][]byte{emitRespEvent("response.output_text.done", done), emitRespEvent("response.content_part.done", part), emitRespEvent("response.output_item.done", item)}
 }
 
