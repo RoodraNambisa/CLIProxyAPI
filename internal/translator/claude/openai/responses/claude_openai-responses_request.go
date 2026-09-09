@@ -314,10 +314,9 @@ func convertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 					emittedToolResults[callID] = true
 					targetItem = lastToolResult[callID]
 				}
-				outputStr := targetItem.Get("output").String()
 				toolResult := []byte(`{"type":"tool_result","tool_use_id":"","content":""}`)
 				toolResult, _ = sjson.SetBytes(toolResult, "tool_use_id", callID)
-				toolResult, _ = sjson.SetBytes(toolResult, "content", outputStr)
+				toolResult = applyClaudeResponsesToolResultContent(toolResult, targetItem.Get("output"))
 				if cache := targetItem.Get("cache_control"); cache.IsObject() {
 					toolResult, _ = sjson.SetRawBytes(toolResult, "cache_control", []byte(cache.Raw))
 				}

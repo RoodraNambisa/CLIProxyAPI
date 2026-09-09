@@ -64,3 +64,42 @@ func TestClaudeToolResultsUseLastPayloadAtFirstPosition(t *testing.T) {
 		}
 	}
 }
+
+func TestClaudeStructuredToolResultsReachEveryOperation(t *testing.T) {
+	for _, compat := range []bool{false, true} {
+		for _, operation := range []string{"execute", "stream", "count"} {
+			t.Run(fmt.Sprintf("compat=%t/%s", compat, operation), func(t *testing.T) {
+				captured := make(chan bool, 2)
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					body, err := io.ReadAll(r.Body)
+					if err != nil {
+						t.Error(err)
+						return
+					}
+					result := gjson.GetBytes(body, "messages.0.content.0")
+					captured <- gjson.GetBytes(body, "messages.0.content.#").Int() == 1 && result.Get("tool_use_id").String() == "paired" &&
+						result.Get("content.#").Int() == 3 && result.Get("content.0.text").String() == "result" &&
+						result.Get("content.1.source.data").String() == "aW1hZ2U=" && result.Get("content.2.source.media_type").String() == "application/pdf" &&
+						result.Get("cache_control.ttl").String() == "5m"
+					responseKind := "stream"
+					if operation == "count" {
+						responseKind = "count"
+					}
+					writeClaudeCompatibilityFixture(w, responseKind)
+				}))
+				t.Cleanup(server.Close)
+				manager := claudeCompatibilityManager(t, server.URL, compat)
+				raw := []byte(`{"input":[{"type":"function_call_output","call_id":"paired","output":"stale"},{"type":"custom_tool_call_output","call_id":"paired","output":[{"type":"input_text","text":"result"},{"type":"input_image","image_url":"data:image/png;base64,aW1hZ2U="},{"type":"input_file","file_data":"data:application/pdf;base64,cGRm"}],"cache_control":{"type":"ephemeral","ttl":"5m"}}]}`)
+				runClaudeCompatibilityRequest(t, manager, operation, raw, translator.FormatOpenAIResponse)
+				select {
+				case valid := <-captured:
+					if !valid {
+						t.Fatal("actual request lost structured content or the last duplicate result")
+					}
+				default:
+					t.Fatal("request did not reach the local upstream")
+				}
+			})
+		}
+	}
+}
