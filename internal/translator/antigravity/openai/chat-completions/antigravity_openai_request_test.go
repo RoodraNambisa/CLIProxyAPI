@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
 
 func TestConvertOpenAIRequestToAntigravitySkipsEmptyTextPartsWithoutNulls(t *testing.T) {
@@ -57,17 +58,18 @@ func TestConvertOpenAIRequestToAntigravitySkipsEmptyTextPartsWithoutNulls(t *tes
 
 func TestConvertOpenAIRequestToAntigravityThinkingAliases(t *testing.T) {
 	tests := []struct {
-		name string
-		body string
-		want bool
+		name   string
+		body   string
+		want   bool
+		absent bool
 	}{
 		{
-			name: "Default Gemini include thoughts",
+			name: "Model name does not opt into thoughts",
 			body: `{
 				"model":"gemini-3.1-pro-low",
 				"messages":[{"role":"user","content":"hi"}]
 			}`,
-			want: true,
+			absent: true,
 		},
 		{
 			name: "GenerationConfig snake include thoughts",
@@ -111,15 +113,39 @@ func TestConvertOpenAIRequestToAntigravityThinkingAliases(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			result := ConvertOpenAIRequestToAntigravity("gemini-3.1-pro-low", []byte(tt.body), false)
 			includeThoughts := gjson.GetBytes(result, "request.generationConfig.thinkingConfig.includeThoughts")
-			if !includeThoughts.Exists() {
-				t.Fatalf("includeThoughts missing. Output: %s", result)
+			if includeThoughts.Exists() == tt.absent {
+				t.Fatalf("unexpected includeThoughts presence. Output: %s", result)
 			}
-			if got := includeThoughts.Bool(); got != tt.want {
+			if got := includeThoughts.Bool(); !tt.absent && got != tt.want {
 				t.Fatalf("includeThoughts = %v, want %v. Output: %s", got, tt.want, result)
 			}
 			if snake := gjson.GetBytes(result, "request.generationConfig.thinkingConfig.include_thoughts"); snake.Exists() {
 				t.Fatalf("include_thoughts should be normalized away. Output: %s", result)
 			}
 		})
+	}
+}
+
+func TestConvertOpenAIRequestToAntigravitySummaryAliasesRequireBooleans(t *testing.T) {
+	for _, path := range []string{
+		"generationConfig.thinkingConfig.includeThoughts", "generationConfig.thinkingConfig.include_thoughts",
+		"generationConfig.thinking_config.includeThoughts", "generationConfig.thinking_config.include_thoughts",
+		"generationConfig.includeThoughts", "generationConfig.include_thoughts",
+	} {
+		for _, value := range []any{true, false, "true", "false", 0, 1, nil} {
+			body, err := sjson.SetBytes([]byte(`{"messages":[{"role":"user","content":"fixture"}],"generationConfig":{"thinkingConfig":{"thinkingBudget":2048}}}`), path, value)
+			if err != nil {
+				t.Fatal(err)
+			}
+			out := ConvertOpenAIRequestToAntigravity("gemini-3.1-pro-low", body, false)
+			got := gjson.GetBytes(out, "request.generationConfig.thinkingConfig.includeThoughts")
+			want, valid := value.(bool)
+			if got.Exists() != valid || (valid && (!got.IsBool() || got.Bool() != want)) {
+				t.Fatalf("%s value type %T has invalid summary output: %s", path, value, out)
+			}
+			if gjson.GetBytes(out, "request.generationConfig.thinkingConfig.thinkingBudget").Int() != 2048 {
+				t.Fatal("visibility normalization changed the amount")
+			}
+		}
 	}
 }
