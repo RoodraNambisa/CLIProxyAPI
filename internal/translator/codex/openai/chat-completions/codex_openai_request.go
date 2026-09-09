@@ -105,8 +105,6 @@ func ConvertOpenAIRequestToCodex(modelName string, inputRawJSON []byte, stream b
 				if !matched {
 					continue
 				}
-				content := m.Get("content").String()
-
 				// Preserve the result type recorded for its paired tool call.
 				funcOutput := []byte(`{}`)
 				outputType := "function_call_output"
@@ -115,7 +113,7 @@ func ConvertOpenAIRequestToCodex(modelName string, inputRawJSON []byte, stream b
 				}
 				funcOutput, _ = sjson.SetBytes(funcOutput, "type", outputType)
 				funcOutput, _ = sjson.SetBytes(funcOutput, "call_id", toolCallID)
-				funcOutput, _ = sjson.SetBytes(funcOutput, "output", content)
+				funcOutput = setCodexOpenAIToolOutput(funcOutput, m.Get("content"))
 				inputItems = append(inputItems, funcOutput)
 
 			default:

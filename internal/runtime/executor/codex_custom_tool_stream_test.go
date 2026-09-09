@@ -39,6 +39,12 @@ func TestCodexCustomToolStreamsKeepNamesAndInputAcrossBodyRelease(t *testing.T) 
 						payload, _ = sjson.DeleteBytes(payload, "messages.1.tool_calls.0.custom")
 					}
 					payload, _ = sjson.SetRawBytes(payload, "messages.-1", []byte(`{"role":"tool","content":"history output"}`))
+					content := `[{"type":"text","text":"history output"},{"type":"input_image","file_id":"file-test","detail":"high"}]`
+					if native {
+						payload, _ = sjson.SetBytes(payload, "messages.2.content", content)
+					} else {
+						payload, _ = sjson.SetRawBytes(payload, "messages.2.content", []byte(content))
+					}
 					payload, _ = sjson.SetRawBytes(payload, "messages.-1", []byte(`{"role":"tool","content":"duplicate"}`))
 					ctrl := core.NewRequestBodyReleaseController(int64(len(payload)), []byte("<released>"))
 					server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -67,7 +73,7 @@ func TestCodexCustomToolStreamsKeepNamesAndInputAcrossBodyRelease(t *testing.T) 
 							t.Error("upstream custom name was not normalized")
 							return
 						}
-						if gjson.GetBytes(body, "input.#").Int() != 3 || gjson.GetBytes(body, "input.1.type").String() != "custom_tool_call" || gjson.GetBytes(body, "input.1.call_id").String() != "call_missing_1_0" || gjson.GetBytes(body, "input.1.input").String() != "history input" || gjson.GetBytes(body, "input.2.type").String() != "custom_tool_call_output" || gjson.GetBytes(body, "input.2.call_id").String() != "call_missing_1_0" || gjson.GetBytes(body, "input.2.output").String() != "history output" {
+						if gjson.GetBytes(body, "input.#").Int() != 3 || gjson.GetBytes(body, "input.1.type").String() != "custom_tool_call" || gjson.GetBytes(body, "input.1.call_id").String() != "call_missing_1_0" || gjson.GetBytes(body, "input.1.input").String() != "history input" || gjson.GetBytes(body, "input.2.type").String() != "custom_tool_call_output" || gjson.GetBytes(body, "input.2.call_id").String() != "call_missing_1_0" || gjson.GetBytes(body, "input.2.output").Raw != `[{"type":"input_text","text":"history output"},{"type":"input_image","file_id":"file-test","detail":"high"}]` {
 							t.Error("custom history IDs were not paired exactly once before dispatch")
 							return
 						}
