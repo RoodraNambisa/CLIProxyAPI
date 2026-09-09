@@ -44,20 +44,14 @@ var dataTag = []byte("data:")
 // response.completed.response.output empty. Keep the stream path aligned with the
 // already-patched non-stream path by reconstructing response.output from those items.
 func collectCodexOutputItemDone(eventData []byte, outputItemsByIndex map[int64][]byte, outputItemsFallback *[][]byte) {
-	itemResult := gjson.GetBytes(eventData, "item")
-	if !itemResult.Exists() || itemResult.Type != gjson.JSON {
-		return
-	}
-	outputIndexResult := gjson.GetBytes(eventData, "output_index")
-	if outputIndexResult.Exists() {
-		outputItemsByIndex[outputIndexResult.Int()] = []byte(itemResult.Raw)
-		return
-	}
-	*outputItemsFallback = append(*outputItemsFallback, []byte(itemResult.Raw))
+	helps.CollectCodexOutputItemDone(eventData, outputItemsByIndex, outputItemsFallback)
 }
 
 func patchCodexCompletedOutput(eventData []byte, outputItemsByIndex map[int64][]byte, outputItemsFallback [][]byte) []byte {
 	outputResult := gjson.GetBytes(eventData, "response.output")
+	if outputResult.IsArray() && len(outputResult.Array()) > 0 {
+		return helps.HydrateCodexOutputItemIDs(eventData, outputItemsByIndex)
+	}
 	shouldPatchOutput := (!outputResult.Exists() || !outputResult.IsArray() || len(outputResult.Array()) == 0) && (len(outputItemsByIndex) > 0 || len(outputItemsFallback) > 0)
 	if !shouldPatchOutput {
 		return eventData
