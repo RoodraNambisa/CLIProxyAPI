@@ -33,7 +33,7 @@ func (e *orphanDelegationCaptureExecutor) Execute(_ context.Context, _ *coreauth
 func (e *orphanDelegationCaptureExecutor) ExecuteStream(ctx context.Context, credential *coreauth.Auth, req core.Request, opts core.Options) (*core.StreamResult, error) {
 	_, _ = e.Execute(ctx, credential, req, opts)
 	chunks := make(chan core.StreamChunk, 1)
-	chunks <- core.StreamChunk{Payload: []byte(`{"type":"response.completed","response":{"id":"done","status":"completed","output":[{"type":"function_call","call_id":"known","name":"create_thread","namespace":"codex_app","arguments":"{}"}]}}`)}
+	chunks <- core.StreamChunk{Payload: []byte(`data: {"type":"response.completed","response":{"id":"done","status":"completed","output":[{"type":"function_call","call_id":"known","name":"create_thread","namespace":"codex_app","arguments":"{}"}]}}`)}
 	close(chunks)
 	return &core.StreamResult{Chunks: chunks}, nil
 }

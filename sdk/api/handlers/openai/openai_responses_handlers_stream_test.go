@@ -967,8 +967,8 @@ func TestForwardResponsesStreamReassemblesSplitSSEEventChunks(t *testing.T) {
 
 	data := make(chan []byte, 3)
 	errs := make(chan *interfaces.ErrorMessage)
-	data <- []byte("event: response.created")
-	data <- []byte("data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-1\"}}")
+	data <- []byte("event: response.completed")
+	data <- []byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\"}}")
 	data <- []byte("\n")
 	close(data)
 	close(errs)
@@ -976,7 +976,7 @@ func TestForwardResponsesStreamReassemblesSplitSSEEventChunks(t *testing.T) {
 	h.forwardResponsesStream(c, flusher, func(error) {}, data, errs, nil)
 
 	got := strings.TrimSuffix(recorder.Body.String(), "\n")
-	want := "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-1\"}}\n\n"
+	want := "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\"}}\n\n"
 	if got != want {
 		t.Fatalf("unexpected split-event framing.\nGot:  %q\nWant: %q", got, want)
 	}
@@ -987,7 +987,7 @@ func TestForwardResponsesStreamPreservesValidFullSSEEventChunks(t *testing.T) {
 
 	data := make(chan []byte, 1)
 	errs := make(chan *interfaces.ErrorMessage)
-	chunk := []byte("event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-1\"}}\n\n")
+	chunk := []byte("event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\"}}\n\n")
 	data <- chunk
 	close(data)
 	close(errs)
@@ -1005,7 +1005,7 @@ func TestForwardResponsesStreamBuffersSplitDataPayloadChunks(t *testing.T) {
 
 	data := make(chan []byte, 2)
 	errs := make(chan *interfaces.ErrorMessage)
-	data <- []byte("data: {\"type\":\"response.created\"")
+	data <- []byte("data: {\"type\":\"response.completed\"")
 	data <- []byte(",\"response\":{\"id\":\"resp-1\"}}")
 	close(data)
 	close(errs)
@@ -1013,7 +1013,7 @@ func TestForwardResponsesStreamBuffersSplitDataPayloadChunks(t *testing.T) {
 	h.forwardResponsesStream(c, flusher, func(error) {}, data, errs, nil)
 
 	got := recorder.Body.String()
-	want := "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-1\"}}\n\n\n"
+	want := "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\"}}\n\n\n"
 	if got != want {
 		t.Fatalf("unexpected split-data framing.\nGot:  %q\nWant: %q", got, want)
 	}

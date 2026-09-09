@@ -764,15 +764,15 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 				default:
 				}
 				framer.Flush(&firstFrame)
-				if errFrame := framer.Err(); errFrame != nil {
-					h.WriteErrorResponse(c, h.RewriteExecutionErrorResponseForContext(cliCtx, &interfaces.ErrorMessage{
-						StatusCode: http.StatusBadGateway,
-						Error:      errFrame,
-					}))
-					cliCancel(errFrame)
+				if errClose := framer.CloseError(); errClose != nil {
+					if !handlers.IsErrorResponseRewritten(errClose) {
+						errClose = h.RewriteExecutionErrorResponseForContext(cliCtx, errClose)
+					}
+					h.WriteErrorResponse(c, errClose)
+					cliCancel(errClose.Error)
 					return
 				}
-				// Stream closed without data? Send headers and done.
+				// A valid terminal or trusted stream can finish without further data.
 				setSSEHeaders()
 				handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
 				_, _ = c.Writer.Write(firstFrame.Bytes())
@@ -840,10 +840,20 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesStream(c *gin.Context, flush
 		},
 		WriteTerminalError: func(errMsg *interfaces.ErrorMessage) {
 			framer.Flush(c.Writer)
-			if framer.terminalRewritten {
+			if framer.terminalError != nil || (!framer.passthrough && framer.terminalSeen) {
 				return
 			}
 			h.writePublicResponsesStreamError(c, c.Writer, errMsg)
+		},
+		CloseError: func() *interfaces.ErrorMessage {
+			framer.Flush(c.Writer)
+			if errClose := framer.CloseError(); errClose != nil {
+				if errClose == framer.terminalError {
+					return errClose
+				}
+				return h.RewriteExecutionErrorResponseForGin(c, errClose)
+			}
+			return nil
 		},
 		WriteDone: func() {
 			framer.Flush(c.Writer)

@@ -45,7 +45,7 @@ func (e *multiAgentBoundaryExecutor) Execute(ctx context.Context, _ *coreauth.Au
 func (e *multiAgentBoundaryExecutor) ExecuteStream(ctx context.Context, auth *coreauth.Auth, req core.Request, opts core.Options) (*core.StreamResult, error) {
 	_, _ = e.Execute(ctx, auth, req, opts)
 	chunks := make(chan core.StreamChunk, 1)
-	chunks <- core.StreamChunk{Payload: []byte(`{"type":"response.completed","response":{"id":"done","status":"completed","output":[]}}`)}
+	chunks <- core.StreamChunk{Payload: []byte(`data: {"type":"response.completed","response":{"id":"done","status":"completed","output":[]}}`)}
 	close(chunks)
 	return &core.StreamResult{Chunks: chunks}, nil
 }
