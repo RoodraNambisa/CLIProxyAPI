@@ -68,8 +68,8 @@ func ReasoningReplayNamespace(ctx context.Context, provider, authID string) stri
 }
 
 // SanitizeCodexReasoningEncryptedContent removes malformed encrypted_content
-// values while preserving the surrounding reasoning item. Configured compatibility
-// endpoints may explicitly retain empty string placeholders.
+// values and non-replayable store IDs while preserving the reasoning item.
+// Configured compatibility endpoints may retain empty string placeholders.
 func SanitizeCodexReasoningEncryptedContent(ctx context.Context, provider string, body []byte, preserveEmpty ...bool) []byte {
 	input := gjson.GetBytes(body, "input")
 	if !input.IsArray() {
@@ -80,45 +80,66 @@ func SanitizeCodexReasoningEncryptedContent(ctx context.Context, provider string
 		provider = "codex executor"
 	}
 
-	updated := body
-	for index, item := range input.Array() {
-		if strings.TrimSpace(item.Get("type").String()) != "reasoning" {
-			continue
-		}
-		path := fmt.Sprintf("input.%d.encrypted_content", index)
-		encryptedContent := gjson.GetBytes(updated, path)
-		if !encryptedContent.Exists() {
-			continue
-		}
-
-		reason := ""
-		switch encryptedContent.Type {
-		case gjson.String:
-			raw := encryptedContent.String()
-			if len(preserveEmpty) > 0 && preserveEmpty[0] && strings.TrimSpace(raw) == "" {
-				continue
+	stripOrphans := !gjson.GetBytes(body, "store").Bool()
+	items := input.Array()
+	var rebuilt []string
+	for index, item := range items {
+		rawItem := item.Raw
+		if strings.TrimSpace(item.Get("type").String()) == "reasoning" {
+			keepIdentity := false
+			if encryptedContent := item.Get("encrypted_content"); encryptedContent.Exists() {
+				reason := ""
+				switch encryptedContent.Type {
+				case gjson.String:
+					raw := encryptedContent.String()
+					if len(preserveEmpty) > 0 && preserveEmpty[0] && strings.TrimSpace(raw) == "" {
+						break
+					}
+					if raw != strings.TrimSpace(raw) {
+						reason = "encrypted_content has leading or trailing whitespace"
+					} else if err := validateCodexReasoningSignature(raw); err != nil {
+						reason = err.Error()
+					}
+				case gjson.Null:
+					reason = "encrypted_content is null"
+				default:
+					reason = fmt.Sprintf("encrypted_content must be a string, got %s", encryptedContent.Type.String())
+				}
+				if reason == "" {
+					keepIdentity = true
+				} else if next, errDelete := sjson.Delete(rawItem, "encrypted_content"); errDelete != nil {
+					keepIdentity = true
+					LogWithRequestID(ctx).Debugf("%s: failed to drop invalid reasoning encrypted_content at input[%d]: %v", provider, index, errDelete)
+				} else {
+					rawItem = next
+					LogWithRequestID(ctx).Debugf("%s: dropped invalid reasoning encrypted_content at input[%d]: %s", provider, index, reason)
+				}
 			}
-			if raw != strings.TrimSpace(raw) {
-				reason = "encrypted_content has leading or trailing whitespace"
-			} else if err := validateCodexReasoningSignature(raw); err != nil {
-				reason = err.Error()
+			if stripOrphans && !keepIdentity && item.Get("id").Exists() {
+				if next, errDelete := sjson.Delete(rawItem, "id"); errDelete != nil {
+					LogWithRequestID(ctx).Debugf("%s: failed to drop orphan reasoning id at input[%d]: %v", provider, index, errDelete)
+				} else {
+					rawItem = next
+				}
 			}
-		case gjson.Null:
-			reason = "encrypted_content is null"
-		default:
-			reason = fmt.Sprintf("encrypted_content must be a string, got %s", encryptedContent.Type.String())
 		}
-		if reason == "" {
-			continue
+		if rawItem != item.Raw && rebuilt == nil {
+			rebuilt = make([]string, 0, len(items))
+			for _, previous := range items[:index] {
+				rebuilt = append(rebuilt, previous.Raw)
+			}
 		}
-
-		next, errDelete := sjson.DeleteBytes(updated, path)
-		if errDelete != nil {
-			LogWithRequestID(ctx).Debugf("%s: failed to drop invalid reasoning encrypted_content at input[%d]: %v", provider, index, errDelete)
-			continue
+		if rebuilt != nil {
+			rebuilt = append(rebuilt, rawItem)
 		}
-		updated = next
-		LogWithRequestID(ctx).Debugf("%s: dropped invalid reasoning encrypted_content at input[%d]: %s", provider, index, reason)
+	}
+	if rebuilt == nil {
+		return body
+	}
+	updated, errSet := sjson.SetRawBytes(body, "input", []byte("["+strings.Join(rebuilt, ",")+"]"))
+	if errSet != nil {
+		LogWithRequestID(ctx).Debugf("%s: failed to update reasoning input: %v", provider, errSet)
+		return body
 	}
 	return updated
 }
