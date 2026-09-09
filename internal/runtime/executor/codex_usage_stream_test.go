@@ -19,15 +19,18 @@ import (
 )
 
 func TestCodexUsageStreamModeThroughDirectExecutors(t *testing.T) {
-	for _, mode := range []string{"http", "sse", "ws", "ws-stream", "image", "image-stream"} {
+	for _, mode := range []string{"http", "sse", "ws", "ws-stream", "image", "image-stream", "image-responses-stream", "image-responses-escaped-stream"} {
 		for _, pinned := range []int{-1, 0, 1} {
 			t.Run(fmt.Sprintf("%s/pinned=%d", mode, pinned), func(t *testing.T) {
 				collector := &alphaUsageCollector{authID: t.Name()}
 				usage.RegisterPlugin(collector)
 				t.Cleanup(func() { collector.mu.Lock(); collector.closed = true; collector.records = nil; collector.mu.Unlock() })
 				websocketMode := strings.HasPrefix(mode, "ws")
-				stream := mode == "sse" || mode == "ws-stream" || mode == "image-stream"
+				stream := mode == "sse" || strings.HasSuffix(mode, "stream")
 				terminal := []byte(`{"type":"response.completed","response":{"id":"fixture","status":"completed","output":[],"usage":{"input_tokens":2,"output_tokens":1,"total_tokens":3}}}`)
+				if mode == "image-responses-escaped-stream" {
+					terminal = []byte(strings.ReplaceAll(string(terminal), `"usage"`, `"\u0075sage"`))
+				}
 				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 					if websocketMode {
 						upgrader := websocket.Upgrader{}
@@ -49,6 +52,10 @@ func TestCodexUsageStreamModeThroughDirectExecutors(t *testing.T) {
 						return
 					}
 					w.Header().Set("Content-Type", "text/event-stream")
+					if strings.HasPrefix(mode, "image-responses") {
+						_, _ = fmt.Fprintf(w, "data: {\"type\":\"image_generation.partial_image\",\"b64_json\":\"fixture\"}\n\ndata: %s\n\n", terminal)
+						return
+					}
 					if mode == "image-stream" {
 						_, _ = io.WriteString(w, "data: {\"type\":\"image_generation.partial_image\",\"b64_json\":\"fixture\"}\n\ndata: {\"type\":\"image_generation.completed\",\"usage\":{\"input_tokens\":2,\"output_tokens\":1,\"total_tokens\":3}}\n\ndata: [DONE]\n\n")
 						return

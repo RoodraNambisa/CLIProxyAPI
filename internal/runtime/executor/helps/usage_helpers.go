@@ -492,7 +492,7 @@ func (b *StreamUsageBuffer) Observe(detail usage.Detail, ok bool) {
 
 // ObserveOpenAIStream avoids JSON parsing for chunks without usage or service tier markers.
 func (b *StreamUsageBuffer) ObserveOpenAIStream(line []byte) {
-	if b == nil || (!bytes.Contains(line, openAIStreamUsageMarker) && !bytes.Contains(line, openAIStreamServiceTierMarker)) {
+	if b == nil {
 		return
 	}
 	b.Observe(ParseOpenAIStreamUsage(line))
@@ -617,7 +617,7 @@ func parseOpenAIStyleUsageNode(usageNode gjson.Result) usage.Detail {
 }
 
 func ParseOpenAIStreamUsage(line []byte) (usage.Detail, bool) {
-	if !bytes.Contains(line, openAIStreamUsageMarker) && !bytes.Contains(line, openAIStreamServiceTierMarker) {
+	if !bytes.Contains(line, openAIStreamUsageMarker) && !bytes.Contains(line, openAIStreamServiceTierMarker) && !bytes.Contains(line, []byte(`\u`)) {
 		return usage.Detail{}, false
 	}
 	payload := jsonPayload(line)
@@ -626,7 +626,12 @@ func ParseOpenAIStreamUsage(line []byte) (usage.Detail, bool) {
 	}
 	responseServiceTier := extractResponseServiceTierFromValidJSON(payload)
 	usageNode := gjson.GetBytes(payload, "usage")
-	if !hasOpenAIStyleUsageTokenFields(usageNode) {
+	hasTokens := hasOpenAIStyleUsageTokenFields(usageNode)
+	if !hasTokens {
+		usageNode = gjson.GetBytes(payload, "response.usage")
+		hasTokens = hasOpenAIStyleUsageTokenFields(usageNode)
+	}
+	if !hasTokens {
 		if responseServiceTier == "" {
 			return usage.Detail{}, false
 		}
