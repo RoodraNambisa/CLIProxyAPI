@@ -327,7 +327,7 @@ func ConvertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 		}
 	}
 	template, _ = sjson.SetBytes(template, "reasoning.effort", reasoningEffort)
-	template, _ = sjson.SetBytes(template, "reasoning.summary", "auto")
+	// Summary visibility is applied from the source protocol by the registry.
 	template, _ = sjson.SetBytes(template, "stream", true)
 	template, _ = sjson.SetBytes(template, "store", false)
 	template, _ = sjson.SetBytes(template, "include", []string{"reasoning.encrypted_content"})

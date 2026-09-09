@@ -330,7 +330,7 @@ func ConvertGeminiRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 		// No thinking config, set default effort
 		out, _ = sjson.SetBytes(out, "reasoning.effort", "medium")
 	}
-	out, _ = sjson.SetBytes(out, "reasoning.summary", "auto")
+	// Summary visibility is applied from the source protocol by the registry.
 	out, _ = sjson.SetBytes(out, "stream", true)
 	out, _ = sjson.SetBytes(out, "store", false)
 	out, _ = sjson.SetBytes(out, "include", []string{"reasoning.encrypted_content"})

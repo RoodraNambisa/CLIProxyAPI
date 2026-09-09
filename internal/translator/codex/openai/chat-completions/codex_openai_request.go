@@ -60,7 +60,7 @@ func ConvertOpenAIRequestToCodex(modelName string, inputRawJSON []byte, stream b
 		out, _ = sjson.SetBytes(out, "reasoning.effort", "medium")
 	}
 	out, _ = sjson.SetBytes(out, "parallel_tool_calls", true)
-	out, _ = sjson.SetBytes(out, "reasoning.summary", "auto")
+	// Summary visibility is applied from the source protocol by the registry.
 	out, _ = sjson.SetBytes(out, "include", []string{"reasoning.encrypted_content"})
 
 	// Model
