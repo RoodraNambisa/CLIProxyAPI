@@ -92,7 +92,7 @@ func DetectSignatureProviderForBlock(rawSignature string, blockKind SignatureBlo
 				return SignatureProviderGemini
 			}
 		case SignatureProviderClaude:
-			if IsValidClaudeThinkingSignature(unprefixed, ClaudeSignatureValidationOptions{Strict: true}) {
+			if IsValidClaudeThinkingSignature(unprefixed, ClaudeSignatureValidationOptions{Strict: true}) || IsValidClaudeCAISSignature(unprefixed) {
 				return SignatureProviderClaude
 			}
 		case SignatureProviderGPT:
@@ -111,6 +111,9 @@ func DetectSignatureProviderForBlock(rawSignature string, blockKind SignatureBlo
 	}
 	if IsValidGPTReasoningSignature(sig) {
 		return SignatureProviderGPT
+	}
+	if IsValidClaudeCAISSignature(sig) {
+		return SignatureProviderClaude
 	}
 	if IsValidClaudeThinkingSignature(sig, ClaudeSignatureValidationOptions{Strict: true}) {
 		return SignatureProviderClaude
@@ -191,7 +194,7 @@ func SplitSignatureProviderPrefix(rawSignature string) (SignatureProvider, strin
 // "claude-cache#..." cannot be mistaken for trusted provider provenance.
 func SignatureProviderFromCachePrefix(prefix string) SignatureProvider {
 	switch strings.ToLower(strings.TrimSpace(prefix)) {
-	case "claude", "anthropic":
+	case "claude", "anthropic", "cais", "claude-cais", "claude_cais", "ccmax", "claude-code-max", "claude_code_max":
 		return SignatureProviderClaude
 	case "gemini", "google":
 		return SignatureProviderGemini
@@ -273,6 +276,9 @@ func normalizeCompatibleSignatureForProvider(targetProvider SignatureProvider, r
 	payload := SignaturePayloadWithoutProviderPrefix(rawSignature)
 	switch normalizeSignatureTargetProvider(targetProvider) {
 	case SignatureProviderClaude:
+		if IsValidClaudeCAISSignature(payload) {
+			return payload
+		}
 		normalized, err := NormalizeClaudeProviderNativeThinkingSignature(payload)
 		if err != nil {
 			return ""
@@ -294,6 +300,9 @@ func normalizeCompatibleSignatureForProvider(targetProvider SignatureProvider, r
 }
 
 func isRecognizedGeminiProviderSignature(rawSignature string, blockKind SignatureBlockKind) bool {
+	if IsValidClaudeCAISSignature(rawSignature) {
+		return false
+	}
 	if IsValidGeminiThoughtSignature(rawSignature, GeminiThoughtSignatureValidationOptions{RequireKnownEnvelope: true}) {
 		return true
 	}
