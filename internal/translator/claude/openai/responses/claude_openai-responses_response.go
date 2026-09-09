@@ -120,12 +120,22 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 			created, _ = sjson.SetBytes(created, "sequence_number", nextSeq())
 			created, _ = sjson.SetBytes(created, "response.id", st.ResponseID)
 			created, _ = sjson.SetBytes(created, "response.created_at", st.CreatedAt)
+			requestModel := translatorcommon.RequestModelName(originalRequestRawJSON, requestRawJSON)
+			if requestModel == "" {
+				requestModel = modelName
+			}
+			if requestModel != "" {
+				created, _ = sjson.SetBytes(created, "response.model", requestModel)
+			}
 			out = append(out, emitEvent("response.created", created))
 			// response.in_progress
-			inprog := []byte(`{"type":"response.in_progress","sequence_number":0,"response":{"id":"","object":"response","created_at":0,"status":"in_progress"}}`)
+			inprog := []byte(`{"type":"response.in_progress","sequence_number":0,"response":{"id":"","object":"response","created_at":0,"status":"in_progress","output":[]}}`)
 			inprog, _ = sjson.SetBytes(inprog, "sequence_number", nextSeq())
 			inprog, _ = sjson.SetBytes(inprog, "response.id", st.ResponseID)
 			inprog, _ = sjson.SetBytes(inprog, "response.created_at", st.CreatedAt)
+			if requestModel != "" {
+				inprog, _ = sjson.SetBytes(inprog, "response.model", requestModel)
+			}
 			out = append(out, emitEvent("response.in_progress", inprog))
 		}
 	case "content_block_start":
