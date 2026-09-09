@@ -15,12 +15,15 @@ import (
 )
 
 type claudeToResponsesState struct {
-	Seq         int
-	ResponseID  string
-	CreatedAt   int64
-	TextBlocks  map[int]*claudeResponsesTextBlock
-	Completed   bool
-	FuncArgsBuf map[int]*strings.Builder // index -> args
+	Seq             int
+	ResponseID      string
+	CreatedAt       int64
+	TextBlocks      map[int]*claudeResponsesTextBlock
+	Completed       bool
+	ItemDone        map[int]bool
+	LastOutputIndex int
+	StopReason      string
+	FuncArgsBuf     map[int]*strings.Builder // index -> args
 	// function call bookkeeping for output aggregation
 	FuncNames       map[int]string // index -> function name
 	FuncCallIDs     map[int]string // index -> call id
@@ -64,6 +67,8 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 		(*param).(*claudeToResponsesState).ToolIdentities = claudeResponsesToolIdentities(originalRequestRawJSON, requestRawJSON)
 		(*param).(*claudeToResponsesState).TextBlocks = make(map[int]*claudeResponsesTextBlock)
 		(*param).(*claudeToResponsesState).ReasoningBlocks = make(map[int]*claudeResponsesTextBlock)
+		(*param).(*claudeToResponsesState).ItemDone = make(map[int]bool)
+		(*param).(*claudeToResponsesState).LastOutputIndex = -1
 	}
 	st := (*param).(*claudeToResponsesState)
 
@@ -98,6 +103,9 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 			st.TextBlocks = make(map[int]*claudeResponsesTextBlock)
 			st.ReasoningBlocks = make(map[int]*claudeResponsesTextBlock)
 			st.Completed = false
+			st.ItemDone = make(map[int]bool)
+			st.LastOutputIndex = -1
+			st.StopReason = ""
 			st.FuncArgsBuf = make(map[int]*strings.Builder)
 			st.FuncNames = make(map[int]string)
 			st.FuncCallIDs = make(map[int]string)
@@ -148,6 +156,7 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 			break
 		}
 		if typ == "text" {
+			out = append(out, st.noteOutputIndex(idx, nextSeq)...)
 			// open message item + content part
 			block := &claudeResponsesTextBlock{ID: fmt.Sprintf("msg_%s_%d", st.ResponseID, idx)}
 			st.TextBlocks[idx] = block
@@ -170,6 +179,7 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 			if callID == "" {
 				break
 			}
+			out = append(out, st.noteOutputIndex(idx, nextSeq)...)
 			name := cb.Get("name").String()
 			item := []byte(`{"type":"response.output_item.added","sequence_number":0,"output_index":0}`)
 			item, _ = sjson.SetBytes(item, "sequence_number", nextSeq())
@@ -183,6 +193,7 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 			st.FuncCallIDs[idx] = callID
 			st.FuncNames[idx] = name
 		} else if typ == "thinking" || typ == "redacted_thinking" {
+			out = append(out, st.noteOutputIndex(idx, nextSeq)...)
 			// start reasoning item
 			block := newClaudeResponsesReasoningBlock(fmt.Sprintf("rs_%s_%d", st.ResponseID, idx), cb)
 			st.ReasoningBlocks[idx] = block
@@ -217,6 +228,7 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 			}
 			block := st.TextBlocks[idx]
 			if block == nil {
+				out = append(out, st.noteOutputIndex(idx, nextSeq)...)
 				block = &claudeResponsesTextBlock{ID: fmt.Sprintf("msg_%s_%d", st.ResponseID, idx)}
 				st.TextBlocks[idx] = block
 			}
@@ -267,90 +279,14 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 			}
 		}
 	case "content_block_stop":
-		if st.FuncDone[idx] {
-			break
-		}
-		if block := st.TextBlocks[idx]; block != nil {
-			if block.Done {
-				break
-			}
-			block.Done = true
-			done := []byte(`{"type":"response.output_text.done","sequence_number":0,"item_id":"","output_index":0,"content_index":0,"text":"","logprobs":[]}`)
-			done, _ = sjson.SetBytes(done, "sequence_number", nextSeq())
-			done, _ = sjson.SetBytes(done, "output_index", idx)
-			done, _ = sjson.SetBytes(done, "item_id", block.ID)
-			done, _ = sjson.SetBytes(done, "text", block.Text.String())
-			out = append(out, emitEvent("response.output_text.done", done))
-			partDone := []byte(`{"type":"response.content_part.done","sequence_number":0,"item_id":"","output_index":0,"content_index":0,"part":{"type":"output_text","annotations":[],"logprobs":[],"text":""}}`)
-			partDone, _ = sjson.SetBytes(partDone, "sequence_number", nextSeq())
-			partDone, _ = sjson.SetBytes(partDone, "output_index", idx)
-			partDone, _ = sjson.SetBytes(partDone, "item_id", block.ID)
-			partDone, _ = sjson.SetBytes(partDone, "part.text", block.Text.String())
-			out = append(out, emitEvent("response.content_part.done", partDone))
-			final := []byte(`{"type":"response.output_item.done","sequence_number":0,"output_index":0,"item":{"id":"","type":"message","status":"completed","content":[{"type":"output_text","text":""}],"role":"assistant"}}`)
-			final, _ = sjson.SetBytes(final, "sequence_number", nextSeq())
-			final, _ = sjson.SetBytes(final, "output_index", idx)
-			final, _ = sjson.SetRawBytes(final, "item", claudeResponsesTextItem(block))
-			out = append(out, emitEvent("response.output_item.done", final))
-		} else if _, exists := st.FuncCallIDs[idx]; exists {
-			args := "{}"
-			if buf := st.FuncArgsBuf[idx]; buf != nil {
-				if buf.Len() > 0 {
-					args = buf.String()
-				}
-			}
-			name, callID := st.FuncNames[idx], st.FuncCallIDs[idx]
-			itemID := claudeResponsesToolItemID(st.ToolIdentities, name, callID)
-			kind, field, value := "response.function_call_arguments.done", "arguments", args
-			if st.ToolIdentities[name].custom {
-				kind, field, value = "response.custom_tool_call_input.done", "input", claudeResponsesCustomInput(args)
-				// Unwrap completed input without publishing partial JSON escapes.
-				if value != "" {
-					delta := []byte(`{"type":"response.custom_tool_call_input.delta","sequence_number":0,"item_id":"","output_index":0,"delta":""}`)
-					delta, _ = sjson.SetBytes(delta, "sequence_number", nextSeq())
-					delta, _ = sjson.SetBytes(delta, "item_id", itemID)
-					delta, _ = sjson.SetBytes(delta, "output_index", idx)
-					delta, _ = sjson.SetBytes(delta, "delta", value)
-					out = append(out, emitEvent("response.custom_tool_call_input.delta", delta))
-				}
-			}
-			fcDone := []byte(`{"type":"","sequence_number":0,"item_id":"","output_index":0}`)
-			fcDone, _ = sjson.SetBytes(fcDone, "type", kind)
-			fcDone, _ = sjson.SetBytes(fcDone, "sequence_number", nextSeq())
-			fcDone, _ = sjson.SetBytes(fcDone, "item_id", itemID)
-			fcDone, _ = sjson.SetBytes(fcDone, "output_index", idx)
-			fcDone, _ = sjson.SetBytes(fcDone, field, value)
-			out = append(out, emitEvent(kind, fcDone))
-			itemDone := []byte(`{"type":"response.output_item.done","sequence_number":0,"output_index":0}`)
-			itemDone, _ = sjson.SetBytes(itemDone, "sequence_number", nextSeq())
-			itemDone, _ = sjson.SetBytes(itemDone, "output_index", idx)
-			itemDone, _ = sjson.SetRawBytes(itemDone, "item", buildClaudeResponsesToolItem(st.ToolIdentities, name, callID, args, "completed"))
-			out = append(out, emitEvent("response.output_item.done", itemDone))
-			st.FuncDone[idx] = true
-		} else if block := st.ReasoningBlocks[idx]; block != nil && !block.Done {
-			block.Done = true
-			if !block.Redacted {
-				full := block.Text.String()
-				textDone := []byte(`{"type":"response.reasoning_summary_text.done","sequence_number":0,"item_id":"","output_index":0,"summary_index":0,"text":""}`)
-				textDone, _ = sjson.SetBytes(textDone, "sequence_number", nextSeq())
-				textDone, _ = sjson.SetBytes(textDone, "item_id", block.ID)
-				textDone, _ = sjson.SetBytes(textDone, "output_index", idx)
-				textDone, _ = sjson.SetBytes(textDone, "text", full)
-				out = append(out, emitEvent("response.reasoning_summary_text.done", textDone))
-				partDone := []byte(`{"type":"response.reasoning_summary_part.done","sequence_number":0,"item_id":"","output_index":0,"summary_index":0,"part":{"type":"summary_text","text":""}}`)
-				partDone, _ = sjson.SetBytes(partDone, "sequence_number", nextSeq())
-				partDone, _ = sjson.SetBytes(partDone, "item_id", block.ID)
-				partDone, _ = sjson.SetBytes(partDone, "output_index", idx)
-				partDone, _ = sjson.SetBytes(partDone, "part.text", full)
-				out = append(out, emitEvent("response.reasoning_summary_part.done", partDone))
-			}
-			itemDone := []byte(`{"type":"response.output_item.done"}`)
-			itemDone, _ = sjson.SetBytes(itemDone, "sequence_number", nextSeq())
-			itemDone, _ = sjson.SetBytes(itemDone, "output_index", idx)
-			itemDone, _ = sjson.SetRawBytes(itemDone, "item", claudeResponsesReasoningItem(block))
-			out = append(out, emitEvent("response.output_item.done", itemDone))
+		st.closeBlock(idx)
+		if idx < st.LastOutputIndex {
+			out = append(out, st.finalizeBlock(idx, "completed", nextSeq)...)
 		}
 	case "message_delta":
+		if reason := root.Get("delta.stop_reason"); reason.Type == gjson.String && reason.String() != "" {
+			st.StopReason = reason.String()
+		}
 		if usage := root.Get("usage"); usage.Exists() {
 			if v := usage.Get("output_tokens"); v.Exists() {
 				st.OutputTokens = v.Int()
@@ -362,13 +298,23 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 			}
 		}
 	case "message_stop":
+		eventType, responseStatus, incompleteDetails := claudeResponsesTerminalState(st.StopReason)
 		for _, index := range st.pendingBlockIndexes() {
-			stop := []byte(fmt.Sprintf(`data: {"type":"content_block_stop","index":%d}`, index))
-			out = append(out, ConvertClaudeResponseToOpenAIResponses(ctx, modelName, nil, nil, stop, param)...)
+			status := "completed"
+			if index == st.LastOutputIndex {
+				status = responseStatus
+			}
+			out = append(out, st.finalizeBlock(index, status, nextSeq)...)
 		}
 		st.Completed = true
 
 		completed := []byte(`{"type":"response.completed","sequence_number":0,"response":{"id":"","object":"response","created_at":0,"status":"completed","background":false,"error":null}}`)
+		completed, _ = sjson.SetBytes(completed, "type", eventType)
+		completed, _ = sjson.SetBytes(completed, "response.status", responseStatus)
+		completed, _ = sjson.SetRawBytes(completed, "response.output", []byte("[]"))
+		if len(incompleteDetails) > 0 {
+			completed, _ = sjson.SetRawBytes(completed, "response.incomplete_details", incompleteDetails)
+		}
 		completed, _ = sjson.SetBytes(completed, "sequence_number", nextSeq())
 		completed, _ = sjson.SetBytes(completed, "response.id", st.ResponseID)
 		completed, _ = sjson.SetBytes(completed, "response.created_at", st.CreatedAt)
@@ -451,12 +397,11 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 		for index, block := range st.TextBlocks {
 			outputItems[index] = claudeResponsesTextItem(block)
 		}
-		for index, callID := range st.FuncCallIDs {
-			args := "{}"
-			if b := st.FuncArgsBuf[index]; b != nil && b.Len() > 0 {
-				args = b.String()
-			}
-			outputItems[index] = buildClaudeResponsesToolItem(st.ToolIdentities, st.FuncNames[index], callID, args, "completed")
+		for index := range st.FuncCallIDs {
+			outputItems[index] = st.outputItem(index, "completed")
+		}
+		if st.LastOutputIndex >= 0 {
+			outputItems[st.LastOutputIndex] = st.outputItem(st.LastOutputIndex, responseStatus)
 		}
 		if len(outputItems) > 0 {
 			completed, _ = sjson.SetRawBytes(completed, "response.output", claudeResponsesOrderedOutput(outputItems))
@@ -476,7 +421,7 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 				completed, _ = sjson.SetBytes(completed, "response.usage.total_tokens", total)
 			}
 		}
-		out = append(out, emitEvent("response.completed", completed))
+		out = append(out, emitEvent(eventType, completed))
 	}
 
 	return out
@@ -484,18 +429,18 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 
 func (st *claudeToResponsesState) pendingBlockIndexes() []int {
 	var indexes []int
-	for index, block := range st.TextBlocks {
-		if !block.Done {
+	for index := range st.TextBlocks {
+		if !st.ItemDone[index] {
 			indexes = append(indexes, index)
 		}
 	}
-	for index, block := range st.ReasoningBlocks {
-		if !block.Done {
+	for index := range st.ReasoningBlocks {
+		if !st.ItemDone[index] {
 			indexes = append(indexes, index)
 		}
 	}
 	for index := range st.FuncCallIDs {
-		if !st.FuncDone[index] {
+		if !st.ItemDone[index] {
 			indexes = append(indexes, index)
 		}
 	}
