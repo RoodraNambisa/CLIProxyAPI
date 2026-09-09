@@ -51,6 +51,12 @@ func (st *oaiToResponsesState) emitToolEvents(key string, final bool, nextSeq fu
 	if st.FuncItemDone[key] {
 		return nil
 	}
+	if final && st.FinishReasons[st.FuncChoices[key]] == "" {
+		buffer := st.FuncArgsBuf[key]
+		if buffer == nil || !gjson.Valid(buffer.String()) {
+			return nil
+		}
+	}
 	var out [][]byte
 	if !st.FuncItemAdded[key] {
 		name, callID := st.FuncNames[key], st.FuncCallIDs[key]
@@ -64,6 +70,9 @@ func (st *oaiToResponsesState) emitToolEvents(key string, final bool, nextSeq fu
 					st.FuncNames[key] = name
 				}
 			}
+		}
+		if name == "" {
+			return nil
 		}
 		if callID == "" {
 			callID = "call_" + st.ResponseID + "_" + strings.ReplaceAll(key, ":", "_")

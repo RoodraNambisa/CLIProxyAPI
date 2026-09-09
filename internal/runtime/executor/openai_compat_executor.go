@@ -322,6 +322,7 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 		protocolFailed := false
 		var protocolErr error
 		terminalSeen := false
+		translatedTerminalSeen := false
 		for scanner.Scan() {
 			line := scanner.Bytes()
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
@@ -363,7 +364,23 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 			}
 			chunks := multiAgentResponse.TranslateStream(ctx, to, from, req.Model, originalRef.Bytes(), translatedRef.Bytes(), bytes.Clone(trimmedLine), &param)
 			for i := range chunks {
+				if from == sdktranslator.FormatOpenAIResponse && !translatedTerminalSeen {
+					translatedTerminalSeen = helps.HasResponsesStreamTerminal(chunks[i])
+				}
 				out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}
+			}
+			if terminal && from == sdktranslator.FormatOpenAIResponse && !translatedTerminalSeen {
+				streamErr := protocolErr
+				if streamErr == nil {
+					streamErr = helps.IncompleteStreamError("openai-compatible")
+				}
+				helps.RecordAPIResponseError(ctx, e.cfg, streamErr)
+				reporter.PublishFailure(ctx, streamErr)
+				select {
+				case out <- cliproxyexecutor.StreamChunk{Err: streamErr}:
+				case <-ctx.Done():
+				}
+				return
 			}
 			if markerRequested && terminal && !protocolFailed && scanner.Err() == nil {
 				streamUsage.Publish(ctx, reporter)

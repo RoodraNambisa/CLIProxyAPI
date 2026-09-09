@@ -27,6 +27,7 @@ type oaiToResponsesState struct {
 	Started           bool
 	CompletionPending bool
 	CompletedEmitted  bool
+	StreamEnded       bool
 	ReasoningBlocks   map[int]*responsesReasoningBlock
 	FinishReasons     map[int]string
 	// aggregation buffers for response.output
@@ -232,7 +233,7 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponses(ctx context.Context, 
 		}
 	}
 	st := (*param).(*oaiToResponsesState)
-	if st.CompletedEmitted {
+	if st.CompletedEmitted || st.StreamEnded {
 		return nil
 	}
 
@@ -245,11 +246,17 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponses(ctx context.Context, 
 		return [][]byte{}
 	}
 	if bytes.Equal(rawJSON, []byte("[DONE]")) {
-		if st.CompletionPending && !st.CompletedEmitted {
+		st.StreamEnded = true
+		if st.Started && (st.CompletionPending || len(st.MsgItemAdded) > 0 || len(st.ReasoningBlocks) > 0 || len(st.FuncArgsBuf) > 0) {
 			nextSeq := func() int { st.Seq++; return st.Seq }
 			var out [][]byte
 			for _, choice := range st.knownChoices() {
 				out = append(out, st.finishChoice(choice, nextSeq)...)
+			}
+			for key := range st.FuncArgsBuf {
+				if !st.FuncItemDone[key] {
+					return out
+				}
 			}
 			st.CompletedEmitted = true
 			return append(out, buildResponsesCompletedEvent(st, pickResponsesRequestJSON(originalRequestRawJSON, requestRawJSON), nextSeq))
