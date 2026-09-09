@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 
+	sigcompat "github.com/router-for-me/CLIProxyAPI/v6/internal/signature"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -33,7 +34,17 @@ import (
 //
 // Returns:
 //   - []byte: The transformed request data in internal client format
-func ConvertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool) []byte {
+func ConvertClaudeRequestToCodex(modelName string, inputRawJSON []byte, stream bool) []byte {
+	return convertClaudeRequestToCodex(modelName, inputRawJSON, stream, false)
+}
+
+// ConvertClaudeRequestToCodexWithCompat also preserves unsigned reasoning
+// placeholders for explicitly configured compatibility endpoints.
+func ConvertClaudeRequestToCodexWithCompat(modelName string, inputRawJSON []byte, stream bool) []byte {
+	return convertClaudeRequestToCodex(modelName, inputRawJSON, stream, true)
+}
+
+func convertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool, preserveEmptyThinking bool) []byte {
 	rawJSON := inputRawJSON
 
 	template := []byte(`{"model":"","instructions":"","input":[]}`)
@@ -128,6 +139,22 @@ func ConvertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 					contentType := messageContentResult.Get("type").String()
 
 					switch contentType {
+					case "thinking":
+						if messageRole != "assistant" {
+							continue
+						}
+						rawSignature := messageContentResult.Get("signature")
+						signature, ok := sigcompat.CompatibleSignatureForProvider(sigcompat.SignatureProviderGPT, rawSignature.String())
+						if !ok {
+							if !preserveEmptyThinking || (rawSignature.Exists() && rawSignature.Type != gjson.String) || strings.TrimSpace(rawSignature.String()) != "" {
+								continue
+							}
+							signature = rawSignature.String()
+						}
+						flushMessage()
+						reasoning := []byte(`{"type":"reasoning","summary":[],"content":null}`)
+						reasoning, _ = sjson.SetBytes(reasoning, "encrypted_content", signature)
+						template, _ = sjson.SetRawBytes(template, "input.-1", reasoning)
 					case "text":
 						appendTextContent(messageContentResult.Get("text").String())
 					case "image":

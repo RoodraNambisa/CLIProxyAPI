@@ -590,10 +590,11 @@ func translateCodexRequestBodies(from, to sdktranslator.Format, baseModel string
 	if len(opts.OriginalRequest) > 0 {
 		originalPayload = opts.OriginalRequest
 	}
-	body := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, stream)
+	isCompat := helps.APIKeyModelIsCompat(req)
+	body := helps.TranslateRequestWithAPIKeyModelCompatibility(from, to, baseModel, req.Payload, stream, isCompat)
 	originalTranslated := body
 	if len(originalPayload) > 0 && !bytes.Equal(originalPayload, req.Payload) {
-		originalTranslated = sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, stream)
+		originalTranslated = helps.TranslateRequestWithAPIKeyModelCompatibility(from, to, baseModel, originalPayload, stream, isCompat)
 	}
 	return originalPayload, originalTranslated, body
 }
@@ -855,7 +856,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		return resp, err
 	}
 	body = helps.SanitizeCodexInputItemIDs(body)
-	body = helps.SanitizeCodexReasoningEncryptedContent(ctx, "codex executor", body)
+	body = helps.SanitizeCodexReasoningEncryptedContent(ctx, "codex executor", body, helps.APIKeyModelIsCompat(req))
 	body = helps.NormalizeCodexToolSelection(body)
 	body = e.codexPreparedSessionIdentity(ctx, req, opts).ResponsesLite.ApplyBody(body, false)
 	body, multiAgentResponse := helps.OptimizeCodexMultiAgentV2Request(body, e.codexPreparedSessionIdentity(ctx, req, opts).MultiAgentV2, helps.APIKeyModelIsCompat(req))
@@ -1060,7 +1061,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 		return resp, err
 	}
 	body = helps.SanitizeCodexInputItemIDs(body)
-	body = helps.SanitizeCodexReasoningEncryptedContent(ctx, "codex executor", body)
+	body = helps.SanitizeCodexReasoningEncryptedContent(ctx, "codex executor", body, helps.APIKeyModelIsCompat(req))
 	body = helps.NormalizeCodexToolSelection(body)
 	body = e.codexPreparedSessionIdentity(ctx, req, opts).ResponsesLite.ApplyBody(body, false)
 	body, multiAgentResponse := helps.OptimizeCodexMultiAgentV2Request(body, e.codexPreparedSessionIdentity(ctx, req, opts).MultiAgentV2, helps.APIKeyModelIsCompat(req))
@@ -1207,7 +1208,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		return nil, err
 	}
 	body = helps.SanitizeCodexInputItemIDs(body)
-	body = helps.SanitizeCodexReasoningEncryptedContent(ctx, "codex executor", body)
+	body = helps.SanitizeCodexReasoningEncryptedContent(ctx, "codex executor", body, helps.APIKeyModelIsCompat(req))
 	body = helps.NormalizeCodexToolSelection(body)
 	body = e.codexPreparedSessionIdentity(ctx, req, opts).ResponsesLite.ApplyBody(body, false)
 	body, multiAgentResponse := helps.OptimizeCodexMultiAgentV2Request(body, e.codexPreparedSessionIdentity(ctx, req, opts).MultiAgentV2, helps.APIKeyModelIsCompat(req))
@@ -1626,7 +1627,7 @@ func (e *CodexExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth
 
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("codex")
-	body := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, false)
+	body := helps.TranslateRequestWithAPIKeyModelCompatibility(from, to, baseModel, req.Payload, false, helps.APIKeyModelIsCompat(req))
 
 	body, err := helps.ApplyRequestThinking(body, req, opts, from.String(), to.String(), e.Identifier())
 	if err != nil {

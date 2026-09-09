@@ -24,7 +24,7 @@ func TestCodexModelCompatibilityUsesSelectedPolicyAcrossTransports(t *testing.T)
 		for _, optimize := range []bool{false, true} {
 			for _, compat := range []bool{false, true} {
 				t.Run(fmt.Sprintf("%s/optimize=%t/compat=%t", transport, optimize, compat), func(t *testing.T) {
-					type fields struct{ kind, role, text, cipherKind, cipher, cache, id string }
+					type fields struct{ kind, role, text, cipherKind, cipher, cache, id, reasoningSignature string }
 					captured := make(chan fields, 4)
 					var calls atomic.Int32
 					upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -53,6 +53,7 @@ func TestCodexModelCompatibilityUsesSelectedPolicyAcrossTransports(t *testing.T)
 							gjson.GetBytes(body, "input.0.content.0.text").String(), gjson.GetBytes(body, "input.1.type").String(),
 							gjson.GetBytes(body, "input.1.content.0.encrypted_content").String(), gjson.GetBytes(body, "prompt_cache_key").String(),
 							gjson.GetBytes(body, "input.0.id").String(),
+							gjson.GetBytes(body, "input.2.encrypted_content").Raw,
 						}
 						terminal := []byte(`{"type":"response.completed","response":{"id":"resp_fixture","object":"response","status":"completed","output":[]}}`)
 						if conn != nil {
@@ -89,7 +90,7 @@ func TestCodexModelCompatibilityUsesSelectedPolicyAcrossTransports(t *testing.T)
 					reg := registry.GetGlobalRegistry()
 					reg.RegisterClient(t.Name(), "codex", []*registry.ModelInfo{{ID: "alias", IsCompat: !compat}})
 					t.Cleanup(func() { reg.UnregisterClient(t.Name()) })
-					payload := []byte(`{"model":"alias","prompt_cache_key":"cache-fixture","input":[{"type":"agent_message","id":"plain","content":[{"type":"input_text","text":"plaintext"}]},{"type":"agent_message","content":[{"type":"encrypted_content","encrypted_content":"opaque"}]}]}`)
+					payload := []byte(`{"model":"alias","prompt_cache_key":"cache-fixture","input":[{"type":"agent_message","id":"plain","content":[{"type":"input_text","text":"plaintext"}]},{"type":"agent_message","content":[{"type":"encrypted_content","encrypted_content":"opaque"}]},{"type":"reasoning","encrypted_content":""}]}`)
 					req := core.Request{Model: "alias", Payload: payload}
 					opts := core.Options{SourceFormat: translator.FormatOpenAIResponse, OriginalRequest: payload,
 						Headers: http.Header{"User-Agent": {"codex_cli_rs/0.153.4"}}, Metadata: map[string]any{core.ExecutionSessionMetadataKey: t.Name()}}
@@ -137,6 +138,13 @@ func TestCodexModelCompatibilityUsesSelectedPolicyAcrossTransports(t *testing.T)
 						}
 						if got.id != wantID {
 							t.Fatal("outbound message ID did not match its final item type")
+						}
+						wantSignature := ""
+						if compat {
+							wantSignature = `""`
+						}
+						if got.reasoningSignature != wantSignature {
+							t.Fatal("unsigned reasoning did not follow model compatibility independently of Multi-agent v2")
 						}
 					default:
 						t.Fatal("upstream request was not observed")

@@ -312,7 +312,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		return resp, err
 	}
 	body = helps.SanitizeCodexInputItemIDs(body)
-	body = helps.SanitizeCodexReasoningEncryptedContent(ctx, "codex websockets executor", body)
+	body = helps.SanitizeCodexReasoningEncryptedContent(ctx, "codex websockets executor", body, helps.APIKeyModelIsCompat(req))
 	body = helps.NormalizeCodexToolSelection(body)
 	body = e.codexPreparedSessionIdentity(ctx, req, opts).ResponsesLite.ApplyBody(body, true)
 	multiAgentDeclaresTools := helps.CodexMultiAgentDeclaresTools(body)
@@ -651,7 +651,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		return nil, err
 	}
 	body = helps.SanitizeCodexInputItemIDs(body)
-	body = helps.SanitizeCodexReasoningEncryptedContent(ctx, "codex websockets executor", body)
+	body = helps.SanitizeCodexReasoningEncryptedContent(ctx, "codex websockets executor", body, helps.APIKeyModelIsCompat(req))
 	body = helps.NormalizeCodexToolSelection(body)
 	body = e.codexPreparedSessionIdentity(ctx, req, opts).ResponsesLite.ApplyBody(body, true)
 	multiAgentDeclaresTools := helps.CodexMultiAgentDeclaresTools(body)

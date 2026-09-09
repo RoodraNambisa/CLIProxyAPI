@@ -68,8 +68,9 @@ func ReasoningReplayNamespace(ctx context.Context, provider, authID string) stri
 }
 
 // SanitizeCodexReasoningEncryptedContent removes malformed encrypted_content
-// values while preserving the surrounding reasoning item.
-func SanitizeCodexReasoningEncryptedContent(ctx context.Context, provider string, body []byte) []byte {
+// values while preserving the surrounding reasoning item. Configured compatibility
+// endpoints may explicitly retain empty string placeholders.
+func SanitizeCodexReasoningEncryptedContent(ctx context.Context, provider string, body []byte, preserveEmpty ...bool) []byte {
 	input := gjson.GetBytes(body, "input")
 	if !input.IsArray() {
 		return body
@@ -94,6 +95,9 @@ func SanitizeCodexReasoningEncryptedContent(ctx context.Context, provider string
 		switch encryptedContent.Type {
 		case gjson.String:
 			raw := encryptedContent.String()
+			if len(preserveEmpty) > 0 && preserveEmpty[0] && strings.TrimSpace(raw) == "" {
+				continue
+			}
 			if raw != strings.TrimSpace(raw) {
 				reason = "encrypted_content has leading or trailing whitespace"
 			} else if err := validateCodexReasoningSignature(raw); err != nil {
