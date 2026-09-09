@@ -136,6 +136,13 @@ func (st *oaiToResponsesState) acceptToolCallDelta(choiceIndex, toolIndex int, c
 	if existing := st.FuncCallIDs[key]; existing != "" && callID != "" && existing != callID {
 		return ""
 	}
+	if callID != "" {
+		for otherKey, existingID := range st.FuncCallIDs {
+			if otherKey != key && existingID == callID {
+				return ""
+			}
+		}
+	}
 	if st.FuncArgsBuf[key] == nil {
 		st.FuncChoices[key] = choiceIndex
 		st.FuncArgsBuf[key] = &strings.Builder{}

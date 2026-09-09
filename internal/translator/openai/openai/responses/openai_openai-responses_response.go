@@ -429,8 +429,9 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponses(ctx context.Context, 
 					out = append(out, st.finishReasoning(idx, "completed", nextSeq)...)
 					out = append(out, st.finishMessage(idx, "completed", nextSeq)...)
 
+					toolCount := len(tcs.Array())
 					tcs.ForEach(func(index, tc gjson.Result) bool {
-						toolIndex, validIndex := responsesStreamIndex(tc.Get("index"), int(index.Int()))
+						toolIndex, validIndex := st.toolDeltaIndex(idx, tc, int(index.Int()), toolCount)
 						if !validIndex {
 							return true
 						}
