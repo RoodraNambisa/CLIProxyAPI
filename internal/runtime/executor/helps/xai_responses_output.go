@@ -25,16 +25,25 @@ func (policy XAIResponsesOutputPolicy) Rewrite(payload []byte) []byte {
 }
 
 func (policy XAIResponsesOutputPolicy) TranslateNonStream(ctx context.Context, from, to sdktranslator.Format, model string, original, request, response []byte, param *any) []byte {
-	return policy.Rewrite(sdktranslator.TranslateNonStream(ctx, from, to, model, original, request, response, param))
+	output := policy.Rewrite(sdktranslator.TranslateNonStream(ctx, from, to, model, original, request, response, param))
+	if to == sdktranslator.FormatOpenAIResponse || to == sdktranslator.FormatCodex {
+		output = EnsureResponsesUsageDetails(output)
+	}
+	return output
 }
 
 func (policy XAIResponsesOutputPolicy) TranslateStream(ctx context.Context, from, to sdktranslator.Format, model string, original, request, response []byte, param *any) [][]byte {
 	chunks := sdktranslator.TranslateStream(ctx, from, to, model, original, request, response, param)
-	if len(policy.namespaces) == 0 && !policy.codex.PlaintextCalls && !policy.codex.NamespaceOptimized {
+	normalizeUsage := to == sdktranslator.FormatOpenAIResponse || to == sdktranslator.FormatCodex
+	if !normalizeUsage && len(policy.namespaces) == 0 && !policy.codex.PlaintextCalls && !policy.codex.NamespaceOptimized {
 		return chunks
 	}
+	output := make([][]byte, len(chunks))
 	for index := range chunks {
-		chunks[index] = rewriteCodexSSEChunk(chunks[index], policy.Rewrite)
+		output[index] = rewriteCodexSSEChunk(chunks[index], policy.Rewrite)
+		if normalizeUsage {
+			output[index] = EnsureResponsesUsageDetails(output[index])
+		}
 	}
-	return chunks
+	return output
 }

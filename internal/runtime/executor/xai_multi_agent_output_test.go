@@ -33,7 +33,7 @@ func runXAIResponsesOutputIdentity(t *testing.T, additional bool) {
 			t.Run(fmt.Sprintf("%s/enabled=%t", operation, enabled), func(t *testing.T) {
 				cfg := &config.Config{Codex: config.CodexConfig{OptimizeMultiAgentV2: enabled}}
 				call := `{"type":"function_call","id":"fc_pair","call_id":"pair","name":"spawn_agent","arguments":"{\"message\":\"work\"}"}`
-				events := []string{`{"type":"response.output_item.added","output_index":0,"item":` + call + `}`, `{"type":"response.output_item.done","output_index":0,"item":` + call + `}`, `{"type":"response.completed","response":{"id":"result","status":"completed","output":[` + call + `]}}`}
+				events := []string{`{"type":"response.output_item.added","output_index":0,"item":` + call + `}`, `{"type":"response.output_item.done","output_index":0,"item":` + call + `}`, `{"type":"response.completed","response":{"id":"result","status":"completed","output":[` + call + `],"usage":{"input_tokens":2,"output_tokens":1,"total_tokens":3}}}`}
 				inspect := func(body []byte) {
 					if operation == "compact" {
 						if gjson.GetBytes(body, "tools").Exists() {
@@ -97,6 +97,7 @@ func runXAIResponsesOutputIdentity(t *testing.T, additional bool) {
 				}
 				opts := core.Options{SourceFormat: sdktranslator.FormatOpenAIResponse, Headers: http.Header{"User-Agent": {"codex_cli_rs/0.153.4"}}}
 				var items []gjson.Result
+				var responseUsage gjson.Result
 				if operation == "execute" || operation == "compact" {
 					if operation == "compact" {
 						opts.Alt = "responses/compact"
@@ -112,6 +113,7 @@ func runXAIResponsesOutputIdentity(t *testing.T, additional bool) {
 						return
 					}
 					items = append(items, gjson.GetBytes(result.Payload, "output.0"))
+					responseUsage = gjson.GetBytes(result.Payload, "usage")
 				} else {
 					result, err := executor.ExecuteStream(ctx, auth, req, opts)
 					if err != nil {
@@ -128,9 +130,13 @@ func runXAIResponsesOutputIdentity(t *testing.T, additional bool) {
 							}
 							if event.Get("type").String() == "response.completed" {
 								items = append(items, event.Get("response.output.0"))
+								responseUsage = event.Get("response.usage")
 							}
 						}
 					}
+				}
+				if responseUsage.Get("total_tokens").Int() != 3 || responseUsage.Get("input_tokens_details.cached_tokens").Raw != "0" || responseUsage.Get("output_tokens_details.reasoning_tokens").Raw != "0" {
+					t.Fatal("xAI Responses usage details were not completed")
 				}
 				want := 3
 				if operation == "execute" {

@@ -895,8 +895,8 @@ func (e *XAIWebsocketsExecutor) executeStream(ctx context.Context, auth *cliprox
 							downstreamWarmupCompletedPayload = idMapper.downstreamResponsePayload(warmupCompletedPayload)
 						}
 					}
-					downstreamPayload = prepared.outputPolicy.Rewrite(downstreamPayload)
-					downstreamWarmupCompletedPayload = prepared.outputPolicy.Rewrite(downstreamWarmupCompletedPayload)
+					downstreamPayload = helps.EnsureResponsesUsageDetails(prepared.outputPolicy.Rewrite(downstreamPayload))
+					downstreamWarmupCompletedPayload = helps.EnsureResponsesUsageDetails(prepared.outputPolicy.Rewrite(downstreamWarmupCompletedPayload))
 					if !send(cliproxyexecutor.StreamChunk{Payload: downstreamPayload}) {
 						terminateReason = "context_done"
 						terminateErr = ctx.Err()
