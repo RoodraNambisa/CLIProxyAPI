@@ -11,6 +11,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/translator/common"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -135,43 +136,18 @@ func convertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 	// Stream
 	out, _ = sjson.SetBytes(out, "stream", stream)
 
-	// instructions -> as a leading message (use role user for Claude API compatibility)
-	instructionsText := ""
-	extractedFromSystem := false
-	if instr := root.Get("instructions"); instr.Exists() && instr.Type == gjson.String {
-		instructionsText = instr.String()
-		if instructionsText != "" {
-			messages.appendParts("user", claudeResponsesTextPart(instructionsText))
-		}
+	// Keep operator authority and source ordering before applying local cloaking.
+	var systemBlocks [][]byte
+	if instr := root.Get("instructions"); instr.Type == gjson.String {
+		systemBlocks = append(systemBlocks, common.ClaudeSystemInputBlocks(instr, gjson.Result{})...)
 	}
-
-	if instructionsText == "" {
-		if input := root.Get("input"); input.Exists() && input.IsArray() {
-			input.ForEach(func(_, item gjson.Result) bool {
-				if strings.EqualFold(item.Get("role").String(), "system") {
-					var builder strings.Builder
-					if parts := item.Get("content"); parts.Exists() && parts.IsArray() {
-						parts.ForEach(func(_, part gjson.Result) bool {
-							textResult := part.Get("text")
-							text := textResult.String()
-							if builder.Len() > 0 && text != "" {
-								builder.WriteByte('\n')
-							}
-							builder.WriteString(text)
-							return true
-						})
-					} else if parts.Type == gjson.String {
-						builder.WriteString(parts.String())
-					}
-					instructionsText = builder.String()
-					if instructionsText != "" {
-						messages.appendParts("user", claudeResponsesTextPart(instructionsText))
-						extractedFromSystem = true
-					}
-				}
-				return instructionsText == ""
-			})
-		}
+	if input := root.Get("input"); input.IsArray() {
+		input.ForEach(func(_, item gjson.Result) bool {
+			if common.IsClaudeSystemInputRole(item.Get("role").String()) {
+				systemBlocks = append(systemBlocks, common.ClaudeSystemInputBlocks(item.Get("content"), item)...)
+			}
+			return true
+		})
 	}
 
 	// input array processing
@@ -188,7 +164,7 @@ func convertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 		})
 		emittedToolResults := make(map[string]bool)
 		input.ForEach(func(_, item gjson.Result) bool {
-			if extractedFromSystem && strings.EqualFold(item.Get("role").String(), "system") {
+			if common.IsClaudeSystemInputRole(item.Get("role").String()) {
 				return true
 			}
 			typ := item.Get("type").String()
@@ -354,6 +330,12 @@ func convertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 		messages.appendParts("user", claudeResponsesTextPart(input.String()))
 	}
 	out, _ = sjson.SetRawBytes(out, "messages", messages.finish(isCompat))
+	if len(systemBlocks) > 0 {
+		out, _ = sjson.SetRawBytes(out, "system", claudeResponsesRawArray(systemBlocks))
+		if gjson.GetBytes(out, "messages.#").Int() == 0 {
+			out, _ = sjson.SetRawBytes(out, "messages", []byte(`[{"role":"user","content":""}]`))
+		}
+	}
 
 	// tools mapping: parameters -> input_schema
 	if tools := claudeResponsesTools(root); len(tools) > 0 {

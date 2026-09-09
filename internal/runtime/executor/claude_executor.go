@@ -168,7 +168,10 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 
 	// Apply cloaking (system prompt injection, fake user ID, sensitive word obfuscation)
 	// based on client type and configuration.
-	body = applyCloaking(ctx, e.cfg, auth, body, baseModel, apiKey)
+	body, err = applyCloaking(ctx, e.cfg, auth, body, baseModel, apiKey)
+	if err != nil {
+		return resp, err
+	}
 
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	body = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel)
@@ -375,7 +378,10 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 
 	// Apply cloaking (system prompt injection, fake user ID, sensitive word obfuscation)
 	// based on client type and configuration.
-	body = applyCloaking(ctx, e.cfg, auth, body, baseModel, apiKey)
+	body, err = applyCloaking(ctx, e.cfg, auth, body, baseModel, apiKey)
+	if err != nil {
+		return nil, err
+	}
 
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	body = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel)
@@ -659,6 +665,9 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 	}
 	body, _ = sjson.SetBytes(body, "model", baseModel)
 
+	if err = helps.ValidateClaudeSystemInputs(ctx, body); err != nil {
+		return cliproxyexecutor.Response{}, err
+	}
 	if !strings.HasPrefix(baseModel, "claude-3-5-haiku") {
 		body = checkSystemInstructions(body)
 	}
@@ -1804,7 +1813,10 @@ IMPORTANT: this context may or may not be relevant to your tasks. You should not
 
 // applyCloaking applies cloaking transformations to the payload based on config and client.
 // Cloaking includes: system prompt injection, fake user ID, and sensitive word obfuscation.
-func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, payload []byte, model string, apiKey string) []byte {
+func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, payload []byte, model string, apiKey string) ([]byte, error) {
+	if ctx != nil && ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
 	clientUserAgent := getClientUserAgent(ctx)
 	// Enable cch signing for OAuth tokens by default (not just experimental flag).
 	oauthToken := isClaudeOAuthToken(apiKey)
@@ -1836,8 +1848,16 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 	}
 
 	// Determine if cloaking should be applied
-	if !helps.ShouldCloak(cloakMode, clientUserAgent) {
-		return payload
+	shouldCloak := helps.ShouldCloak(cloakMode, clientUserAgent)
+	discardsSystem := shouldCloak && strictMode && !strings.HasPrefix(model, "claude-3-5-haiku") &&
+		!strings.HasPrefix(gjson.GetBytes(payload, "system.0.text").String(), "x-anthropic-billing-header:")
+	if !discardsSystem {
+		if errSystem := helps.ValidateClaudeSystemInputs(ctx, payload); errSystem != nil {
+			return nil, errSystem
+		}
+	}
+	if !shouldCloak {
+		return payload, nil
 	}
 
 	// Skip system instructions for claude-3-5-haiku models
@@ -1857,7 +1877,7 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 		payload = helps.ObfuscateSensitiveWords(payload, matcher)
 	}
 
-	return payload
+	return payload, nil
 }
 
 // ensureCacheControl injects cache_control breakpoints into the payload for optimal prompt caching.

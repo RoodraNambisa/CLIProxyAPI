@@ -16,6 +16,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/translator/common"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -188,22 +189,14 @@ func convertOpenAIRequestToClaude(modelName string, inputRawJSON []byte, stream,
 		messages.ForEach(func(_, message gjson.Result) bool {
 			role := message.Get("role").String()
 			contentResult := message.Get("content")
+			if common.IsClaudeSystemInputRole(role) {
+				role = "system"
+			}
 
 			switch role {
 			case "system":
-				if contentResult.Exists() && contentResult.Type == gjson.String && contentResult.String() != "" {
-					textPart := []byte(`{"type":"text","text":""}`)
-					textPart, _ = sjson.SetBytes(textPart, "text", contentResult.String())
-					out, _ = sjson.SetRawBytes(out, "system.-1", textPart)
-				} else if contentResult.Exists() && contentResult.IsArray() {
-					contentResult.ForEach(func(_, part gjson.Result) bool {
-						if part.Get("type").String() == "text" {
-							textPart := []byte(`{"type":"text","text":""}`)
-							textPart, _ = sjson.SetBytes(textPart, "text", part.Get("text").String())
-							out, _ = sjson.SetRawBytes(out, "system.-1", textPart)
-						}
-						return true
-					})
+				for _, block := range common.ClaudeSystemInputBlocks(contentResult, message) {
+					out, _ = sjson.SetRawBytes(out, "system.-1", block)
 				}
 			case "user", "assistant":
 				msg := []byte(`{"role":"","content":[]}`)
