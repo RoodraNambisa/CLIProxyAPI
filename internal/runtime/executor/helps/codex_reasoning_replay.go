@@ -15,6 +15,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
+	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/session"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -245,7 +246,49 @@ func codexReasoningReplayScopeFromRequest(ctx context.Context, sourceFormat, rep
 			}
 		}
 	}
+	if sessionKey != "" {
+		if agent := codexReplayClaudeAgentIdentity(ctx, requestPayload, headers); agent != "" {
+			digest := sha256.Sum256([]byte(agent))
+			sessionKey += "\x00claude-agent:" + hex.EncodeToString(digest[:])
+		}
+	}
 	return CodexReasoningReplayScope{namespace: strings.TrimSpace(replayNamespace), modelName: strings.TrimSpace(modelName), sessionKey: sessionKey}
+}
+
+// Agent replay isolation is independent of optional credential affinity and
+// outbound prompt caching. The existing main-session cache key stays unchanged.
+func codexReplayClaudeAgentIdentity(ctx context.Context, payload []byte, headers http.Header) string {
+	var incoming http.Header
+	if ctx != nil {
+		if c, _ := ctx.Value("gin").(*gin.Context); c != nil && c.Request != nil {
+			incoming = c.Request.Header
+		}
+	}
+	identityHeaders := make(http.Header)
+	for _, identityHeader := range []string{"X-Claude-Code-Session-Id", "X-Claude-Code-Agent-Id"} {
+		for _, source := range []http.Header{headers, incoming} {
+			var candidates []string
+			for name, values := range source {
+				if strings.EqualFold(name, identityHeader) {
+					for _, value := range values {
+						if strings.TrimSpace(value) != "" {
+							candidates = append(candidates, value)
+						}
+					}
+				}
+			}
+			if len(candidates) > 0 {
+				// Preserve duplicate values so the shared parser rejects ambiguity.
+				identityHeaders[identityHeader] = candidates
+				break
+			}
+		}
+	}
+	identity, ok := session.ExtractExplicitIdentity(identityHeaders, payload, "")
+	if ok && (strings.HasPrefix(identity.SessionID, "claude:") || strings.HasPrefix(identity.SessionID, "claude-agent:")) && (identity.IsSubagent || identity.IsFork) {
+		return identity.SessionID
+	}
+	return ""
 }
 
 func codexReplayMetadataString(metadata map[string]any, key string) string {
