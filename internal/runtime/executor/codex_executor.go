@@ -112,6 +112,9 @@ func codexTerminalStreamError(eventData []byte) (result statusErr, terminal bool
 			}
 		}
 	}()
+	if isCodexCompletionType(eventType) && !gjson.ValidBytes(eventData) {
+		return codexStreamStatusErr(http.StatusBadGateway, "invalid upstream Codex terminal JSON", "invalid_response", "server_error", nil), true
+	}
 	switch eventType {
 	case "response.failed":
 		return codexResponseFailedError(eventData), true
@@ -162,7 +165,7 @@ func normalizeCodexCompletion(payload []byte) []byte {
 }
 
 func isCodexSuccessfulCompletion(payload []byte) bool {
-	if !isCodexCompletionType(gjson.GetBytes(payload, "type").String()) {
+	if !isCodexCompletionType(gjson.GetBytes(payload, "type").String()) || !gjson.ValidBytes(payload) {
 		return false
 	}
 	status := strings.ToLower(strings.TrimSpace(gjson.GetBytes(payload, "response.status").String()))
