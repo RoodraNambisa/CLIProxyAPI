@@ -5,7 +5,6 @@ import (
 	"context"
 	"fmt"
 	"math"
-	"net/http"
 	"strings"
 	"sync"
 	"time"
@@ -193,10 +192,6 @@ func reportsReasoningSeparately(provider string) bool {
 // SetTranslatedReasoningEffort is retained for executor compatibility. The v6
 // usage record does not persist reasoning-effort metadata.
 func (r *UsageReporter) SetTranslatedReasoningEffort(_ []byte, _ string) {}
-
-// TrackHTTPClient returns the configured client. Request latency is already
-// tracked by the reporter's request timestamp in v6.
-func (r *UsageReporter) TrackHTTPClient(client *http.Client) *http.Client { return client }
 
 func (r *UsageReporter) PublishAdditionalModel(ctx context.Context, model string, detail usage.Detail) {
 	record, ok := r.buildAdditionalModelRecord(model, detail)
