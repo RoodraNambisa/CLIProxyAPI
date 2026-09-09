@@ -6,6 +6,12 @@ import (
 	core "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 )
 
+// APIKeyModelIsCompat reads only the selected attempt's private model snapshot.
+func APIKeyModelIsCompat(req core.Request) bool {
+	info, ok := cliproxyauth.ResolvedAPIKeyModelInfo(req)
+	return ok && info != nil && info.IsCompat
+}
+
 // ApplyRequestThinking uses the selected credential's declaration when bound by
 // the manager. Direct executor calls retain the existing registry lookup path.
 // Applied payload rules remain authoritative over the field roles they own;

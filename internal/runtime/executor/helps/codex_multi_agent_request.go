@@ -10,7 +10,7 @@ type CodexMultiAgentResponsePolicy struct {
 
 // OptimizeCodexMultiAgentV2Request applies transport-specific preparation after
 // any Responses boundary model descriptions. Native encrypted history is opaque.
-func OptimizeCodexMultiAgentV2Request(payload []byte, policy CodexMultiAgentPolicy) ([]byte, CodexMultiAgentResponsePolicy) {
+func OptimizeCodexMultiAgentV2Request(payload []byte, policy CodexMultiAgentPolicy, isCompat ...bool) ([]byte, CodexMultiAgentResponsePolicy) {
 	if !policy.Enabled {
 		return payload, CodexMultiAgentResponsePolicy{}
 	}
@@ -21,6 +21,9 @@ func OptimizeCodexMultiAgentV2Request(payload []byte, policy CodexMultiAgentPoli
 	}
 	updated := removeCodexCollaborationMessageEncryption(payload, scan.messagePaths)
 	updated, responsePolicy.NamespaceOptimized = OptimizeCodexCollaborationNamespace(updated)
+	if len(isCompat) > 0 && isCompat[0] {
+		updated = rewriteCodexCompatibilityAgentMessages(updated)
+	}
 	return updated, responsePolicy
 }
 

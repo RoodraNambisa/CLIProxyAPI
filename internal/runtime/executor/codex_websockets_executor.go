@@ -316,7 +316,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	body = helps.NormalizeCodexToolSelection(body)
 	body = e.codexPreparedSessionIdentity(ctx, req, opts).ResponsesLite.ApplyBody(body, true)
 	multiAgentDeclaresTools := helps.CodexMultiAgentDeclaresTools(body)
-	body, multiAgentResponse := helps.OptimizeCodexMultiAgentV2Request(body, e.codexPreparedSessionIdentity(ctx, req, opts).MultiAgentV2)
+	body, multiAgentResponse := helps.OptimizeCodexMultiAgentV2Request(body, e.codexPreparedSessionIdentity(ctx, req, opts).MultiAgentV2, helps.APIKeyModelIsCompat(req))
 	if strings.TrimSpace(gjson.GetBytes(body, "previous_response_id").String()) != "" {
 		ctx = cliproxyexecutor.WithRequiredUpstreamWebsocket(ctx)
 	}
@@ -655,7 +655,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	body = helps.NormalizeCodexToolSelection(body)
 	body = e.codexPreparedSessionIdentity(ctx, req, opts).ResponsesLite.ApplyBody(body, true)
 	multiAgentDeclaresTools := helps.CodexMultiAgentDeclaresTools(body)
-	body, multiAgentResponse := helps.OptimizeCodexMultiAgentV2Request(body, e.codexPreparedSessionIdentity(ctx, req, opts).MultiAgentV2)
+	body, multiAgentResponse := helps.OptimizeCodexMultiAgentV2Request(body, e.codexPreparedSessionIdentity(ctx, req, opts).MultiAgentV2, helps.APIKeyModelIsCompat(req))
 	if strings.TrimSpace(gjson.GetBytes(body, "previous_response_id").String()) != "" {
 		ctx = cliproxyexecutor.WithRequiredUpstreamWebsocket(ctx)
 	}

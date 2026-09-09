@@ -19,6 +19,50 @@ func (*codexEncryptedAgentMessageError) StatusCode() int      { return http.Stat
 func (*codexEncryptedAgentMessageError) SkipAuthResult() bool { return true }
 func (*codexEncryptedAgentMessageError) RetryOtherAuth() bool { return false }
 
+// rewriteCodexCompatibilityAgentMessages adapts plaintext envelopes for a
+// Responses-compatible endpoint. Native encrypted history stays opaque.
+func rewriteCodexCompatibilityAgentMessages(payload []byte) []byte {
+	if !gjson.ValidBytes(payload) {
+		return payload
+	}
+	input := gjson.GetBytes(payload, "input")
+	if !input.IsArray() {
+		return payload
+	}
+	updated := payload
+	changed := false
+	for index, item := range input.Array() {
+		if strings.TrimSpace(item.Get("type").String()) != "agent_message" {
+			continue
+		}
+		encrypted := false
+		for _, part := range item.Get("content").Array() {
+			if strings.TrimSpace(part.Get("type").String()) == "encrypted_content" {
+				encrypted = true
+				break
+			}
+		}
+		if encrypted {
+			continue
+		}
+		path := fmt.Sprintf("input.%d", index)
+		var err error
+		updated, err = sjson.SetBytes(updated, path+".role", "user")
+		if err != nil {
+			return payload
+		}
+		updated, err = sjson.SetBytes(updated, path+".type", "message")
+		if err != nil {
+			return payload
+		}
+		changed = true
+	}
+	if changed {
+		return SanitizeCodexInputItemIDs(updated)
+	}
+	return updated
+}
+
 // NormalizeCodexMultiAgentInput converts plaintext collaboration envelopes for
 // other protocols. Encrypted content remains opaque and is never relabeled.
 func NormalizeCodexMultiAgentInput(payload []byte, enabled bool, target sdktranslator.Format) ([]byte, error) {

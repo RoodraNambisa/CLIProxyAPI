@@ -66,7 +66,7 @@ func TestAPIKeyExecutionBindsSelectedCredentialCapabilities(t *testing.T) {
 				configuration := func(secondLevel string) *config.Config {
 					return &config.Config{NoCooldownStatusCodes: []int{500}, CodexKey: []config.CodexKey{
 						{APIKey: "a", Models: []config.CodexModel{{Name: "upstream", Alias: "shared", Thinking: &registry.ThinkingSupport{Levels: []string{"low"}}}}},
-						{APIKey: "b", Models: []config.CodexModel{{Name: "upstream", Alias: "shared", Thinking: &registry.ThinkingSupport{Levels: []string{secondLevel}}}}},
+						{APIKey: "b", Models: []config.CodexModel{{Name: "upstream", Alias: "shared", IsCompat: secondLevel == "max", Thinking: &registry.ThinkingSupport{Levels: []string{secondLevel}}}}},
 					}}
 				}
 				m := NewManager(nil, &FillFirstSelector{}, nil)
@@ -88,13 +88,16 @@ func TestAPIKeyExecutionBindsSelectedCredentialCapabilities(t *testing.T) {
 					if enabled, ok := CodexMultiAgentV2RequestSetting(ctx); !ok || enabled {
 						return fmt.Errorf("logical request policy changed between credentials")
 					}
+					if info.IsCompat != (auth.ID == "b") {
+						return fmt.Errorf("selected attempt inherited another credential's compatibility policy")
+					}
 					seen = append(seen, auth.ID+":"+info.Thinking.Levels[0])
 					if auth.ID == "a" {
 						next := configuration("max")
 						next.Codex.OptimizeMultiAgentV2 = true
 						m.SetConfig(next)
 						retained, _ := ResolvedAPIKeyModelInfo(attempt)
-						if retained.Thinking.Levels[0] != "low" {
+						if retained.Thinking.Levels[0] != "low" || retained.IsCompat {
 							return fmt.Errorf("hot update changed an already bound attempt")
 						}
 						return &Error{HTTPStatus: 500, Message: "fixture failure"}

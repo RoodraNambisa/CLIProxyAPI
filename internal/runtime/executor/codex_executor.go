@@ -858,7 +858,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	body = helps.SanitizeCodexReasoningEncryptedContent(ctx, "codex executor", body)
 	body = helps.NormalizeCodexToolSelection(body)
 	body = e.codexPreparedSessionIdentity(ctx, req, opts).ResponsesLite.ApplyBody(body, false)
-	body, multiAgentResponse := helps.OptimizeCodexMultiAgentV2Request(body, e.codexPreparedSessionIdentity(ctx, req, opts).MultiAgentV2)
+	body, multiAgentResponse := helps.OptimizeCodexMultiAgentV2Request(body, e.codexPreparedSessionIdentity(ctx, req, opts).MultiAgentV2, helps.APIKeyModelIsCompat(req))
 	replayAuthID := ""
 	if auth != nil {
 		replayAuthID = auth.ID
@@ -1063,7 +1063,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	body = helps.SanitizeCodexReasoningEncryptedContent(ctx, "codex executor", body)
 	body = helps.NormalizeCodexToolSelection(body)
 	body = e.codexPreparedSessionIdentity(ctx, req, opts).ResponsesLite.ApplyBody(body, false)
-	body, multiAgentResponse := helps.OptimizeCodexMultiAgentV2Request(body, e.codexPreparedSessionIdentity(ctx, req, opts).MultiAgentV2)
+	body, multiAgentResponse := helps.OptimizeCodexMultiAgentV2Request(body, e.codexPreparedSessionIdentity(ctx, req, opts).MultiAgentV2, helps.APIKeyModelIsCompat(req))
 	reporter.SetRequestServiceTierFromPayload(body)
 	imageRequest := cliproxyauth.PayloadHasImageGenerationTool(body)
 
@@ -1210,7 +1210,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	body = helps.SanitizeCodexReasoningEncryptedContent(ctx, "codex executor", body)
 	body = helps.NormalizeCodexToolSelection(body)
 	body = e.codexPreparedSessionIdentity(ctx, req, opts).ResponsesLite.ApplyBody(body, false)
-	body, multiAgentResponse := helps.OptimizeCodexMultiAgentV2Request(body, e.codexPreparedSessionIdentity(ctx, req, opts).MultiAgentV2)
+	body, multiAgentResponse := helps.OptimizeCodexMultiAgentV2Request(body, e.codexPreparedSessionIdentity(ctx, req, opts).MultiAgentV2, helps.APIKeyModelIsCompat(req))
 	replayAuthID := ""
 	if auth != nil {
 		replayAuthID = auth.ID
@@ -1641,6 +1641,9 @@ func (e *CodexExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth
 	body, _ = sjson.SetBytes(body, "stream", false)
 	body = normalizeCodexInstructions(body)
 
+	if helps.APIKeyModelIsCompat(req) {
+		body, _ = helps.OptimizeCodexMultiAgentV2Request(body, e.codexPreparedSessionIdentity(ctx, req, opts).MultiAgentV2, true)
+	}
 	enc, err := tokenizerForCodexModel(baseModel)
 	if err != nil {
 		return cliproxyexecutor.Response{}, fmt.Errorf("codex executor: tokenizer init failed: %w", err)
