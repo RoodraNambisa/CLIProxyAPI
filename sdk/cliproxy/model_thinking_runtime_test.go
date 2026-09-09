@@ -20,9 +20,8 @@ func TestModelThinkingHotReloadPreservesCredentialLifecycle(t *testing.T) {
 		{"vertex-api-key", "vertex", "gemini-2.5-pro"}, {"openai-compatibility", "openai-compatibility", "gpt-5.5"},
 	} {
 		t.Run(tc.family, func(t *testing.T) {
-			makeConfig := func(support *registry.ThinkingSupport) *config.Config {
+			makeConfig := func(support *registry.ThinkingSupport, isCompat bool) *config.Config {
 				thinking, _ := json.Marshal(support)
-				isCompat := support != nil && len(support.Levels) > 0 && support.Levels[0] == " HIGH "
 				body := fmt.Sprintf(`{"%s":[{"api-key":"fixture","name":"thinking-compat","base-url":"https://example.test","models":[{"name":"%s","alias":"thinking-live-alias","thinking":%s,"is-compat":%t}]}]}`, tc.family, tc.upstream, thinking, isCompat)
 				var cfg config.Config
 				if err := json.Unmarshal([]byte(body), &cfg); err != nil {
@@ -41,7 +40,7 @@ func TestModelThinkingHotReloadPreservesCredentialLifecycle(t *testing.T) {
 				t.Fatal(err)
 			}
 			initial := &registry.ThinkingSupport{Levels: []string{"low", "high"}}
-			s := &Service{cfg: makeConfig(initial), coreManager: manager}
+			s := &Service{cfg: makeConfig(initial, false), coreManager: manager}
 			s.registerModelsForAuth(installed)
 			r := registry.GetGlobalRegistry()
 			t.Cleanup(func() { r.UnregisterClient(installed.ID) })
@@ -65,8 +64,12 @@ func TestModelThinkingHotReloadPreservesCredentialLifecycle(t *testing.T) {
 				t.Fatal("execution fixture did not start")
 			}
 			defer finish()
-			for _, support := range []*registry.ThinkingSupport{{Levels: []string{" HIGH ", "none", "auto"}}, nil} {
-				if _, err := s.ApplyRuntimeConfig(t.Context(), makeConfig(support)); err != nil {
+			for _, update := range []struct {
+				support  *registry.ThinkingSupport
+				isCompat bool
+			}{{initial, true}, {initial, false}, {&registry.ThinkingSupport{Levels: []string{" HIGH ", "none", "auto"}}, true}, {nil, true}, {nil, false}} {
+				support := update.support
+				if _, err := s.ApplyRuntimeConfig(t.Context(), makeConfig(support, update.isCompat)); err != nil {
 					t.Fatal(err)
 				}
 				want := config.NormalizeModelThinkingSupport(support)
@@ -76,7 +79,7 @@ func TestModelThinkingHotReloadPreservesCredentialLifecycle(t *testing.T) {
 						want = &registry.ThinkingSupport{Levels: []string{"low", "medium", "high"}}
 					}
 				}
-				if !reflect.DeepEqual(get().Thinking, want) || get().IsCompat != (support != nil) {
+				if !reflect.DeepEqual(get().Thinking, want) || get().IsCompat != update.isCompat {
 					t.Fatal("thinking update did not refresh the catalog")
 				}
 				current, _ := manager.GetByID(installed.ID)
@@ -94,10 +97,10 @@ func TestModelThinkingHotReloadPreservesCredentialLifecycle(t *testing.T) {
 			}
 			cancelled, cancel := context.WithCancel(t.Context())
 			cancel()
-			if _, err := s.ApplyRuntimeConfig(cancelled, makeConfig(initial)); err == nil {
+			if _, err := s.ApplyRuntimeConfig(cancelled, makeConfig(initial, true)); err == nil {
 				t.Fatal("cancelled capability update succeeded")
 			}
-			if reflect.DeepEqual(get().Thinking, initial) {
+			if reflect.DeepEqual(get().Thinking, initial) || get().IsCompat {
 				t.Fatal("cancelled capability update did not roll back")
 			}
 		})
