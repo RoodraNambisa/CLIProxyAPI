@@ -82,11 +82,12 @@ type responsesSSEFramer struct {
 	terminalRewritten    bool
 	terminalBeforeData   bool
 	terminalError        *interfaces.ErrorMessage
+	terminalSeen         bool
 	sawNonTerminalData   bool
 }
 
 func (f *responsesSSEFramer) WriteChunk(w io.Writer, chunk []byte) {
-	if len(chunk) == 0 || f.err != nil {
+	if len(chunk) == 0 || f.err != nil || (!f.passthrough && f.terminalSeen) {
 		return
 	}
 	if f.passthrough && f.rewriteTerminalError == nil {
@@ -103,10 +104,11 @@ func (f *responsesSSEFramer) WriteChunk(w io.Writer, chunk []byte) {
 		limit = responsesSSEMaxPendingBytes
 	}
 	appendFrameBytes := func(data []byte) bool {
-		return appendBoundedSSEFrames(&f.pending, data, limit, func(frame []byte) {
+		return appendBoundedSSEFrames(&f.pending, data, limit, func(frame []byte) bool {
 			if f.err == nil {
 				f.writeFrame(w, frame)
 			}
+			return f.err == nil && (f.passthrough || !f.terminalSeen)
 		})
 	}
 	if needsLineBreak && !appendFrameBytes([]byte{'\n'}) {
@@ -119,7 +121,7 @@ func (f *responsesSSEFramer) WriteChunk(w io.Writer, chunk []byte) {
 		f.err = &responsesSSEFrameLimitError{limit: limit}
 		return
 	}
-	if f.err != nil {
+	if f.err != nil || (!f.passthrough && f.terminalSeen) {
 		f.pending = nil
 		return
 	}
@@ -134,11 +136,11 @@ func (f *responsesSSEFramer) WriteChunk(w io.Writer, chunk []byte) {
 	f.pending = f.pending[:0]
 }
 
-func appendBoundedSSEFrames(pending *[]byte, chunk []byte, limit int, consume func([]byte)) bool {
+func appendBoundedSSEFrames(pending *[]byte, chunk []byte, limit int, consume func([]byte) bool) bool {
 	if pending == nil || limit <= 0 {
 		return false
 	}
-	consumeComplete := func() {
+	consumeComplete := func() bool {
 		buffer := *pending
 		consumed := 0
 		for consumed < len(buffer) {
@@ -148,7 +150,10 @@ func appendBoundedSSEFrames(pending *[]byte, chunk []byte, limit int, consume fu
 			}
 			frame := buffer[consumed : consumed+frameLen]
 			if consume != nil && len(bytes.TrimSpace(frame)) > 0 {
-				consume(frame)
+				if !consume(frame) {
+					*pending = nil
+					return false
+				}
 			}
 			consumed += frameLen
 		}
@@ -156,8 +161,11 @@ func appendBoundedSSEFrames(pending *[]byte, chunk []byte, limit int, consume fu
 			copy(buffer, buffer[consumed:])
 			*pending = buffer[:len(buffer)-consumed]
 		}
+		return true
 	}
-	consumeComplete()
+	if !consumeComplete() {
+		return true
+	}
 	for len(chunk) > 0 {
 		room := limit - len(*pending)
 		if room <= 0 {
@@ -169,7 +177,9 @@ func appendBoundedSSEFrames(pending *[]byte, chunk []byte, limit int, consume fu
 		}
 		*pending = append(*pending, chunk[:take]...)
 		chunk = chunk[take:]
-		consumeComplete()
+		if !consumeComplete() {
+			return true
+		}
 	}
 	return true
 }
@@ -182,7 +192,7 @@ func (f *responsesSSEFramer) Err() error {
 }
 
 func (f *responsesSSEFramer) Flush(w io.Writer) {
-	if f.err != nil {
+	if f.err != nil || (!f.passthrough && f.terminalSeen) {
 		return
 	}
 	if f.passthrough && f.rewriteTerminalError == nil {
@@ -273,6 +283,9 @@ func (f *responsesSSEFramer) writeFrame(w io.Writer, frame []byte) {
 	output := frame
 	if !f.imagePassthroughEnabled() && !f.passthrough {
 		output = f.repairFrame(frame)
+	}
+	if !f.passthrough {
+		f.observeTerminal(frame)
 	}
 	if f.rewriteTerminalError != nil {
 		if rewritten, errMsg, ok := f.rewriteTerminalError(output); ok {

@@ -2565,8 +2565,9 @@ func (p *imageSSEParser) Push(chunk []byte) []imageSSEItem {
 	}
 	var items []imageSSEItem
 	appendFrameBytes := func(data []byte) bool {
-		return appendBoundedSSEFrames(&p.pending, data, maxPendingBytes, func(frame []byte) {
+		return appendBoundedSSEFrames(&p.pending, data, maxPendingBytes, func(frame []byte) bool {
 			items = append(items, extractImageSSEItems(frame)...)
+			return true
 		})
 	}
 	if needsLineBreak && !appendFrameBytes([]byte{'\n'}) {
