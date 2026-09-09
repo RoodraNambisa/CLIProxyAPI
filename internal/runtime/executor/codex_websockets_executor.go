@@ -452,6 +452,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	if !multiAgentDeclaresTools {
 		multiAgentResponse = sess.multiAgentResponseForConn(conn)
 	}
+	reporter.StartResponseTTFT()
 	if errSend := writeCurrentCodexWebsocketMessage(ctx, auth, sess, conn, wsReqBody); errSend != nil {
 		if cliproxyexecutor.RequiredUpstreamWebsocket(ctx) {
 			if sess != nil {
@@ -542,6 +543,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		if len(payload) == 0 {
 			continue
 		}
+		helps.ObserveResponsesTokenEvent(reporter, payload)
 		payload = applyCodexIdentityConfuseResponsePayload(payload, identityState)
 		normalizedPayload := normalizeCodexCompletion(payload)
 		clientPayload := applyCodexIdentityExposeResponsePayload(normalizedPayload, identityState)
@@ -592,6 +594,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 			if detail, ok := helps.ParseCodexUsage(payload); ok {
 				reporter.Publish(ctx, detail)
 			}
+			reporter.EnsurePublished(ctx)
 			var param any
 			clientPayload = multiAgentResponse.Rewrite(clientPayload)
 			out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, originalRef.Bytes(), clientBodyRef.Bytes(), clientPayload, &param)
@@ -809,6 +812,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	if !multiAgentDeclaresTools {
 		multiAgentResponse = sess.multiAgentResponseForConn(conn)
 	}
+	reporter.StartResponseTTFT()
 	if errSend := writeCurrentCodexWebsocketMessage(ctx, auth, sess, conn, wsReqBody); errSend != nil {
 		if cliproxyexecutor.RequiredUpstreamWebsocket(ctx) {
 			if sess != nil {
@@ -892,6 +896,9 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		bufferedBytes := 0
 		for helps.RequestBodyReplayable(ctx, opts) {
 			msgType, payload, errRead := readCodexWebsocketMessage(ctx, sess, conn, readCh)
+			if msgType == websocket.TextMessage && len(payload) > 0 {
+				helps.ObserveResponsesTokenEvent(reporter, payload)
+			}
 			if errCurrent := codexWebsocketExecutionStateError(ctx, auth); errCurrent != nil {
 				errRead = errCurrent
 			}
@@ -1017,6 +1024,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			if len(payload) == 0 {
 				continue
 			}
+			helps.ObserveResponsesTokenEvent(reporter, payload)
 			payload = applyCodexIdentityConfuseResponsePayload(payload, identityState)
 			normalizedPayload := normalizeCodexCompletion(payload)
 			clientPayload := applyCodexIdentityExposeResponsePayload(normalizedPayload, identityState)
