@@ -955,7 +955,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		AuthValue: authValue,
 	})
 	upstreamBody = nil
-	httpClient := e.newCodexHTTPClient(ctx, auth, imageRequest)
+	httpClient := reporter.TrackHTTPClient(e.newCodexHTTPClient(ctx, auth, imageRequest))
 	httpResp, err := helps.DoUpstreamHTTPRequest(httpClient, httpReq)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
@@ -1001,6 +1001,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 			}
 
 			eventData := bytes.TrimSpace(trimmedLine[len(dataTag):])
+			helps.ObserveResponsesTokenEvent(reporter, eventData)
 			eventType := gjson.GetBytes(eventData, "type").String()
 			if eventType == "response.output_item.done" {
 				helps.AppendAPIResponseChunk(ctx, e.cfg, line)
@@ -1157,7 +1158,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 		AuthValue: authValue,
 	})
 	upstreamBody = nil
-	httpClient := e.newCodexHTTPClient(ctx, auth, imageRequest)
+	httpClient := reporter.TrackHTTPClient(e.newCodexHTTPClient(ctx, auth, imageRequest))
 	httpResp, err := helps.DoUpstreamHTTPRequest(httpClient, httpReq)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
@@ -1315,7 +1316,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	})
 	upstreamBody = nil
 
-	httpClient := e.newCodexHTTPClient(ctx, auth, imageRequest)
+	httpClient := reporter.TrackHTTPClient(e.newCodexHTTPClient(ctx, auth, imageRequest))
 	httpResp, err := helps.DoUpstreamHTTPRequest(httpClient, httpReq)
 	if err != nil {
 		cleanupBodies()
@@ -1415,10 +1416,11 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 			frame = multiAgentResponse.RewriteSSEFrame(frame)
 			hasData := false
 			terminal := false
-			if codexTrustedSSEFrameNeedsInspection(frame) {
+			if !reporter.IsTTFTSet() || codexTrustedSSEFrameNeedsInspection(frame) {
 				data, frameHasData := codexSSEFrameDataPayload(frame)
 				hasData = frameHasData
 				if hasData {
+					helps.ObserveResponsesTokenEvent(reporter, data)
 					if terminalErr, ok := codexTerminalStreamError(data); ok {
 						helps.ClearCodexReasoningReplayOnInvalidSignature(replayScope, terminalErr.code, data)
 						reporter.PublishFailure(ctx, terminalErr)
@@ -1440,8 +1442,12 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 			clientLine := applyCodexIdentityExposeResponsePayload(line, identityState)
 			if bytes.HasPrefix(clientLine, dataTag) {
 				clientData := bytes.TrimSpace(clientLine[len(dataTag):])
+				if !trustUpstreamSSE {
+					helps.ObserveResponsesTokenEvent(reporter, clientData)
+				}
 				// Multi-line trusted frames are classified after their data fields are joined.
 				if originalTerminalErr, ok := codexTerminalStreamError(clientData); ok && (!trustUpstreamSSE || gjson.ValidBytes(clientData)) {
+					helps.ObserveResponsesTokenEvent(reporter, clientData)
 					line = codexauth.SanitizeAgentIdentityErrorBody(authMetadata(auth), line)
 					clientLine = applyCodexIdentityExposeResponsePayload(line, identityState)
 					clientData = bytes.TrimSpace(clientLine[len(dataTag):])
