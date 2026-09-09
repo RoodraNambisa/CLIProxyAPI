@@ -2135,6 +2135,13 @@ func setSelectionAttemptMetadata(opts cliproxyexecutor.Options, selectionAttempt
 	return opts
 }
 
+// AuthSupportsRouteModel checks declared model capability, including local
+// prefixes and OAuth aliases. It does not select, reserve or authorize a request.
+func (m *Manager) AuthSupportsRouteModel(auth *Auth, routeModel string) bool {
+	return m != nil && auth != nil && strings.TrimSpace(routeModel) != "" &&
+		m.authSupportsRouteModel(registry.GetGlobalRegistry(), auth, routeModel)
+}
+
 func (m *Manager) authSupportsRouteModel(registryRef *registry.ModelRegistry, auth *Auth, routeModel string) bool {
 	if registryRef == nil || auth == nil {
 		return true

@@ -153,9 +153,19 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		appendWebsocketTimelineEvent(&wsTimelineLog, "request", payload, time.Now(), util.PromptCacheLogForGin(c))
 
 		allowIncrementalInputWithPreviousResponseID := false
-		if pinnedAuthID != "" && h != nil && h.AuthManager != nil {
-			if pinnedAuth, ok := h.AuthManager.GetByID(pinnedAuthID); ok && pinnedAuth != nil {
+		requestPinnedAuthID := pinnedAuthID
+		if requestPinnedAuthID != "" && h != nil && h.AuthManager != nil {
+			modelName := strings.TrimSpace(gjson.GetBytes(payload, "model").String())
+			if modelName == "" {
+				modelName = strings.TrimSpace(gjson.GetBytes(lastRequest, "model").String())
+			}
+			modelName = util.ResolveAutoModel(thinking.ParseSuffix(modelName).ModelName)
+			if pinnedAuth, ok := h.AuthManager.GetByID(requestPinnedAuthID); ok && h.AuthManager.AuthSupportsRouteModel(pinnedAuth, modelName) {
 				allowIncrementalInputWithPreviousResponseID = websocketUpstreamSupportsIncrementalInput(pinnedAuth.Attributes, pinnedAuth.Metadata)
+			} else {
+				// A different model may require a different credential. Normalize
+				// replayable history before selecting it, without carrying a foreign ID.
+				requestPinnedAuthID = ""
 			}
 		}
 
@@ -245,9 +255,9 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		}
 		cliCtx = handlers.WithExecutionSessionID(cliCtx, passthroughSessionID)
 		lastAttemptedAuthID = ""
-		if pinnedAuthID != "" {
-			lastAttemptedAuthID = pinnedAuthID
-			cliCtx = handlers.WithPinnedAuthID(cliCtx, pinnedAuthID)
+		if requestPinnedAuthID != "" {
+			lastAttemptedAuthID = requestPinnedAuthID
+			cliCtx = handlers.WithPinnedAuthID(cliCtx, requestPinnedAuthID)
 		} else {
 			cliCtx = handlers.WithSelectedAuthIDCallback(cliCtx, func(authID string) {
 				authID = strings.TrimSpace(authID)
