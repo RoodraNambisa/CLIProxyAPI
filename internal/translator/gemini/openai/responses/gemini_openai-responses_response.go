@@ -750,5 +750,5 @@ func ConvertGeminiResponseToOpenAIResponsesNonStream(_ context.Context, _ string
 		}
 	}
 
-	return resp
+	return translatorcommon.EnsureResponsesUsageDetails(resp)
 }
