@@ -25,6 +25,31 @@ func CollectCodexOutputItemDone(eventData []byte, indexed map[int64][]byte, fall
 	*fallback = append(*fallback, []byte(item.Raw))
 }
 
+// CollectCodexOutputIdentity keeps only identity fields for transports that do
+// not rebuild missing output arrays, avoiding retention of image or tool bodies.
+func CollectCodexOutputIdentity(eventData []byte, indexed map[int64][]byte) {
+	index := gjson.GetBytes(eventData, "output_index")
+	value, errIndex := strconv.ParseInt(index.Raw, 10, 64)
+	if index.Type != gjson.Number || errIndex != nil || value < 0 {
+		return
+	}
+	item := gjson.GetBytes(eventData, "item")
+	id := item.Get("id")
+	if !item.IsObject() || id.Type != gjson.String || strings.TrimSpace(id.String()) == "" {
+		return
+	}
+	identity := []byte(`{}`)
+	for _, field := range []string{"id", "type", "call_id"} {
+		if fieldValue := item.Get(field); fieldValue.Exists() {
+			if fieldValue.Type != gjson.String {
+				return
+			}
+			identity, _ = sjson.SetRawBytes(identity, field, []byte(fieldValue.Raw))
+		}
+	}
+	indexed[value] = identity
+}
+
 // HydrateCodexOutputItemIDs fills missing IDs only when the indexed streamed item
 // agrees with the terminal item's role and pairing identity.
 func HydrateCodexOutputItemIDs(eventData []byte, indexed map[int64][]byte) []byte {

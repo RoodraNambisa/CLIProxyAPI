@@ -515,6 +515,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	wsReqBody = nil
 
 	streamEstablished := false
+	outputIdentities := make(map[int64][]byte)
 	for {
 		if ctx != nil && ctx.Err() != nil {
 			return resp, ctx.Err()
@@ -581,7 +582,12 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 			helps.ReleaseRequestBodyAfterStreamEstablished(ctx, opts)
 			streamEstablished = true
 		}
+		if eventType == "response.output_item.done" {
+			helps.CollectCodexOutputIdentity(payload, outputIdentities)
+		}
 		if eventType == "response.completed" {
+			payload = helps.HydrateCodexOutputItemIDs(payload, outputIdentities)
+			clientPayload = applyCodexIdentityExposeResponsePayload(payload, identityState)
 			if detail, ok := helps.ParseCodexUsage(payload); ok {
 				reporter.Publish(ctx, detail)
 			}
@@ -953,6 +959,8 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 
 		var param any
 		streamEstablished := false
+		repairOutputIDs := from != sdktranslator.FormatOpenAIResponse || !metadataBool(opts.Metadata, cliproxyexecutor.TrustUpstreamSSEMetadataKey)
+		outputIdentities := make(map[int64][]byte)
 		for {
 			if ctx != nil && ctx.Err() != nil {
 				terminateReason = "context_done"
@@ -1057,9 +1065,15 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				streamEstablished = true
 			}
 			if eventType == "response.completed" || eventType == "response.done" {
+				if repairOutputIDs {
+					payload = helps.HydrateCodexOutputItemIDs(payload, outputIdentities)
+					clientPayload = applyCodexIdentityExposeResponsePayload(payload, identityState)
+				}
 				if detail, ok := helps.ParseCodexUsage(payload); ok {
 					reporter.Observe(detail)
 				}
+			} else if repairOutputIDs && eventType == "response.output_item.done" {
+				helps.CollectCodexOutputIdentity(payload, outputIdentities)
 			}
 
 			clientPayload = multiAgentResponse.Rewrite(clientPayload)

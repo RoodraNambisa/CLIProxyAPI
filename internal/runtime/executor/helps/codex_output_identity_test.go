@@ -2,6 +2,7 @@ package helps
 
 import (
 	"bytes"
+	"strings"
 	"testing"
 
 	"github.com/tidwall/gjson"
@@ -43,6 +44,22 @@ func TestHydrateCodexOutputItemIDsPreservesIdentity(t *testing.T) {
 		if bytes.Count(got, []byte(`"id":"msg_a"`)) != 1 {
 			t.Fatal("hydration introduced a duplicate output ID")
 		}
+	}
+}
+
+func TestCollectCodexOutputIdentityDoesNotRetainContent(t *testing.T) {
+	indexed := make(map[int64][]byte)
+	source := []byte(`{"output_index":3,"item":{"type":"custom_tool_call","id":"ctc_a","call_id":"a","input":"` + strings.Repeat("x", 1<<20) + `"}}`)
+	CollectCodexOutputIdentity(source, indexed)
+	clear(source)
+	if len(indexed) != 1 || len(indexed[3]) > 100 || gjson.GetBytes(indexed[3], "id").String() != "ctc_a" || gjson.GetBytes(indexed[3], "call_id").String() != "a" || gjson.GetBytes(indexed[3], "type").String() != "custom_tool_call" {
+		t.Fatal("identity snapshot retained content or aliased the source buffer")
+	}
+	for _, bad := range []string{`{"output_index":null,"item":{"id":"bad"}}`, `{"item":{"id":"bad"}}`, `{"output_index":0,"item":{"id":"bad","call_id":123}}`, `{"output_index":0,"item":{"id":123}}`} {
+		CollectCodexOutputIdentity([]byte(bad), indexed)
+	}
+	if len(indexed) != 1 {
+		t.Fatal("invalid identity metadata was retained")
 	}
 }
 
