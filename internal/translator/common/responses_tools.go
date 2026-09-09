@@ -13,6 +13,19 @@ type ResponsesToolDeclaration struct {
 	Name, Namespace, QualifiedName string
 }
 
+// ResponsesToolArgumentsObject validates a complete object without decoding its
+// numbers or repairing a partial argument string into a usable tool call.
+func ResponsesToolArgumentsObject(arguments gjson.Result) (string, bool) {
+	raw := arguments.Raw
+	if arguments.Type == gjson.String {
+		raw = arguments.String()
+	}
+	if !gjson.Valid(raw) || !gjson.Parse(raw).IsObject() {
+		return "", false
+	}
+	return raw, true
+}
+
 func QualifyResponsesToolName(namespace, name string) string {
 	if namespace == "" || strings.HasPrefix(name, "mcp__") || strings.HasPrefix(name, namespace+".") {
 		return name

@@ -111,6 +111,9 @@ func ConvertCodexResponseToInteractionsNonStream(ctx context.Context, modelName 
 		case "reasoning":
 			out = appendCodexReasoningItemToInteractions(out, item)
 		case "function_call", "tool_call":
+			if _, validArgs := translatorcommon.ResponsesToolArgumentsObject(item.Get("arguments")); !validArgs && (root.Get("type").String() == "response.incomplete" || response.Get("status").String() == "incomplete") {
+				return true
+			}
 			out = appendCodexFunctionCallItemToInteractions(out, item)
 		case "image_generation_call":
 			out = appendCodexImageItemToInteractions(out, item)
@@ -477,18 +480,8 @@ func codexItemCallID(item gjson.Result) string {
 }
 
 func codexArgumentsJSON(arguments gjson.Result) []byte {
-	if !arguments.Exists() {
-		return nil
-	}
-	if arguments.Type == gjson.String {
-		parsed := gjson.Parse(arguments.String())
-		if parsed.Exists() && parsed.IsObject() {
-			return []byte(arguments.String())
-		}
-		return []byte(`{}`)
-	}
-	if arguments.IsObject() {
-		return []byte(arguments.Raw)
+	if raw, valid := translatorcommon.ResponsesToolArgumentsObject(arguments); valid {
+		return []byte(raw)
 	}
 	return nil
 }

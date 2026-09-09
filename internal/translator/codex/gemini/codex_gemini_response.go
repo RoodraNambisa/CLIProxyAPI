@@ -138,6 +138,10 @@ func ConvertCodexResponseToGemini(_ context.Context, modelName string, originalR
 			return [][]byte{template}
 		}
 		if itemType == "function_call" {
+			args, validArgs := translatorcommon.ResponsesToolArgumentsObject(itemResult.Get("arguments"))
+			if !validArgs && (itemResult.Get("status").String() == "incomplete" || strings.TrimSpace(itemResult.Get("arguments").String()) != "") {
+				return nil
+			}
 			// Create function call part
 			functionCall := []byte(`{"functionCall":{"name":"","args":{}}}`)
 			{
@@ -151,12 +155,8 @@ func ConvertCodexResponseToGemini(_ context.Context, modelName string, originalR
 			}
 
 			// Parse and set arguments
-			argsStr := itemResult.Get("arguments").String()
-			if argsStr != "" {
-				argsResult := gjson.Parse(argsStr)
-				if argsResult.IsObject() {
-					functionCall, _ = sjson.SetRawBytes(functionCall, "functionCall.args", []byte(argsStr))
-				}
+			if validArgs {
+				functionCall, _ = sjson.SetRawBytes(functionCall, "functionCall.args", []byte(args))
 			}
 
 			template, _ = sjson.SetRawBytes(template, "candidates.0.content.parts.-1", functionCall)
@@ -337,6 +337,10 @@ func ConvertCodexResponseToGeminiNonStream(_ context.Context, modelName string, 
 					template, _ = sjson.SetRawBytes(template, "candidates.0.content.parts.-1", part)
 
 				case "function_call":
+					args, validArgs := translatorcommon.ResponsesToolArgumentsObject(value.Get("arguments"))
+					if !validArgs && (responseType == "response.incomplete" || responseData.Get("status").String() == "incomplete") {
+						return true
+					}
 					// Collect function call for potential merging with consecutive ones
 					functionCall := []byte(`{"functionCall":{"args":{},"name":""}}`)
 					{
@@ -349,11 +353,8 @@ func ConvertCodexResponseToGeminiNonStream(_ context.Context, modelName string, 
 					}
 
 					// Parse and set arguments
-					if argsStr := value.Get("arguments").String(); argsStr != "" {
-						argsResult := gjson.Parse(argsStr)
-						if argsResult.IsObject() {
-							functionCall, _ = sjson.SetRawBytes(functionCall, "functionCall.args", []byte(argsStr))
-						}
+					if validArgs {
+						functionCall, _ = sjson.SetRawBytes(functionCall, "functionCall.args", []byte(args))
 					}
 
 					pendingFunctionCalls = append(pendingFunctionCalls, functionCall)
