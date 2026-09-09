@@ -109,7 +109,7 @@ func TestConfiguredModelCapabilityCompilerSelectsEachCredentialFamily(t *testing
 		ClaudeKey:           []config.ClaudeKey{{APIKey: "fixture", Models: []config.ClaudeModel{{Name: "native", Alias: "local", IsCompat: true, Thinking: support}}}},
 		CodexKey:            []config.CodexKey{{APIKey: "fixture", Models: []config.CodexModel{{Name: "native", Alias: "local", IsCompat: true, Thinking: support}}}},
 		VertexCompatAPIKey:  []config.VertexCompatKey{{APIKey: "fixture", Models: []config.VertexCompatModel{{Name: "native", Alias: "local", IsCompat: true, Thinking: support}}}},
-		OpenAICompatibility: []config.OpenAICompatibility{{Name: "compat", Models: []config.OpenAICompatibilityModel{{Name: "native", Alias: "local", IsCompat: true, Thinking: support}, {Name: "default"}}}},
+		OpenAICompatibility: []config.OpenAICompatibility{{Name: "compat", Models: []config.OpenAICompatibilityModel{{Name: "native", Alias: "local", Thinking: support}, {Name: "default"}}}},
 	}
 	for _, provider := range []string{"gemini", "gemini-interactions", "claude", "codex", "vertex", "compat"} {
 		t.Run(provider, func(t *testing.T) {
@@ -121,7 +121,7 @@ func TestConfiguredModelCapabilityCompilerSelectsEachCredentialFamily(t *testing
 				auth.Attributes["compat_name"] = "compat"
 			}
 			compiled := compileAPIKeyModelCapabilitiesForAuth(cfg, auth)
-			if len(compiled["local"]) != 1 || !compiled["local"][0].modelInfo.IsCompat || !reflect.DeepEqual(compiled["local"][0].modelInfo.Thinking.Levels, []string{"high"}) {
+			if len(compiled["local"]) != 1 || compiled["local"][0].modelInfo.IsCompat != (provider != "compat") || !reflect.DeepEqual(compiled["local"][0].modelInfo.Thinking.Levels, []string{"high"}) {
 				t.Fatal("selected credential definition not compiled")
 			}
 			if provider == "compat" {

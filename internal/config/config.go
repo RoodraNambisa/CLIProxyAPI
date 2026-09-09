@@ -2138,8 +2138,6 @@ type OpenAICompatibilityAPIKey struct {
 // OpenAICompatibilityModel represents a model configuration for OpenAI compatibility,
 // including the actual model name and its alias for API routing.
 type OpenAICompatibilityModel struct {
-	// IsCompat preserves compatibility-only thinking blocks; false keeps native validation.
-	IsCompat bool `yaml:"is-compat,omitempty" json:"is-compat,omitempty"`
 	// MaxContextLength overrides the advertised window; zero inherits the catalog.
 	MaxContextLength int `yaml:"max-context-length,omitempty" json:"max-context-length,omitempty"`
 	// DisplayName is an optional catalog label; blank inherits the model label.
@@ -2159,7 +2157,7 @@ type OpenAICompatibilityModel struct {
 }
 
 func (m OpenAICompatibilityModel) GetName() string                        { return m.Name }
-func (m OpenAICompatibilityModel) GetIsCompat() bool                      { return m.IsCompat }
+func (m OpenAICompatibilityModel) GetIsCompat() bool                      { return false }
 func (m OpenAICompatibilityModel) GetDisplayName() string                 { return m.DisplayName }
 func (m OpenAICompatibilityModel) GetMaxContextLength() int               { return m.MaxContextLength }
 func (m OpenAICompatibilityModel) GetAlias() string                       { return m.Alias }

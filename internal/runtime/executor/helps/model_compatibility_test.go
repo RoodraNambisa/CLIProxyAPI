@@ -49,6 +49,18 @@ func TestGoogleModelCompatibilityThinkingRolesAndText(t *testing.T) {
 	}
 }
 
+func TestOpenAICompatibilityAlreadyPreservesAssistantThinking(t *testing.T) {
+	raw := []byte(`{"messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"kept","signature":"opaque"},{"type":"text","text":"answer"},{"type":"tool_use","id":"paired","name":"lookup","input":{"query":"kept"}}]}]}`)
+	for _, flag := range []bool{false, true} {
+		got := TranslateRequestWithAPIKeyModelCompatibility(translator.FormatClaude, translator.FormatOpenAI, "fixture", raw, false, flag)
+		if gjson.GetBytes(got, "messages.0.reasoning_content").String() != "kept" ||
+			gjson.GetBytes(got, "messages.0.tool_calls.0.id").String() != "paired" ||
+			gjson.GetBytes(got, "messages.0.tool_calls.0.function.name").String() != "lookup" {
+			t.Fatal("existing OpenAI thinking/tool support became dependent on a new flag")
+		}
+	}
+}
+
 func TestModelCompatibilityDoesNotBypassOpaqueHistoryOrCancellation(t *testing.T) {
 	cfg := &config.Config{Codex: config.CodexConfig{OptimizeMultiAgentV2: true}}
 	headers := http.Header{"User-Agent": {"codex_cli_rs/0.153.4"}}

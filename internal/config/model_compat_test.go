@@ -8,8 +8,37 @@ import (
 	"testing"
 )
 
+var modelCompatFamilies = []string{"gemini-api-key", "interactions-api-key", "claude-api-key", "codex-api-key", "vertex-api-key"}
+
+func TestOpenAICompatibilityDoesNotRequireModelCompatFlag(t *testing.T) {
+	var model OpenAICompatibilityModel
+	if err := json.Unmarshal([]byte(`{"name":"upstream","is-compat":true}`), &model); err != nil || model.GetIsCompat() {
+		t.Fatal("OpenAI compatibility gained an unnecessary opt-in policy")
+	}
+	serialized, err := json.Marshal(model)
+	if err != nil || strings.Contains(string(serialized), "is-compat") {
+		t.Fatal("unused compatibility flag was advertised as configuration")
+	}
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	body := "openai-compatibility: [{name: compat, base-url: https://example.test, models: [{name: upstream, alias: local, is-compat: legacy-extension}]}]\n"
+	if err := os.WriteFile(path, []byte(body), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveConfigPreserveComments(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	saved, err := os.ReadFile(path)
+	if err != nil || !strings.Contains(string(saved), "legacy-extension") {
+		t.Fatal("existing unknown OpenAI YAML extension was removed or interpreted")
+	}
+}
+
 func TestModelCompatRejectsInvalidTypesAndAllowsDefault(t *testing.T) {
-	for _, family := range retryConfigFamilies {
+	for _, family := range modelCompatFamilies {
 		for _, value := range []string{"true", "false", "null", "'true'", "1", "[]", "{}"} {
 			t.Run(family+"/"+value, func(t *testing.T) {
 				body := family + ": [{api-key: fixture, name: compat, base-url: https://example.test, models: [{name: upstream, alias: local, is-compat: " + value + "}]}]\n"
@@ -50,7 +79,7 @@ func TestModelCompatRejectsInvalidTypesAndAllowsDefault(t *testing.T) {
 
 func TestModelCompatSaveReloadCloneAndClearPreserveExtensions(t *testing.T) {
 	var body strings.Builder
-	for _, family := range retryConfigFamilies {
+	for _, family := range modelCompatFamilies {
 		body.WriteString(family + ": [{api-key: fixture, name: compat, base-url: https://example.test, models: [{name: upstream, alias: local, is-compat: true, future-model: keep}]}]\n")
 	}
 	path := filepath.Join(t.TempDir(), "config.yaml")
@@ -62,7 +91,7 @@ func TestModelCompatSaveReloadCloneAndClearPreserveExtensions(t *testing.T) {
 		t.Fatal(err)
 	}
 	get := func(c *Config) []bool {
-		return []bool{c.GeminiKey[0].Models[0].GetIsCompat(), c.InteractionsKey[0].Models[0].GetIsCompat(), c.ClaudeKey[0].Models[0].GetIsCompat(), c.CodexKey[0].Models[0].GetIsCompat(), c.VertexCompatAPIKey[0].Models[0].GetIsCompat(), c.OpenAICompatibility[0].Models[0].GetIsCompat()}
+		return []bool{c.GeminiKey[0].Models[0].GetIsCompat(), c.InteractionsKey[0].Models[0].GetIsCompat(), c.ClaudeKey[0].Models[0].GetIsCompat(), c.CodexKey[0].Models[0].GetIsCompat(), c.VertexCompatAPIKey[0].Models[0].GetIsCompat()}
 	}
 	snapshot, err := Clone(cfg)
 	if err != nil {
@@ -80,7 +109,6 @@ func TestModelCompatSaveReloadCloneAndClearPreserveExtensions(t *testing.T) {
 			cfg.ClaudeKey[0].Models[0].IsCompat = false
 			cfg.CodexKey[0].Models[0].IsCompat = false
 			cfg.VertexCompatAPIKey[0].Models[0].IsCompat = false
-			cfg.OpenAICompatibility[0].Models[0].IsCompat = false
 		}
 		if err := SaveConfigPreserveComments(path, cfg); err != nil {
 			t.Fatal(err)
@@ -103,7 +131,7 @@ func TestModelCompatSaveReloadCloneAndClearPreserveExtensions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if strings.Count(string(saved), "future-model: keep") != 6 || (!want && strings.Contains(string(saved), "is-compat: true")) {
+		if strings.Count(string(saved), "future-model: keep") != len(modelCompatFamilies) || (!want && strings.Contains(string(saved), "is-compat: true")) {
 			t.Fatal("save removed unknown extensions or retained a cleared flag")
 		}
 	}

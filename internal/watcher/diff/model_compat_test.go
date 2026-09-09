@@ -22,7 +22,7 @@ func TestModelCompatChangeDetailsPreserveRoutingIdentity(t *testing.T) {
 	}
 	for _, pair := range [][2]*config.Config{{&before, &after}, {&after, &before}} {
 		details := strings.Join(BuildConfigChangeDetails(pair[0], pair[1]), "\n")
-		for _, marker := range []string{"gemini[0].models", "interactions[0].models", "claude[0].models", "codex[0].models", "vertex[0].models", "models updated"} {
+		for _, marker := range []string{"gemini[0].models", "interactions[0].models", "claude[0].models", "codex[0].models", "vertex[0].models"} {
 			if !strings.Contains(details, marker) {
 				t.Errorf("missing compatibility change marker %s", marker)
 			}

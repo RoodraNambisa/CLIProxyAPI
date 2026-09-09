@@ -79,7 +79,7 @@ func TestModelThinkingHotReloadPreservesCredentialLifecycle(t *testing.T) {
 						want = &registry.ThinkingSupport{Levels: []string{"low", "medium", "high"}}
 					}
 				}
-				if !reflect.DeepEqual(get().Thinking, want) || get().IsCompat != update.isCompat {
+				if !reflect.DeepEqual(get().Thinking, want) || get().IsCompat != (update.isCompat && tc.provider != "openai-compatibility") {
 					t.Fatal("thinking update did not refresh the catalog")
 				}
 				current, _ := manager.GetByID(installed.ID)

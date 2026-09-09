@@ -24,7 +24,7 @@ func validateModelCatalogFieldsYAML(data []byte) error {
 		}
 		return node
 	}
-	validate := func(models *yaml.Node, contextLengths bool) error {
+	validate := func(models *yaml.Node, contextLengths, compatibility bool) error {
 		models = resolve(models)
 		if models == nil || models.Kind != yaml.SequenceNode {
 			return nil
@@ -41,13 +41,15 @@ func validateModelCatalogFieldsYAML(data []byte) error {
 			if !contextLengths {
 				continue
 			}
-			compat, err := credentialYAMLField(model, "is-compat", make(map[*yaml.Node]bool))
-			if err != nil {
-				return err
-			}
-			compat = resolve(compat)
-			if compat != nil && compat.Tag != "!!null" && (compat.Kind != yaml.ScalarNode || compat.Tag != "!!bool") {
-				return fmt.Errorf("models[%d].is-compat must be a boolean", index)
+			if compatibility {
+				compat, err := credentialYAMLField(model, "is-compat", make(map[*yaml.Node]bool))
+				if err != nil {
+					return err
+				}
+				compat = resolve(compat)
+				if compat != nil && compat.Tag != "!!null" && (compat.Kind != yaml.ScalarNode || compat.Tag != "!!bool") {
+					return fmt.Errorf("models[%d].is-compat must be a boolean", index)
+				}
 			}
 			thinking, err := credentialYAMLField(model, "thinking", make(map[*yaml.Node]bool))
 			if err != nil {
@@ -91,7 +93,7 @@ func validateModelCatalogFieldsYAML(data []byte) error {
 			if err != nil {
 				return err
 			}
-			if err := validate(models, true); err != nil {
+			if err := validate(models, true, family != "openai-compatibility"); err != nil {
 				return fmt.Errorf("%s: %w", family, err)
 			}
 		}
@@ -107,7 +109,7 @@ func validateModelCatalogFieldsYAML(data []byte) error {
 			return nil
 		}
 		for _, rules := range providers {
-			if err := validate(&rules, false); err != nil {
+			if err := validate(&rules, false, false); err != nil {
 				return fmt.Errorf("oauth-model-alias: %w", err)
 			}
 		}
