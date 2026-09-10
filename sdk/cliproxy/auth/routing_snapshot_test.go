@@ -41,6 +41,28 @@ func TestRoutingPolicySelectorInitializationWithoutConfig(t *testing.T) {
 	}
 }
 
+func TestCodexQuotaObservationPolicySurvivesReloadAndSelectorChanges(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	oldContext := manager.WithRoutingPolicySnapshot(t.Context())
+	if manager.selectionPolicy(oldContext).observeCodexQuota {
+		t.Fatal("quota observation must default to disabled")
+	}
+	manager.SetConfig(&config.Config{Codex: config.CodexConfig{ObserveQuota: true}})
+	onContext := manager.WithRoutingPolicySnapshot(t.Context())
+	manager.SetSelector(&RandomSelector{})
+	if !manager.selectionPolicy(onContext).observeCodexQuota || !manager.selectionPolicy().observeCodexQuota || manager.selectionPolicy(oldContext).observeCodexQuota {
+		t.Fatal("selector change or reload drifted a quota policy snapshot")
+	}
+	manager.SetConfig(&config.Config{})
+	if manager.selectionPolicy().observeCodexQuota || !manager.selectionPolicy(onContext).observeCodexQuota || manager.WithRoutingPolicySnapshot(onContext) != onContext {
+		t.Fatal("disabling quota observation changed an in-flight request")
+	}
+	other := NewManager(nil, nil, nil)
+	if other.selectionPolicy(other.WithRoutingPolicySnapshot(onContext)).observeCodexQuota {
+		t.Fatal("a different manager inherited the quota observation setting")
+	}
+}
+
 func TestRoutingPolicyMatchesEffectiveSchedulerRange(t *testing.T) {
 	manager := NewManager(nil, &FillFirstSelector{Range: 4}, nil)
 	check := func(stage string) {

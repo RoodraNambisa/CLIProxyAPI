@@ -555,6 +555,8 @@ type CodexConfig struct {
 	StreamBootstrapBuffering bool `yaml:"stream-bootstrap-buffering" json:"stream-bootstrap-buffering"`
 	// EstimateClaudeInputTokens fills empty Claude message_start input usage with a local estimate.
 	EstimateClaudeInputTokens bool `yaml:"estimate-claude-input-tokens" json:"estimate-claude-input-tokens"`
+	// ObserveQuota records passive Codex quota signals without changing availability.
+	ObserveQuota bool `yaml:"observe-quota" json:"observe-quota"`
 	// PassthroughPromptCacheKey preserves explicit client cache keys independently of session identity.
 	PassthroughPromptCacheKey bool                 `yaml:"passthrough-prompt-cache-key" json:"passthrough-prompt-cache-key"`
 	IdentityConfuse           bool                 `yaml:"identity-confuse" json:"identity-confuse"`

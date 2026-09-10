@@ -1170,6 +1170,7 @@ func (m *Manager) SetSelector(selector Selector) {
 	}
 	routing.FillFirstRange = fillFirstRangeFromSelector(selector)
 	policy := newRoutingRequestPolicy(m, selector, routing)
+	policy.observeCodexQuota = cfg != nil && cfg.Codex.ObserveQuota
 	if previous := m.routingPolicy.Load(); previous != nil {
 		policy.oauthErrorRules = previous.oauthErrorRules
 	}
@@ -1352,6 +1353,7 @@ func (m *Manager) setConfigLocked(cfg *internalconfig.Config) {
 	m.runtimeConfig.Store(cfg)
 	m.rebuildAPIKeyModelAliasLocked(cfg)
 	policy := newRoutingRequestPolicy(m, m.selector, cfg.Routing)
+	policy.observeCodexQuota = cfg.Codex.ObserveQuota
 	policy.oauthErrorRules = oauthErrorRules
 	m.routingPolicy.Store(policy)
 	if m.backingPathAuthDir != strings.TrimSpace(cfg.AuthDir) {

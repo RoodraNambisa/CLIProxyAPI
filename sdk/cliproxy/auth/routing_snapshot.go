@@ -20,6 +20,7 @@ type routingRequestPolicy struct {
 	priorityRPM        map[int]int
 	priorityMaxRetries map[int]int
 	strictAffinity     bool
+	observeCodexQuota  bool
 	oauthErrorRules    map[string]*config.CompiledRequestScopedErrors
 }
 

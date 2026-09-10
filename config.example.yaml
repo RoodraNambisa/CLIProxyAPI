@@ -787,6 +787,11 @@ nonstream-keepalive-interval: 0
 #   # Adds CPU/allocation cost, excludes media, and never changes final upstream usage.
 #   # Hot updates affect the next logical request; retries keep the numeric snapshot.
 #   estimate-claude-input-tokens: false
+#   # Observe quota headers and WebSocket quota events from actual Codex requests.
+#   # Boolean, missing/null defaults to false; other types are rejected. No extra network query,
+#   # credential persistence, routing or cooldown changes. Hot updates affect new
+#   # logical requests; in-flight retries keep the original setting.
+#   observe-quota: false
 #   # Convert unpaired Codex app delegation results to user messages only for
 #   # X-Openai-Subagent: collab_spawn. Paired calls and other tools are unchanged.
 #   orphan-delegation-compatibility: false
