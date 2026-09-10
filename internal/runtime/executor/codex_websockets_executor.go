@@ -802,7 +802,8 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				return nil, newCodexWebsocketHandshakeStatusErr(respHS.StatusCode, bodyErr, respHS.Header)
 			}
 			cleanupBodies()
-			return e.CodexExecutor.ExecuteStream(ctx, auth, fallbackReq, fallbackOpts)
+			// WebSocket streaming receives an already translated Responses frame.
+			return e.CodexExecutor.executeStream(ctx, auth, fallbackReq, fallbackOpts, true)
 		}
 		if respHS != nil && respHS.StatusCode > 0 {
 			cleanupBodies()

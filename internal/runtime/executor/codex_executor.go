@@ -613,7 +613,7 @@ func (e *CodexExecutor) registerAgentIdentityTask(ctx context.Context, auth *cli
 	return updated, nil
 }
 
-func (e *CodexExecutor) translateCodexRequestBodies(ctx context.Context, from, to sdktranslator.Format, baseModel string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, stream bool) ([]byte, []byte, []byte) {
+func (e *CodexExecutor) translateCodexRequestBodies(ctx context.Context, from, to sdktranslator.Format, baseModel string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, stream bool, translated ...bool) ([]byte, []byte, []byte) {
 	if from == sdktranslator.FormatCodex || from == sdktranslator.FormatOpenAIResponse {
 		enabled := e.codexPreparedSessionIdentity(ctx, req, opts).OrphanDelegationCompatibility
 		if enabled {
@@ -628,16 +628,19 @@ func (e *CodexExecutor) translateCodexRequestBodies(ctx context.Context, from, t
 			req.Payload = payload
 		}
 	}
-	return translateCodexRequestBodies(from, to, baseModel, req, opts, stream)
+	return translateCodexRequestBodies(from, to, baseModel, req, opts, stream, translated...)
 }
 
-func translateCodexRequestBodies(from, to sdktranslator.Format, baseModel string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, stream bool) ([]byte, []byte, []byte) {
+func translateCodexRequestBodies(from, to sdktranslator.Format, baseModel string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, stream bool, translated ...bool) ([]byte, []byte, []byte) {
 	originalPayload := req.Payload
 	if len(opts.OriginalRequest) > 0 {
 		originalPayload = opts.OriginalRequest
 	}
 	isCompat := helps.APIKeyModelIsCompat(req)
-	body := helps.TranslateRequestWithAPIKeyModelCompatibility(from, to, baseModel, req.Payload, stream, isCompat)
+	body := req.Payload
+	if len(translated) == 0 || !translated[0] || from == sdktranslator.FormatCodex || from == sdktranslator.FormatOpenAIResponse {
+		body = helps.TranslateRequestWithAPIKeyModelCompatibility(from, to, baseModel, req.Payload, stream, isCompat)
+	}
 	originalTranslated := body
 	if len(originalPayload) > 0 && !bytes.Equal(originalPayload, req.Payload) {
 		originalTranslated = helps.TranslateRequestWithAPIKeyModelCompatibility(from, to, baseModel, originalPayload, stream, isCompat)
@@ -1203,6 +1206,10 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 }
 
 func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
+	return e.executeStream(ctx, auth, req, opts, false)
+}
+
+func (e *CodexExecutor) executeStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, translated bool) (_ *cliproxyexecutor.StreamResult, err error) {
 	if opts.SourceFormat == sdktranslator.FormatCodexLive {
 		return nil, helps.CodexLiveNativeRouteError{}
 	}
@@ -1239,7 +1246,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("codex")
-	originalPayload, originalTranslated, body := e.translateCodexRequestBodies(ctx, from, to, baseModel, req, opts, true)
+	originalPayload, originalTranslated, body := e.translateCodexRequestBodies(ctx, from, to, baseModel, req, opts, true, translated)
 
 	body, err = helps.ApplyRequestThinking(body, req, opts, from.String(), to.String(), e.Identifier())
 	if err != nil {

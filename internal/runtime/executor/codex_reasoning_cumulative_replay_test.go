@@ -21,7 +21,7 @@ import (
 )
 
 func TestCodexTransportsRestoreCumulativeReasoningOnlyFromCompletedTurns(t *testing.T) {
-	for _, transport := range []string{"http", "websocket"} {
+	for _, transport := range []string{"http", "websocket", "http-fallback"} {
 		for _, stream := range []bool{false, true} {
 			for _, release := range []bool{false, true} {
 				t.Run(fmt.Sprintf("%s/stream=%t/release=%t", transport, stream, release), func(t *testing.T) {
@@ -73,6 +73,10 @@ func TestCodexTransportsRestoreCumulativeReasoningOnlyFromCompletedTurns(t *test
 					}
 					upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 						if websocket.IsWebSocketUpgrade(r) {
+							if transport == "http-fallback" {
+								w.WriteHeader(http.StatusUpgradeRequired)
+								return
+							}
 							upgrader := websocket.Upgrader{}
 							conn, err := upgrader.Upgrade(w, r, nil)
 							if err != nil {
@@ -98,7 +102,7 @@ func TestCodexTransportsRestoreCumulativeReasoningOnlyFromCompletedTurns(t *test
 					}))
 					defer upstream.Close()
 					var executor coreauth.ProviderExecutor = NewCodexExecutor(&config.Config{})
-					if transport == "websocket" {
+					if transport != "http" {
 						ws := NewCodexWebsocketsExecutor(&config.Config{})
 						ws.store = &codexWebsocketSessionStore{sessions: make(map[string]*codexWebsocketSession)}
 						defer ws.CloseExecutionSession(t.Name())
@@ -127,7 +131,7 @@ func TestCodexTransportsRestoreCumulativeReasoningOnlyFromCompletedTurns(t *test
 						attempts <- attempt{cancel, ctrl, done}
 						opts := core.Options{SourceFormat: translator.FormatClaude, Stream: stream, Metadata: map[string]any{core.ExecutionSessionMetadataKey: t.Name(), core.BodyReleaseControllerMetadataKey: ctrl}}
 						req := core.Request{Model: "gpt-5.4-mini", Payload: payload}
-						if transport == "websocket" && stream {
+						if transport != "http" && stream {
 							opts.OriginalRequest = payload
 							req.Payload = translator.TranslateRequest(translator.FormatClaude, translator.FormatCodex, req.Model, payload, true)
 						}
