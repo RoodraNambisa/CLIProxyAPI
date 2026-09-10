@@ -552,6 +552,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		if len(payload) == 0 {
 			continue
 		}
+		helps.ObserveCodexWebsocketQuota(ctx, auth, payload)
 		helps.ObserveResponsesTokenEvent(reporter, payload)
 		payload = applyCodexIdentityConfuseResponsePayload(payload, identityState)
 		normalizedPayload := normalizeCodexCompletion(payload)
@@ -920,6 +921,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		for helps.RequestBodyReplayable(ctx, opts) {
 			msgType, payload, errRead := readCodexWebsocketMessage(ctx, sess, conn, readCh)
 			if msgType == websocket.TextMessage && len(payload) > 0 {
+				helps.ObserveCodexWebsocketQuota(ctx, auth, payload)
 				helps.ObserveResponsesTokenEvent(reporter, payload)
 			}
 			if errCurrent := codexWebsocketExecutionStateError(ctx, auth); errCurrent != nil {
@@ -1011,6 +1013,9 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				msgType, payload, errRead = frame.msgType, frame.payload, frame.err
 			} else {
 				msgType, payload, errRead = readCodexWebsocketMessage(ctx, sess, conn, readCh)
+				if errRead == nil && msgType == websocket.TextMessage {
+					helps.ObserveCodexWebsocketQuota(ctx, auth, payload)
+				}
 			}
 			if errRead != nil {
 				if sess != nil && ctx != nil && ctx.Err() != nil {
@@ -1169,6 +1174,9 @@ func (e *CodexWebsocketsExecutor) dialCodexWebsocket(ctx context.Context, auth *
 		ctx = context.Background()
 	}
 	conn, resp, err := dialer.DialContext(ctx, wsURL, headers)
+	if resp != nil {
+		helps.ObserveCodexHTTPQuota(ctx, auth, resp.Header)
+	}
 	helps.ObserveUpstreamWebsocketDial(ctx, resp, err)
 	if conn != nil {
 		// Avoid gorilla/websocket flate tail validation issues on some upstreams/Go versions.
