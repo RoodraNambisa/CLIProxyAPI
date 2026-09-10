@@ -121,7 +121,7 @@ func TestConvertCodexResponseToClaude_StreamThinkingWithoutReasoningItemStillInc
 	}
 }
 
-func TestConvertCodexResponseToClaude_StreamThinkingFinalizesPendingBlockBeforeNextSummaryPart(t *testing.T) {
+func TestConvertCodexResponseToClaude_StreamThinkingKeepsBlockAcrossSummaryParts(t *testing.T) {
 	ctx := context.Background()
 	originalRequest := []byte(`{"messages":[]}`)
 	var param any
@@ -155,11 +155,11 @@ func TestConvertCodexResponseToClaude_StreamThinkingFinalizesPendingBlockBeforeN
 		}
 	}
 
-	if startCount != 2 {
-		t.Fatalf("expected 2 thinking block starts, got %d", startCount)
+	if startCount != 1 {
+		t.Fatalf("expected one thinking block start, got %d", startCount)
 	}
-	if stopCount != 1 {
-		t.Fatalf("expected pending thinking block to be finalized before second start, got %d stops", stopCount)
+	if stopCount != 0 {
+		t.Fatalf("summary parts must not close the reasoning item, got %d stops", stopCount)
 	}
 }
 
@@ -200,8 +200,8 @@ func TestConvertCodexResponseToClaude_StreamThinkingRetainsSignatureAcrossMultip
 		}
 	}
 
-	if signatureDeltaCount != 2 {
-		t.Fatalf("expected signature_delta for both multipart thinking blocks, got %d", signatureDeltaCount)
+	if signatureDeltaCount != 1 {
+		t.Fatalf("expected one signature_delta for the reasoning item, got %d", signatureDeltaCount)
 	}
 }
 
