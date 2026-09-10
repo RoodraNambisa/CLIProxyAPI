@@ -24,6 +24,20 @@ func (*CodexAlphaSearchAPIHandler) HandlerType() string {
 }
 func (*CodexAlphaSearchAPIHandler) Models() []map[string]any { return nil }
 
+type codexSearchRequestReadError struct {
+	cause    error
+	tooLarge bool
+}
+
+func (e *codexSearchRequestReadError) Error() string {
+	if e.tooLarge {
+		return "Codex search request exceeds the maximum size of 16 MiB"
+	}
+	return "failed to read Codex search request"
+}
+
+func (e *codexSearchRequestReadError) Unwrap() error { return e.cause }
+
 // Search uses the regular Manager lifecycle with a native search protocol.
 // No credential or upstream connection is acquired until this route is called.
 func (h *CodexAlphaSearchAPIHandler) Search(c *gin.Context) {
@@ -40,12 +54,15 @@ func (h *CodexAlphaSearchAPIHandler) Search(c *gin.Context) {
 	}
 	body, err := io.ReadAll(http.MaxBytesReader(c.Writer, c.Request.Body, helps.CodexAlphaSearchMaxRequestBytes))
 	if err != nil {
-		code := http.StatusBadRequest
+		code := statusFromError(err)
+		if code == 0 {
+			code = http.StatusBadRequest
+		}
 		var tooLarge *http.MaxBytesError
 		if errors.As(err, &tooLarge) {
 			code = http.StatusRequestEntityTooLarge
 		}
-		h.WriteErrorResponse(c, &interfaces.ErrorMessage{StatusCode: code, Error: errors.New("failed to read Codex search request; maximum size is 16 MiB")})
+		h.WriteErrorResponse(c, &interfaces.ErrorMessage{StatusCode: code, Error: &codexSearchRequestReadError{cause: err, tooLarge: tooLarge != nil}})
 		return
 	}
 	routing, err := helps.ParseCodexAlphaSearchRouting(body)
