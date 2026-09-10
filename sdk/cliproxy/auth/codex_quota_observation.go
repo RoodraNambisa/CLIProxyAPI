@@ -75,6 +75,12 @@ func newCodexQuotaObservation(headers http.Header, source string, observedAt tim
 	return &CodexQuotaObservation{ObservedAt: observedAt, Source: source, Signals: signals}
 }
 
+// CollectCodexQuotaSignals returns an owned, bounded map of accepted signals.
+// Transport decoders share the same filter as credential snapshot publication.
+func CollectCodexQuotaSignals(headers http.Header) map[string]string {
+	return collectCodexQuotaSignals(headers)
+}
+
 func collectCodexQuotaSignals(headers http.Header) map[string]string {
 	keys := make([]string, 0, len(headers))
 	for key, values := range headers {
