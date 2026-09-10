@@ -141,6 +141,10 @@ func ValidateConfig(config ThinkingConfig, modelInfo *registry.ModelInfo, fromFo
 	// Convert ModeAuto to mid-range if dynamic not allowed
 	if config.Mode == ModeAuto && !support.DynamicAllowed {
 		config = convertAutoToMidRange(config, support, toFormat, model)
+		// A generated fallback must belong to the model's discrete level subset.
+		if config.Mode == ModeLevel && len(support.Levels) > 0 && !isLevelSupported(string(config.Level), support.Levels) {
+			config.Level = clampLevel(config.Level, modelInfo, toFormat)
+		}
 	}
 
 	if config.Mode == ModeNone && toFormat == "claude" {
