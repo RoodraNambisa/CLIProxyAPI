@@ -53,6 +53,7 @@ func TestCodexClaudeMultipartThinkingAcrossTransports(t *testing.T) {
 						`{"type":"response.reasoning_summary_text.delta","item_id":"rs_test","summary_index":1,"delta":"Second"}`,
 						`{"type":"response.reasoning_summary_part.done","item_id":"rs_test","summary_index":1}`,
 						`{"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"rs_test","encrypted_content":"final-signature"}}`,
+						`{"type":"response.output_text.delta","delta":"Answer"}`,
 						`{"type":"response.completed","response":{"id":"test","status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":1}}}`,
 					} {
 						if conn != nil {
@@ -79,7 +80,7 @@ func TestCodexClaudeMultipartThinkingAcrossTransports(t *testing.T) {
 					t.Fatal(err)
 				}
 				starts, stops, signatures := 0, 0, 0
-				var thought strings.Builder
+				var thought, answer strings.Builder
 				for chunk := range result.Chunks {
 					if chunk.Err != nil {
 						t.Fatal(chunk.Err)
@@ -96,6 +97,7 @@ func TestCodexClaudeMultipartThinkingAcrossTransports(t *testing.T) {
 							stops++
 						case "content_block_delta":
 							thought.WriteString(event.Get("delta.thinking").String())
+							answer.WriteString(event.Get("delta.text").String())
 							if event.Get("delta.type").String() == "signature_delta" {
 								signatures++
 								if event.Get("delta.signature").String() != "final-signature" {
@@ -105,7 +107,7 @@ func TestCodexClaudeMultipartThinkingAcrossTransports(t *testing.T) {
 						}
 					}
 				}
-				if starts != 1 || stops != 1 || signatures != 1 || thought.String() != "First\n\nSecond" || controller.Released() != release {
+				if starts != 2 || stops != 2 || signatures != 1 || thought.String() != "First\n\nSecond" || answer.String() != "Answer" || controller.Released() != release {
 					t.Fatalf("starts=%d stops=%d signatures=%d thought=%q released=%t", starts, stops, signatures, thought.String(), controller.Released())
 				}
 			})

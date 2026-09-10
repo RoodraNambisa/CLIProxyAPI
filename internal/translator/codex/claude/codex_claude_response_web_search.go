@@ -26,6 +26,7 @@ func appendCodexWebSearchServerToolUse(output []byte, params *ConvertCodexRespon
 
 	if !alreadyStarted {
 		output = append(output, finalizeCodexThinkingBlock(params)...)
+		output = append(output, stopCodexTextBlock(params)...)
 		template := []byte(`{"type":"content_block_start","index":0,"content_block":{"type":"server_tool_use","id":"","name":"web_search","input":{}}}`)
 		template, _ = sjson.SetBytes(template, "index", params.BlockIndex)
 		template, _ = sjson.SetBytes(template, "content_block.id", toolUseID)
