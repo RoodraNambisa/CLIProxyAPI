@@ -1,6 +1,7 @@
 package responses
 
 import (
+	"strconv"
 	"strings"
 
 	"github.com/tidwall/gjson"
@@ -62,19 +63,62 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 	if input := root.Get("input"); input.Exists() && input.IsArray() {
 		var pendingCalls, deferredMessages [][]byte
 		awaitingOutputs := make(map[string]bool)
+		messageCount := int(gjson.GetBytes(out, "messages.#").Int())
+		mergeableIndex := -1
+		var mergeableAssistant []byte
+		pendingReasoning := ""
+		appendMessage := func(message []byte) int {
+			index := messageCount
+			out, _ = sjson.SetRawBytes(out, "messages.-1", message)
+			messageCount++
+			return index
+		}
 		flushCalls := func() {
 			if len(pendingCalls) == 0 {
 				return
 			}
-			message, _ := sjson.SetRawBytes([]byte(`{"role":"assistant"}`), "tool_calls", joinResponsesRawArray(pendingCalls))
-			out, _ = sjson.SetRawBytes(out, "messages.-1", message)
+			merge := mergeableIndex >= 0 && mergeableIndex == messageCount-1 && !gjson.GetBytes(mergeableAssistant, "tool_calls").Exists()
+			message := []byte(`{"role":"assistant"}`)
+			if merge {
+				message = mergeableAssistant
+			}
+			message, _ = sjson.SetRawBytes(message, "tool_calls", joinResponsesRawArray(pendingCalls))
+			if reasoning := combineResponsesInputReasoning(gjson.GetBytes(message, "reasoning_content").String(), pendingReasoning); strings.TrimSpace(reasoning) != "" {
+				message, _ = sjson.SetBytes(message, "reasoning_content", reasoning)
+			}
+			if merge {
+				out, _ = sjson.SetRawBytes(out, "messages."+strconv.Itoa(mergeableIndex), message)
+			} else {
+				appendMessage(message)
+			}
+			mergeableIndex, mergeableAssistant = -1, nil
+			pendingReasoning = ""
 			pendingCalls = nil
 		}
 		flushMessages := func() {
 			for _, message := range deferredMessages {
-				out, _ = sjson.SetRawBytes(out, "messages.-1", message)
+				appendMessage(message)
 			}
 			deferredMessages = nil
+		}
+		appendRegularMessage := func(message []byte) int {
+			if len(pendingCalls) > 0 || len(awaitingOutputs) > 0 {
+				deferredMessages = append(deferredMessages, message)
+				return -1
+			}
+			return appendMessage(message)
+		}
+		flushReasoning := func() {
+			if strings.TrimSpace(pendingReasoning) == "" {
+				return
+			}
+			if len(pendingCalls) > 0 {
+				flushCalls()
+				return
+			}
+			message, _ := sjson.SetBytes([]byte(`{"role":"assistant","content":""}`), "reasoning_content", pendingReasoning)
+			appendRegularMessage(message)
+			pendingReasoning = ""
 		}
 		input.ForEach(func(_, item gjson.Result) bool {
 			itemType := item.Get("type").String()
@@ -89,6 +133,10 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 				if role == "developer" {
 					role = "user"
 				}
+				if role != "assistant" {
+					flushReasoning()
+				}
+				mergeableIndex, mergeableAssistant = -1, nil
 				message := []byte(`{"role":"","content":[]}`)
 				message, _ = sjson.SetBytes(message, "role", role)
 
@@ -128,13 +176,23 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 					message, _ = sjson.SetBytes(message, "content", content.String())
 				}
 
-				if len(pendingCalls) > 0 || len(awaitingOutputs) > 0 {
-					deferredMessages = append(deferredMessages, message)
-				} else {
-					out, _ = sjson.SetRawBytes(out, "messages.-1", message)
+				if role == "assistant" {
+					reasoning := combineResponsesInputReasoning(pendingReasoning, responsesInputReasoningString(item.Get("reasoning_content")))
+					if strings.TrimSpace(reasoning) != "" {
+						message, _ = sjson.SetBytes(message, "reasoning_content", reasoning)
+					}
+					pendingReasoning = ""
+				}
+				index := appendRegularMessage(message)
+				if role == "assistant" && index >= 0 {
+					mergeableIndex, mergeableAssistant = index, message
 				}
 
+			case "reasoning":
+				pendingReasoning = combineResponsesInputReasoning(pendingReasoning, responsesInputReasoningText(item))
+
 			case "function_call", "custom_tool_call":
+				pendingReasoning = combineResponsesInputReasoning(pendingReasoning, responsesInputReasoningString(item.Get("reasoning_content")))
 				toolCall := []byte(`{"id":"","type":"function","function":{"name":"","arguments":""}}`)
 				callID := item.Get("call_id").String()
 				toolCall, _ = sjson.SetBytes(toolCall, "id", callID)
@@ -152,6 +210,7 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 
 			case "function_call_output", "custom_tool_call_output":
 				flushCalls()
+				mergeableIndex, mergeableAssistant = -1, nil
 				// Handle function call output conversion to tool message
 				toolMessage := []byte(`{"role":"tool","tool_call_id":"","content":""}`)
 
@@ -163,16 +222,19 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 					toolMessage = setResponsesChatToolOutput(toolMessage, output)
 				}
 
-				out, _ = sjson.SetRawBytes(out, "messages.-1", toolMessage)
+				appendMessage(toolMessage)
 				delete(awaitingOutputs, item.Get("call_id").String())
 				if len(awaitingOutputs) == 0 {
 					flushMessages()
 				}
+			default:
+				mergeableIndex, mergeableAssistant = -1, nil
 			}
 
 			return true
 		})
 		flushCalls()
+		flushReasoning()
 		flushMessages()
 	} else if input.Type == gjson.String {
 		msg := []byte(`{}`)
