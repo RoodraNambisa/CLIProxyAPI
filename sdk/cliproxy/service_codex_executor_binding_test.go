@@ -1,11 +1,55 @@
 package cliproxy
 
 import (
+	"net/http"
+	"sync"
 	"testing"
 
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
 )
+
+func TestCodexExecutorBindingReadsConfigurationSnapshot(t *testing.T) {
+	service := &Service{cfg: &config.Config{}, coreManager: coreauth.NewManager(nil, nil, nil)}
+	auth := &coreauth.Auth{ID: "config-binding-fixture", Provider: "codex"}
+	var workers sync.WaitGroup
+	workers.Go(func() {
+		for range 200 {
+			cfg := &config.Config{}
+			cfg.CodexHeaderDefaults.BetaFeatures = "snapshot-fixture"
+			service.cfgMu.Lock()
+			service.cfg = cfg
+			service.cfgMu.Unlock()
+		}
+	})
+	workers.Go(func() {
+		for range 200 {
+			service.ensureExecutorsForAuthWithMode(auth, true)
+		}
+	})
+	workers.Wait()
+	service.ensureExecutorsForAuthWithMode(auth, true)
+	exec, ok := service.coreManager.Executor("codex")
+	if !ok {
+		t.Fatal("Codex executor was not bound")
+	}
+	preparer, ok := exec.(interface {
+		PrepareRequest(*http.Request, *coreauth.Auth) error
+	})
+	if !ok {
+		t.Fatal("Codex executor lost request preparation")
+	}
+	r, err := http.NewRequest(http.MethodPost, "https://fixture.invalid/responses", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = preparer.PrepareRequest(r, auth); err != nil {
+		t.Fatal(err)
+	}
+	if r.Header.Get("X-Codex-Beta-Features") != "snapshot-fixture" {
+		t.Fatal("final binding did not use the latest configuration")
+	}
+}
 
 func TestEnsureExecutorsForAuth_CodexDoesNotReplaceInNormalMode(t *testing.T) {
 	service := &Service{
