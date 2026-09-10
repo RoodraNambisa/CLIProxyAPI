@@ -38,6 +38,9 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 
 	// Set stream configuration
 	out, _ = sjson.SetBytes(out, "stream", stream)
+	if responseFormat := responsesTextFormatForChat(root.Get("text.format")); len(responseFormat) > 0 {
+		out, _ = sjson.SetRawBytes(out, "response_format", responseFormat)
+	}
 
 	// Map generation parameters from responses format to chat completions format
 	if maxTokens := root.Get("max_output_tokens"); maxTokens.Exists() {
