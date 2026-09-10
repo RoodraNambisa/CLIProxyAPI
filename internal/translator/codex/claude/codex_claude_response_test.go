@@ -393,7 +393,7 @@ func TestConvertCodexResponseToClaude_UnresolvedPendingFunctionCallEndsTurn(t *t
 		t.Fatalf("unresolved pending function call should end turn: %s", result)
 	}
 	params := param.(*ConvertCodexResponseToClaudeParams)
-	if len(params.PendingFunctionCalls) != 0 || params.LastPendingFunctionCallKey != "" {
+	if len(params.FunctionCalls) != 0 || len(params.FunctionCallQueue) != 0 || params.ActiveFunctionCall != nil {
 		t.Fatalf("pending state was not cleared: %#v", params)
 	}
 }

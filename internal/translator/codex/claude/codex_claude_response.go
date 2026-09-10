@@ -23,28 +23,20 @@ var (
 
 // ConvertCodexResponseToClaudeParams holds parameters for response conversion.
 type ConvertCodexResponseToClaudeParams struct {
-	TerminalEmitted            bool
-	HasToolCall                bool
-	BlockIndex                 int
-	HasReceivedArgumentsDelta  bool
-	FunctionCallBlockOpen      bool
-	FunctionCallBlockCallID    string
-	FunctionCallBlockIndex     int
-	HasTextDelta               bool
-	TextBlockOpen              bool
-	ThinkingBlockOpen          bool
-	ThinkingSignature          string
-	WebSearchToolUseIDs        map[string]struct{}
-	WebSearchToolResultIDs     map[string]struct{}
-	LastWebSearchToolUseID     string
-	PendingFunctionCalls       map[string]*pendingCodexFunctionCall
-	LastPendingFunctionCallKey string
-}
-
-type pendingCodexFunctionCall struct {
-	CallID                    string
-	Arguments                 string
-	HasReceivedArgumentsDelta bool
+	TerminalEmitted        bool
+	HasToolCall            bool
+	BlockIndex             int
+	HasTextDelta           bool
+	TextBlockOpen          bool
+	ThinkingBlockOpen      bool
+	ThinkingSignature      string
+	WebSearchToolUseIDs    map[string]struct{}
+	WebSearchToolResultIDs map[string]struct{}
+	LastWebSearchToolUseID string
+	FunctionCalls          map[string]*codexFunctionCallStream
+	FunctionCallQueue      []*codexFunctionCallStream
+	ActiveFunctionCall     *codexFunctionCallStream
+	DeferredContentEvents  [][]byte
 }
 
 // ConvertCodexResponseToClaude performs sophisticated streaming response format conversion.
@@ -85,6 +77,13 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
 
 	typeResult := rootResult.Get("type")
 	typeStr := typeResult.String()
+	if output, handled := convertCodexClaudeFunctionEvent(params, rootResult, originalRequestRawJSON); handled {
+		return [][]byte{appendDeferredCodexContent(output, originalRequestRawJSON, param)}
+	}
+	if params.ActiveFunctionCall != nil && isCodexDeferredContentEvent(typeStr, rootResult) {
+		params.DeferredContentEvents = append(params.DeferredContentEvents, append([]byte("data: "), rawJSON...))
+		return nil
+	}
 	var template []byte
 
 	if typeStr == "response.created" {
@@ -128,14 +127,15 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
 	} else if typeStr == "response.web_search_call.searching" || typeStr == "response.web_search_call.completed" || typeStr == "response.web_search_call.in_progress" {
 		// Wait for output_item.done, which carries the populated search action.
 	} else if typeStr == "response.completed" || typeStr == "response.incomplete" {
-		params.TerminalEmitted = true
 		output = append(output, finalizeCodexThinkingBlock(params)...)
 		output = append(output, stopCodexTextBlock(params)...)
 		template = []byte(`{"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"input_tokens":0,"output_tokens":0}}`)
 		responseData := rootResult.Get("response")
-		output = hydrateOpenCodexFunctionCallFromTerminal(output, params, responseData)
-		output = appendCodexOpenFunctionCallStop(output, params)
-		output = appendPendingCodexFunctionCallsFromTerminal(output, params, originalRequestRawJSON, responseData)
+		output = finishCodexClaudeFunctionCalls(output, params, originalRequestRawJSON, responseData)
+		output = appendDeferredCodexContent(output, originalRequestRawJSON, param)
+		output = append(output, finalizeCodexThinkingBlock(params)...)
+		output = append(output, stopCodexTextBlock(params)...)
+		params.TerminalEmitted = true
 		template, _ = sjson.SetBytes(template, "delta.stop_reason", mapCodexStopReasonToClaude(responseData, params.HasToolCall))
 		inputTokens, outputTokens, cachedTokens := extractResponsesUsage(responseData.Get("usage"))
 		template, _ = sjson.SetBytes(template, "usage.input_tokens", inputTokens)
@@ -149,39 +149,7 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
 	} else if typeStr == "response.output_item.added" {
 		itemResult := rootResult.Get("item")
 		itemType := itemResult.Get("type").String()
-		if itemType == "function_call" {
-			output = append(output, finalizeCodexThinkingBlock(params)...)
-			output = append(output, stopCodexTextBlock(params)...)
-			params.HasReceivedArgumentsDelta = false
-			callID := codexFunctionCallID(itemResult)
-			name := itemResult.Get("name").String()
-			if name == "" {
-				recordPendingCodexFunctionCall(params, rootResult, itemResult)
-				return [][]byte{output}
-			}
-			deletePendingCodexFunctionCall(params, rootResult, itemResult)
-			params.HasToolCall = true
-			template = []byte(`{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"","name":"","input":{}}}`)
-			template, _ = sjson.SetBytes(template, "index", params.BlockIndex)
-			template, _ = sjson.SetBytes(template, "content_block.id", util.SanitizeClaudeToolID(callID))
-			{
-				rev := buildReverseMapFromClaudeOriginalShortToOriginal(originalRequestRawJSON)
-				if orig, ok := rev[name]; ok {
-					name = orig
-				}
-				template, _ = sjson.SetBytes(template, "content_block.name", name)
-			}
-
-			output = translatorcommon.AppendSSEEventBytes(output, "content_block_start", template, 2)
-
-			template = []byte(`{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":""}}`)
-			template, _ = sjson.SetBytes(template, "index", params.BlockIndex)
-
-			output = translatorcommon.AppendSSEEventBytes(output, "content_block_delta", template, 2)
-			params.FunctionCallBlockOpen = true
-			params.FunctionCallBlockCallID = callID
-			params.FunctionCallBlockIndex = params.BlockIndex
-		} else if itemType == "reasoning" {
+		if itemType == "reasoning" {
 			output = append(output, stopCodexTextBlock(params)...)
 			output = append(output, finalizeCodexThinkingBlock(params)...)
 			// The early snapshot is only a fallback if the final item omits its signature.
@@ -226,38 +194,6 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
 
 			output = append(output, stopCodexTextBlock(params)...)
 			params.HasTextDelta = true
-		} else if itemType == "function_call" {
-			if pending := pendingCodexFunctionCallForEvent(params, rootResult, itemResult); pending != nil {
-				name := itemResult.Get("name").String()
-				if name == "" {
-					return [][]byte{output}
-				}
-				callID := pending.CallID
-				if callID == "" {
-					callID = codexFunctionCallID(itemResult)
-				}
-				blockIndex := params.BlockIndex
-				output = appendCodexFunctionCallStart(output, originalRequestRawJSON, callID, name, blockIndex)
-				params.HasToolCall = true
-				args := pending.Arguments
-				if args == "" {
-					args = itemResult.Get("arguments").String()
-				}
-				if args != "" {
-					output = appendCodexFunctionCallArgumentDelta(output, args, blockIndex)
-				}
-				output = appendCodexFunctionCallStop(output, blockIndex)
-				params.BlockIndex++
-				deletePendingCodexFunctionCall(params, rootResult, itemResult)
-			} else if params.FunctionCallBlockOpen {
-				if !params.HasReceivedArgumentsDelta {
-					if args := itemResult.Get("arguments").String(); args != "" {
-						output = appendCodexFunctionCallArgumentDelta(output, args, params.FunctionCallBlockIndex)
-						params.HasReceivedArgumentsDelta = true
-					}
-				}
-				output = appendCodexOpenFunctionCallStop(output, params)
-			}
 		} else if itemType == "reasoning" {
 			if signature := itemResult.Get("encrypted_content").String(); signature != "" {
 				params.ThinkingSignature = signature
@@ -266,35 +202,6 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
 			params.ThinkingSignature = ""
 		} else if itemType == "web_search_call" {
 			output = appendCodexWebSearchToolResult(output, params, rootResult, itemResult)
-		}
-	} else if typeStr == "response.function_call_arguments.delta" {
-		if pending := pendingCodexFunctionCallForArguments(params, rootResult); pending != nil {
-			pending.HasReceivedArgumentsDelta = true
-			pending.Arguments += rootResult.Get("delta").String()
-			return [][]byte{output}
-		}
-		params.HasReceivedArgumentsDelta = true
-		template = []byte(`{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":""}}`)
-		template, _ = sjson.SetBytes(template, "index", currentCodexFunctionCallBlockIndex(params))
-		template, _ = sjson.SetBytes(template, "delta.partial_json", rootResult.Get("delta").String())
-
-		output = translatorcommon.AppendSSEEventBytes(output, "content_block_delta", template, 2)
-	} else if typeStr == "response.function_call_arguments.done" {
-		if pending := pendingCodexFunctionCallForArguments(params, rootResult); pending != nil {
-			if !pending.HasReceivedArgumentsDelta {
-				pending.Arguments = rootResult.Get("arguments").String()
-			}
-			return [][]byte{output}
-		}
-		if !params.HasReceivedArgumentsDelta {
-			if args := rootResult.Get("arguments").String(); args != "" {
-				template = []byte(`{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":""}}`)
-				template, _ = sjson.SetBytes(template, "index", currentCodexFunctionCallBlockIndex(params))
-				template, _ = sjson.SetBytes(template, "delta.partial_json", args)
-
-				output = translatorcommon.AppendSSEEventBytes(output, "content_block_delta", template, 2)
-				params.HasReceivedArgumentsDelta = true
-			}
 		}
 	}
 
