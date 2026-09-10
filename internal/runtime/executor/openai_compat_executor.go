@@ -104,6 +104,17 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	}
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	translated, payloadAuthority := helps.ApplyPayloadConfigWithThinkingAuthority(e.cfg, baseModel, to.String(), "", translated, originalTranslated, requestedModel)
+	textOnly, bound := helps.OpenAIToolResultPolicyFromRequest(req)
+	if !bound {
+		textOnly = helps.ShouldNormalizeOpenAIToolResultsForModel(e.resolveCompatConfig(auth), req.Model, requestedModel)
+	}
+	if textOnly {
+		if to == sdktranslator.FormatOpenAIResponse {
+			translated = helps.NormalizeResponsesToolResultsTextOnly(translated)
+		} else {
+			translated = helps.NormalizeOpenAIToolResultsTextOnly(translated)
+		}
+	}
 	if opts.Alt == "responses/compact" {
 		if updated, errDelete := sjson.DeleteBytes(translated, "stream"); errDelete == nil {
 			translated = updated
@@ -225,6 +236,13 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	}
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	translated, payloadAuthority := helps.ApplyPayloadConfigWithThinkingAuthority(e.cfg, baseModel, to.String(), "", translated, originalTranslated, requestedModel)
+	textOnly, bound := helps.OpenAIToolResultPolicyFromRequest(req)
+	if !bound {
+		textOnly = helps.ShouldNormalizeOpenAIToolResultsForModel(e.resolveCompatConfig(auth), req.Model, requestedModel)
+	}
+	if textOnly {
+		translated = helps.NormalizeOpenAIToolResultsTextOnly(translated)
+	}
 
 	translated, err = helps.ApplyRequestThinking(translated, req, opts, from.String(), to.String(), e.Identifier(), payloadAuthority)
 	if err != nil {
