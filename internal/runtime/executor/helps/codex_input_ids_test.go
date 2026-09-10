@@ -79,7 +79,7 @@ func TestSanitizeCodexInputItemIDsEncryptedAndLegacyPayloads(t *testing.T) {
 	if utf8.RuneCountInString(items[0].Get("id").Str) > 64 {
 		t.Fatal("unencrypted reasoning was not shortened")
 	}
-	for _, raw := range []string{`{}`, `{"input":"text"}`, `{"input":null}`, `{"input":[{"type":"message"},{"id":42},{"type":"message","id":""}]}`} {
+	for _, raw := range []string{`{}`, `{"input":"text"}`, `{"input":null}`, `{"input":[{"type":"message"},{"id":42},{"type":"message","id":""}]}`, `{"input":[{"role":"user","id":"raw"}]}`} {
 		if got := SanitizeCodexInputItemIDs([]byte(raw)); string(got) != raw {
 			t.Fatal("changed a legacy payload without string IDs")
 		}
@@ -104,6 +104,56 @@ func TestSanitizeCodexOverlongPrefixCollisionKeepsDistinctOriginalIDs(t *testing
 		}
 		if !bytes.Equal(got, SanitizeCodexInputItemIDs(got)) {
 			t.Fatal("overlong prefix collision repair is not idempotent")
+		}
+	}
+}
+
+func TestSanitizeCodexInputIDCollisionKeepsToolPairIdentities(t *testing.T) {
+	for _, kind := range []string{"function_call", "function_call_output", "custom_tool_call", "custom_tool_call_output"} {
+		for _, source := range []string{"same", "fc_valid", strings.Repeat("long", 30)} {
+			t.Run(kind+"/"+source, func(t *testing.T) {
+				body := []byte(fmt.Sprintf(`{"input":[{"type":%q,"id":%q,"call_id":"a"},{"type":%q,"id":%q,"call_id":"b"},{"type":%q,"id":%q,"call_id":"a"}]}`, kind, source, kind, source, kind, source))
+				got := SanitizeCodexInputItemIDs(body)
+				items := gjson.GetBytes(got, "input").Array()
+				if len(items) != 3 || items[0].Get("id").Str == items[1].Get("id").Str || items[0].Get("id").Str != items[2].Get("id").Str {
+					t.Fatal("distinct pairs collided or repeated pair lost its stable ID")
+				}
+				for i, wantCallID := range []string{"a", "b", "a"} {
+					if items[i].Get("call_id").Str != wantCallID || utf8.RuneCountInString(items[i].Get("id").Str) > codexInputItemIDLimit {
+						t.Fatal("pairing or ID length changed incorrectly")
+					}
+				}
+				if !bytes.Equal(got, SanitizeCodexInputItemIDs(body)) || !bytes.Equal(got, SanitizeCodexInputItemIDs(got)) {
+					t.Fatal("collision repair is not deterministic and idempotent")
+				}
+			})
+		}
+	}
+}
+
+func TestSanitizeCodexInputIDCollisionReservesCanonicalAndHashNames(t *testing.T) {
+	for _, reverse := range []bool{false, true} {
+		first := `{"type":"function_call","id":"msg_same","call_id":"a"}`
+		second := `{"type":"function_call_output","id":"fc_msg_same","call_id":"a"}`
+		if reverse {
+			first, second = second, first
+		}
+		reserved := codexInputItemIDWithHashSuffix("fc_msg_same", 0)
+		body := []byte(fmt.Sprintf(`{"input":[%s,%s,{"type":"function_call_output","id":%q,"call_id":"b"}]}`, first, second, reserved))
+		got := SanitizeCodexInputItemIDs(body)
+		seen := map[string]bool{}
+		for _, item := range gjson.GetBytes(got, "input").Array() {
+			id := item.Get("id").Str
+			if seen[id] {
+				t.Fatal("prefix repair stole a canonical or reserved hash ID")
+			}
+			seen[id] = true
+			if item.Get("type").Str == "function_call_output" && id != "fc_msg_same" && id != reserved {
+				t.Fatal("changed an existing canonical output ID")
+			}
+		}
+		if !bytes.Equal(got, SanitizeCodexInputItemIDs(got)) {
+			t.Fatal("cross-type repair is not idempotent")
 		}
 	}
 }

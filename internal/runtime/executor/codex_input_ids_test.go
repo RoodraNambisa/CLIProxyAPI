@@ -57,7 +57,7 @@ func TestCodexInputItemIDsAllResponsesTransports(t *testing.T) {
 			defer server.Close()
 			cfg := &config.Config{SDKConfig: sdkconfig.SDKConfig{ProxyURL: "direct"}}
 			auth := &cliproxyauth.Auth{ID: "id-test", Provider: "codex", Attributes: map[string]string{"api_key": "test-key", "base_url": server.URL}}
-			req := cliproxyexecutor.Request{Model: "gpt-5.4", Payload: []byte(`{"model":"gpt-5.4","store":false,"input":[{"type":"message","role":"user","id":"source","content":[{"type":"input_text","text":"hello"}]},{"type":"reasoning","id":"rs_orphan","summary":[{"type":"summary_text","text":"visible"}]},{"type":"reasoning","id":"rs_invalid","encrypted_content":"bad"},{"type":"function_call","id":"fc_tool","call_id":"rs_orphan","name":"fixture","arguments":"{}"},{"type":"function_call_output","call_id":"rs_orphan","output":{"type":"reasoning","id":"business"}}]}`)}
+			req := cliproxyexecutor.Request{Model: "gpt-5.4", Payload: []byte(`{"model":"gpt-5.4","store":false,"input":[{"type":"message","role":"user","id":"source","content":[{"type":"input_text","text":"hello"}]},{"type":"reasoning","id":"rs_orphan","summary":[{"type":"summary_text","text":"visible"}]},{"type":"reasoning","id":"rs_invalid","encrypted_content":"bad"},{"type":"function_call","id":"fc_tool","call_id":"rs_orphan","name":"fixture","arguments":"{}"},{"type":"function_call_output","id":"result","call_id":"rs_orphan","output":{"type":"reasoning","id":"business"}},{"type":"function_call","id":"fc_tool","call_id":"other","name":"fixture","arguments":"{}"},{"type":"function_call_output","id":"result","call_id":"other","output":"second"}]}`)}
 			opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai-response")}
 			var provider cliproxyauth.ProviderExecutor = NewCodexExecutor(cfg)
 			if operation == "websocket" || operation == "websocket-stream" {
@@ -90,6 +90,22 @@ func TestCodexInputItemIDsAllResponsesTransports(t *testing.T) {
 				}
 				if gjson.GetBytes(body, "input.1.id").Exists() || gjson.GetBytes(body, "input.2.id").Exists() || gjson.GetBytes(body, "input.2.encrypted_content").Exists() || gjson.GetBytes(body, "input.1.summary.0.text").String() != "visible" || gjson.GetBytes(body, "input.3.call_id").String() != "rs_orphan" || gjson.GetBytes(body, "input.4.call_id").String() != "rs_orphan" || gjson.GetBytes(body, "input.4.output.id").String() != "business" {
 					t.Fatal("outbound cleanup retained orphan reasoning IDs or rewrote a different identity role")
+				}
+				items := gjson.GetBytes(body, "input").Array()
+				if len(items) != 7 {
+					t.Fatal("outbound normalization lost a colliding tool pair")
+				}
+				seenIDs := make(map[string]bool)
+				for index, item := range items[3:] {
+					id := item.Get("id").String()
+					wantCallID := "rs_orphan"
+					if index >= 2 {
+						wantCallID = "other"
+					}
+					if id == "" || seenIDs[id] || item.Get("call_id").String() != wantCallID {
+						t.Fatal("outbound tool IDs still collide or pairing was changed")
+					}
+					seenIDs[id] = true
 				}
 			default:
 				t.Fatal("no upstream request captured")

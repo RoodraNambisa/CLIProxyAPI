@@ -13,6 +13,24 @@ import (
 
 const codexInputItemIDLimit = 64
 
+type codexInputItemIdentity struct {
+	id     string
+	kind   string
+	callID string
+}
+
+func codexInputIdentity(item gjson.Result, id, kind string) codexInputItemIdentity {
+	identity := codexInputItemIdentity{id: id, kind: kind}
+	if identity.kind == "" && item.Get("role").Str != "" {
+		identity.kind = "message"
+	}
+	switch identity.kind {
+	case "function_call", "function_call_output", "custom_tool_call", "custom_tool_call_output":
+		identity.callID = item.Get("call_id").String()
+	}
+	return identity
+}
+
 // SanitizeCodexInputItemIDs applies type prefixes and bounded deterministic IDs.
 // Existing valid IDs reserve their names before replacements are allocated.
 // call_id is a separate tool-pairing key and is never rewritten here.
@@ -22,34 +40,38 @@ func SanitizeCodexInputItemIDs(body []byte) []byte {
 		return body
 	}
 	items := input.Array()
-	occupied := make(map[string]bool, len(items))
-	preserved := make(map[string]bool, len(items))
+	owners := make(map[string]codexInputItemIdentity, len(items))
 	needsRewrite := false
 	for _, item := range items {
 		id := item.Get("id")
-		if id.Type != gjson.String {
+		if id.Type != gjson.String || id.Str == "" {
 			continue
 		}
 		if dropCodexEncryptedReasoningID(item, id) {
 			needsRewrite = true
 			continue
 		}
-		normalized := normalizeCodexInputItemID(item, id.Str)
+		kind := item.Get("type").Str
+		normalized := normalizeCodexInputItemID(kind, id.Str)
 		tooLong := utf8.RuneCountInString(normalized) > codexInputItemIDLimit
 		needsRewrite = needsRewrite || normalized != id.Str || tooLong
-		if !tooLong {
-			occupied[normalized] = true
+		identity := codexInputIdentity(item, id.Str, kind)
+		owner, exists := owners[normalized]
+		if exists && owner != identity {
+			needsRewrite = true
 		}
-		if normalized == id.Str {
-			preserved[normalized] = true
+		// Prefer an existing canonical ID over one that only gains this name
+		// through prefix normalization. Otherwise the first identity owns it.
+		if !exists || (owner.id != normalized && id.Str == normalized) {
+			owners[normalized] = identity
 		}
 	}
 	if !needsRewrite {
 		return body
 	}
-	// Prefix collisions must not share the shortening map with preserved IDs.
-	mapped := make(map[string]string)
-	collisionMapped := make(map[string]string)
+	// Repeated occurrences of one item keep their mapping; distinct tool pairs
+	// can reuse a source ID without being assigned the same replacement.
+	mapped := make(map[codexInputItemIdentity]string)
 	rebuilt := make([]string, 0, len(items))
 	changed := false
 	for _, item := range items {
@@ -59,25 +81,22 @@ func SanitizeCodexInputItemIDs(body []byte) []byte {
 			continue
 		}
 		raw := item.Raw
-		if id.Type == gjson.String {
-			normalized := normalizeCodexInputItemID(item, id.Str)
-			prefixCollision := normalized != id.Str && preserved[normalized]
-			needsSuffix := utf8.RuneCountInString(normalized) > codexInputItemIDLimit || prefixCollision
+		if id.Type == gjson.String && id.Str != "" {
+			kind := item.Get("type").Str
+			normalized := normalizeCodexInputItemID(kind, id.Str)
+			identity := codexInputIdentity(item, id.Str, kind)
+			needsSuffix := utf8.RuneCountInString(normalized) > codexInputItemIDLimit || owners[normalized] != identity
 			if needsSuffix {
-				mappings := mapped
-				if prefixCollision {
-					mappings = collisionMapped
-				}
-				replacement, ok := mappings[normalized]
+				replacement, ok := mapped[identity]
 				if !ok {
 					for attempt := 0; ; attempt++ {
 						replacement = codexInputItemIDWithHashSuffix(normalized, attempt)
-						if !occupied[replacement] {
+						if _, occupied := owners[replacement]; !occupied {
 							break
 						}
 					}
-					mappings[normalized] = replacement
-					occupied[replacement] = true
+					mapped[identity] = replacement
+					owners[replacement] = identity
 				}
 				normalized = replacement
 			}
@@ -100,9 +119,9 @@ func SanitizeCodexInputItemIDs(body []byte) []byte {
 	return updated
 }
 
-func normalizeCodexInputItemID(item gjson.Result, id string) string {
+func normalizeCodexInputItemID(kind, id string) string {
 	var prefix string
-	switch item.Get("type").Str {
+	switch kind {
 	case "message":
 		prefix = "msg"
 	case "reasoning":

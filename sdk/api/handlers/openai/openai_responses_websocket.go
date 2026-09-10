@@ -609,7 +609,12 @@ func dedupeInputItemsByID(rawArray string) (string, error) {
 		return "", errUnmarshal
 	}
 
-	seenIDs := make(map[string]struct{}, len(items))
+	type inputIdentity struct {
+		kind   string
+		id     string
+		callID string
+	}
+	seenIDs := make(map[inputIdentity]struct{}, len(items))
 	filtered := make([]json.RawMessage, 0, len(items))
 	for _, item := range items {
 		if len(item) == 0 {
@@ -617,10 +622,20 @@ func dedupeInputItemsByID(rawArray string) (string, error) {
 		}
 		id := strings.TrimSpace(gjson.GetBytes(item, "id").String())
 		if id != "" {
-			if _, ok := seenIDs[id]; ok {
+			kind := strings.TrimSpace(gjson.GetBytes(item, "type").String())
+			if kind == "" && strings.TrimSpace(gjson.GetBytes(item, "role").String()) != "" {
+				kind = "message"
+			}
+			identity := inputIdentity{kind: kind, id: id}
+			if isResponsesToolCallType(kind) || isResponsesToolCallOutputType(kind) {
+				identity.callID = strings.TrimSpace(gjson.GetBytes(item, "call_id").String())
+			}
+			// Item IDs can collide before provider normalization. Distinct tool
+			// pairs and item types must survive until their IDs can be repaired.
+			if _, ok := seenIDs[identity]; ok {
 				continue
 			}
-			seenIDs[id] = struct{}{}
+			seenIDs[identity] = struct{}{}
 		}
 		filtered = append(filtered, item)
 	}
