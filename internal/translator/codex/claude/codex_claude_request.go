@@ -378,6 +378,19 @@ func convertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool, 
 	}
 	template, _ = sjson.SetBytes(template, "reasoning.effort", reasoningEffort)
 	// Summary visibility is applied from the source protocol by the registry.
+	serviceTier := ""
+	if tier := rootResult.Get("service_tier"); tier.Type == gjson.String {
+		switch strings.ToLower(strings.TrimSpace(tier.String())) {
+		case "fast", "priority":
+			serviceTier = "priority"
+		}
+	}
+	if speed := rootResult.Get("speed"); speed.Type == gjson.String && speed.String() == "fast" {
+		serviceTier = "priority"
+	}
+	if serviceTier != "" {
+		template, _ = sjson.SetBytes(template, "service_tier", serviceTier)
+	}
 	template, _ = sjson.SetBytes(template, "stream", true)
 	template, _ = sjson.SetBytes(template, "store", false)
 	template, _ = sjson.SetBytes(template, "include", []string{"reasoning.encrypted_content"})
