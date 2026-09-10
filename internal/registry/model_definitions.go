@@ -248,7 +248,7 @@ func GetStaticModelDefinitionsByChannel(channel string) []*ModelInfo {
 	switch key {
 	case "claude":
 		return GetClaudeModels()
-	case "gemini":
+	case "gemini", "gemini-interactions":
 		return GetGeminiModels()
 	case "vertex":
 		return GetGeminiVertexModels()
