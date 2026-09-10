@@ -617,6 +617,7 @@ func (m *Manager) installAuthLocked(id string, auth *Auth) {
 		return
 	}
 	m.removeAuthIndexesLocked(id)
+	normalizeModelStates(auth)
 	m.auths[id] = auth
 	m.addAuthIndexesLocked(auth, m.currentConfig())
 	m.authIndexRevision++

@@ -4308,6 +4308,7 @@ func (m *Manager) LoadWithReport(ctx context.Context) (StoreLoadReport, error) {
 		}
 		auth.EnsureIndex()
 		loadedAuth := auth.Clone()
+		normalizeModelStates(loadedAuth)
 		if errRules := prepareAuthRequestScopedErrors(loadedAuth); errRules != nil {
 			log.WithError(errRules).Warn("auth: skipping credential with invalid request-scoped error rules")
 			continue
@@ -7949,6 +7950,7 @@ func (m *Manager) markResult(
 	if result.AuthID == "" {
 		return
 	}
+	modelKey := canonicalModelKey(result.Model)
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -8104,7 +8106,7 @@ func (m *Manager) markResult(
 			// request was in flight. Keep the result observable to hooks without
 			// recreating stale per-model cooldown state.
 		} else if result.Success {
-			if result.Model != "" {
+			if modelKey != "" {
 				state := ensureModelState(auth, result.Model)
 				if !chatGPTWebImageQuotaOwnedModelStateForModels(auth, result.Model, state, registeredImageModels) {
 					resetModelState(state, now)
@@ -8127,7 +8129,7 @@ func (m *Manager) markResult(
 					}
 				}
 			}
-			if result.Model != "" || len(additionalSuccessModelsApplied) > 0 {
+			if modelKey != "" || len(additionalSuccessModelsApplied) > 0 {
 				updateAggregatedAvailability(auth, now)
 				if !hasModelError(auth, now) && !hasActiveAuthWideCooldown(auth, now) {
 					auth.LastError = nil
@@ -8142,7 +8144,7 @@ func (m *Manager) markResult(
 			if chatGPTWebImageQuotaResult {
 				imageQuotaSuspendModels = projectChatGPTWebImageQuotaExhausted(auth, registeredImageModels, now)
 			}
-			if result.Model != "" {
+			if modelKey != "" {
 				if authWideDynamicCooldown {
 					skipCooling := !hasDynamicFixedCooldown && m.cooldownSkippedForStatus(resultStatusCode, ctx)
 					auth.Status = StatusError
@@ -8288,7 +8290,7 @@ func (m *Manager) markResult(
 		}
 
 		if removedDynamicModelWithAuthCooldown {
-			delete(auth.ModelStates, result.Model)
+			delete(auth.ModelStates, modelKey)
 			if len(auth.ModelStates) == 0 {
 				auth.ModelStates = nil
 			}
@@ -8327,16 +8329,16 @@ func (m *Manager) markResult(
 	m.upsertCurrentResultAuthState(authSnapshot)
 
 	applyRegistryResult := func() {
-		if clearModelQuota && result.Model != "" {
-			registry.GetGlobalRegistry().ClearModelQuotaExceeded(result.AuthID, result.Model)
+		if clearModelQuota && modelKey != "" {
+			registry.GetGlobalRegistry().ClearModelQuotaExceeded(result.AuthID, modelKey)
 		}
-		if setModelQuota && result.Model != "" {
-			registry.GetGlobalRegistry().SetModelQuotaExceeded(result.AuthID, result.Model)
+		if setModelQuota && modelKey != "" {
+			registry.GetGlobalRegistry().SetModelQuotaExceeded(result.AuthID, modelKey)
 		}
 		if shouldResumeModel {
-			registry.GetGlobalRegistry().ResumeClientModel(result.AuthID, result.Model)
+			registry.GetGlobalRegistry().ResumeClientModel(result.AuthID, modelKey)
 		} else if shouldSuspendModel {
-			registry.GetGlobalRegistry().SuspendClientModel(result.AuthID, result.Model, suspendReason)
+			registry.GetGlobalRegistry().SuspendClientModel(result.AuthID, modelKey, suspendReason)
 		}
 		for _, additionalModel := range additionalSuccessModelsApplied {
 			registry.GetGlobalRegistry().ClearModelQuotaExceeded(result.AuthID, additionalModel)
@@ -8400,9 +8402,11 @@ func clientRegistrySupportsExecutionModel(authID, model string) bool {
 }
 
 func ensureModelState(auth *Auth, model string) *ModelState {
+	model = canonicalModelKey(model)
 	if auth == nil || model == "" {
 		return nil
 	}
+	normalizeModelStates(auth)
 	if auth.ModelStates == nil {
 		auth.ModelStates = make(map[string]*ModelState)
 	}
