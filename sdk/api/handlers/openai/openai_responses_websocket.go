@@ -1320,6 +1320,11 @@ func collectResponsesWebsocketOutputItem(payload []byte, outputItemsByIndex map[
 func restoreResponsesWebsocketCompletionOutput(payload []byte, outputItemsByIndex map[int64][]byte, outputItemsFallback [][]byte) []byte {
 	output := gjson.GetBytes(payload, "response.output")
 	if output.Exists() && output.IsArray() && len(output.Array()) > 0 {
+		if repaired, changed := reconcileResponsesWebsocketCompletionToolCalls(output, outputItemsByIndex, outputItemsFallback); changed {
+			if updated, errSet := sjson.SetRawBytes(payload, "response.output", repaired); errSet == nil {
+				return updated
+			}
+		}
 		return payload
 	}
 	if len(outputItemsByIndex) == 0 && len(outputItemsFallback) == 0 {
@@ -1348,11 +1353,18 @@ func responseCompletedOutputFromPayloadWithFallback(payload []byte, outputItemsB
 	sort.Slice(indexes, func(i, j int) bool { return indexes[i] < indexes[j] })
 
 	items := make([]json.RawMessage, 0, len(outputItemsByIndex)+len(outputItemsFallback))
+	appendItem := func(raw []byte) {
+		item := gjson.ParseBytes(raw)
+		if isResponsesToolCallType(item.Get("type").String()) && !isCompleteResponsesWebsocketToolCall(item) {
+			return
+		}
+		items = append(items, json.RawMessage(raw))
+	}
 	for _, index := range indexes {
-		items = append(items, json.RawMessage(outputItemsByIndex[index]))
+		appendItem(outputItemsByIndex[index])
 	}
 	for _, item := range outputItemsFallback {
-		items = append(items, json.RawMessage(item))
+		appendItem(item)
 	}
 	marshaled, errMarshal := json.Marshal(items)
 	if errMarshal != nil {

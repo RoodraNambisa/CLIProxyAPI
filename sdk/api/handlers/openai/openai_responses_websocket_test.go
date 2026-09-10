@@ -473,7 +473,7 @@ func TestRestoreResponsesWebsocketCompletionOutputUsesDoneItems(t *testing.T) {
 	var fallback [][]byte
 	collectResponsesWebsocketOutputItem([]byte(`{"type":"response.output_item.done","output_index":1,"item":{"type":"message","id":"out-2"}}`), indexed, &fallback)
 	collectResponsesWebsocketOutputItem([]byte(`{"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"out-1"}}`), indexed, &fallback)
-	collectResponsesWebsocketOutputItem([]byte(`{"type":"response.output_item.done","item":{"type":"function_call","id":"out-3"}}`), indexed, &fallback)
+	collectResponsesWebsocketOutputItem([]byte(`{"type":"response.output_item.done","item":{"type":"function_call","id":"out-3","call_id":"call-3","name":"exec","arguments":"{}"}}`), indexed, &fallback)
 
 	restored := restoreResponsesWebsocketCompletionOutput(
 		[]byte(`{"type":"response.done","response":{"id":"resp-1","output":[]}}`),
