@@ -1330,8 +1330,8 @@ func (h *BaseAPIHandler) executeStreamWithResolvedProviders(ctx context.Context,
 		return nil, nil, errChan
 	}
 	passthroughHeadersEnabled := PassthroughHeadersEnabled(h.Cfg)
-	// Capture upstream headers from the initial connection synchronously before the goroutine starts.
-	// Keep a mutable map so bootstrap retries can replace it before first payload is sent.
+	// Bootstrap retries own this map until output is committed. Publish it once
+	// so callers can safely read headers before consuming the returned channels.
 	upstreamHeaders := cloneHeader(ClientUpstreamHeaders(streamResult.Headers, passthroughHeadersEnabled))
 	if upstreamHeaders == nil && (passthroughHeadersEnabled || handlerType == "openai-response") {
 		upstreamHeaders = make(http.Header)
@@ -1339,14 +1339,24 @@ func (h *BaseAPIHandler) executeStreamWithResolvedProviders(ctx context.Context,
 	chunks := streamResult.Chunks
 	dataChan := make(chan []byte)
 	errChan := make(chan *interfaces.ErrorMessage, 1)
+	headersReady := make(chan struct{})
 	go func() {
 		defer close(dataChan)
 		defer close(errChan)
+		headersPublished := false
+		publishHeaders := func() {
+			if !headersPublished {
+				headersPublished = true
+				close(headersReady)
+			}
+		}
+		defer publishHeaders()
 		sentPayload := false
 		bootstrapRetries := 0
 		maxBootstrapRetries := StreamingBootstrapRetries(h.Cfg)
 
 		sendErr := func(msg *interfaces.ErrorMessage) bool {
+			publishHeaders()
 			if ctx == nil {
 				errChan <- msg
 				return true
@@ -1360,6 +1370,7 @@ func (h *BaseAPIHandler) executeStreamWithResolvedProviders(ctx context.Context,
 		}
 
 		sendData := func(chunk []byte) bool {
+			publishHeaders()
 			if ctx == nil {
 				dataChan <- chunk
 				return true
@@ -1489,6 +1500,7 @@ func (h *BaseAPIHandler) executeStreamWithResolvedProviders(ctx context.Context,
 				}
 				if coreexecutor.IsBootstrapCommitStreamChunk(chunk) {
 					sentPayload = true
+					publishHeaders()
 					if !flushBootstrapBuffer() {
 						return
 					}
@@ -1540,6 +1552,7 @@ func (h *BaseAPIHandler) executeStreamWithResolvedProviders(ctx context.Context,
 			}
 		}
 	}()
+	<-headersReady
 	return dataChan, upstreamHeaders, errChan
 }
 
