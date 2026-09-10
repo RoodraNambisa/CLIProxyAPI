@@ -598,15 +598,7 @@ func (m *ModelState) Clone() *ModelState {
 		return nil
 	}
 	copyState := *m
-	if m.LastError != nil {
-		copyState.LastError = &Error{
-			Code:       m.LastError.Code,
-			Message:    m.LastError.Message,
-			Retryable:  m.LastError.Retryable,
-			HTTPStatus: m.LastError.HTTPStatus,
-			Diagnostic: m.LastError.Diagnostic.Clone(),
-		}
-	}
+	copyState.LastError = cloneError(m.LastError)
 	return &copyState
 }
 

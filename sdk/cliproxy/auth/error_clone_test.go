@@ -4,6 +4,8 @@ import (
 	"reflect"
 	"sync"
 	"testing"
+
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 )
 
 func TestAuthCloneLastErrorIsolation(t *testing.T) {
@@ -31,6 +33,32 @@ func TestAuthCloneLastErrorIsolation(t *testing.T) {
 			}
 			if clone.run(&Auth{}).LastError != nil || clone.run(nil) != nil {
 				t.Fatal("nil clone behavior changed")
+			}
+		})
+	}
+}
+
+func TestModelStateSnapshotsRetainRequestScopedAction(t *testing.T) {
+	for _, action := range []config.RequestScopedErrorAction{config.RequestScopedActionStop, config.RequestScopedActionStopAndCooldown, config.RequestScopedActionContinue, config.RequestScopedActionContinueAndCooldown} {
+		t.Run(string(action), func(t *testing.T) {
+			original := &Auth{ID: "action-copy", Provider: "codex", ModelStates: map[string]*ModelState{
+				"model(high)": {LastError: &Error{HTTPStatus: 403, Message: "fixture", requestScopedAction: action, Diagnostic: &ErrorDiagnostic{Stage: "request"}}},
+			}}
+			manager := NewManager(nil, nil, nil)
+			registered, err := manager.Register(WithSkipPersist(t.Context()), original)
+			if err != nil {
+				t.Fatal(err)
+			}
+			current, _ := manager.GetByID(original.ID)
+			for _, state := range []*ModelState{original.Clone().ModelStates["model(high)"], registered.ModelStates["model"], current.ModelStates["model"]} {
+				if state.LastError.requestScopedAction != action {
+					t.Fatal("model error snapshot lost the selected request action")
+				}
+				state.LastError.requestScopedAction = ""
+				state.LastError.Diagnostic.Stage = "changed"
+			}
+			if original.ModelStates["model(high)"].LastError.requestScopedAction != action || original.ModelStates["model(high)"].LastError.Diagnostic.Stage != "request" {
+				t.Fatal("model error snapshot aliases the original")
 			}
 		})
 	}
