@@ -104,22 +104,28 @@ func ConvertCodexResponseToInteractionsNonStream(ctx context.Context, modelName 
 	} else {
 		out, _ = sjson.SetBytes(out, "model", modelName)
 	}
+	var steps [][]byte
 	response.Get("output").ForEach(func(_, item gjson.Result) bool {
+		var step []byte
 		switch item.Get("type").String() {
 		case "message":
-			out = appendCodexMessageItemToInteractions(out, item)
+			step = buildCodexMessageItemToInteractions(item)
 		case "reasoning":
-			out = appendCodexReasoningItemToInteractions(out, item)
+			step = buildCodexReasoningItemToInteractions(item)
 		case "function_call", "tool_call":
 			if _, validArgs := translatorcommon.ResponsesToolArgumentsObject(item.Get("arguments")); !validArgs && (root.Get("type").String() == "response.incomplete" || response.Get("status").String() == "incomplete") {
 				return true
 			}
-			out = appendCodexFunctionCallItemToInteractions(out, item)
+			step = buildCodexFunctionCallItemToInteractions(item)
 		case "image_generation_call":
-			out = appendCodexImageItemToInteractions(out, item)
+			step = buildCodexImageItemToInteractions(item)
+		}
+		if len(step) > 0 {
+			steps = append(steps, step)
 		}
 		return true
 	})
+	out = translatorcommon.SetRawArrayItems(out, "steps", steps)
 	out = setCodexInteractionsUsage(out, "usage", response.Get("usage"), false)
 	return out
 }
@@ -309,33 +315,31 @@ func appendCodexInteractionsStepStop(out [][]byte, st *codexToInteractionsStream
 	return out
 }
 
-func appendCodexMessageItemToInteractions(out []byte, item gjson.Result) []byte {
-	step := []byte(`{"type":"model_output","content":[]}`)
+func buildCodexMessageItemToInteractions(item gjson.Result) []byte {
+	var contents [][]byte
 	item.Get("content").ForEach(func(_, content gjson.Result) bool {
 		if contentItem := codexContentToInteractionsContent(content); len(contentItem) > 0 {
-			step, _ = sjson.SetRawBytes(step, "content.-1", contentItem)
+			contents = append(contents, contentItem)
 		}
 		return true
 	})
-	if gjson.GetBytes(step, "content.#").Int() == 0 {
-		return out
+	if len(contents) == 0 {
+		return nil
 	}
-	out, _ = sjson.SetRawBytes(out, "steps.-1", step)
-	return out
+	return translatorcommon.SetRawArrayItems([]byte(`{"type":"model_output","content":[]}`), "content", contents)
 }
 
-func appendCodexReasoningItemToInteractions(out []byte, item gjson.Result) []byte {
+func buildCodexReasoningItemToInteractions(item gjson.Result) []byte {
 	text := codexReasoningText(item)
 	if text == "" {
-		return out
+		return nil
 	}
 	step := []byte(`{"type":"thought","content":[{"type":"text","text":""}]}`)
 	step, _ = sjson.SetBytes(step, "content.0.text", text)
-	out, _ = sjson.SetRawBytes(out, "steps.-1", step)
-	return out
+	return step
 }
 
-func appendCodexFunctionCallItemToInteractions(out []byte, item gjson.Result) []byte {
+func buildCodexFunctionCallItemToInteractions(item gjson.Result) []byte {
 	step := []byte(`{"type":"function_call","name":"","arguments":{}}`)
 	step, _ = sjson.SetBytes(step, "name", item.Get("name").String())
 	if callID := codexItemCallID(item); callID != "" {
@@ -344,20 +348,18 @@ func appendCodexFunctionCallItemToInteractions(out []byte, item gjson.Result) []
 	if args := codexArgumentsJSON(item.Get("arguments")); len(args) > 0 {
 		step, _ = sjson.SetRawBytes(step, "arguments", args)
 	}
-	out, _ = sjson.SetRawBytes(out, "steps.-1", step)
-	return out
+	return step
 }
 
-func appendCodexImageItemToInteractions(out []byte, item gjson.Result) []byte {
+func buildCodexImageItemToInteractions(item gjson.Result) []byte {
 	result := item.Get("result").String()
 	if result == "" {
-		return out
+		return nil
 	}
 	step := []byte(`{"type":"model_output","content":[{"type":"image","mime_type":"","data":""}]}`)
 	step, _ = sjson.SetBytes(step, "content.0.mime_type", mimeTypeFromCodexOutputFormat(item.Get("output_format").String()))
 	step, _ = sjson.SetBytes(step, "content.0.data", result)
-	out, _ = sjson.SetRawBytes(out, "steps.-1", step)
-	return out
+	return step
 }
 
 func appendCodexMessageItemToInteractionsStream(out [][]byte, st *codexToInteractionsStreamState, item gjson.Result) [][]byte {
