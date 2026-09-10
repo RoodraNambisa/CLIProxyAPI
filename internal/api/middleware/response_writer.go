@@ -384,7 +384,8 @@ func (w *ResponseWriterWrapper) Finalize(c *gin.Context) error {
 
 	hasAPIError := hasActionableResponseError(finalStatusCode, slicesAPIResponseError)
 	forceLog := w.logOnErrorOnly && hasAPIError && !w.logger.IsEnabled()
-	if !w.logger.IsEnabled() && !forceLog {
+	// An already opened stream owns resources even if logging was disabled mid-request.
+	if !w.logger.IsEnabled() && !forceLog && !(w.isStreaming && w.streamWriter != nil) {
 		return nil
 	}
 
