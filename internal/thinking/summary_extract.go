@@ -31,6 +31,18 @@ type SummaryConfig struct {
 // protocol carries a dedicated summary field, so effort alone means nothing.
 func ExtractSummaryConfig(body []byte, format string) SummaryConfig {
 	normalized := strings.ToLower(strings.TrimSpace(format))
+	if normalized == "codex" || normalized == "openai-response" {
+		config, ok := responsesSummaryConfig(body, "reasoning.summary")
+		if !ok {
+			config, ok = responsesSummaryConfig(body, "reasoning.generate_summary")
+		}
+		// Absence already means unspecified, even for malformed input. Validate
+		// the complete document before accepting any extracted visibility intent.
+		if ok && gjson.ValidBytes(body) {
+			return config
+		}
+		return SummaryConfig{}
+	}
 	// Check the format first so unsupported targets skip whole-body validation.
 	if !summaryFormatSupported(normalized) || len(body) == 0 || !gjson.ValidBytes(body) {
 		return SummaryConfig{}
@@ -50,13 +62,6 @@ func ExtractSummaryConfig(body []byte, format string) SummaryConfig {
 				return SummaryConfig{Mode: SummaryDisabled}
 			}
 			return SummaryConfig{Mode: SummaryEnabled, Detail: "auto"}
-		}
-	case "openai-response", "codex":
-		if config, ok := responsesSummaryConfig(body, "reasoning.summary"); ok {
-			return config
-		}
-		if config, ok := responsesSummaryConfig(body, "reasoning.generate_summary"); ok {
-			return config
 		}
 	case "claude":
 		// Anthropic only accepts display alongside active adaptive/manual thinking.
