@@ -4623,7 +4623,14 @@ func (s *Service) ensureExecutorsForAuthWithMode(a *coreauth.Auth, forceReplace 
 				}
 			}
 		}
-		s.coreManager.RegisterExecutor(executor.NewCodexAutoExecutor(cfg))
+		next := executor.NewCodexAutoExecutor(cfg)
+		if forceReplace {
+			s.coreManager.RegisterExecutor(next)
+		} else {
+			// An unused Codex wrapper owns no connections. In particular, do not
+			// close shared session state when another binding won this race.
+			s.coreManager.RegisterExecutorIfTypeChanged(next)
+		}
 		return
 	}
 	// Skip disabled auth entries when (re)binding executors.

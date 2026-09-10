@@ -51,6 +51,36 @@ func TestCodexExecutorBindingReadsConfigurationSnapshot(t *testing.T) {
 	}
 }
 
+func TestConcurrentInitialCodexBindingsShareOneExecutor(t *testing.T) {
+	for round := range 64 {
+		service := &Service{cfg: &config.Config{}, coreManager: coreauth.NewManager(nil, nil, nil)}
+		auth := &coreauth.Auth{ID: "initial-binding-fixture", Provider: "codex"}
+		start := make(chan struct{})
+		observed := make(chan coreauth.ProviderExecutor, 32)
+		var workers sync.WaitGroup
+		for range 32 {
+			workers.Go(func() {
+				<-start
+				service.ensureExecutorsForAuth(auth)
+				exec, _ := service.coreManager.Executor("codex")
+				observed <- exec
+			})
+		}
+		close(start)
+		workers.Wait()
+		close(observed)
+		var first coreauth.ProviderExecutor
+		for exec := range observed {
+			if first == nil {
+				first = exec
+			}
+			if first != exec {
+				t.Fatalf("round=%d initial bindings replaced a newly installed executor", round)
+			}
+		}
+	}
+}
+
 func TestEnsureExecutorsForAuth_CodexDoesNotReplaceInNormalMode(t *testing.T) {
 	service := &Service{
 		cfg:         &config.Config{},

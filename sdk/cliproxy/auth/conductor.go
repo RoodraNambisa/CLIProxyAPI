@@ -2925,23 +2925,37 @@ func (m *Manager) SetRetryConfig(retry int, maxRetryInterval time.Duration, maxR
 
 // RegisterExecutor registers a provider executor with the manager.
 func (m *Manager) RegisterExecutor(executor ProviderExecutor) {
+	m.registerExecutor(executor, false)
+}
+
+// RegisterExecutorIfTypeChanged atomically preserves an installed executor of
+// the same concrete type. False leaves ownership of executor with the caller.
+func (m *Manager) RegisterExecutorIfTypeChanged(executor ProviderExecutor) bool {
+	return m.registerExecutor(executor, true)
+}
+
+func (m *Manager) registerExecutor(executor ProviderExecutor, preserveType bool) bool {
 	if executor == nil {
-		return
+		return false
 	}
 	provider := strings.TrimSpace(executor.Identifier())
 	if provider == "" {
-		return
+		return false
 	}
 
 	m.executorLifecycleMu.Lock()
 	if m.executorsClosed {
+		if preserveType {
+			m.executorLifecycleMu.Unlock()
+			return false
+		}
 		m.mu.RLock()
 		current := m.executors[provider]
 		alreadyOwned := sameProviderExecutor(current, executor) || m.executorTrackedForShutdownLocked(executor)
 		m.mu.RUnlock()
 		if alreadyOwned {
 			m.executorLifecycleMu.Unlock()
-			return
+			return false
 		}
 		m.executorShutdownSet = append(m.executorShutdownSet, executor)
 		trackedClose := !m.executorCloseSealed
@@ -2970,18 +2984,23 @@ func (m *Manager) RegisterExecutor(executor ProviderExecutor) {
 		if errClose != nil {
 			log.Errorf("failed to close provider executor registered after shutdown %s: %v", provider, errClose)
 		}
-		return
+		return false
 	}
 
 	var replaced ProviderExecutor
 	m.mu.Lock()
 	replaced = m.executors[provider]
+	if preserveType && reflect.TypeOf(replaced) == reflect.TypeOf(executor) {
+		m.mu.Unlock()
+		m.executorLifecycleMu.Unlock()
+		return false
+	}
 	m.executors[provider] = executor
 	m.mu.Unlock()
 
 	if replaced == nil || sameProviderExecutor(replaced, executor) {
 		m.executorLifecycleMu.Unlock()
-		return
+		return true
 	}
 	m.executorCloseWG.Add(1)
 	m.executorLifecycleMu.Unlock()
@@ -2990,6 +3009,7 @@ func (m *Manager) RegisterExecutor(executor ProviderExecutor) {
 		log.Errorf("failed to close replaced provider executor %s: %v", provider, errClose)
 		m.recordExecutorAsyncCloseError(errClose)
 	}
+	return true
 }
 
 func (m *Manager) executorTrackedForShutdownLocked(executor ProviderExecutor) bool {
