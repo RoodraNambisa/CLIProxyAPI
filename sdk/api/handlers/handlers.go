@@ -1613,12 +1613,8 @@ func (h *BaseAPIHandler) getRequestDetails(modelName string) (providers []string
 	}
 
 	if len(providers) == 0 {
-		// An unroutable client model is a request error.
-		body, _ := json.Marshal(map[string]map[string]string{"error": {
-			"message": "unknown provider for model " + modelName,
-			"type":    "invalid_request_error", "code": "model_not_found", "param": "model",
-		}})
-		return nil, "", &interfaces.ErrorMessage{StatusCode: http.StatusBadRequest, Error: errors.New(string(body))}
+		// Preserve gateway status so callers can try another channel for this model.
+		return nil, "", &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: fmt.Errorf("unknown provider for model %s", modelName)}
 	}
 
 	// The thinking suffix is preserved in the model name itself, so no

@@ -40,7 +40,7 @@ func TestResponsesUnroutableModelAcrossHTTPAndWebsocket(t *testing.T) {
 		request.Header.Set("Content-Type", "application/json")
 		response := httptest.NewRecorder()
 		router.ServeHTTP(response, request)
-		if response.Code != http.StatusBadRequest || gjson.Get(response.Body.String(), "error.code").String() != "model_not_found" {
+		if response.Code != http.StatusBadGateway || gjson.Get(response.Body.String(), "error.code").String() != "internal_server_error" {
 			t.Fatalf("HTTP %s stream=%t: status=%d body=%s", route.path, route.stream, response.Code, response.Body.String())
 		}
 	}
@@ -60,7 +60,7 @@ func TestResponsesUnroutableModelAcrossHTTPAndWebsocket(t *testing.T) {
 		if errRead != nil {
 			t.Fatal(errRead)
 		}
-		if gjson.GetBytes(body, "status").Int() != http.StatusBadRequest || gjson.GetBytes(body, "error.code").String() != "model_not_found" {
+		if gjson.GetBytes(body, "status").Int() != http.StatusBadGateway || gjson.GetBytes(body, "error.code").String() != "internal_server_error" {
 			t.Fatalf("WebSocket error=%s", body)
 		}
 	}
