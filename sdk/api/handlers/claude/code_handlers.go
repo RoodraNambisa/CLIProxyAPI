@@ -257,6 +257,15 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 			return
 		case chunk, ok := <-dataChan:
 			if !ok {
+				if errMsg, pending := handlers.PendingStreamError(errChan); pending {
+					h.WriteErrorResponse(c, errMsg)
+					if errMsg != nil {
+						cliCancel(errMsg.Error)
+					} else {
+						cliCancel(nil)
+					}
+					return
+				}
 				// Stream closed without data? Send DONE or just headers.
 				setSSEHeaders()
 				handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
