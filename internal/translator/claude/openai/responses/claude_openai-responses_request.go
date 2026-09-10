@@ -179,6 +179,15 @@ func convertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 							} else {
 								role = "assistant"
 							}
+						case "refusal":
+							if refusal := part.Get("refusal"); refusal.Type == gjson.String && refusal.String() != "" {
+								contentPart := claudeResponsesTextPart(refusal.String())
+								if cacheControl := part.Get("cache_control"); cacheControl.Exists() {
+									contentPart, _ = sjson.SetRawBytes(contentPart, "cache_control", []byte(cacheControl.Raw))
+								}
+								partsJSON = append(partsJSON, string(contentPart))
+								role = "assistant"
+							}
 						case "input_image":
 							url := part.Get("image_url").String()
 							if url == "" {
