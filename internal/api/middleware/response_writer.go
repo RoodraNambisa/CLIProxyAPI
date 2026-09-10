@@ -213,7 +213,7 @@ func (w *ResponseWriterWrapper) shouldBufferResponseBody() bool {
 			status = http.StatusOK
 		}
 	}
-	return status >= http.StatusBadRequest
+	return status >= http.StatusBadRequest && status != statusClientCanceled
 }
 
 // WriteString wraps the underlying ResponseWriter's WriteString method to capture response data.
@@ -382,7 +382,7 @@ func (w *ResponseWriterWrapper) Finalize(c *gin.Context) error {
 		}
 	}
 
-	hasAPIError := len(slicesAPIResponseError) > 0 || finalStatusCode >= http.StatusBadRequest
+	hasAPIError := hasActionableResponseError(finalStatusCode, slicesAPIResponseError)
 	forceLog := w.logOnErrorOnly && hasAPIError && !w.logger.IsEnabled()
 	if !w.logger.IsEnabled() && !forceLog {
 		return nil
