@@ -145,7 +145,7 @@ func TestResponsesWebsocketDisconnectSharesRequestProjection(t *testing.T) {
 }
 
 func TestResponsesWebsocketDisconnectPreservesRequestError(t *testing.T) {
-	for _, code := range []string{"misalignment_policy_violation", "cyber_policy", "context_length_exceeded"} {
+	for _, code := range []string{"misalignment_policy_violation", "cyber_policy", "context_length_exceeded", "unstored_history"} {
 		t.Run(code, func(t *testing.T) {
 			gin.SetMode(gin.TestMode)
 			exec := &websocketUpstreamDisconnectExecutor{subscribed: make(chan string, 1)}
@@ -167,13 +167,19 @@ func TestResponsesWebsocketDisconnectPreservesRequestError(t *testing.T) {
 			case <-time.After(5 * time.Second):
 				t.Fatal("subscription missing")
 			}
-			exec.TriggerDisconnect(sessionID, websocketPinnedFailoverStatusError{status: 502, msg: fmt.Sprintf(`{"error":{"code":%q,"message":"request rejected"}}`, code)})
+			message := fmt.Sprintf(`{"error":{"code":%q,"message":"request rejected"}}`, code)
+			wantCode := code
+			if code == "unstored_history" {
+				message = "Item with id 'fixture' not found. Items are not persisted when `store` is set to false."
+				wantCode = "internal_server_error"
+			}
+			exec.TriggerDisconnect(sessionID, websocketPinnedFailoverStatusError{status: 502, msg: message})
 			_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 			_, payload, err := conn.ReadMessage()
 			if err != nil {
 				t.Fatalf("request rejection lost on disconnect: %v", err)
 			}
-			if gjson.GetBytes(payload, "error.code").String() != code || gjson.GetBytes(payload, "status").Int() != 502 {
+			if gjson.GetBytes(payload, "error.code").String() != wantCode || gjson.GetBytes(payload, "status").Int() != 502 {
 				t.Fatalf("error changed: %s", payload)
 			}
 			if _, _, err = conn.ReadMessage(); err == nil {

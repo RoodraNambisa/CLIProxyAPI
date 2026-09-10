@@ -30,6 +30,10 @@ func TestKnownRequestFaultPreservesCredentialEvidence(t *testing.T) {
 		{name: "real payment", err: &Error{HTTPStatus: 402, Message: `{"error":{"type":"invalid_request_error","code":"misalignment_policy_violation"}}`}},
 		{name: "real rate limit", err: &Error{HTTPStatus: 429, Message: `{"error":{"type":"invalid_request_error","code":"misalignment_policy_violation"}}`}},
 		{name: "permission unknown", err: &Error{HTTPStatus: 403, Message: "request not allowed"}},
+		{name: "unstored history through gateway", err: &Error{HTTPStatus: 502, Message: requestScopedNotFoundMessage}, want: true},
+		{name: "unstored history with braces in item id", err: &Error{HTTPStatus: 502, Message: "Item with id '{fixture}' not found. Items are not persisted when `store` is set to false."}, want: true},
+		{name: "unstored history cannot mask auth", err: &Error{HTTPStatus: 401, Code: "invalid_api_key", Message: requestScopedNotFoundMessage}},
+		{name: "unstored history cannot mask quota", err: &Error{HTTPStatus: 429, Message: requestScopedNotFoundMessage}},
 		{name: "unstructured policy mention", err: &Error{HTTPStatus: 503, Message: "failed while handling misalignment_policy_violation"}},
 		{name: "configurable image fault", err: &Error{HTTPStatus: 400, Message: `{"error":{"type":"image_generation_user_error","code":"invalid_value"}}`}},
 	} {
@@ -38,6 +42,41 @@ func TestKnownRequestFaultPreservesCredentialEvidence(t *testing.T) {
 				t.Fatalf("request fault = %t, want %t", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestUnstoredHistoryStopsAllExecutionEntrypointsWithoutCooling(t *testing.T) {
+	for _, status := range []int{404, 502} {
+		for _, operation := range []string{"execute", "count", "stream"} {
+			t.Run(fmt.Sprintf("%d/%s", status, operation), func(t *testing.T) {
+				manager := NewManager(nil, &FillFirstSelector{}, nil)
+				manager.SetRetryConfig(0, 0, 0)
+				exec := &suffixCooldownExecutor{}
+				exec.err = &Error{HTTPStatus: status, Message: requestScopedNotFoundMessage}
+				manager.RegisterExecutor(exec)
+				for i := range 3 {
+					registerFallbackAuthForModel(t, manager, &Auth{ID: fmt.Sprintf("history-%d", i), Provider: "codex"}, "history-model")
+				}
+				req := cliproxyexecutor.Request{Model: "history-model"}
+				var err error
+				switch operation {
+				case "execute":
+					_, err = manager.Execute(t.Context(), []string{"codex"}, req, cliproxyexecutor.Options{})
+				case "count":
+					_, err = manager.ExecuteCount(t.Context(), []string{"codex"}, req, cliproxyexecutor.Options{})
+				case "stream":
+					_, err = manager.ExecuteStream(t.Context(), []string{"codex"}, req, cliproxyexecutor.Options{})
+				}
+				if !errors.Is(err, exec.err) || statusCodeFromError(err) != status || exec.Calls() != 1 {
+					t.Fatalf("calls=%d status=%d original=%t", exec.Calls(), statusCodeFromError(err), errors.Is(err, exec.err))
+				}
+				for _, auth := range manager.List() {
+					if auth.Unavailable || !auth.NextRetryAfter.IsZero() || len(auth.ModelStates) != 0 {
+						t.Fatal("unstored item reference changed credential availability")
+					}
+				}
+			})
+		}
 	}
 }
 

@@ -53,6 +53,7 @@ func matchesKnownRequestFault(err error, policyOnly bool) bool {
 		codes = append(codes, strings.ToLower(strings.TrimSpace(source.Code)))
 		body = strings.TrimSpace(source.Message)
 	}
+	message := body
 	// Error.Error and fmt.Errorf wrappers can prefix a plain message with a code.
 	// Inspect only complete prefix tokens, never arbitrary words inside the message.
 	for rest := body; rest != ""; {
@@ -102,6 +103,9 @@ func matchesKnownRequestFault(err error, policyOnly bool) bool {
 	}
 	if policyOnly {
 		return false
+	}
+	if isRequestScopedNotFoundMessage(message) {
+		return true
 	}
 	if imageUserError {
 		return false
