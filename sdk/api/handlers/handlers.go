@@ -1739,6 +1739,9 @@ func enrichAuthSelectionError(err error, providers []string, model string) error
 }
 
 func shouldForwardErrorAddonHeader(key string, passthroughHeaders bool) bool {
+	if isLocalCORSHeader(key) {
+		return false
+	}
 	if passthroughHeaders {
 		return true
 	}

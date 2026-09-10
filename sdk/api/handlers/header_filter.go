@@ -7,6 +7,19 @@ import (
 
 const codexTurnStateResponseHeader = "X-Codex-Turn-State"
 
+// isLocalCORSHeader keeps the proxy's browser access policy independent of
+// upstream response headers, including fields the local policy leaves absent.
+func isLocalCORSHeader(key string) bool {
+	switch http.CanonicalHeaderKey(key) {
+	case "Access-Control-Allow-Credentials", "Access-Control-Allow-Headers",
+		"Access-Control-Allow-Methods", "Access-Control-Allow-Origin",
+		"Access-Control-Expose-Headers", "Access-Control-Max-Age":
+		return true
+	default:
+		return false
+	}
+}
+
 // gatewayHeaderPrefixes lists header name prefixes injected by known AI gateway
 // proxies. Claude Code's client-side telemetry detects these and reports the
 // gateway type, so we strip them from upstream responses to avoid detection.
@@ -48,6 +61,9 @@ func FilterUpstreamHeaders(src http.Header) http.Header {
 	dst := make(http.Header)
 	for key, values := range src {
 		canonicalKey := http.CanonicalHeaderKey(key)
+		if isLocalCORSHeader(canonicalKey) {
+			continue
+		}
 		if _, blocked := hopByHopHeaders[canonicalKey]; blocked {
 			continue
 		}
