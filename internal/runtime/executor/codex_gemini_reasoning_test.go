@@ -20,7 +20,14 @@ func TestCodexGeminiReasoningSurvivesHTTPStreamAndRelease(t *testing.T) {
 		for _, release := range []bool{false, true} {
 			t.Run(fmt.Sprintf("stream=%t/release=%t", stream, release), func(t *testing.T) {
 				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-					_, _ = io.Copy(io.Discard, r.Body)
+					body, err := io.ReadAll(r.Body)
+					if err != nil {
+						t.Error(err)
+						return
+					}
+					if strings.Contains(string(body), "hidden") || !strings.Contains(string(body), "public system") {
+						t.Error("hidden Gemini thoughts leaked into the actual Codex request")
+					}
 					w.Header().Set("Content-Type", "text/event-stream")
 					for _, event := range []string{
 						`{"type":"response.created","response":{"id":"thinking","model":"gpt-5.4-mini"}}`,
@@ -39,7 +46,7 @@ func TestCodexGeminiReasoningSurvivesHTTPStreamAndRelease(t *testing.T) {
 				if release {
 					opts.Metadata[core.BodyReleaseControllerMetadataKey] = controller
 				}
-				req := core.Request{Model: "gpt-5.4-mini", Payload: []byte(`{"contents":[{"role":"user","parts":[{"text":"ask"}]}],"generationConfig":{"thinkingConfig":{"includeThoughts":true}}}`)}
+				req := core.Request{Model: "gpt-5.4-mini", Payload: []byte(`{"systemInstruction":{"parts":[{"thought":true,"text":"hidden system"},{"text":"public system"}]},"contents":[{"role":"model","parts":[{"thought":true,"text":"hidden history"}]},{"role":"user","parts":[{"text":"ask"}]}],"generationConfig":{"thinkingConfig":{"includeThoughts":true}}}`)}
 				var outputs [][]byte
 				if stream {
 					result, err := executor.ExecuteStream(t.Context(), auth, req, opts)

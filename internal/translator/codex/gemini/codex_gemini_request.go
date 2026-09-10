@@ -116,6 +116,9 @@ func ConvertGeminiRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 		arr := sysParts.Array()
 		for i := 0; i < len(arr); i++ {
 			p := arr[i]
+			if p.Get("thought").Bool() {
+				continue
+			}
 			if t := p.Get("text"); t.Exists() {
 				part := []byte(`{}`)
 				part, _ = sjson.SetBytes(part, "type", "input_text")
@@ -146,6 +149,9 @@ func ConvertGeminiRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 			parr := parts.Array()
 			for j := 0; j < len(parr); j++ {
 				p := parr[j]
+				if p.Get("thought").Bool() {
+					continue
+				}
 				// text part
 				if t := p.Get("text"); t.Exists() {
 					msg := []byte(`{"type":"message","role":"","content":[]}`)
