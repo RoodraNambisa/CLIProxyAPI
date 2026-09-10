@@ -103,7 +103,7 @@ func ConvertCodexResponseToGemini(_ context.Context, modelName string, originalR
 		part := []byte(`{"inlineData":{"data":"","mimeType":""}}`)
 		part, _ = sjson.SetBytes(part, "inlineData.data", b64)
 		part, _ = sjson.SetBytes(part, "inlineData.mimeType", mimeType)
-		template, _ = sjson.SetRawBytes(template, "candidates.0.content.parts.-1", part)
+		template = translatorcommon.SetRawArrayItems(template, "candidates.0.content.parts", [][]byte{part})
 		return [][]byte{template}
 	}
 
@@ -134,7 +134,7 @@ func ConvertCodexResponseToGemini(_ context.Context, modelName string, originalR
 			part := []byte(`{"inlineData":{"data":"","mimeType":""}}`)
 			part, _ = sjson.SetBytes(part, "inlineData.data", b64)
 			part, _ = sjson.SetBytes(part, "inlineData.mimeType", mimeType)
-			template, _ = sjson.SetRawBytes(template, "candidates.0.content.parts.-1", part)
+			template = translatorcommon.SetRawArrayItems(template, "candidates.0.content.parts", [][]byte{part})
 			return [][]byte{template}
 		}
 		if itemType == "function_call" {
@@ -159,7 +159,7 @@ func ConvertCodexResponseToGemini(_ context.Context, modelName string, originalR
 				functionCall, _ = sjson.SetRawBytes(functionCall, "functionCall.args", []byte(args))
 			}
 
-			template, _ = sjson.SetRawBytes(template, "candidates.0.content.parts.-1", functionCall)
+			template = translatorcommon.SetRawArrayItems(template, "candidates.0.content.parts", [][]byte{functionCall})
 			return [][]byte{template}
 		}
 	}
@@ -171,12 +171,12 @@ func ConvertCodexResponseToGemini(_ context.Context, modelName string, originalR
 	} else if typeStr == "response.reasoning_summary_text.delta" || typeStr == "response.reasoning_text.delta" { // Handle reasoning/thinking content delta
 		part := []byte(`{"thought":true,"text":""}`)
 		part, _ = sjson.SetBytes(part, "text", rootResult.Get("delta").String())
-		template, _ = sjson.SetRawBytes(template, "candidates.0.content.parts.-1", part)
+		template = translatorcommon.SetRawArrayItems(template, "candidates.0.content.parts", [][]byte{part})
 	} else if typeStr == "response.output_text.delta" { // Handle regular text content delta
 		params.HasOutputTextDelta = true
 		part := []byte(`{"text":""}`)
 		part, _ = sjson.SetBytes(part, "text", rootResult.Get("delta").String())
-		template, _ = sjson.SetRawBytes(template, "candidates.0.content.parts.-1", part)
+		template = translatorcommon.SetRawArrayItems(template, "candidates.0.content.parts", [][]byte{part})
 	} else if typeStr == "response.output_item.done" { // Fallback: emit final message text when no delta chunks were received
 		itemResult := rootResult.Get("item")
 		if itemResult.Get("type").String() != "message" || params.HasOutputTextDelta {
@@ -186,7 +186,7 @@ func ConvertCodexResponseToGemini(_ context.Context, modelName string, originalR
 		if !contentResult.Exists() || !contentResult.IsArray() {
 			return [][]byte{}
 		}
-		wroteText := false
+		var parts [][]byte
 		contentResult.ForEach(func(_, partResult gjson.Result) bool {
 			if partResult.Get("type").String() != "output_text" {
 				return true
@@ -197,11 +197,11 @@ func ConvertCodexResponseToGemini(_ context.Context, modelName string, originalR
 			}
 			part := []byte(`{"text":""}`)
 			part, _ = sjson.SetBytes(part, "text", text)
-			template, _ = sjson.SetRawBytes(template, "candidates.0.content.parts.-1", part)
-			wroteText = true
+			parts = append(parts, part)
 			return true
 		})
-		if wroteText {
+		if len(parts) > 0 {
+			template = translatorcommon.SetRawArrayItems(template, "candidates.0.content.parts", parts)
 			params.HasOutputTextDelta = true
 			return [][]byte{template}
 		}
