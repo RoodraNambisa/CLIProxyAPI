@@ -160,6 +160,9 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 							imageURL := contentItem.Get("image_url").String()
 							contentPart := []byte(`{"type":"image_url","image_url":{"url":""}}`)
 							contentPart, _ = sjson.SetBytes(contentPart, "image_url.url", imageURL)
+							if detail, valid := responsesChatImageDetail(contentItem.Get("detail")); valid && detail != "" {
+								contentPart, _ = sjson.SetBytes(contentPart, "image_url.detail", detail)
+							}
 							message, _ = sjson.SetRawBytes(message, "content.-1", contentPart)
 						}
 						return true

@@ -67,8 +67,17 @@ func responsesChatToolImage(item gjson.Result) (string, string, bool) {
 	default:
 		return "", "", false
 	}
-	if url.Type != gjson.String || strings.TrimSpace(url.String()) == "" || detail.Exists() && detail.Type != gjson.String {
+	if url.Type != gjson.String || strings.TrimSpace(url.String()) == "" {
 		return "", "", false
+	}
+	resolution, valid := responsesChatImageDetail(detail)
+	return url.String(), resolution, valid
+}
+
+// Responses permits original, while Chat Completions accepts auto, low and high.
+func responsesChatImageDetail(detail gjson.Result) (string, bool) {
+	if detail.Exists() && detail.Type != gjson.String {
+		return "", false
 	}
 	resolution := strings.ToLower(strings.TrimSpace(detail.String()))
 	switch resolution {
@@ -78,5 +87,5 @@ func responsesChatToolImage(item gjson.Result) (string, string, bool) {
 	default:
 		resolution = ""
 	}
-	return url.String(), resolution, true
+	return resolution, true
 }
