@@ -82,6 +82,65 @@ func TestInteractionsToolStreamIdentityAndLifecycle(t *testing.T) {
 	}
 }
 
+func TestInteractionsToolStartDeliversInitialArgumentsOnce(t *testing.T) {
+	for _, tc := range []struct{ name, args, want, kind string }{
+		{"object", `{"n":9007199254740993}`, `{"n":9007199254740993}`, "function"},
+		{"partial string", `"{\"n\":"`, `{"n":`, "function"},
+		{"empty", `{}`, "", "function"},
+		{"custom", `{"input":"command"}`, "", "custom"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var state any
+			request := []byte(`{"tools":[{"type":"` + tc.kind + `","name":"fixture"}]}`)
+			feed := func(raw string) [][]byte {
+				return ConvertInteractionsResponseToOpenAIResponses(t.Context(), "fixture", request, nil, []byte(raw), &state)
+			}
+			start := `{"event_type":"step.start","index":2,"step":{"type":"function_call","id":"item_fixture","call_id":"call_fixture","name":"fixture","arguments":` + tc.args + `}}`
+			out := feed(start)
+			wantEvents := 1
+			if tc.want != "" {
+				wantEvents = 2
+			}
+			if len(out) != wantEvents {
+				t.Fatalf("start events=%d, want %d", len(out), wantEvents)
+			}
+			if tc.want != "" {
+				delta := gjson.ParseBytes(findResponsesEventPayload(out, "response.function_call_arguments.delta"))
+				if delta.Get("delta").String() != tc.want || delta.Get("item_id").String() != "item_fixture" || delta.Get("output_index").Int() != 2 {
+					t.Fatal("initial arguments or identity lost")
+				}
+				added := gjson.ParseBytes(findResponsesEventPayload(out, "response.output_item.added"))
+				if delta.Get("sequence_number").Int() <= added.Get("sequence_number").Int() {
+					t.Fatal("arguments preceded item start")
+				}
+			}
+			if len(feed(start)) != 0 {
+				t.Fatal("duplicate start emitted arguments again")
+			}
+			if tc.name == "partial string" {
+				feed(`{"event_type":"step.delta","index":2,"delta":{"type":"arguments_delta","arguments":"1}"}}`)
+			}
+			stop := feed(`{"event_type":"step.stop","index":2}`)
+			kind, field, want := "response.function_call_arguments.done", "arguments", tc.want
+			if tc.name == "partial string" {
+				want = `{"n":1}`
+			}
+			if tc.name == "empty" {
+				want = `{}`
+			}
+			if tc.kind == "custom" {
+				kind, field, want = "response.custom_tool_call_input.done", "input", "command"
+			}
+			if gjson.GetBytes(findResponsesEventPayload(stop, kind), field).String() != want {
+				t.Fatal("completed arguments disagree with initial content")
+			}
+			if len(feed(`{"event_type":"step.stop","index":2}`)) != 0 {
+				t.Fatal("duplicate stop emitted content")
+			}
+		})
+	}
+}
+
 func TestInteractionsToolStreamRejectsInvalidIndexes(t *testing.T) {
 	for _, index := range []string{"", `,"index":null`, `,"index":"0"`, `,"index":-1`, `,"index":0.5`, `,"index":9223372036854775808`} {
 		t.Run(index, func(t *testing.T) {

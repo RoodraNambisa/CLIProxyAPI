@@ -256,9 +256,22 @@ func interactionsStepStartToResponses(root gjson.Result, st *interactionsToRespo
 		added, _ = sjson.SetBytes(added, "sequence_number", nextResponsesSeq(st))
 		added, _ = sjson.SetBytes(added, "output_index", index)
 		added, _ = sjson.SetRawBytes(added, "item", item)
-		return [][]byte{emitResponsesEvent("response.output_item.added", added)}
+		out := [][]byte{emitResponsesEvent("response.output_item.added", added)}
+		if call.Arguments.Len() > 0 && !st.ToolIdentities[call.Name].custom {
+			out = append(out, interactionsFunctionArgumentsDelta(index, st.ItemIDs[index], call.Arguments.String(), st))
+		}
+		return out
 	}
 	return nil
+}
+
+func interactionsFunctionArgumentsDelta(index int, itemID, arguments string, st *interactionsToResponsesStreamState) []byte {
+	payload := []byte(`{"type":"response.function_call_arguments.delta","output_index":0,"delta":""}`)
+	payload, _ = sjson.SetBytes(payload, "sequence_number", nextResponsesSeq(st))
+	payload, _ = sjson.SetBytes(payload, "output_index", index)
+	payload, _ = sjson.SetBytes(payload, "item_id", itemID)
+	payload, _ = sjson.SetBytes(payload, "delta", arguments)
+	return emitResponsesEvent("response.function_call_arguments.delta", payload)
 }
 
 func interactionsStepDeltaToResponses(root gjson.Result, st *interactionsToResponsesStreamState) [][]byte {
@@ -292,12 +305,7 @@ func interactionsStepDeltaToResponses(root gjson.Result, st *interactionsToRespo
 		if st.ToolIdentities[call.Name].custom {
 			return nil
 		}
-		payload := []byte(`{"type":"response.function_call_arguments.delta","output_index":0,"delta":""}`)
-		payload, _ = sjson.SetBytes(payload, "sequence_number", nextResponsesSeq(st))
-		payload, _ = sjson.SetBytes(payload, "output_index", index)
-		payload, _ = sjson.SetBytes(payload, "item_id", st.ItemIDs[index])
-		payload, _ = sjson.SetBytes(payload, "delta", delta.Get("arguments").String())
-		return [][]byte{emitResponsesEvent("response.function_call_arguments.delta", payload)}
+		return [][]byte{interactionsFunctionArgumentsDelta(index, st.ItemIDs[index], delta.Get("arguments").String(), st)}
 	default:
 		payload := []byte(`{"type":"response.output_text.delta","output_index":0,"content_index":0,"item_id":"","delta":""}`)
 		payload, _ = sjson.SetBytes(payload, "sequence_number", nextResponsesSeq(st))
