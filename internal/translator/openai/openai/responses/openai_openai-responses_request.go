@@ -160,7 +160,7 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 				}
 
 				if output := item.Get("output"); output.Exists() {
-					toolMessage, _ = sjson.SetBytes(toolMessage, "content", responsesToolOutputText(output))
+					toolMessage = setResponsesChatToolOutput(toolMessage, output)
 				}
 
 				out, _ = sjson.SetRawBytes(out, "messages.-1", toolMessage)
