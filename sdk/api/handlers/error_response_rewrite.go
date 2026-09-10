@@ -107,6 +107,10 @@ func (h *BaseAPIHandler) rewriteExecutionErrorResponse(msg *interfaces.ErrorMess
 	originalText := ""
 	if msg.Error != nil {
 		originalText = msg.Error.Error()
+		var diagnostic interface{ ErrorResponseMatchText() string }
+		if errors.As(msg.Error, &diagnostic) {
+			originalText = diagnostic.ErrorResponseMatchText()
+		}
 	}
 	lowerText := strings.ToLower(originalText)
 

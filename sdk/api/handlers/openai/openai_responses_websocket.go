@@ -1094,6 +1094,18 @@ func responsesWebsocketCompletionEvent(eventType string) bool {
 	return eventType == wsEventTypeCompleted || eventType == wsEventTypeDone
 }
 
+type responsesWebsocketPayloadError struct {
+	status  int
+	payload string
+	message string
+}
+
+func (e *responsesWebsocketPayloadError) Error() string   { return e.payload }
+func (e *responsesWebsocketPayloadError) StatusCode() int { return e.status }
+
+// ErrorResponseMatchText preserves the existing message-only rewrite contract.
+func (e *responsesWebsocketPayloadError) ErrorResponseMatchText() string { return e.message }
+
 func responsesWebsocketErrorMessageFromPayload(payload []byte) *interfaces.ErrorMessage {
 	eventType := gjson.GetBytes(payload, "type").String()
 	if eventType != wsEventTypeError && eventType != wsEventTypeFailed {
@@ -1129,7 +1141,8 @@ func responsesWebsocketErrorMessageFromPayload(payload []byte) *interfaces.Error
 	if code != "" && !strings.Contains(strings.ToLower(message), strings.ToLower(code)) {
 		message = code + ": " + message
 	}
-	return &interfaces.ErrorMessage{StatusCode: status, Error: fmt.Errorf("%s", message)}
+	// The error owns its text so source buffers can be released or reused safely.
+	return &interfaces.ErrorMessage{StatusCode: status, Error: &responsesWebsocketPayloadError{status: status, payload: string(bytes.TrimSpace(payload)), message: message}}
 }
 
 func shouldClearResponsesWebsocketPinnedAuth(pinnedAuthID, lastAttemptedAuthID string, errMsg *interfaces.ErrorMessage) bool {
