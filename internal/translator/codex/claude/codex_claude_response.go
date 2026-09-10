@@ -315,6 +315,10 @@ func ConvertCodexResponseToClaudeNonStream(_ context.Context, _ string, original
 			case "web_search_call":
 				out = appendCodexWebSearchNonStreamContent(out, item, webSearchSeen)
 			case "function_call":
+				name, callID := item.Get("name").String(), item.Get("call_id").String()
+				if name == "" || callID == "" {
+					return true
+				}
 				inputRaw, validArgs := translatorcommon.ResponsesToolArgumentsObject(item.Get("arguments"))
 				if !validArgs && (typeStr == "response.incomplete" || responseData.Get("status").String() == "incomplete") {
 					return true
@@ -323,13 +327,12 @@ func ConvertCodexResponseToClaudeNonStream(_ context.Context, _ string, original
 					inputRaw = "{}"
 				}
 				hasToolCall = true
-				name := item.Get("name").String()
 				if original, ok := revNames[name]; ok {
 					name = original
 				}
 
 				toolBlock := []byte(`{"type":"tool_use","id":"","name":"","input":{}}`)
-				toolBlock, _ = sjson.SetBytes(toolBlock, "id", util.SanitizeClaudeToolID(item.Get("call_id").String()))
+				toolBlock, _ = sjson.SetBytes(toolBlock, "id", util.SanitizeClaudeToolID(callID))
 				toolBlock, _ = sjson.SetBytes(toolBlock, "name", name)
 				toolBlock, _ = sjson.SetRawBytes(toolBlock, "input", []byte(inputRaw))
 				out, _ = sjson.SetRawBytes(out, "content.-1", toolBlock)
