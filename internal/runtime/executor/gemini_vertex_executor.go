@@ -713,6 +713,10 @@ func (e *GeminiVertexExecutor) executeStreamWithServiceAccount(ctx context.Conte
 			line := scanner.Bytes()
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
 			payload := helps.JSONPayload(line)
+			// Only the executor may synthesize a trusted Responses end marker.
+			if from == sdktranslator.FormatOpenAIResponse && len(payload) == 0 {
+				continue
+			}
 			if len(payload) > 0 && helps.IsJSONStreamProtocolError(payload) {
 				protocolFailed = true
 				if protocolErr == nil {
@@ -905,6 +909,10 @@ func (e *GeminiVertexExecutor) executeStreamWithAPIKey(ctx context.Context, auth
 			line := scanner.Bytes()
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
 			payload := helps.JSONPayload(line)
+			// Only the executor may synthesize a trusted Responses end marker.
+			if from == sdktranslator.FormatOpenAIResponse && len(payload) == 0 {
+				continue
+			}
 			if len(payload) > 0 && helps.IsJSONStreamProtocolError(payload) {
 				protocolFailed = true
 				if protocolErr == nil {

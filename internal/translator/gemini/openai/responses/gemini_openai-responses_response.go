@@ -18,6 +18,7 @@ type geminiToResponsesState struct {
 	ResponseID string
 	CreatedAt  int64
 	Started    bool
+	Completed  bool
 
 	// message aggregation
 	MsgOpened    bool
@@ -120,8 +121,14 @@ func ConvertGeminiResponseToOpenAIResponses(_ context.Context, modelName string,
 	}
 
 	rawJSON = bytes.TrimSpace(rawJSON)
-	if len(rawJSON) == 0 || bytes.Equal(rawJSON, []byte("[DONE]")) {
+	if len(rawJSON) == 0 || st.Completed {
 		return [][]byte{}
+	}
+	if bytes.Equal(rawJSON, []byte("[DONE]")) {
+		if !st.Started {
+			return [][]byte{}
+		}
+		rawJSON = []byte(`{"candidates":[{"finishReason":"STOP"}]}`)
 	}
 
 	root := gjson.ParseBytes(rawJSON)
@@ -549,6 +556,7 @@ func ConvertGeminiResponseToOpenAIResponses(_ context.Context, modelName string,
 		}
 
 		out = append(out, emitEvent("response.completed", completed))
+		st.Completed = true
 	}
 
 	return out
