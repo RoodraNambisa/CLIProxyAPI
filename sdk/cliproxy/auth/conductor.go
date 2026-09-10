@@ -9764,6 +9764,9 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 			}
 			var errPick error
 			selected, errPick = m.pickAvailableAuthWithPriorityPolicy(ctx, provider, selectionArgForSelector(m.selectorForContext(ctx), model), opts, available, reservation.acquire)
+			if isBuiltInSelector(m.selectorForContext(ctx)) {
+				errPick = restoreModelCooldownErrorModel(errPick, model)
+			}
 			if reservation.stalePolicy {
 				requestBlocked = authRequestLimitBlock{}
 				clear(dynamicallyLimited)
@@ -9996,6 +9999,9 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 			}
 			var errPick error
 			selected, errPick = m.pickAvailableAuthWithPriorityPolicy(ctx, selectorProvider, selectionArgForSelector(m.selectorForContext(ctx), model), opts, available, reservation.acquire)
+			if isBuiltInSelector(m.selectorForContext(ctx)) {
+				errPick = restoreModelCooldownErrorModel(errPick, model)
+			}
 			if reservation.stalePolicy {
 				requestBlocked = authRequestLimitBlock{}
 				clear(dynamicallyLimited)

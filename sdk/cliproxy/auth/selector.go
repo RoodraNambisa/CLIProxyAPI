@@ -64,6 +64,7 @@ type modelCooldownError struct {
 	model    string
 	resetIn  time.Duration
 	provider string
+	cause    error
 }
 
 func newModelCooldownError(model, provider string, resetIn time.Duration) *modelCooldownError {
