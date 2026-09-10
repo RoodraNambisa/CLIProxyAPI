@@ -103,6 +103,7 @@ type codexWebsocketSession struct {
 
 	upstreamDisconnectOnce sync.Once
 	upstreamDisconnectCh   chan error
+	upstreamCloseState     helps.WebsocketCloseState
 	// logRedactor is protected by connMu.
 	logRedactor *util.PromptCacheLogRedactor
 }
@@ -229,6 +230,7 @@ func (s *codexWebsocketSession) configureConn(conn *websocket.Conn) {
 	if s == nil || conn == nil {
 		return
 	}
+	s.upstreamCloseState.Configure(conn)
 	conn.SetPingHandler(func(appData string) error {
 		s.writeMu.Lock()
 		defer s.writeMu.Unlock()
@@ -471,7 +473,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		}
 		if sess != nil {
 			e.invalidateUpstreamConn(sess, conn, "send_error", errSend)
-			if !helps.RequestBodyReplayable(ctx, opts) {
+			if helps.IsWebsocketMessageTooBig(errSend) || !helps.RequestBodyReplayable(ctx, opts) {
 				helps.RecordAPIWebsocketError(ctx, e.cfg, "send", errSend)
 				return resp, errSend
 			}
@@ -852,7 +854,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		helps.RecordAPIWebsocketError(ctx, e.cfg, "send", errSend)
 		if sess != nil {
 			e.invalidateUpstreamConn(sess, conn, "send_error", errSend)
-			if !helps.RequestBodyReplayable(ctx, opts) {
+			if helps.IsWebsocketMessageTooBig(errSend) || !helps.RequestBodyReplayable(ctx, opts) {
 				sess.clearActiveForConn(readCh, conn)
 				sess.reqMu.Unlock()
 				cleanupBodies()
@@ -1232,18 +1234,15 @@ func writeCurrentCodexWebsocketMessage(ctx context.Context, auth *cliproxyauth.A
 	if errCurrent := codexWebsocketExecutionStateError(ctx, auth); errCurrent != nil {
 		return errCurrent
 	}
-	return helps.ObserveUpstreamWebsocketWrite(ctx, writeCodexWebsocketMessage(sess, conn, payload))
+	err := helps.ObserveUpstreamWebsocketWrite(ctx, writeCodexWebsocketMessage(sess, conn, payload))
+	if sess != nil {
+		err = sess.upstreamCloseState.RecoverWrite(conn, err)
+	}
+	return err
 }
 
 func mapCodexWebsocketReadError(err error) error {
-	if err == nil {
-		return nil
-	}
-	var closeErr *websocket.CloseError
-	if errors.As(err, &closeErr) && closeErr.Code == websocket.CloseMessageTooBig {
-		return statusErr{code: http.StatusRequestEntityTooLarge, msg: `{"error":{"message":"upstream websocket message too big","type":"invalid_request_error","code":"message_too_big"}}`}
-	}
-	return err
+	return helps.MapWebsocketMessageTooBigError(err)
 }
 
 func buildCodexWebsocketRequestBody(body []byte) []byte {
