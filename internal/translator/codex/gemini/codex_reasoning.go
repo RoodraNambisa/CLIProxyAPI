@@ -5,13 +5,13 @@ import (
 	"github.com/tidwall/sjson"
 )
 
-func appendCodexGeminiReasoningParts(response []byte, item gjson.Result) []byte {
+func appendCodexGeminiReasoningParts(parts [][]byte, item gjson.Result) [][]byte {
 	appendText := func(text string) {
 		if text == "" {
 			return
 		}
 		part, _ := sjson.SetBytes([]byte(`{"text":"","thought":true}`), "text", text)
-		response, _ = sjson.SetRawBytes(response, "candidates.0.content.parts.-1", part)
+		parts = append(parts, part)
 	}
 	for _, field := range []string{"summary", "content"} {
 		value := item.Get(field)
@@ -31,5 +31,5 @@ func appendCodexGeminiReasoningParts(response []byte, item gjson.Result) []byte 
 			}
 		}
 	}
-	return response
+	return parts
 }
