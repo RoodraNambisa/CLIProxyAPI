@@ -1,6 +1,7 @@
 package openai
 
 import (
+	"bytes"
 	"errors"
 	"net/http"
 	"sync"
@@ -10,6 +11,94 @@ import (
 
 	"github.com/gorilla/websocket"
 )
+
+type recordedResponsesWebsocketOutput struct {
+	frames   [][]byte
+	closed   bool
+	writeErr error
+}
+
+func (o *recordedResponsesWebsocketOutput) WriteMessage(_ int, payload []byte) error {
+	if o.writeErr == nil {
+		o.frames = append(o.frames, bytes.Clone(payload))
+	}
+	return o.writeErr
+}
+func (o *recordedResponsesWebsocketOutput) WriteControl(int, []byte, time.Time) error { return nil }
+func (o *recordedResponsesWebsocketOutput) Close() error                              { o.closed = true; return nil }
+
+func TestResponsesWebsocketDisconnectTerminalArbitration(t *testing.T) {
+	for _, previousTerminal := range []string{"", `{"type":"response.completed"}`, `{"type":"error"}`} {
+		for _, newTurn := range []bool{false, true} {
+			output := &recordedResponsesWebsocketOutput{}
+			writer := newResponsesWebsocketWriter(output)
+			if previousTerminal != "" {
+				if err := writeResponsesWebsocketTerminalPayload(writer, nil, []byte(previousTerminal), time.Now()); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if newTurn {
+				writer.beginTurn()
+			}
+			err := websocketPinnedFailoverStatusError{status: 403, msg: `{"error":{"code":"misalignment_policy_violation"}}`}
+			writer.closeForUpstreamDisconnect(err)
+			writer.closeForUpstreamDisconnect(err)
+			want := 1
+			if previousTerminal != "" && newTurn {
+				want = 2
+			}
+			if len(output.frames) != want || !output.closed {
+				t.Fatalf("terminal=%s newTurn=%v: frames=%d closed=%v", previousTerminal, newTurn, len(output.frames), output.closed)
+			}
+			if errWrite := writer.WriteMessage(websocket.TextMessage, nil); !errors.Is(errWrite, websocket.ErrCloseSent) {
+				t.Fatal("write after disconnect allowed")
+			}
+		}
+	}
+	for _, failure := range []error{
+		nil, errors.New("misalignment_policy_violation appears only in an unstructured sentence"),
+		websocketPinnedFailoverStatusError{status: 429, msg: `{"error":{"code":"cyber_policy"}}`},
+		websocketPinnedFailoverStatusError{status: 401, msg: `{"error":{"code":"cyber_policy","type":"authentication_error"}}`},
+	} {
+		output := &recordedResponsesWebsocketOutput{}
+		newResponsesWebsocketWriter(output).closeForUpstreamDisconnect(failure)
+		if !output.closed || len(output.frames) != 0 {
+			t.Fatal("unrelated disconnect produced a request rejection")
+		}
+	}
+	writeErr := errors.New("test write failed")
+	output := &recordedResponsesWebsocketOutput{writeErr: writeErr}
+	if err := newResponsesWebsocketWriter(output).closeWithPayload([]byte(`{}`)); !errors.Is(err, writeErr) || !output.closed {
+		t.Fatal("failed terminal write leaked socket or error")
+	}
+}
+
+func TestResponsesWebsocketRequestFaultClosesBlockedOutput(t *testing.T) {
+	for _, ping := range []bool{false, true} {
+		output := &blockedResponsesWebsocketOutput{started: make(chan struct{}), closed: make(chan struct{})}
+		writer := newResponsesWebsocketWriter(output)
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			if ping {
+				_ = writer.WriteControl(websocket.PingMessage, nil, time.Time{})
+			} else {
+				_ = writer.WriteMessage(websocket.TextMessage, nil)
+			}
+		}()
+		<-output.started
+		writer.closeForUpstreamDisconnect(websocketPinnedFailoverStatusError{status: 403, msg: `{"error":{"code":"cyber_policy"}}`})
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			_ = output.Close()
+			t.Fatal("request error waited for blocked writer")
+		}
+		if output.closeFrames.Load() != 0 {
+			t.Fatal("close frame competed with active output")
+		}
+	}
+}
 
 type blockedResponsesWebsocketOutput struct {
 	started     chan struct{}

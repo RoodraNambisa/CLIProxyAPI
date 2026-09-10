@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	"github.com/tidwall/gjson"
 )
 
@@ -18,9 +20,10 @@ type responsesWebsocketOutput interface {
 }
 
 type responsesWebsocketWriter struct {
-	conn    responsesWebsocketOutput
-	writeMu sync.Mutex
-	closing atomic.Bool
+	conn            responsesWebsocketOutput
+	writeMu         sync.Mutex
+	closing         atomic.Bool
+	terminalWritten bool
 }
 
 func newResponsesWebsocketWriter(conn responsesWebsocketOutput) *responsesWebsocketWriter {
@@ -31,12 +34,26 @@ func newResponsesWebsocketWriter(conn responsesWebsocketOutput) *responsesWebsoc
 }
 
 func (w *responsesWebsocketWriter) WriteMessage(kind int, payload []byte) error {
+	return w.writeMessage(kind, payload, false)
+}
+
+func (w *responsesWebsocketWriter) beginTurn() {
+	w.writeMu.Lock()
+	w.terminalWritten = false
+	w.writeMu.Unlock()
+}
+
+func (w *responsesWebsocketWriter) writeMessage(kind int, payload []byte, terminal bool) error {
 	w.writeMu.Lock()
 	defer w.writeMu.Unlock()
 	if w.closing.Load() {
 		return websocket.ErrCloseSent
 	}
-	return w.conn.WriteMessage(kind, payload)
+	errWrite := w.conn.WriteMessage(kind, payload)
+	if errWrite == nil && terminal {
+		w.terminalWritten = true
+	}
+	return errWrite
 }
 
 func (w *responsesWebsocketWriter) WriteControl(kind int, payload []byte, deadline time.Time) error {
@@ -89,8 +106,41 @@ func (w *responsesWebsocketWriter) closeForUpstreamError(err error) (bool, error
 	return true, errClose
 }
 
-func (w *responsesWebsocketWriter) closeForUpstreamDisconnect(err error) {
-	if matched, _ := w.closeForUpstreamError(err); !matched {
-		_ = w.Close()
+// closeWithPayload never competes with a blocked writer or adds a second terminal event.
+func (w *responsesWebsocketWriter) closeWithPayload(payload []byte) error {
+	if !w.closing.CompareAndSwap(false, true) {
+		return nil
 	}
+	if !w.writeMu.TryLock() {
+		return w.conn.Close()
+	}
+	defer w.writeMu.Unlock()
+	var errWrite error
+	if !w.terminalWritten {
+		errWrite = w.conn.WriteMessage(websocket.TextMessage, payload)
+	}
+	errClose := w.conn.Close()
+	if errWrite != nil {
+		return errWrite
+	}
+	return errClose
+}
+
+func (w *responsesWebsocketWriter) closeForUpstreamDisconnect(err error, projections ...func(error) ([]byte, error)) {
+	if matched, _ := w.closeForUpstreamError(err); matched {
+		return
+	}
+	if coreauth.IsRequestFaultError(err) {
+		project := func(err error) ([]byte, error) {
+			return buildResponsesWebsocketErrorPayload(handlers.ExecutionErrorMessage(err))
+		}
+		if len(projections) > 0 && projections[0] != nil {
+			project = projections[0]
+		}
+		if payload, errBuild := project(err); errBuild == nil {
+			_ = w.closeWithPayload(payload)
+			return
+		}
+	}
+	_ = w.Close()
 }

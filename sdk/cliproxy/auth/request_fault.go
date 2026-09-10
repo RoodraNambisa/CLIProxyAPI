@@ -26,6 +26,12 @@ func isKnownRequestFault(err error) bool {
 	return matchesKnownRequestFault(err, false)
 }
 
+// IsRequestFaultError shares request-fault classification with transport error delivery.
+// Authentication and quota evidence retain the same precedence as credential selection.
+func IsRequestFaultError(err error) bool {
+	return isKnownRequestFault(err)
+}
+
 // IsPolicyRefusalError allows executors to preserve structured policy failures
 // before transport-level status normalization can erase their original meaning.
 func IsPolicyRefusalError(err error) bool {

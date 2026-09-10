@@ -1562,6 +1562,11 @@ func statusFromError(err error) int {
 	return 0
 }
 
+// ExecutionErrorMessage preserves an execution failure's status, cause, and headers.
+func ExecutionErrorMessage(err error) *interfaces.ErrorMessage {
+	return executionErrorMessage(err, nil, "")
+}
+
 func executionErrorMessage(err error, providers []string, model string) *interfaces.ErrorMessage {
 	err = enrichAuthSelectionError(err, providers, model)
 	status := http.StatusInternalServerError
