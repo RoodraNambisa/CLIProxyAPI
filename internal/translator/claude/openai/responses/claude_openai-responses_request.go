@@ -117,6 +117,9 @@ func convertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 
 	// Stream
 	out, _ = sjson.SetBytes(out, "stream", stream)
+	if tier := root.Get("service_tier"); tier.Type == gjson.String && tier.String() == "priority" {
+		out, _ = sjson.SetBytes(out, "speed", "fast")
+	}
 
 	// Keep operator authority and source ordering before applying local cloaking.
 	var systemBlocks [][]byte

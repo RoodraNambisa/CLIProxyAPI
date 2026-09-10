@@ -659,6 +659,10 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 		return cliproxyexecutor.Response{}, err
 	}
 	body, _ = sjson.SetBytes(body, "model", baseModel)
+	if from == sdktranslator.FormatOpenAIResponse {
+		// Responses priority affects generation, not the token counting request.
+		body, _ = sjson.DeleteBytes(body, "speed")
+	}
 
 	if err = helps.ValidateClaudeSystemInputs(ctx, body); err != nil {
 		return cliproxyexecutor.Response{}, err
