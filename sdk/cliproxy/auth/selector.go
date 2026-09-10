@@ -946,37 +946,7 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 			return true, blockReasonCooldown, resetAt
 		}
 		if len(auth.ModelStates) > 0 {
-			state, ok := auth.ModelStates[model]
-			if (!ok || state == nil) && model != "" {
-				baseModel := canonicalModelKey(model)
-				if baseModel != "" && baseModel != model {
-					state, ok = auth.ModelStates[baseModel]
-				}
-			}
-			if ok && state != nil {
-				if state.Status == StatusDisabled {
-					return true, blockReasonDisabled, time.Time{}
-				}
-				if state.Unavailable {
-					if state.NextRetryAfter.IsZero() {
-						return false, blockReasonNone, time.Time{}
-					}
-					if state.NextRetryAfter.After(now) {
-						next := state.NextRetryAfter
-						if !state.Quota.NextRecoverAt.IsZero() && state.Quota.NextRecoverAt.After(now) {
-							next = state.Quota.NextRecoverAt
-						}
-						if next.Before(now) {
-							next = now
-						}
-						if state.Quota.Exceeded {
-							return true, blockReasonCooldown, next
-						}
-						return true, blockReasonOther, next
-					}
-				}
-				return false, blockReasonNone, time.Time{}
-			}
+			return modelStatesBlock(auth.ModelStates, model, now)
 		}
 		return false, blockReasonNone, time.Time{}
 	}

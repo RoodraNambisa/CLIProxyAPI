@@ -25,17 +25,20 @@ func (r *candidateFailureRecord) consider(failure *Error, updatedAt time.Time, a
 	}
 }
 
-// observe reads only the candidate model selected by the caller. Callers must
+// observe reads the candidate's logical model, including stored effort variants. Callers must
 // first enforce eligibility and hold a scheduler lock or use an auth snapshot.
 func (c *candidateFailureChoice) observe(candidate *Auth, model string) {
 	if candidate == nil {
 		return
 	}
-	state := candidate.ModelStates[model]
-	if state == nil {
-		state = candidate.ModelStates[canonicalModelKey(model)]
-	}
-	if state != nil {
+	var selectedFailure *Error
+	var selectedAt time.Time
+	selectedModel := ""
+	key := canonicalModelKey(model)
+	for stateModel, state := range candidate.ModelStates {
+		if state == nil || canonicalModelKey(stateModel) != key {
+			continue
+		}
 		failure := state.LastError
 		if failure == nil && strings.TrimSpace(state.StatusMessage) != "" {
 			failure = &Error{Message: state.StatusMessage}
@@ -45,9 +48,14 @@ func (c *candidateFailureChoice) observe(candidate *Auth, model string) {
 			if updatedAt.IsZero() {
 				updatedAt = candidate.UpdatedAt
 			}
-			c.model.consider(failure, updatedAt, candidate.ID)
-			return
+			if selectedFailure == nil || updatedAt.After(selectedAt) || updatedAt.Equal(selectedAt) && stateModel > selectedModel {
+				selectedFailure, selectedAt, selectedModel = failure, updatedAt, stateModel
+			}
 		}
+	}
+	if selectedFailure != nil {
+		c.model.consider(selectedFailure, selectedAt, candidate.ID)
+		return
 	}
 	failure := candidate.LastError
 	if failure == nil && strings.TrimSpace(candidate.StatusMessage) != "" {

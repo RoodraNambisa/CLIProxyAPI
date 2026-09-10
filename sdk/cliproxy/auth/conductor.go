@@ -6653,11 +6653,11 @@ func antigravityCreditsQuotaCooldown(auth *Auth, model string, now time.Time) bo
 		}
 		return hasQuotaBlocker
 	}
-	state := auth.ModelStates[model]
-	if state == nil {
-		state = auth.ModelStates[canonicalModelKey(model)]
-	}
-	if state != nil {
+	modelKey := canonicalModelKey(model)
+	for stateModel, state := range auth.ModelStates {
+		if state == nil || canonicalModelKey(stateModel) != modelKey {
+			continue
+		}
 		if state.Status == StatusDisabled {
 			return false
 		}
