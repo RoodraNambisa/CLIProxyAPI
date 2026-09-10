@@ -9,7 +9,7 @@ import (
 )
 
 func TestCodexLiveEnabledTypesAndDefaults(t *testing.T) {
-	for _, value := range []string{"", "true", "false", "null", `"true"`, "1", "[]", "{}", "yes"} {
+	for _, value := range []string{"", "true", "false", "null", `"true"`, "1", "[]", "{}", "yes", "!!bool yes", "!!bool invalid"} {
 		valid := value == "" || value == "true" || value == "false" || value == "null"
 		for _, optional := range []bool{false, true} {
 			path := filepath.Join(t.TempDir(), "config.yaml")

@@ -2275,6 +2275,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	if errLive := validateCodexLiveEnabledYAML(data); errLive != nil {
 		return nil, errLive
 	}
+	if errPolicies := validateRequestPolicyBooleansYAML(data); errPolicies != nil {
+		return nil, errPolicies
+	}
 	if errMedia := validateCodexLiveMediaYAML(data); errMedia != nil {
 		return nil, errMedia
 	}

@@ -23,11 +23,8 @@ func validateCodexAlphaSearchYAML(data []byte) error {
 		if err != nil {
 			return err
 		}
-		if value == nil || value.Tag == "!!null" {
-			continue
-		}
-		if value.Kind != yaml.ScalarNode || value.Tag != "!!bool" {
-			return fmt.Errorf("codex-api-key[%d].alpha-search must be a boolean", index)
+		if err := validateRequestPolicyBoolean(value, fmt.Sprintf("codex-api-key[%d].alpha-search", index)); err != nil {
+			return err
 		}
 	}
 	return nil

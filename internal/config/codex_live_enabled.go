@@ -1,8 +1,6 @@
 package config
 
 import (
-	"fmt"
-
 	"gopkg.in/yaml.v3"
 )
 
@@ -19,11 +17,5 @@ func validateCodexLiveEnabledYAML(data []byte) error {
 	if err != nil {
 		return err
 	}
-	if value == nil || value.Tag == "!!null" {
-		return nil
-	}
-	if value.Kind != yaml.ScalarNode || value.Tag != "!!bool" {
-		return fmt.Errorf("codex.live-enabled must be a boolean")
-	}
-	return nil
+	return validateRequestPolicyBoolean(value, "codex.live-enabled")
 }

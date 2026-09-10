@@ -15,6 +15,7 @@ func TestCodexAlphaSearchConfigurationTypesAndDefaults(t *testing.T) {
 	}{
 		{"", false, false}, {"true", true, false}, {"false", false, false}, {"null", false, false},
 		{`"true"`, false, true}, {"yes", false, true}, {"1", false, true}, {"[]", false, true}, {"{}", false, true},
+		{"!!bool yes", false, true}, {"!!bool invalid", false, true},
 	} {
 		for _, optional := range []bool{false, true} {
 			path := filepath.Join(t.TempDir(), "config.yaml")
