@@ -24,18 +24,28 @@ func SanitizeCodexInputItemIDs(body []byte) []byte {
 	items := input.Array()
 	occupied := make(map[string]bool, len(items))
 	preserved := make(map[string]bool, len(items))
+	needsRewrite := false
 	for _, item := range items {
 		id := item.Get("id")
-		if id.Type != gjson.String || dropCodexEncryptedReasoningID(item, id) {
+		if id.Type != gjson.String {
+			continue
+		}
+		if dropCodexEncryptedReasoningID(item, id) {
+			needsRewrite = true
 			continue
 		}
 		normalized := normalizeCodexInputItemID(item, id.Str)
-		if utf8.RuneCountInString(normalized) <= codexInputItemIDLimit {
+		tooLong := utf8.RuneCountInString(normalized) > codexInputItemIDLimit
+		needsRewrite = needsRewrite || normalized != id.Str || tooLong
+		if !tooLong {
 			occupied[normalized] = true
 		}
 		if normalized == id.Str {
 			preserved[normalized] = true
 		}
+	}
+	if !needsRewrite {
+		return body
 	}
 	// Prefix collisions must not share the shortening map with preserved IDs.
 	mapped := make(map[string]string)
