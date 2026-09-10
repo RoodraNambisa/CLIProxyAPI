@@ -7,9 +7,8 @@ import (
 )
 
 // CredentialFileName returns the filename used to persist Codex OAuth credentials.
-// When planType is available (e.g. "plus", "team"), it is appended after the email
-// as a suffix to disambiguate subscriptions. Team-scoped plans include the account
-// hash to avoid overwriting credentials for the same email across multiple teams.
+// An available account hash distinguishes accounts sharing an email and plan.
+// Missing account metadata retains the legacy email-based filename.
 func CredentialFileName(email, planType, hashAccountID string, includeProviderPrefix bool) string {
 	email = strings.TrimSpace(email)
 	plan := normalizePlanTypeForFilename(planType)
@@ -20,16 +19,16 @@ func CredentialFileName(email, planType, hashAccountID string, includeProviderPr
 		prefix = "codex"
 	}
 
-	if plan == "" {
-		return fmt.Sprintf("%s-%s.json", prefix, email)
-	} else if isTeamScopedPlan(plan) && hashAccountID != "" {
+	if hashAccountID != "" {
+		if plan == "" {
+			return fmt.Sprintf("%s-%s-%s.json", prefix, hashAccountID, email)
+		}
 		return fmt.Sprintf("%s-%s-%s-%s.json", prefix, hashAccountID, email, plan)
 	}
+	if plan == "" {
+		return fmt.Sprintf("%s-%s.json", prefix, email)
+	}
 	return fmt.Sprintf("%s-%s-%s.json", prefix, email, plan)
-}
-
-func isTeamScopedPlan(plan string) bool {
-	return plan == "team" || plan == "k12"
 }
 
 func normalizePlanTypeForFilename(planType string) string {
