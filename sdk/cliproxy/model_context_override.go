@@ -33,6 +33,11 @@ func applyConfiguredModelCatalogMetadata(info *ModelInfo, model modelEntry) {
 			info.Thinking = upstream.Thinking
 		}
 	}
+	if declared, ok := model.(interface{ GetInputModalities() []string }); ok {
+		if modalities := declared.GetInputModalities(); len(modalities) > 0 {
+			info.SupportedInputModalities = modalities
+		}
+	}
 	if limit := model.GetMaxContextLength(); limit > 0 {
 		info.ContextLength = limit
 		info.MaxContextLength = limit

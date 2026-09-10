@@ -382,9 +382,8 @@ func applyCodexClientInputModalitiesMetadata(entry map[string]any, modalities []
 			}
 		}
 	}
-	if len(codexModalities) == 0 {
-		return
-	}
+	// A nonempty declaration with no client-supported modality must not
+	// inherit text/image capabilities from the generic model template.
 	entry["input_modalities"] = codexModalities
 	if supportsImage {
 		entry["supports_image_detail_original"] = true

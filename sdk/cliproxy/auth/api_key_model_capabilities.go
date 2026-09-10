@@ -62,6 +62,7 @@ func ResolvedAPIKeyModelInfo(req cliproxyexecutor.Request) (*registry.ModelInfo,
 		return nil, false
 	}
 	info := *bound.info
+	info.SupportedInputModalities = append([]string(nil), info.SupportedInputModalities...)
 	if info.Thinking != nil {
 		support := *info.Thinking
 		support.Levels = append([]string(nil), support.Levels...)
@@ -70,16 +71,31 @@ func ResolvedAPIKeyModelInfo(req cliproxyexecutor.Request) (*registry.ModelInfo,
 	return &info, true
 }
 
+// ResolvedModelInputModalities reports the attempt's explicit declaration, not
+// inherited catalog capabilities. A present empty declaration prevents an old
+// executor config from reactivating a removed override after hot reload.
+func ResolvedModelInputModalities(req cliproxyexecutor.Request) ([]string, bool) {
+	bound, ok := req.Metadata[resolvedAPIKeyModelInfoMetadataKey].(resolvedAPIKeyModelInfo)
+	if !ok {
+		return nil, false
+	}
+	if bound.info == nil {
+		return nil, true
+	}
+	return append([]string(nil), bound.info.SupportedInputModalities...), true
+}
+
 func attachResolvedAPIKeyModelInfo(routing *apiKeyModelRoutingSnapshot, req cliproxyexecutor.Request, auth *Auth, routeModel, upstreamModel string) cliproxyexecutor.Request {
 	info, ok := lookupAPIKeyModelCapability(routing, auth, routeModel, upstreamModel)
 	_, previouslyBound := req.Metadata[resolvedAPIKeyModelInfoMetadataKey]
-	if !ok && !previouslyBound {
+	compatAttempt := isOpenAICompatAPIKeyAuth(auth)
+	if !ok && !previouslyBound && !compatAttempt {
 		return req
 	}
 	metadata := make(map[string]any, len(req.Metadata)+1)
 	maps.Copy(metadata, req.Metadata)
 	delete(metadata, resolvedAPIKeyModelInfoMetadataKey)
-	if ok {
+	if ok || compatAttempt {
 		metadata[resolvedAPIKeyModelInfoMetadataKey] = resolvedAPIKeyModelInfo{info: info}
 	}
 	req.Metadata = metadata
@@ -171,6 +187,11 @@ func compileConfiguredModelCapabilities[T interface {
 		if modelType == "openai-compatibility" {
 			info.Thinking = &registry.ThinkingSupport{Levels: []string{"low", "medium", "high"}}
 			info.UserDefined = false
+		}
+		// Only explicit configuration enters the attempt. Static input capability
+		// inheritance belongs to model advertisement, never content rewriting.
+		if declared, ok := any(model).(interface{ GetInputModalities() []string }); ok {
+			info.SupportedInputModalities = declared.GetInputModalities()
 		}
 		if support := model.GetThinking(); support != nil {
 			info.Thinking = config.NormalizeModelThinkingSupport(support)

@@ -4,11 +4,32 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"testing"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 )
+
+func TestCodexClientInputModalitiesKeepOnlyDeclaredSupportedInputs(t *testing.T) {
+	for _, tc := range []struct {
+		input []string
+		want  []any
+		image bool
+	}{
+		{nil, []any{"text", "image"}, true},
+		{[]string{}, []any{"text", "image"}, true},
+		{[]string{"audio", "video"}, []any{}, false},
+		{[]string{"text"}, []any{"text"}, false},
+		{[]string{"image", "audio"}, []any{"image"}, true},
+	} {
+		entry := map[string]any{"input_modalities": []any{"text", "image"}, "supports_image_detail_original": true}
+		applyCodexClientInputModalitiesMetadata(entry, tc.input)
+		if !reflect.DeepEqual(entry["input_modalities"], tc.want) || (entry["supports_image_detail_original"] == true) != tc.image {
+			t.Fatalf("declared %v produced incorrect client capabilities", tc.input)
+		}
+	}
+}
 
 func TestOpenAIModels_ClientVersionSelectsCodexCatalog(t *testing.T) {
 	gin.SetMode(gin.TestMode)
