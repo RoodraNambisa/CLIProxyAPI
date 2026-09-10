@@ -10,17 +10,36 @@ import (
 )
 
 func TestPayloadLimitExistingRulesPreserveDefaultFailoverChoice(t *testing.T) {
+	testStatusOnlyFailureRules(t, 413, "upstream payload too large")
+}
+
+func TestUnclassifiedErrorsKeepConfiguredFailoverChoice(t *testing.T) {
+	for _, fixture := range []struct {
+		status  int
+		message string
+	}{
+		{400, "bad request"}, {409, "request conflict"},
+		{500, `{"error":{"status":"UNKNOWN","message":"fixture upstream failure"}}`},
+	} {
+		t.Run(fmt.Sprint(fixture.status), func(t *testing.T) {
+			testStatusOnlyFailureRules(t, fixture.status, fixture.message)
+		})
+	}
+}
+
+func testStatusOnlyFailureRules(t *testing.T, status int, message string) {
+	t.Helper()
 	for _, stop := range []bool{false, true} {
 		for _, operation := range []string{"execute", "count", "stream"} {
 			t.Run(fmt.Sprintf("stop=%t/%s", stop, operation), func(t *testing.T) {
 				manager, exec := newCredentialRetryLimitTestManagerWithAuthCount(t, 0, 3)
 				manager.SetRetryConfig(0, 0, 0)
-				cfg := &config.Config{NoCooldownStatusCodes: []int{413}, NonRetryableErrors: []config.NonRetryableErrorRule{}}
+				cfg := &config.Config{NoCooldownStatusCodes: []int{status}, NonRetryableErrors: []config.NonRetryableErrorRule{}}
 				if stop {
-					cfg.NonRetryableErrors = []config.NonRetryableErrorRule{{StatusCode: 413}}
+					cfg.NonRetryableErrors = []config.NonRetryableErrorRule{{StatusCode: status}}
 				}
 				manager.SetConfig(cfg)
-				exec.err = &Error{HTTPStatus: 413, Message: "upstream payload too large"}
+				exec.err = &Error{HTTPStatus: status, Message: message}
 				request := coreexecutor.Request{Model: "test-model"}
 				var err error
 				switch operation {
@@ -35,7 +54,7 @@ func TestPayloadLimitExistingRulesPreserveDefaultFailoverChoice(t *testing.T) {
 				if stop {
 					want = 1
 				}
-				if !errors.Is(err, exec.err) || statusCodeFromError(err) != 413 || exec.Calls() != want {
+				if !errors.Is(err, exec.err) || statusCodeFromError(err) != status || exec.Calls() != want {
 					t.Fatalf("calls=%d want=%d status=%d error preserved=%t", exec.Calls(), want, statusCodeFromError(err), errors.Is(err, exec.err))
 				}
 				for _, auth := range manager.List() {
