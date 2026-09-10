@@ -1115,7 +1115,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	body = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel)
 	originalTranslated = nil
-	body, _ = sjson.SetBytes(body, "model", baseModel)
+	body, _ = helps.SetStringIfDifferent(body, "model", baseModel)
 	body, _ = sjson.DeleteBytes(body, "stream")
 	body = normalizeCodexInstructions(body)
 	body, err = e.applyDisabledImageGenerationToolPolicy(auth, body)
@@ -1730,12 +1730,12 @@ func (e *CodexExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth
 		return cliproxyexecutor.Response{}, err
 	}
 
-	body, _ = sjson.SetBytes(body, "model", baseModel)
+	body, _ = helps.SetStringIfDifferent(body, "model", baseModel)
 	body, _ = sjson.DeleteBytes(body, "previous_response_id")
 	body, _ = sjson.DeleteBytes(body, "prompt_cache_retention")
 	body, _ = sjson.DeleteBytes(body, "safety_identifier")
 	body, _ = sjson.DeleteBytes(body, "stream_options")
-	body, _ = sjson.SetBytes(body, "stream", false)
+	body, _ = helps.SetBoolIfDifferent(body, "stream", false)
 	body = normalizeCodexInstructions(body)
 
 	if helps.APIKeyModelIsCompat(req) {
@@ -2243,7 +2243,7 @@ func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Form
 	}
 
 	if cache.ID != "" {
-		rawJSON, _ = sjson.SetBytes(rawJSON, "prompt_cache_key", cache.ID)
+		rawJSON, _ = helps.SetStringIfDifferent(rawJSON, "prompt_cache_key", cache.ID)
 	}
 	sessionHeaderID := ""
 	if _, errParse := uuid.Parse(strings.TrimSpace(cache.ID)); errParse == nil {
@@ -2317,7 +2317,7 @@ func applyCodexIdentityConfuseBodyWithCacheKey(cfg *config.Config, auth *cliprox
 		state.originalPromptCacheKey = promptCacheKey
 		state.promptCacheKey = codexIdentityConfuseUUID(auth.ID, "prompt-cache", promptCacheKey)
 		if protectedKey == "" {
-			rawJSON, _ = sjson.SetBytes(rawJSON, "prompt_cache_key", state.promptCacheKey)
+			rawJSON, _ = helps.SetStringIfDifferent(rawJSON, "prompt_cache_key", state.promptCacheKey)
 		}
 	}
 	if installationID := strings.TrimSpace(gjson.GetBytes(userPayload, "client_metadata.x-codex-installation-id").String()); installationID != "" {

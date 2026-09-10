@@ -55,7 +55,7 @@ func (snapshot CodexResponsesLiteSnapshot) ApplyHeaders(headers http.Header) {
 // tool calls only for explicitly selected Lite requests.
 func (snapshot CodexResponsesLiteSnapshot) ApplyBody(body []byte, websocket bool) []byte {
 	if snapshot.Enabled {
-		body, _ = sjson.SetBytes(body, "parallel_tool_calls", false)
+		body, _ = SetBoolIfDifferent(body, "parallel_tool_calls", false)
 	}
 	if websocket && snapshot.Specified && !gjson.GetBytes(body, CodexResponsesLiteMetadata).Exists() {
 		body, _ = sjson.SetBytes(body, CodexResponsesLiteMetadata, strconv.FormatBool(snapshot.Enabled))

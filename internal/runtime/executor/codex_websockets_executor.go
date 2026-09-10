@@ -299,11 +299,11 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	body = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel)
-	body, err = sjson.SetBytes(body, "model", baseModel)
+	body, err = helps.SetStringIfDifferent(body, "model", baseModel)
 	if err != nil {
 		return resp, fmt.Errorf("codex websockets executor: set base model in request body: %w", err)
 	}
-	body, _ = sjson.SetBytes(body, "stream", true)
+	body, _ = helps.SetBoolIfDifferent(body, "stream", true)
 	body, _ = sjson.DeleteBytes(body, "prompt_cache_retention")
 	body, _ = sjson.DeleteBytes(body, "safety_identifier")
 	if !gjson.GetBytes(body, "instructions").Exists() {
@@ -668,7 +668,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	body = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, body, requestedModel)
-	body, err = sjson.SetBytes(body, "model", baseModel)
+	body, err = helps.SetStringIfDifferent(body, "model", baseModel)
 	if err != nil {
 		return nil, fmt.Errorf("codex websockets executor: set base model in request body: %w", err)
 	}
@@ -1461,7 +1461,7 @@ func applyCodexPromptCacheHeaders(ctx context.Context, from sdktranslator.Format
 	}
 
 	if cache.ID != "" {
-		rawJSON, _ = sjson.SetBytes(rawJSON, "prompt_cache_key", cache.ID)
+		rawJSON, _ = helps.SetStringIfDifferent(rawJSON, "prompt_cache_key", cache.ID)
 		if _, errParse := uuid.Parse(strings.TrimSpace(cache.ID)); errParse == nil {
 			setHeaderCasePreserved(headers, "session_id", cache.ID)
 			headers.Set("Conversation_id", cache.ID)
