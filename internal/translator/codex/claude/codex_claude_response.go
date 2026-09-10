@@ -30,6 +30,8 @@ type ConvertCodexResponseToClaudeParams struct {
 	TextBlockOpen          bool
 	ThinkingBlockOpen      bool
 	ThinkingSignature      string
+	ThinkingSummarySeen    bool
+	FinishedThinkingItems  map[string]struct{}
 	WebSearchToolUseIDs    map[string]struct{}
 	WebSearchToolResultIDs map[string]struct{}
 	LastWebSearchToolUseID string
@@ -93,6 +95,7 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
 
 		output = translatorcommon.AppendSSEEventBytes(output, "message_start", template, 2)
 	} else if typeStr == "response.reasoning_summary_part.added" {
+		params.ThinkingSummarySeen = true
 		output = append(output, stopCodexTextBlock(params)...)
 		// One reasoning item owns one signature, even when its summary has several parts.
 		if params.ThinkingBlockOpen {
@@ -101,6 +104,7 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
 			output = append(output, startCodexThinkingBlock(params)...)
 		}
 	} else if typeStr == "response.reasoning_summary_text.delta" {
+		params.ThinkingSummarySeen = true
 		output = append(output, stopCodexTextBlock(params)...)
 		output = append(output, startCodexThinkingBlock(params)...)
 		output = appendCodexThinkingDelta(output, params, rootResult.Get("delta").String())
@@ -155,6 +159,7 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
 		if itemType == "reasoning" {
 			output = append(output, stopCodexTextBlock(params)...)
 			output = append(output, finalizeCodexThinkingBlock(params)...)
+			params.ThinkingSummarySeen = false
 			// The early snapshot is only a fallback if the final item omits its signature.
 			params.ThinkingSignature = itemResult.Get("encrypted_content").String()
 		} else if itemType == "web_search_call" {
@@ -198,11 +203,7 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
 			output = append(output, stopCodexTextBlock(params)...)
 			params.HasTextDelta = true
 		} else if itemType == "reasoning" {
-			if signature := itemResult.Get("encrypted_content").String(); signature != "" {
-				params.ThinkingSignature = signature
-			}
-			output = append(output, finalizeCodexThinkingBlock(params)...)
-			params.ThinkingSignature = ""
+			output = finishCodexReasoningItem(output, params, rootResult, itemResult)
 		} else if itemType == "web_search_call" {
 			output = appendCodexWebSearchToolResult(output, params, rootResult, itemResult)
 		}

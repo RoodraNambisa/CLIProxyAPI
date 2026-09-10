@@ -53,6 +53,8 @@ func TestCodexClaudeMultipartThinkingAcrossTransports(t *testing.T) {
 						`{"type":"response.reasoning_summary_text.delta","item_id":"rs_test","summary_index":1,"delta":"Second"}`,
 						`{"type":"response.reasoning_summary_part.done","item_id":"rs_test","summary_index":1}`,
 						`{"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"rs_test","encrypted_content":"final-signature"}}`,
+						`{"type":"response.output_item.added","output_index":1,"item":{"type":"reasoning","id":"rs_cipher","encrypted_content":"early-cipher"}}`,
+						`{"type":"response.output_item.done","output_index":1,"item":{"type":"reasoning","id":"rs_cipher","encrypted_content":"final-cipher"}}`,
 						`{"type":"response.output_text.delta","delta":"Answer"}`,
 						`{"type":"response.completed","response":{"id":"test","status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":1}}}`,
 					} {
@@ -100,14 +102,18 @@ func TestCodexClaudeMultipartThinkingAcrossTransports(t *testing.T) {
 							answer.WriteString(event.Get("delta.text").String())
 							if event.Get("delta.type").String() == "signature_delta" {
 								signatures++
-								if event.Get("delta.signature").String() != "final-signature" {
+								expected := "final-signature"
+								if signatures == 2 {
+									expected = "final-cipher"
+								}
+								if event.Get("delta.signature").String() != expected {
 									t.Error("placeholder signature reached the client")
 								}
 							}
 						}
 					}
 				}
-				if starts != 2 || stops != 2 || signatures != 1 || thought.String() != "First\n\nSecond" || answer.String() != "Answer" || controller.Released() != release {
+				if starts != 3 || stops != 3 || signatures != 2 || thought.String() != "First\n\nSecond" || answer.String() != "Answer" || controller.Released() != release {
 					t.Fatalf("starts=%d stops=%d signatures=%d thought=%q released=%t", starts, stops, signatures, thought.String(), controller.Released())
 				}
 			})
