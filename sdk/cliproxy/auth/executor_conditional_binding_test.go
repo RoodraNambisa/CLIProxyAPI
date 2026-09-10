@@ -22,6 +22,9 @@ func TestConditionalExecutorBindingKeepsExistingOwnership(t *testing.T) {
 	if current, _ := manager.Executor("codex"); current != first {
 		t.Fatal("unused wrapper replaced the installed executor")
 	}
+	if manager.RegisterExecutorIfTypeChanged(first) {
+		t.Fatal("the already owned instance was treated as a replacement")
+	}
 	if first.CloseCalls() != 0 || unused.CloseCalls() != 0 || len(first.ClosedSessionIDs()) != 0 || len(unused.ClosedSessionIDs()) != 0 {
 		t.Fatal("rejected binding closed installed or caller-owned state")
 	}
@@ -33,6 +36,9 @@ func TestConditionalExecutorBindingKeepsExistingOwnership(t *testing.T) {
 	}
 	if manager.RegisterExecutorIfTypeChanged(unused) || unused.CloseCalls() != 0 {
 		t.Fatal("conditional registration took ownership after shutdown")
+	}
+	if manager.RegisterExecutorIfTypeChanged(first) || first.CloseCalls() != 1 {
+		t.Fatal("an already closed owned instance was closed twice")
 	}
 	if manager.RegisterExecutorIfTypeChanged(nil) || manager.RegisterExecutorIfTypeChanged(&replaceAwareExecutor{}) {
 		t.Fatal("invalid executor was installed")

@@ -2929,7 +2929,7 @@ func (m *Manager) RegisterExecutor(executor ProviderExecutor) {
 }
 
 // RegisterExecutorIfTypeChanged atomically preserves an installed executor of
-// the same concrete type. False leaves ownership of executor with the caller.
+// the same concrete type. False transfers no ownership and performs no cleanup.
 func (m *Manager) RegisterExecutorIfTypeChanged(executor ProviderExecutor) bool {
 	return m.registerExecutor(executor, true)
 }
