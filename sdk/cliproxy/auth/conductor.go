@@ -2081,10 +2081,14 @@ func (m *Manager) pickAvailableAuthWithPriorityPolicy(ctx context.Context, provi
 		accept = acceptors[0]
 	}
 	pick := func(selector Selector) (*Auth, error) {
-		if weighted, ok := selector.(*WeightedRoundRobinSelector); ok {
-			return weighted.pickAccepted(ctx, provider, model, opts, available, accept)
+		candidates := available
+		if model == "" && isBuiltInSelector(selector) {
+			candidates = preparedAuthsForEmptyModelSelection(available)
 		}
-		return selector.Pick(ctx, provider, model, opts, available)
+		if weighted, ok := selector.(*WeightedRoundRobinSelector); ok {
+			return weighted.pickAccepted(ctx, provider, model, opts, candidates, accept)
+		}
+		return selector.Pick(ctx, provider, model, opts, candidates)
 	}
 	if selector, ok := m.selectorForContext(ctx).(*SessionAffinitySelector); ok && selector != nil {
 		fallback, hasOverride := m.prioritySelectorForAvailable(available, ctx)
