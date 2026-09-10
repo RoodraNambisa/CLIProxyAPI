@@ -33,6 +33,37 @@ func (q *CodexQuotaObservation) Clone() *CodexQuotaObservation {
 	return &copy
 }
 
+// CodexQuotaSnapshot returns detached passive information for management views.
+func (a *Auth) CodexQuotaSnapshot() *CodexQuotaObservation {
+	if a == nil {
+		return nil
+	}
+	return a.codexQuotaObservation.Clone()
+}
+
+// recordCodexQuotaObservation accepts only the currently installed credential
+// instance. It deliberately bypasses persistence, hooks and scheduler updates.
+func (m *Manager) recordCodexQuotaObservation(authID, instanceID, source string, headers http.Header, observedAt time.Time) bool {
+	if m == nil || authID == "" || instanceID == "" {
+		return false
+	}
+	observation := newCodexQuotaObservation(headers, source, observedAt)
+	if observation == nil || observedAt.IsZero() {
+		return false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	auth := m.auths[strings.TrimSpace(authID)]
+	if auth == nil || auth.instanceID != instanceID || auth.RuntimeInstanceRetired() || !strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
+		return false
+	}
+	if previous := auth.codexQuotaObservation; previous != nil && observedAt.Before(previous.ObservedAt) {
+		return false
+	}
+	auth.codexQuotaObservation = observation
+	return true
+}
+
 func newCodexQuotaObservation(headers http.Header, source string, observedAt time.Time) *CodexQuotaObservation {
 	if source != "http" && source != "websocket" {
 		return nil

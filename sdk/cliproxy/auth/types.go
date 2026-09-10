@@ -235,6 +235,7 @@ type Auth struct {
 	chatGPTWebCredentialGeneration string
 	requestRefreshFamilyID         string
 	requestScopedErrorRules        *authRequestScopedErrorSnapshot
+	codexQuotaObservation          *CodexQuotaObservation
 }
 
 type authInstanceState struct {
@@ -465,6 +466,7 @@ func (a *Auth) Clone() *Auth {
 	}
 	copyAuth := *a
 	copyAuth.LastError = cloneError(a.LastError)
+	copyAuth.codexQuotaObservation = a.codexQuotaObservation.Clone()
 	if len(a.Attributes) > 0 {
 		copyAuth.Attributes = make(map[string]string, len(a.Attributes))
 		for key, value := range a.Attributes {
@@ -507,6 +509,7 @@ func (a *Auth) CloneWithoutRuntimeInstance() *Auth {
 	clone.runtimeProxyResolved = false
 	clone.chatGPTWebCredentialGeneration = ""
 	clone.requestRefreshFamilyID = ""
+	clone.codexQuotaObservation = nil
 	return clone
 }
 

@@ -617,6 +617,13 @@ func (m *Manager) installAuthLocked(id string, auth *Auth) {
 		return
 	}
 	m.removeAuthIndexesLocked(id)
+	// Carry observations only across installations of the same live credential.
+	// Incoming snapshots may be stale, and replacements must not inherit them.
+	if previous := m.auths[id]; previous != nil && auth.instanceID != "" && auth.instanceID == previous.instanceID && !previous.RuntimeInstanceRetired() {
+		auth.codexQuotaObservation = previous.codexQuotaObservation.Clone()
+	} else {
+		auth.codexQuotaObservation = nil
+	}
 	normalizeModelStates(auth)
 	m.auths[id] = auth
 	m.addAuthIndexesLocked(auth, m.currentConfig())
