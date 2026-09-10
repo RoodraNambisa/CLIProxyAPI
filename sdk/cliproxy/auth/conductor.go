@@ -5673,6 +5673,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		}
 		selectionStarted := time.Now()
 		requestSlotBefore := opts.AuthRequestSlot.ReservationDurationNanos()
+		opts = m.withSessionAffinityResultSnapshot(ctx, providers, routeModel, opts)
 		auth, executor, provider, errPick := m.pickNextMixedWithImageToolFallback(ctx, providers, routeModel, req, opts, roundState.tried, pickAllowed)
 		observeImageRequestSelectionPhases(opts.Metadata, opts.AuthRequestSlot, selectionStarted, requestSlotBefore)
 		if errPick != nil {
@@ -5957,6 +5958,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			}
 			return cliproxyexecutor.Response{}, &Error{Code: "request_body_released", Message: "request body released; retry disabled"}
 		}
+		opts = m.withSessionAffinityResultSnapshot(ctx, providers, routeModel, opts)
 		auth, executor, provider, errPick := m.pickNextMixed(ctx, providers, routeModel, opts, roundState.tried, pickAllowed)
 		if errPick != nil {
 			if chatGPTWebImageQuotaRefreshPendingError(errPick) {
@@ -6232,6 +6234,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		}
 		selectionStarted := time.Now()
 		requestSlotBefore := opts.AuthRequestSlot.ReservationDurationNanos()
+		opts = m.withSessionAffinityResultSnapshot(ctx, providers, routeModel, opts)
 		auth, executor, provider, errPick := m.pickNextMixedWithImageToolFallback(ctx, providers, routeModel, req, opts, roundState.tried, pickAllowed)
 		observeImageRequestSelectionPhases(opts.Metadata, opts.AuthRequestSlot, selectionStarted, requestSlotBefore)
 		if errPick != nil {

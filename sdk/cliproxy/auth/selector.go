@@ -1170,7 +1170,7 @@ func (s *SessionAffinitySelector) pickWithFallbackDeferredBinding(ctx context.Co
 		if err != nil || auth == nil {
 			return nil, nil, err
 		}
-		bind := s.deferSelectionBinding(cacheKey, auth.ID)
+		bind := s.deferSelectionBinding(cacheKey, auth.ID, opts)
 		entry.Infof("session-affinity: cache hit but auth unavailable, selected fallback | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 		return auth, bind, nil
 	}
@@ -1180,7 +1180,7 @@ func (s *SessionAffinitySelector) pickWithFallbackDeferredBinding(ctx context.Co
 		if cachedAuthID, ok := s.cache.Get(fallbackKey); ok {
 			for _, auth := range available {
 				if auth.ID == cachedAuthID {
-					bind := s.deferSelectionBinding(cacheKey, auth.ID)
+					bind := s.deferSelectionBinding(cacheKey, auth.ID, opts)
 					entry.Infof("session-affinity: fallback cache hit | session=%s fallback=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), truncateSessionID(fallbackID), auth.ID, provider, model)
 					return auth, bind, nil
 				}
@@ -1192,7 +1192,7 @@ func (s *SessionAffinitySelector) pickWithFallbackDeferredBinding(ctx context.Co
 	if err != nil || auth == nil {
 		return nil, nil, err
 	}
-	bind := s.deferSelectionBinding(cacheKey, auth.ID)
+	bind := s.deferSelectionBinding(cacheKey, auth.ID, opts)
 	entry.Infof("session-affinity: cache miss, selected auth | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 	return auth, bind, nil
 }
@@ -1246,7 +1246,7 @@ func (s *SessionAffinitySelector) pickWithPreparedFallbackDeferredBinding(ctx co
 		if err != nil || auth == nil {
 			return nil, nil, err
 		}
-		bind := s.deferSelectionBinding(cacheKey, auth.ID)
+		bind := s.deferSelectionBinding(cacheKey, auth.ID, opts)
 		entry.Infof("session-affinity: cache hit but auth unavailable, selected fallback | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 		return auth, bind, nil
 	}
@@ -1256,7 +1256,7 @@ func (s *SessionAffinitySelector) pickWithPreparedFallbackDeferredBinding(ctx co
 		if cachedAuthID, ok := s.cache.Get(fallbackKey); ok {
 			for _, auth := range available {
 				if auth.ID == cachedAuthID {
-					bind := s.deferSelectionBinding(cacheKey, auth.ID)
+					bind := s.deferSelectionBinding(cacheKey, auth.ID, opts)
 					entry.Infof("session-affinity: fallback cache hit | session=%s fallback=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), truncateSessionID(fallbackID), auth.ID, provider, model)
 					return auth, bind, nil
 				}
@@ -1268,14 +1268,17 @@ func (s *SessionAffinitySelector) pickWithPreparedFallbackDeferredBinding(ctx co
 	if err != nil || auth == nil {
 		return nil, nil, err
 	}
-	bind := s.deferSelectionBinding(cacheKey, auth.ID)
+	bind := s.deferSelectionBinding(cacheKey, auth.ID, opts)
 	entry.Infof("session-affinity: cache miss, selected auth | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 	return auth, bind, nil
 }
 
-func (s *SessionAffinitySelector) deferSelectionBinding(cacheKey, authID string) func() {
+func (s *SessionAffinitySelector) deferSelectionBinding(cacheKey, authID string, opts cliproxyexecutor.Options) func() {
 	if s == nil || s.cache == nil || cacheKey == "" || authID == "" {
 		return nil
+	}
+	if snapshot := sessionBindingSnapshotFromOptions(opts, s.cache); snapshot != nil && snapshot.key == cacheKey {
+		return func() { snapshot.bind(authID) }
 	}
 	return func() {
 		s.cache.Set(cacheKey, authID)
@@ -1292,6 +1295,10 @@ func (s *SessionAffinitySelector) BindSession(ctx context.Context, provider, mod
 func (s *SessionAffinitySelector) BindSessionWithRollback(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, authID string) func() {
 	if s == nil || s.cache == nil || authID == "" {
 		return nil
+	}
+	if snapshot := sessionBindingSnapshotFromOptions(opts, s.cache); snapshot != nil && snapshot.provider == provider && snapshot.model == canonicalModelKey(model) {
+		mutation := snapshot.bind(authID)
+		return func() { s.cache.rollback(snapshot.key, mutation) }
 	}
 	entry := selectorLogEntry(ctx)
 	primaryID, _ := s.sessionIDs(ctx, opts)

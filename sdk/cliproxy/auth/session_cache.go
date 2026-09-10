@@ -10,13 +10,16 @@ type sessionEntry struct {
 	authID         string
 	authGeneration uint64
 	expiresAt      time.Time
+	// version protects rollback of every write; bindingVersion ignores TTL renewals.
 	version        uint64
+	bindingVersion uint64
 }
 
 type sessionMutation struct {
-	version     uint64
-	previous    sessionEntry
-	hadPrevious bool
+	version        uint64
+	bindingVersion uint64
+	previous       sessionEntry
+	hadPrevious    bool
 }
 
 type authGenerationState struct {
@@ -115,11 +118,38 @@ func (c *SessionCache) setWithRollback(sessionID, authID string) sessionMutation
 		return sessionMutation{}
 	}
 	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.setWithRollbackLocked(sessionID, authID)
+}
+
+func (c *SessionCache) bindingVersion(sessionID string) uint64 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.entries[sessionID].bindingVersion
+}
+
+func (c *SessionCache) setWithRollbackIfVersion(sessionID, authID string, expected uint64) sessionMutation {
+	if sessionID == "" || authID == "" {
+		return sessionMutation{}
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.entries[sessionID].bindingVersion != expected {
+		return sessionMutation{}
+	}
+	return c.setWithRollbackLocked(sessionID, authID)
+}
+
+func (c *SessionCache) setWithRollbackLocked(sessionID, authID string) sessionMutation {
 	previous, hadPrevious := c.entries[sessionID]
 	c.version++
 	version := c.version
 	expiresAt := time.Now().Add(c.ttl)
 	generationState := c.authGenerations[authID]
+	bindingVersion := version
+	if hadPrevious && previous.authID == authID && previous.authGeneration == generationState.generation {
+		bindingVersion = previous.bindingVersion
+	}
 	if generationState.generation > 0 && expiresAt.After(generationState.expiresAt) {
 		generationState.expiresAt = expiresAt
 		c.authGenerations[authID] = generationState
@@ -129,9 +159,9 @@ func (c *SessionCache) setWithRollback(sessionID, authID string) sessionMutation
 		authGeneration: generationState.generation,
 		expiresAt:      expiresAt,
 		version:        version,
+		bindingVersion: bindingVersion,
 	}
-	c.mu.Unlock()
-	return sessionMutation{version: version, previous: previous, hadPrevious: hadPrevious}
+	return sessionMutation{version: version, bindingVersion: bindingVersion, previous: previous, hadPrevious: hadPrevious}
 }
 
 func (c *SessionCache) invalidateIfVersion(sessionID string, version uint64) {
