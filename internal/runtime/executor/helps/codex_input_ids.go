@@ -26,7 +26,7 @@ func SanitizeCodexInputItemIDs(body []byte) []byte {
 	preserved := make(map[string]bool, len(items))
 	for _, item := range items {
 		id := item.Get("id")
-		if id.Type != gjson.String || dropCodexEncryptedReasoningID(item) {
+		if id.Type != gjson.String || dropCodexEncryptedReasoningID(item, id) {
 			continue
 		}
 		normalized := normalizeCodexInputItemID(item, id.Str)
@@ -43,12 +43,12 @@ func SanitizeCodexInputItemIDs(body []byte) []byte {
 	rebuilt := make([]string, 0, len(items))
 	changed := false
 	for _, item := range items {
-		if dropCodexEncryptedReasoningID(item) {
+		id := item.Get("id")
+		if dropCodexEncryptedReasoningID(item, id) {
 			changed = true
 			continue
 		}
 		raw := item.Raw
-		id := item.Get("id")
 		if id.Type == gjson.String {
 			normalized := normalizeCodexInputItemID(item, id.Str)
 			prefixCollision := normalized != id.Str && preserved[normalized]
@@ -112,11 +112,12 @@ func normalizeCodexInputItemID(item gjson.Result, id string) string {
 	return prefix + "_" + id
 }
 
-func dropCodexEncryptedReasoningID(item gjson.Result) bool {
-	id := item.Get("id")
+func dropCodexEncryptedReasoningID(item, id gjson.Result) bool {
+	if id.Type != gjson.String || utf8.RuneCountInString(id.Str) <= codexInputItemIDLimit || item.Get("type").Str != "reasoning" {
+		return false
+	}
 	encrypted := item.Get("encrypted_content")
-	return item.Get("type").Str == "reasoning" && id.Type == gjson.String &&
-		utf8.RuneCountInString(id.Str) > codexInputItemIDLimit && encrypted.Type == gjson.String && encrypted.Str != ""
+	return encrypted.Type == gjson.String && encrypted.Str != ""
 }
 
 func codexInputItemIDWithHashSuffix(id string, attempt int) string {
