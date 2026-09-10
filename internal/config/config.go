@@ -553,6 +553,8 @@ type CodexConfig struct {
 	OrphanDelegationCompatibility bool `yaml:"orphan-delegation-compatibility" json:"orphan-delegation-compatibility"`
 	// StreamBootstrapBuffering holds bounded pre-output metadata to detect retryable overloads.
 	StreamBootstrapBuffering bool `yaml:"stream-bootstrap-buffering" json:"stream-bootstrap-buffering"`
+	// EstimateClaudeInputTokens fills empty Claude message_start input usage with a local estimate.
+	EstimateClaudeInputTokens bool `yaml:"estimate-claude-input-tokens" json:"estimate-claude-input-tokens"`
 	// PassthroughPromptCacheKey preserves explicit client cache keys independently of session identity.
 	PassthroughPromptCacheKey bool                 `yaml:"passthrough-prompt-cache-key" json:"passthrough-prompt-cache-key"`
 	IdentityConfuse           bool                 `yaml:"identity-confuse" json:"identity-confuse"`

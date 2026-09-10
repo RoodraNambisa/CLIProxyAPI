@@ -782,6 +782,11 @@ nonstream-keepalive-interval: 0
 #   # Buffer up to 16 pre-output metadata events / 64 KiB to detect overloads before
 #   # committing the stream. Uses the existing retry budget and requires a replayable request.
 #   stream-bootstrap-buffering: false
+#   # Estimate text/tool input for the first empty Claude message_start usage when
+#   # streaming through Codex. Boolean, off by default; invalid types are rejected.
+#   # Adds CPU/allocation cost, excludes media, and never changes final upstream usage.
+#   # Hot updates affect the next logical request; retries keep the numeric snapshot.
+#   estimate-claude-input-tokens: false
 #   # Convert unpaired Codex app delegation results to user messages only for
 #   # X-Openai-Subagent: collab_spawn. Paired calls and other tools are unchanged.
 #   orphan-delegation-compatibility: false

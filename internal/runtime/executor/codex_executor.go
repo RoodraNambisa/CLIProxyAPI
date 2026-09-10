@@ -368,6 +368,7 @@ func (e *CodexExecutor) Identifier() string { return "codex" }
 type codexPreparedSessionIdentity struct {
 	MultiAgentV2                  helps.CodexMultiAgentPolicy
 	StreamBootstrapBuffering      bool
+	ClaudeInputTokensEstimate     int64
 	PromptCacheLog                *util.PromptCacheLogRedactor
 	PromptCacheKey                helps.CodexPromptCacheKeySnapshot
 	ResponsesLite                 helps.CodexResponsesLiteSnapshot
@@ -442,6 +443,10 @@ func (e *CodexExecutor) PrepareProviderRequest(ctx context.Context, req cliproxy
 	}
 	if opts.SourceFormat != sdktranslator.FormatCodex && opts.SourceFormat != sdktranslator.FormatOpenAIResponse {
 		prepared.MultiAgentV2 = helps.CodexMultiAgentPolicy{}
+	}
+	if operation == cliproxyexecutor.RequestOperationStream && opts.SourceFormat == sdktranslator.FormatClaude &&
+		cliproxyexecutor.ResponseFormatOrSource(opts) == sdktranslator.FormatClaude && e.cfg != nil && e.cfg.Codex.EstimateClaudeInputTokens {
+		prepared.ClaudeInputTokensEstimate = helps.EstimateClaudeInputTokens(ctx, payload)
 	}
 	if !prepared.Enabled {
 		return prepared, nil
@@ -1395,6 +1400,7 @@ func (e *CodexExecutor) executeStream(ctx context.Context, auth *cliproxyauth.Au
 		if trustUpstreamSSE {
 			scanner.Split(splitCodexSSELinesPreserveEndings)
 		}
+		claudeInputTokens := helps.ClaudeInputTokenState{Estimate: e.codexPreparedSessionIdentity(ctx, req, opts).ClaudeInputTokensEstimate}
 		var param any
 		outputItemsByIndex := make(map[int64][]byte)
 		var outputItemsFallback [][]byte
@@ -1595,6 +1601,7 @@ func (e *CodexExecutor) executeStream(ctx context.Context, auth *cliproxyauth.Au
 					if terminal {
 						pendingTranslatedCompletionEvent = []byte("event: " + gjson.GetBytes(data, "type").String())
 						eventChunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, streamOriginalPayload.Bytes(), streamBody.Bytes(), pendingTranslatedCompletionEvent, &param)
+						eventChunks = claudeInputTokens.Apply(eventChunks)
 						for i := range eventChunks {
 							if !emit(cliproxyexecutor.StreamChunk{Payload: eventChunks[i]}) {
 								return
@@ -1612,6 +1619,7 @@ func (e *CodexExecutor) executeStream(ctx context.Context, auth *cliproxyauth.Au
 
 			translatedLine = applyCodexIdentityExposeResponsePayload(translatedLine, identityState)
 			chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, streamOriginalPayload.Bytes(), streamBody.Bytes(), translatedLine, &param)
+			chunks = claudeInputTokens.Apply(chunks)
 			for i := range chunks {
 				chunkPayload := chunks[i]
 				if from == sdktranslator.FormatOpenAIResponse {
