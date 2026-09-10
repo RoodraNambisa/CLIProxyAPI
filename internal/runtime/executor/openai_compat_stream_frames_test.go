@@ -33,6 +33,7 @@ func TestOpenAICompatMultilineFramesPreserveToolsAndUsage(t *testing.T) {
 							`data: {"id":"multiline","object":"chat.completion.chunk","choices":[`,
 							`data: {"index":0,"delta":{"tool_calls":[{"index":0,"id":"paired","function":{"name":"run","arguments":"{\"input\":\"command\"}"}}]},"finish_reason":"tool_calls"}]}`,
 							"", `data: {"choices":[],"usage":`, `data: {"prompt_tokens":2,"completion_tokens":3,"total_tokens":5}}`, "", "data: [DONE]", "", "",
+							`data: {"choices":[{"index":0,"delta":{"content":"late"}}]}`, "", `data: {"choices":[],"usage":{"total_tokens":999}}`, "", "",
 						}, ending)
 						for offset := 0; offset < len(wire); offset += 7 {
 							end := min(offset+7, len(wire))

@@ -9,7 +9,7 @@ import (
 
 // ConvertOpenAIResponseToOpenAI normalizes a single chunk of an OpenAI-compatible streaming response.
 // If the chunk is an SSE "data:" line, the prefix is stripped and the remaining JSON payload is returned.
-// The "[DONE]" marker yields no output.
+// The "[DONE]" marker yields no output and terminates a stateful stream.
 //
 // Parameters:
 //   - ctx: The context for the request, used for cancellation and timeout handling
@@ -20,10 +20,18 @@ import (
 // Returns:
 //   - [][]byte: A slice of JSON payload chunks in OpenAI format.
 func ConvertOpenAIResponseToOpenAI(_ context.Context, _ string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, param *any) [][]byte {
+	if param != nil {
+		if ended, ok := (*param).(bool); ok && ended {
+			return [][]byte{}
+		}
+	}
 	if bytes.HasPrefix(rawJSON, []byte("data:")) {
 		rawJSON = bytes.TrimSpace(rawJSON[5:])
 	}
 	if bytes.Equal(rawJSON, []byte("[DONE]")) {
+		if param != nil {
+			*param = true
+		}
 		return [][]byte{}
 	}
 	return [][]byte{rawJSON}
