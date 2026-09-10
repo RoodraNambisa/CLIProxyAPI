@@ -814,6 +814,7 @@ func (e *CodexExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Aut
 		attrs = auth.Attributes
 	}
 	clientBetaFeatures := headerValueCaseInsensitive(req.Header, "X-Codex-Beta-Features")
+	deleteHeaderCaseInsensitive(req.Header, "Authorization")
 	util.ApplyCustomHeadersFromAttrs(req, attrs)
 	applyCodexSoftwareIdentity(req.Header, auth, e.cfg)
 	applyCodexBetaFeatures(req.Header, auth, e.cfg, clientBetaFeatures)
@@ -2509,6 +2510,7 @@ func applyCodexHeadersFromSources(r *http.Request, auth *cliproxyauth.Auth, toke
 	if auth != nil {
 		attrs = auth.Attributes
 	}
+	deleteHeaderCaseInsensitive(r.Header, "Authorization")
 	util.ApplyCustomHeadersFromAttrs(r, attrs)
 	normalizeCodexHTTPSessionHeader(r.Header, codexCustomHTTPSessionHeader(attrs))
 	applyCodexSoftwareIdentity(r.Header, auth, cfg)

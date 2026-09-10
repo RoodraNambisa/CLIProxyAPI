@@ -1539,6 +1539,7 @@ func prepareCodexWebsocketHeadersForURL(ctx context.Context, headers http.Header
 	if auth != nil {
 		attrs = auth.Attributes
 	}
+	deleteHeaderCaseInsensitive(headers, "Authorization")
 	util.ApplyCustomHeadersFromAttrs(&http.Request{Header: headers}, attrs)
 	applyCodexSoftwareIdentity(headers, auth, cfg)
 	applyCodexBetaFeatures(headers, auth, cfg, clientBetaFeatures)
