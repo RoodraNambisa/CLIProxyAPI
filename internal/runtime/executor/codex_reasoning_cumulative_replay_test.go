@@ -147,7 +147,11 @@ func TestCodexTransportsRestoreCumulativeReasoningOnlyFromCompletedTurns(t *test
 								}
 							}
 						} else {
-							_, executionErr = executor.Execute(ctx, credential, req, opts)
+							var result core.Response
+							result, executionErr = executor.Execute(ctx, credential, req, opts)
+							if executionErr == nil && gjson.GetBytes(result.Payload, `content.#(type=="text").text`).String() != fmt.Sprintf("answer%d", min(call, 3)) {
+								t.Errorf("call %d lost the completed output while restoring replay", call)
+							}
 						}
 						<-done
 						if call == 5 && ctx.Err() == nil {

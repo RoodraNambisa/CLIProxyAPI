@@ -323,7 +323,6 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	}
 	replayNamespace := helps.ReasoningReplayNamespace(ctx, e.Identifier(), replayAuthID, auth.RuntimeInstanceID())
 	body, replayScope := helps.ApplyCodexReasoningReplay(ctx, from.String(), replayNamespace, baseModel, originalPayload, body, req.Metadata, opts.Metadata, opts.Headers)
-	replayOutput := helps.NewCodexReasoningReplayCollector(replayScope)
 	if strings.TrimSpace(gjson.GetBytes(body, "previous_response_id").String()) != "" {
 		ctx = cliproxyexecutor.WithRequiredUpstreamWebsocket(ctx)
 	}
@@ -523,7 +522,8 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	wsReqBody = nil
 
 	streamEstablished := false
-	outputIdentities := make(map[int64][]byte)
+	outputItemsByIndex := make(map[int64][]byte)
+	var outputItemsFallback [][]byte
 	for {
 		if ctx != nil && ctx.Err() != nil {
 			return resp, ctx.Err()
@@ -588,7 +588,6 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		}
 		helps.AppendAPIWebsocketResponse(ctx, e.cfg, payload)
 		payload = normalizedPayload
-		replayOutput.Observe(payload)
 
 		eventType := gjson.GetBytes(payload, "type").String()
 		if !streamEstablished && eventType != "" && eventType != "error" {
@@ -596,10 +595,10 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 			streamEstablished = true
 		}
 		if eventType == "response.output_item.done" {
-			helps.CollectCodexOutputIdentity(payload, outputIdentities)
+			collectCodexOutputItemDone(payload, outputItemsByIndex, &outputItemsFallback)
 		}
 		if isCodexSuccessfulCompletion(payload) || helps.IsCodexPartialResponse(payload) {
-			payload = helps.HydrateCodexOutputItemIDs(payload, outputIdentities)
+			payload = patchCodexCompletedOutput(payload, outputItemsByIndex, outputItemsFallback)
 			clientPayload = applyCodexIdentityExposeResponsePayload(payload, identityState)
 			if detail, ok := helps.ParseCodexUsage(payload); ok {
 				reporter.Publish(ctx, detail)
@@ -613,7 +612,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 			}
 			if ctx.Err() == nil && isCodexSuccessfulCompletion(payload) {
 				sess.commitMultiAgentResponseForConn(conn, multiAgentResponse)
-				replayOutput.Commit(ctx, payload)
+				helps.CacheCodexReasoningReplayFromCompleted(replayScope, payload, ctx)
 			}
 			resp = cliproxyexecutor.Response{Payload: out, Headers: codexSuccessfulResponseHeaders(auth, upstreamHeaders)}
 			return resp, nil
