@@ -51,7 +51,7 @@ func TestCodexClaudeParallelToolsAcrossTransports(t *testing.T) {
 						`{"type":"response.output_item.done","output_index":1,"item":{"type":"function_call","id":"fc_b","call_id":"call_b","name":"run","arguments":"{\"b\":2}"}}`,
 						`{"type":"response.output_text.delta","delta":"after tools"}`,
 						`{"type":"response.function_call_arguments.delta","item_id":"fc_a","delta":"{\"a\":"}`,
-						`{"type":"response.completed","response":{"id":"test","status":"completed","output":[{"type":"function_call","id":"fc_a","call_id":"call_a","name":"run","arguments":"{\"a\":1}"},{"type":"function_call","id":"fc_b","call_id":"call_b","name":"run","arguments":"{\"b\":2}"}],"usage":{"input_tokens":1,"output_tokens":1}}}`,
+						`{"type":"response.completed","response":{"id":"test","status":"completed","output":[{"type":"function_call","id":"fc_a","call_id":"call_a","name":"run","arguments":"{\"a\":1}"},{"type":"function_call","id":"fc_b","call_id":"call_b","name":"run","arguments":"{\"b\":2}"}],"usage":{"input_tokens":10,"output_tokens":1,"input_tokens_details":{"cached_tokens":2,"cache_write_tokens":3}}}}`,
 					} {
 						if !gjson.Valid(event) {
 							t.Error("invalid test event")
@@ -83,6 +83,7 @@ func TestCodexClaudeParallelToolsAcrossTransports(t *testing.T) {
 				open, count := -1, 0
 				arguments := map[int]string{}
 				var answer string
+				var cacheWrites int64
 				for chunk := range result.Chunks {
 					if chunk.Err != nil {
 						t.Fatal(chunk.Err)
@@ -114,13 +115,16 @@ func TestCodexClaudeParallelToolsAcrossTransports(t *testing.T) {
 							}
 							open = -1
 						case "message_delta", "message_stop":
+							if event.Get("type").String() == "message_delta" {
+								cacheWrites = event.Get("usage.cache_creation_input_tokens").Int()
+							}
 							if open != -1 {
 								t.Fatal("terminal preceded a block stop")
 							}
 						}
 					}
 				}
-				if count != 3 || open != -1 || arguments[0] != `{"a":1}` || arguments[1] != `{"b":2}` || answer != "after tools" || controller.Released() != release {
+				if count != 3 || open != -1 || arguments[0] != `{"a":1}` || arguments[1] != `{"b":2}` || answer != "after tools" || controller.Released() != release || cacheWrites != 3 {
 					t.Fatalf("invalid output: count=%d args=%v answer=%q", count, arguments, answer)
 				}
 			})
