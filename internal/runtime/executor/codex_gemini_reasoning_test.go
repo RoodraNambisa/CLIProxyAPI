@@ -28,6 +28,11 @@ func TestCodexGeminiReasoningSurvivesHTTPStreamAndRelease(t *testing.T) {
 					if strings.Contains(string(body), "hidden") || !strings.Contains(string(body), "public system") {
 						t.Error("hidden Gemini thoughts leaked into the actual Codex request")
 					}
+					for _, kind := range []string{"function_call", "function_call_output"} {
+						if gjson.GetBytes(body, `input.#(type=="`+kind+`").call_id`).String() != "call_gemini_0000000000000001" {
+							t.Error("actual Codex request lost stable tool pairing")
+						}
+					}
 					w.Header().Set("Content-Type", "text/event-stream")
 					for _, event := range []string{
 						`{"type":"response.created","response":{"id":"thinking","model":"gpt-5.4-mini"}}`,
@@ -46,7 +51,7 @@ func TestCodexGeminiReasoningSurvivesHTTPStreamAndRelease(t *testing.T) {
 				if release {
 					opts.Metadata[core.BodyReleaseControllerMetadataKey] = controller
 				}
-				req := core.Request{Model: "gpt-5.4-mini", Payload: []byte(`{"systemInstruction":{"parts":[{"thought":true,"text":"hidden system"},{"text":"public system"}]},"contents":[{"role":"model","parts":[{"thought":true,"text":"hidden history"}]},{"role":"user","parts":[{"text":"ask"}]}],"generationConfig":{"thinkingConfig":{"includeThoughts":true}}}`)}
+				req := core.Request{Model: "gpt-5.4-mini", Payload: []byte(`{"systemInstruction":{"parts":[{"thought":true,"text":"hidden system"},{"text":"public system"}]},"contents":[{"role":"model","parts":[{"thought":true,"text":"hidden history"},{"functionCall":{"name":"lookup","args":{}}}]},{"role":"user","parts":[{"functionResponse":{"name":"lookup","response":{"result":"ok"}}},{"text":"ask"}]}],"generationConfig":{"thinkingConfig":{"includeThoughts":true}}}`)}
 				var outputs [][]byte
 				if stream {
 					result, err := executor.ExecuteStream(t.Context(), auth, req, opts)

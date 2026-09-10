@@ -6,9 +6,7 @@
 package gemini
 
 import (
-	"crypto/rand"
 	"fmt"
-	"math/big"
 	"strconv"
 	"strings"
 
@@ -63,29 +61,44 @@ func ConvertGeminiRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 		}
 	}
 
-	// helper for generating paired call IDs in the form: call_<alphanum>
+	// Generate stable IDs so repeated history preserves the same prompt prefix.
 	// Gemini uses sequential pairing across possibly multiple in-flight
 	// functionCalls, so we keep a FIFO queue of generated call IDs and
 	// consume them in order when functionResponses arrive.
 	var pendingCallIDs []string
-
-	// genCallID creates a random call id like: call_<8chars>
-	genCallID := func() string {
-		const letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-		var b strings.Builder
-		// 8 chars random suffix
-		for i := 0; i < 24; i++ {
-			n, _ := rand.Int(rand.Reader, big.NewInt(int64(len(letters))))
-			b.WriteByte(letters[n.Int64()])
-		}
-		return "call_" + b.String()
-	}
 
 	getGeminiCallID := func(value gjson.Result) string {
 		if callID := strings.TrimSpace(value.Get("id").String()); callID != "" {
 			return callID
 		}
 		return strings.TrimSpace(value.Get("call_id").String())
+	}
+
+	reservedIDs := make(map[string]struct{})
+	root.Get("contents").ForEach(func(_, content gjson.Result) bool {
+		content.Get("parts").ForEach(func(_, part gjson.Result) bool {
+			if part.Get("thought").Bool() {
+				return true
+			}
+			for _, field := range []string{"functionCall", "functionResponse"} {
+				if id := getGeminiCallID(part.Get(field)); id != "" {
+					reservedIDs[id] = struct{}{}
+				}
+			}
+			return true
+		})
+		return true
+	})
+	callCounter := 0
+	genCallID := func() string {
+		for {
+			callCounter++
+			id := fmt.Sprintf("call_gemini_%016d", callCounter)
+			if _, exists := reservedIDs[id]; !exists {
+				reservedIDs[id] = struct{}{}
+				return id
+			}
+		}
 	}
 
 	removePendingCallID := func(ids []string, callID string) []string {
