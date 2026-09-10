@@ -18,6 +18,7 @@ func TestGeneratedCodexThinkingEffortRespectsLevelCapabilities(t *testing.T) {
 	}{
 		{"auto without medium", "auto", "low", []string{"low", "high"}, false, false},
 		{"auto only high", "auto", "high", []string{"high"}, false, false},
+		{"auto only none", "auto", "none", []string{"none"}, true, false},
 		{"auto medium supported", "auto", "medium", []string{"low", "medium", "high"}, false, false},
 		{"dynamic auto preserved", "auto", "auto", []string{"low", "high"}, false, true},
 		{"none cannot disable", "none", "low", []string{"low", "high"}, false, false},

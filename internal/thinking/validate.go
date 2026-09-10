@@ -144,6 +144,10 @@ func ValidateConfig(config ThinkingConfig, modelInfo *registry.ModelInfo, fromFo
 		// A generated fallback must belong to the model's discrete level subset.
 		if config.Mode == ModeLevel && len(support.Levels) > 0 && !isLevelSupported(string(config.Level), support.Levels) {
 			config.Level = clampLevel(config.Level, modelInfo, toFormat)
+			// A none-only capability has no ranked level for clampLevel to select.
+			if !isLevelSupported(string(config.Level), support.Levels) && isLevelSupported(string(LevelNone), support.Levels) {
+				config.Mode, config.Level, config.Budget = ModeNone, "", 0
+			}
 		}
 	}
 
