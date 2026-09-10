@@ -107,6 +107,7 @@ func (e *CodexExecutor) executeAlphaSearch(ctx context.Context, auth *cliproxyau
 			log.Errorf("codex search: close response body: %v", errClose)
 		}
 	}()
+	helps.ObserveCodexHTTPQuota(ctx, auth, httpResp.Header)
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	data, err := io.ReadAll(io.LimitReader(httpResp.Body, helps.CodexAlphaSearchMaxResponseBytes+1))
 	if errContext := ctx.Err(); errContext != nil {

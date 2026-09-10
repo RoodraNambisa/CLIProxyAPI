@@ -4533,6 +4533,7 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 	ctx = coreusage.WithStreamDefault(ctx, false)
 	ctx = contextWithGenerateMetadata(ctx, opts)
 	ctx = m.WithRoutingPolicySnapshot(ctx)
+	ctx = m.withCodexQuotaObservation(ctx)
 	ctx, upstreamErrors := withUpstreamErrorHistory(ctx)
 	var releaseProducer func()
 	ctx, _, releaseProducer, err = m.beginResultPersistenceProducer(ctx)
@@ -4628,6 +4629,7 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 	ctx = coreusage.WithStreamDefault(ctx, false)
 	ctx = contextWithGenerateMetadata(ctx, opts)
 	ctx = m.WithRoutingPolicySnapshot(ctx)
+	ctx = cliproxyexecutor.WithCodexQuotaObserver(ctx, nil)
 	ctx, upstreamErrors := withUpstreamErrorHistory(ctx)
 	var releaseProducer func()
 	ctx, _, releaseProducer, err = m.beginResultPersistenceProducer(ctx)
@@ -4716,6 +4718,7 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 	ctx = coreusage.WithStreamDefault(ctx, true)
 	ctx = contextWithGenerateMetadata(ctx, opts)
 	ctx = m.WithRoutingPolicySnapshot(ctx)
+	ctx = m.withCodexQuotaObservation(ctx)
 	ctx, upstreamErrors := withUpstreamErrorHistory(ctx)
 	var producer *resultPersistenceProducer
 	var releaseProducer func()

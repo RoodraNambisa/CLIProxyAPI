@@ -1,12 +1,15 @@
 package auth
 
 import (
+	"context"
 	"maps"
 	"net/http"
 	"sort"
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 )
 
 const (
@@ -39,6 +42,16 @@ func (a *Auth) CodexQuotaSnapshot() *CodexQuotaObservation {
 		return nil
 	}
 	return a.codexQuotaObservation.Clone()
+}
+
+func (m *Manager) withCodexQuotaObservation(ctx context.Context) context.Context {
+	var observer cliproxyexecutor.CodexQuotaObserver
+	if policy := m.selectionPolicy(ctx); policy != nil && policy.observeCodexQuota {
+		observer = func(authID, instanceID, source string, headers http.Header) {
+			m.recordCodexQuotaObservation(authID, instanceID, source, headers, time.Now())
+		}
+	}
+	return cliproxyexecutor.WithCodexQuotaObserver(ctx, observer)
 }
 
 // recordCodexQuotaObservation accepts only the currently installed credential
