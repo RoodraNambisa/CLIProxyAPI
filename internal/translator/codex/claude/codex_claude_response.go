@@ -21,6 +21,8 @@ var (
 	dataTag = []byte("data:")
 )
 
+const codexThinkingSummaryPartSeparator = "\n\n"
+
 // ConvertCodexResponseToClaudeParams holds parameters for response conversion.
 type ConvertCodexResponseToClaudeParams struct {
 	TerminalEmitted        bool
@@ -99,7 +101,7 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
 		output = append(output, stopCodexTextBlock(params)...)
 		// One reasoning item owns one signature, even when its summary has several parts.
 		if params.ThinkingBlockOpen {
-			output = appendCodexThinkingDelta(output, params, "\n\n")
+			output = appendCodexThinkingDelta(output, params, codexThinkingSummaryPartSeparator)
 		} else {
 			output = append(output, startCodexThinkingBlock(params)...)
 		}
@@ -254,7 +256,10 @@ func ConvertCodexResponseToClaudeNonStream(_ context.Context, _ string, original
 				signature := item.Get("encrypted_content").String()
 				if summary := item.Get("summary"); summary.Exists() {
 					if summary.IsArray() {
-						summary.ForEach(func(_, part gjson.Result) bool {
+						summary.ForEach(func(index, part gjson.Result) bool {
+							if index.Int() > 0 {
+								thinkingBuilder.WriteString(codexThinkingSummaryPartSeparator)
+							}
 							if txt := part.Get("text"); txt.Exists() {
 								thinkingBuilder.WriteString(txt.String())
 							} else {
