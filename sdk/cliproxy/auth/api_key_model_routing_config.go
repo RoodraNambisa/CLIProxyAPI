@@ -36,6 +36,7 @@ func copyAPIKeyModelRoutingConfig(source *config.Config) *config.Config {
 		entry := config.OpenAICompatibility{Name: provider.Name, Disabled: provider.Disabled, Models: append([]config.OpenAICompatibilityModel(nil), provider.Models...)}
 		for i := range entry.Models {
 			entry.Models[i].Thinking = config.NormalizeModelThinkingSupport(entry.Models[i].Thinking)
+			entry.Models[i].InputModalities = entry.Models[i].GetInputModalities()
 		}
 		next.OpenAICompatibility = append(next.OpenAICompatibility, entry)
 	}

@@ -1293,6 +1293,10 @@ func (m *Manager) SetConfig(cfg *internalconfig.Config) {
 		log.WithError(errThinking).Warn("ignoring invalid model thinking configuration")
 		return
 	}
+	if errModalities := cfg.ValidateModelInputModalities(); errModalities != nil {
+		log.WithError(errModalities).Warn("ignoring invalid model input modalities configuration")
+		return
+	}
 	if errRules := cfg.ValidateRequestScopedErrorRules(); errRules != nil {
 		log.WithError(errRules).Warn("ignoring invalid request-scoped error configuration")
 		return
@@ -1314,6 +1318,10 @@ func (m *Manager) SetConfigAndSelector(cfg *internalconfig.Config, selector Sele
 	}
 	if errThinking := cfg.ValidateModelThinking(); errThinking != nil {
 		log.WithError(errThinking).Warn("ignoring invalid model thinking configuration")
+		return
+	}
+	if errModalities := cfg.ValidateModelInputModalities(); errModalities != nil {
+		log.WithError(errModalities).Warn("ignoring invalid model input modalities configuration")
 		return
 	}
 	if errRules := cfg.ValidateRequestScopedErrorRules(); errRules != nil {

@@ -188,6 +188,9 @@ func (b *Builder) Build() (*Service, error) {
 	if errThinking := b.cfg.ValidateModelThinking(); errThinking != nil {
 		return nil, errThinking
 	}
+	if errModalities := b.cfg.ValidateModelInputModalities(); errModalities != nil {
+		return nil, errModalities
+	}
 
 	tokenProvider := b.tokenProvider
 	if tokenProvider == nil {

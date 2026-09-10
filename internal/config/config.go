@@ -2142,6 +2142,10 @@ type OpenAICompatibilityAPIKey struct {
 // OpenAICompatibilityModel represents a model configuration for OpenAI compatibility,
 // including the actual model name and its alias for API routing.
 type OpenAICompatibilityModel struct {
+	// InputModalities overrides advertised input capabilities. An empty list
+	// inherits the catalog; explicitly selecting only text also flattens tool
+	// results and replaces their image parts with an unsupported-image marker.
+	InputModalities []string `yaml:"input-modalities,omitempty" json:"input-modalities,omitempty"`
 	// MaxContextLength overrides the advertised window; zero inherits the catalog.
 	MaxContextLength int `yaml:"max-context-length,omitempty" json:"max-context-length,omitempty"`
 	// DisplayName is an optional catalog label; blank inherits the model label.
@@ -2167,6 +2171,11 @@ func (m OpenAICompatibilityModel) GetMaxContextLength() int               { retu
 func (m OpenAICompatibilityModel) GetAlias() string                       { return m.Alias }
 func (m OpenAICompatibilityModel) GetForceMapping() bool                  { return m.ForceMapping }
 func (m OpenAICompatibilityModel) GetThinking() *registry.ThinkingSupport { return m.Thinking }
+
+func (m OpenAICompatibilityModel) GetInputModalities() []string {
+	modalities, _ := NormalizeModelInputModalities(m.InputModalities)
+	return modalities
+}
 
 // LoadConfig reads a YAML configuration file from the given path,
 // unmarshals it into a Config struct, applies environment variable overrides,
@@ -2312,6 +2321,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	}
 	if errThinking := cfg.ValidateModelThinking(); errThinking != nil {
 		return nil, errThinking
+	}
+	if errModalities := cfg.ValidateModelInputModalities(); errModalities != nil {
+		return nil, errModalities
 	}
 	// Hash remote management key if plaintext is detected (nested)
 	// We consider a value to be already hashed if it looks like a bcrypt hash ($2a$, $2b$, or $2y$ prefix).
@@ -3964,6 +3976,9 @@ func SaveConfigPreserveComments(configFile string, cfg *Config) error {
 	}
 	if errThinking := cfg.ValidateModelThinking(); errThinking != nil {
 		return errThinking
+	}
+	if errModalities := cfg.ValidateModelInputModalities(); errModalities != nil {
+		return errModalities
 	}
 	if errMedia := cfg.Codex.LiveMediaRelay.Validate(); errMedia != nil {
 		return errMedia

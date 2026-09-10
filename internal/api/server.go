@@ -1398,6 +1398,9 @@ func (s *Server) updateClients(cfg *config.Config, rollbackOnError bool) error {
 	if errThinking := runtimeCfg.ValidateModelThinking(); errThinking != nil {
 		return errThinking
 	}
+	if errModalities := runtimeCfg.ValidateModelInputModalities(); errModalities != nil {
+		return errModalities
+	}
 	// Reconstruct old config from YAML snapshot to avoid reference sharing issues
 	var oldCfg *config.Config
 	if len(s.oldConfigYaml) > 0 {
