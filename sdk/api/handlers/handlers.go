@@ -1553,6 +1553,12 @@ func statusFromError(err error) int {
 			return code
 		}
 	}
+	if errors.Is(err, context.Canceled) {
+		return 499
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return http.StatusGatewayTimeout
+	}
 	return 0
 }
 

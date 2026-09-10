@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -15,6 +16,36 @@ import (
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
 )
+
+func TestExecutionErrorMessagePreservesContextStatusWithoutOverridingHTTP(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		cause  error
+		status int
+	}{
+		{"cancelled", context.Canceled, 499},
+		{"deadline", context.DeadlineExceeded, http.StatusGatewayTimeout},
+		{"explicit authentication", errors.Join(&coreauth.Error{HTTPStatus: http.StatusUnauthorized, Message: "fixture auth failure"}, context.Canceled), http.StatusUnauthorized},
+		{"explicit rate limit", errors.Join(&coreauth.Error{HTTPStatus: http.StatusTooManyRequests, Message: "fixture quota"}, context.DeadlineExceeded), http.StatusTooManyRequests},
+		{"unstructured text", errors.New("business text mentions context canceled"), http.StatusInternalServerError},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, cause := range []error{tc.cause, &wrappedHandlerTestError{cause: tc.cause}} {
+				message := executionErrorMessage(cause, []string{"codex"}, "gpt-5.4-mini")
+				if message.StatusCode != tc.status || !errors.Is(message.Error, tc.cause) {
+					t.Fatal("execution error lost context status, explicit HTTP status or original cause")
+				}
+				recorder := httptest.NewRecorder()
+				c, _ := gin.CreateTestContext(recorder)
+				c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+				NewBaseAPIHandlers(nil, nil).WriteErrorResponse(c, message)
+				if recorder.Code != tc.status {
+					t.Fatalf("public HTTP status = %d, want %d", recorder.Code, tc.status)
+				}
+			}
+		})
+	}
+}
 
 type wrappedHandlerTestError struct {
 	cause error
