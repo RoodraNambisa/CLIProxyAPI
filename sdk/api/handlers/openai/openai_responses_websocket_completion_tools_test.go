@@ -10,7 +10,6 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
-
 	"github.com/tidwall/gjson"
 )
 
@@ -66,6 +65,8 @@ func TestResponsesWebsocketCompletionRejectsAmbiguousToolRepair(t *testing.T) {
 		{"numeric source call ID", placeholder, []string{`{"type":"custom_tool_call","call_id":1,"name":"exec","input":"pwd"}`}},
 		{"unfinished source", placeholder, []string{`{"type":"custom_tool_call","call_id":"call-1","name":"exec","input":"pwd","status":"in_progress"}`}},
 		{"complete final remains authoritative", `{"type":"function_call","call_id":"call-1","name":"exec","arguments":"{}"}`, []string{complete}},
+		{"explicit incomplete final remains authoritative", `{"type":"function_call","call_id":"call-1","name":"exec","status":"incomplete"}`, []string{complete}},
+		{"explicit failed final remains authoritative", `{"type":"custom_tool_call","call_id":"call-1","name":"exec","input":"pwd","status":"failed"}`, []string{complete}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			terminal := []byte(`{"type":"response.completed","response":{"output":[` + tc.terminal + `]}}`)

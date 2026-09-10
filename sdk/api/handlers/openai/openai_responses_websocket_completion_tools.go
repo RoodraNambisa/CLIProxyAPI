@@ -31,6 +31,12 @@ func isCompleteResponsesWebsocketToolCall(item gjson.Result) bool {
 	}
 }
 
+func isResponsesWebsocketToolPlaceholder(item gjson.Result) bool {
+	status := item.Get("status").String()
+	return (status == "" || status == "in_progress" || status == "completed") &&
+		isResponsesToolCallType(item.Get("type").String()) && !isCompleteResponsesWebsocketToolCall(item)
+}
+
 // Reconcile only incomplete placeholders with an unambiguous completed call.
 // Complete terminal items and unrelated extension fields remain authoritative.
 func reconcileResponsesWebsocketCompletionToolCalls(output gjson.Result, indexed map[int64][]byte, fallback [][]byte) ([]byte, bool) {
@@ -46,7 +52,7 @@ func reconcileResponsesWebsocketCompletionToolCalls(output gjson.Result, indexed
 		}
 		if id := item.Get("call_id"); id.Type == gjson.String && id.String() != "" {
 			counts[id.String()]++
-			needsRepair = needsRepair || !isCompleteResponsesWebsocketToolCall(item)
+			needsRepair = needsRepair || isResponsesWebsocketToolPlaceholder(item)
 		}
 	}
 	if !needsRepair {
@@ -76,7 +82,7 @@ func reconcileResponsesWebsocketCompletionToolCalls(output gjson.Result, indexed
 	for _, item := range items {
 		raw := []byte(item.Raw)
 		id := item.Get("call_id")
-		if isResponsesToolCallType(item.Get("type").String()) && !isCompleteResponsesWebsocketToolCall(item) && id.Type == gjson.String && counts[id.String()] == 1 && !ambiguous[id.String()] {
+		if isResponsesWebsocketToolPlaceholder(item) && id.Type == gjson.String && counts[id.String()] == 1 && !ambiguous[id.String()] {
 			if complete, ok := collected[id.String()]; ok {
 				conflict := false
 				for _, field := range []string{"name", "namespace"} {
