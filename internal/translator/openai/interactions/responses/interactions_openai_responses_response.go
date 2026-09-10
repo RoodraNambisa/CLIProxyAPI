@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/signature"
 	translatorcommon "github.com/router-for-me/CLIProxyAPI/v6/internal/translator/common"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -276,7 +277,7 @@ func interactionsStepDeltaToResponses(root gjson.Result, st *interactionsToRespo
 		payload, _ = sjson.SetBytes(payload, "delta", text)
 		return [][]byte{emitResponsesEvent("response.reasoning_summary_text.delta", payload)}
 	case "thought_signature":
-		if signature := delta.Get("signature").String(); signature != "" {
+		if signature := interactionsReasoningEncryptedContent(delta.Get("signature").String()); signature != "" {
 			st.ReasoningEncrypted[index] = signature
 		}
 		return nil
@@ -419,7 +420,7 @@ func interactionsThoughtSignature(step gjson.Result) string {
 		"thoughtSignature",
 		"extra_content.google.thought_signature",
 	} {
-		if signature := step.Get(path).String(); signature != "" {
+		if signature := interactionsReasoningEncryptedContent(step.Get(path).String()); signature != "" {
 			return signature
 		}
 	}
@@ -427,17 +428,28 @@ func interactionsThoughtSignature(step gjson.Result) string {
 	if content.IsArray() {
 		var signature string
 		content.ForEach(func(_, part gjson.Result) bool {
-			signature = firstNonEmpty(
-				part.Get("signature").String(),
-				part.Get("thought_signature").String(),
-				part.Get("thoughtSignature").String(),
-				part.Get("extra_content.google.thought_signature").String(),
-			)
-			return signature == ""
+			for _, path := range []string{"signature", "thought_signature", "thoughtSignature", "extra_content.google.thought_signature"} {
+				if valid := interactionsReasoningEncryptedContent(part.Get(path).String()); valid != "" {
+					signature = valid
+					return false
+				}
+			}
+			return true
 		})
 		return signature
 	}
 	return ""
+}
+
+// Only the Codex transport envelope can populate Responses encrypted_content.
+// This validates shape, not decryptability. Stream state stores validated values
+// so emitting added, done and completed events does not decode them repeatedly.
+func interactionsReasoningEncryptedContent(raw string) string {
+	candidate := strings.TrimSpace(raw)
+	if candidate == "" || !signature.IsValidGPTReasoningSignature(candidate) {
+		return ""
+	}
+	return candidate
 }
 
 func recordResponsesReasoningSummary(st *interactionsToResponsesStreamState, index int, text string) {

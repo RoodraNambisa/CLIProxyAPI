@@ -127,7 +127,7 @@ func TestInteractionsToolStreamSparseIndexAndLegacyText(t *testing.T) {
 func TestInteractionsReasoningStopWithoutStart(t *testing.T) {
 	for _, delta := range []string{
 		`{"type":"thought_summary","text":"summary"}`,
-		`{"type":"thought_signature","signature":"fixture-signature"}`,
+		`{"type":"thought_signature","signature":"` + testResponsesReasoningSignature() + `"}`,
 	} {
 		t.Run(delta, func(t *testing.T) {
 			var state any
@@ -140,7 +140,7 @@ func TestInteractionsReasoningStopWithoutStart(t *testing.T) {
 			if gjson.Get(delta, "type").String() == "thought_summary" && item.Get("summary.0.text").String() != "summary" {
 				t.Fatal("reasoning summary was lost")
 			}
-			if gjson.Get(delta, "type").String() == "thought_signature" && item.Get("encrypted_content").String() != "fixture-signature" {
+			if gjson.Get(delta, "type").String() == "thought_signature" && item.Get("encrypted_content").String() != gjson.Get(delta, "signature").String() {
 				t.Fatal("reasoning signature was lost")
 			}
 		})

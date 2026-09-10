@@ -111,7 +111,7 @@ data: {"index":0,"event_type":"step.stop"}
 
 func TestConvertInteractionsResponseToOpenAIResponsesStreamPreservesThoughtSignature(t *testing.T) {
 	var param any
-	signature := "EtoRtestThoughtSignature"
+	signature := testResponsesReasoningSignature()
 	var out [][]byte
 	for _, raw := range [][]byte{
 		[]byte(`event: step.start
