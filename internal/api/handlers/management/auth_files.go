@@ -677,6 +677,15 @@ func (h *Handler) buildAuthFileEntryAtWithRuntime(auth *coreauth.Auth, now time.
 	if planType := effectiveCodexPlanType(auth); planType != "" {
 		entry["plan_type"] = planType
 	}
+	if strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
+		entry["quota_observation_enabled"] = false
+		if cfg := h.currentConfig(); cfg != nil {
+			entry["quota_observation_enabled"] = cfg.Codex.ObserveQuota
+		}
+		if observation := auth.CodexQuotaSnapshot(); observation != nil {
+			entry["quota_observation"] = observation
+		}
+	}
 	if strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") && !codexAuthUsesAPIKeyCredential(auth) {
 		applyCodexAuthModeSummary(entry, auth.Metadata, now)
 		entry[codex.FingerprintModeMetadataKey] = codex.EffectiveFingerprintMode(auth.Metadata)
