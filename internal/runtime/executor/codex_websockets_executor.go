@@ -2136,36 +2136,36 @@ func (e *CodexWebsocketsExecutor) readUpstreamLoop(sess *codexWebsocketSession, 
 		_ = conn.SetReadDeadline(time.Now().Add(codexResponsesWebsocketIdleTimeout))
 		msgType, payload, errRead := conn.ReadMessage()
 		if errRead != nil {
+			invalidate := func() { e.invalidateUpstreamConn(sess, conn, "upstream_disconnected", errRead) }
+			invalidated := false
 			ch, done := sess.activeForConn(conn)
 			if ch != nil {
-				select {
-				case ch <- codexWebsocketRead{conn: conn, err: errRead}:
-				case <-done:
-				default:
-				}
+				invalidated = helps.SendTerminalWebsocketRead(ch, done, codexWebsocketRead{conn: conn, err: errRead}, invalidate)
 				if sess.clearActiveForConn(ch, conn) {
 					close(ch)
 				}
 			}
-			e.invalidateUpstreamConn(sess, conn, "upstream_disconnected", errRead)
+			if !invalidated {
+				invalidate()
+			}
 			return
 		}
 
 		if msgType != websocket.TextMessage {
 			if msgType == websocket.BinaryMessage {
 				errBinary := fmt.Errorf("codex websockets executor: unexpected binary message")
+				invalidate := func() { e.invalidateUpstreamConn(sess, conn, "unexpected_binary", errBinary) }
+				invalidated := false
 				ch, done := sess.activeForConn(conn)
 				if ch != nil {
-					select {
-					case ch <- codexWebsocketRead{conn: conn, err: errBinary}:
-					case <-done:
-					default:
-					}
+					invalidated = helps.SendTerminalWebsocketRead(ch, done, codexWebsocketRead{conn: conn, err: errBinary}, invalidate)
 					if sess.clearActiveForConn(ch, conn) {
 						close(ch)
 					}
 				}
-				e.invalidateUpstreamConn(sess, conn, "unexpected_binary", errBinary)
+				if !invalidated {
+					invalidate()
+				}
 				return
 			}
 			continue
