@@ -168,8 +168,10 @@ type StreamingConfig struct {
 type ImagesConfig struct {
 	// CodexModel is the outer Responses model used to invoke the Codex image_generation tool.
 	CodexModel string `yaml:"codex-model,omitempty" json:"codex-model,omitempty"`
-	// ImageModel is the image_generation tool model exposed through the OpenAI Images API.
+	// ImageModel is the default when an Images API request omits its model.
 	ImageModel string `yaml:"image-model,omitempty" json:"image-model,omitempty"`
+	// ImageModels lists selectable Codex image tool models in addition to the default.
+	ImageModels []string `yaml:"image-models,omitempty" json:"image-models,omitempty"`
 	// EnableFreePlanImageModel controls whether Codex free-plan auths register the configured image model.
 	EnableFreePlanImageModel bool `yaml:"enable-free-plan-image-model,omitempty" json:"enable-free-plan-image-model,omitempty"`
 	// EnableNAggregation enables multi-call aggregation for Images API n > 1 requests.
@@ -200,6 +202,8 @@ type ImagesConfig struct {
 
 // ChatGPTWebImageConfig controls the ChatGPT Web image compatibility path.
 type ChatGPTWebImageConfig struct {
+	// ImageModels lists public aliases for the shared Web image capability, not upstream engines.
+	ImageModels []string `yaml:"image-models,omitempty" json:"image-models,omitempty"`
 	// UpstreamModel is the ChatGPT Web conversation model that invokes picture_v2.
 	UpstreamModel string `yaml:"upstream-model,omitempty" json:"upstream-model,omitempty"`
 	// RemoteImageURLEnabled allows protected downloads for remote image inputs.

@@ -6063,11 +6063,28 @@ func configuredImagesImageModel(cfg *config.Config) string {
 	return modelID
 }
 
+func configuredImagesImageModels(cfg *config.Config) []string {
+	if cfg == nil {
+		return (config.ImagesConfig{}).ResolvedImageModels()
+	}
+	return cfg.Images.ResolvedImageModels()
+}
+
+func configuredChatGPTWebImageModels(cfg *config.Config) []string {
+	if cfg == nil {
+		return (config.ImagesConfig{}).ResolvedChatGPTWebImageModels()
+	}
+	return cfg.Images.ResolvedChatGPTWebImageModels()
+}
+
 func shouldRefreshCodexRegistrations(previousCfg, nextCfg *config.Config) bool {
 	if codexLiveEnabled(previousCfg) != codexLiveEnabled(nextCfg) {
 		return true
 	}
 	if configuredImagesImageModel(previousCfg) != configuredImagesImageModel(nextCfg) {
+		return true
+	}
+	if strings.Join(configuredImagesImageModels(previousCfg), "\x00") != strings.Join(configuredImagesImageModels(nextCfg), "\x00") {
 		return true
 	}
 	if configuredNativeImageModelsSignature(previousCfg) != configuredNativeImageModelsSignature(nextCfg) {
@@ -6080,7 +6097,7 @@ func shouldRefreshCodexRegistrations(previousCfg, nextCfg *config.Config) bool {
 }
 
 func shouldRefreshChatGPTWebRegistrations(previousCfg, nextCfg *config.Config) bool {
-	return configuredImagesImageModel(previousCfg) != configuredImagesImageModel(nextCfg)
+	return strings.Join(configuredChatGPTWebImageModels(previousCfg), "\x00") != strings.Join(configuredChatGPTWebImageModels(nextCfg), "\x00")
 }
 
 func codexLiveEnabled(cfg *config.Config) bool {
@@ -6114,7 +6131,7 @@ func codexDynamicImageModelInfos(cfg *config.Config) []*ModelInfo {
 }
 
 func configuredCodexImageModels(cfg *config.Config) []string {
-	models := []string{configuredImagesImageModel(cfg)}
+	models := configuredImagesImageModels(cfg)
 	models = append(models, enabledNativeImageEndpointModels(cfg, "generations")...)
 	models = append(models, enabledNativeImageEndpointModels(cfg, "edits")...)
 	return normalizeModelIDs(models)
@@ -6137,7 +6154,7 @@ func enabledNativeImageEndpointModels(cfg *config.Config, endpoint string) []str
 		return nil
 	}
 	if len(endpointCfg.Models) == 0 {
-		return []string{"gpt-image-2", "gpt-image-1.5"}
+		return config.DefaultCodexImageModels()
 	}
 	return endpointCfg.Models
 }

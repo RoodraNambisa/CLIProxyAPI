@@ -157,6 +157,9 @@ const (
 	MaxChatGPTWebImageMemoryFinalizerConcurrency = internalconfig.MaxChatGPTWebImageMemoryFinalizerConcurrency
 )
 
+// DefaultCodexImageModels returns the built-in native image model catalog.
+func DefaultCodexImageModels() []string { return internalconfig.DefaultCodexImageModels() }
+
 func LoadConfig(configFile string) (*Config, error) { return internalconfig.LoadConfig(configFile) }
 
 func LoadConfigOptional(configFile string, optional bool) (*Config, error) {

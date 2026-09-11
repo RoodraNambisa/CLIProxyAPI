@@ -2623,7 +2623,7 @@ func (m *Manager) executeStreamWithModelPool(ctx, resultCtx context.Context, exe
 		}
 		attemptCtx, usageAttempt := cliproxyexecutor.WithRequestUsageAttempt(ctx)
 		attemptCtx = cliproxyexecutor.WithUpstreamAttempt(attemptCtx)
-		streamResult, errStream := executor.ExecuteStream(attemptCtx, auth, execReq, execOpts)
+		streamResult, errStream := executeProviderStream(attemptCtx, executor, auth, execReq, execOpts)
 		streamResult, errStream = validateStreamResult(streamResult, errStream)
 		errStream = recordExecutionAttemptError(attemptCtx, auth, provider, errStream)
 		if errStream != nil {
@@ -5832,7 +5832,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			}
 			roundState.markAttempted(auth)
 			runtimeCtx = cliproxyexecutor.WithUpstreamAttempt(runtimeCtx)
-			resp, errExec := executor.Execute(runtimeCtx, auth, execReq, opts)
+			resp, errExec := executeProviderRequest(runtimeCtx, executor, auth, execReq, opts)
 			retiredDuringExecution := releaseExecution()
 			if !retiredDuringExecution {
 				errExec = recordExecutionAttemptError(runtimeCtx, auth, provider, errExec)
@@ -5895,7 +5895,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 						break
 					}
 					retryCtx = cliproxyexecutor.WithUpstreamAttempt(retryCtx)
-					resp, errExec = executor.Execute(retryCtx, auth, execReq, opts)
+					resp, errExec = executeProviderRequest(retryCtx, executor, auth, execReq, opts)
 					retiredDuringRetry := releaseRetry()
 					if !retiredDuringRetry {
 						errExec = recordExecutionAttemptError(retryCtx, auth, provider, errExec)
@@ -6992,7 +6992,7 @@ func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxy
 			}
 			lastPrepareErr = nil
 			runtimeCtx = cliproxyexecutor.WithUpstreamAttempt(runtimeCtx)
-			resp, errExec := c.executor.Execute(runtimeCtx, c.auth, execReq, creditsOpts)
+			resp, errExec := executeProviderRequest(runtimeCtx, c.executor, c.auth, execReq, creditsOpts)
 			retiredDuringExecution := releaseExecution()
 			if !retiredDuringExecution {
 				errExec = recordExecutionAttemptError(runtimeCtx, c.auth, c.provider, errExec)
@@ -7601,7 +7601,8 @@ func (m *Manager) prepareProviderRequests(
 			preparedProviders = append(preparedProviders, provider)
 			continue
 		}
-		prepared, errPrepare := preparer.PrepareProviderRequest(ctx, req, opts, operation)
+		providerReq, providerOpts := cliproxyexecutor.PrepareImageRequestForProvider(provider, req, opts)
+		prepared, errPrepare := preparer.PrepareProviderRequest(ctx, providerReq, providerOpts, operation)
 		if errPrepare != nil {
 			if cliproxyexecutor.ProviderRequestPreparationScopeOf(errPrepare) != cliproxyexecutor.ProviderRequestPreparationProviderIncompatible {
 				preparedOpts.ExecutionMetrics.RecordPreflightRejected()

@@ -128,12 +128,12 @@ func imageResponsesProviders(req openAIImageRequest, ignoreUnsupportedParams boo
 
 // Models returns the image model exposed by this compatibility layer.
 func (h *OpenAIImagesAPIHandler) Models() []map[string]any {
-	return []map[string]any{{
-		"id":       h.imagesImageModel(),
-		"object":   "model",
-		"created":  0,
-		"owned_by": "openai",
-	}}
+	models := h.configuredImageModels()
+	result := make([]map[string]any, 0, len(models))
+	for _, model := range models {
+		result = append(result, map[string]any{"id": model, "object": "model", "created": 0, "owned_by": "openai"})
+	}
+	return result
 }
 
 type openAIImageRequest struct {
@@ -660,7 +660,7 @@ func (h *OpenAIImagesAPIHandler) handleImagesRequest(c *gin.Context, req openAII
 	h.PinChatGPTWebImageErrorSanitization(c, true)
 	ignoreUnsupportedImageParams := h.chatGPTWebIgnoreUnsupportedImageParams()
 	imageConfig := h.chatGPTWebImageConfigSnapshot()
-	if imageConfig.NormalizeMismatchedImageMIME {
+	if imageConfig.NormalizeMismatchedImageMIME && nativeImageRequest(c) == nil {
 		if err := normalizeChatGPTWebImageRequestMIME(&req); err != nil {
 			h.writeImagesRequestError(c, err)
 			return
@@ -676,7 +676,14 @@ func (h *OpenAIImagesAPIHandler) handleImagesRequest(c *gin.Context, req openAII
 		return
 	}
 	codexModel := h.imagesCodexModel()
-	imageModel := h.imagesImageModel()
+	if nativeImageRequest(c) != nil {
+		codexModel = ""
+	}
+	imageModel := strings.TrimSpace(req.Model)
+	if imageModel == "" {
+		imageModel = h.imagesImageModel()
+	}
+	req.Model = imageModel
 	payload, err := buildCodexImageResponsesPayload(req, op, codexModel, imageModel, h.imagesOverrideInputFidelityEnabled())
 	if err != nil {
 		h.writeImagesError(c, http.StatusBadRequest, err)
@@ -693,7 +700,7 @@ func (h *OpenAIImagesAPIHandler) handleImagesRequest(c *gin.Context, req openAII
 		return
 	}
 	responseFormat := strings.ToLower(strings.TrimSpace(req.ResponseFormat))
-	providers := imageResponsesProviders(req, ignoreUnsupportedImageParams, imageConfig)
+	providers := h.configuredImageProviders(req, op, ignoreUnsupportedImageParams, imageConfig)
 	h.PinChatGPTWebImageErrorSanitization(c, imageProvidersContain(providers, ChatGPTWeb))
 	if req.Stream {
 		h.handleStreamingImagesResponse(c, rawJSON, imageModel, codexModel, op, count, responseFormat, providers, ignoreUnsupportedImageParams, imageConfig)
@@ -731,7 +738,7 @@ func normalizeChatGPTWebImageRequestMIME(req *openAIImageRequest) error {
 	return nil
 }
 
-func (h *OpenAIImagesAPIHandler) handleNativeImagesRequest(c *gin.Context, rawJSON []byte, req openAIImageRequest, op imageOperation) {
+func (h *OpenAIImagesAPIHandler) handleCodexNativeImagesRequest(c *gin.Context, rawJSON []byte, req openAIImageRequest, op imageOperation) {
 	cfg := h.nativeImageEndpointConfig(op)
 	imageModel := strings.TrimSpace(req.Model)
 	if imageModel == "" {
@@ -835,12 +842,19 @@ func (h *OpenAIImagesAPIHandler) handleNonStreamingImagesResponse(c *gin.Context
 		cliCtx = handlers.WithImageGenerationMaxResults(cliCtx, remaining)
 		cliCtx = handlers.WithChatGPTWebIgnoreUnsupportedImageParams(cliCtx, ignoreUnsupportedImageParams)
 		cliCtx = handlers.WithChatGPTWebImageConfigSnapshot(cliCtx, iterationImageConfig)
+		cliCtx = coreexecutor.WithCodexNativeImageRequest(cliCtx, nativeImageRequest(c))
 		stopKeepAlive := h.StartNonStreamingKeepAlive(c, cliCtx)
 		resp, headers, errMsg := h.ExecuteWithProvidersAndExecutionModel(cliCtx, providers, h.HandlerType(), imageModel, codexModel, rawJSON, "")
 		stopKeepAlive()
 		if errMsg != nil {
 			h.WriteErrorResponse(c, errMsg)
 			cliCancel(errMsg.Error)
+			return
+		}
+		if nativeImageRequest(c).NativeResponse() {
+			handlers.WriteUpstreamHeaders(c.Writer.Header(), headers)
+			observeImageResponseWrite(c, func() { _, _ = c.Writer.Write(resp) })
+			cliCancel(resp)
 			return
 		}
 		parsed, err := parseResponsesToImagesResponse(resp, time.Now().Unix())
@@ -876,6 +890,11 @@ func (h *OpenAIImagesAPIHandler) handleNonStreamingImagesResponse(c *gin.Context
 		combined.Data = append(combined.Data, parsed.Data...)
 		combined.Usage = mergeImageUsageForNAggregation(combined.Usage, parsed.Usage)
 		cliCancel(resp)
+		if nativeImageRequest(c) != nil {
+			// Once Web output exists, keep its n-aggregation contract instead of
+			// mixing synthesized results with native passthrough responses.
+			providers = []string{ChatGPTWeb}
+		}
 	}
 	applyImageResponseFormat(&combined, responseFormat)
 	encodeStarted := time.Now()
@@ -905,6 +924,7 @@ func (h *OpenAIImagesAPIHandler) handleStreamingImagesResponse(c *gin.Context, r
 	cliCtx = handlers.WithImageGenerationMaxResults(cliCtx, 1)
 	cliCtx = handlers.WithChatGPTWebIgnoreUnsupportedImageParams(cliCtx, ignoreUnsupportedImageParams)
 	cliCtx = handlers.WithChatGPTWebImageConfigSnapshot(cliCtx, imageConfig)
+	cliCtx = coreexecutor.WithCodexNativeImageRequest(cliCtx, nativeImageRequest(c))
 	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithProvidersAndExecutionModel(cliCtx, providers, h.HandlerType(), imageModel, codexModel, rawJSON, "")
 
 	setSSEHeaders := func() {
@@ -920,6 +940,7 @@ func (h *OpenAIImagesAPIHandler) handleStreamingImagesResponse(c *gin.Context, r
 		responseByteLimit = imageResponseByteLimit(imageConfig)
 	}
 	mapper := &imageStreamMapper{
+		nativeRequest:         nativeImageRequest(c),
 		operation:             op,
 		responseFormat:        responseFormat,
 		maxResults:            1,
@@ -966,7 +987,9 @@ func (h *OpenAIImagesAPIHandler) handleStreamingImagesResponse(c *gin.Context, r
 				handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
 				observeImageResponseWrite(c, func() {
 					_, _ = c.Writer.Write(firstFrame.Bytes())
-					_, _ = c.Writer.Write([]byte("\n"))
+					if !mapper.nativeRequest.NativeResponse() {
+						_, _ = c.Writer.Write([]byte("\n"))
+					}
 					flusher.Flush()
 				})
 				cliCancel(nil)
@@ -1026,11 +1049,13 @@ func (h *OpenAIImagesAPIHandler) handleMultiStreamingImagesResponse(c *gin.Conte
 		cliCtx = handlers.WithImageGenerationMaxResults(cliCtx, 1)
 		cliCtx = handlers.WithChatGPTWebIgnoreUnsupportedImageParams(cliCtx, ignoreUnsupportedImageParams)
 		cliCtx = handlers.WithChatGPTWebImageConfigSnapshot(cliCtx, iterationImageConfig)
+		cliCtx = coreexecutor.WithCodexNativeImageRequest(cliCtx, nativeImageRequest(c))
 		dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithProvidersAndExecutionModel(cliCtx, providers, h.HandlerType(), imageModel, codexModel, rawJSON, "")
 		if i == 0 {
 			handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
 		}
 		mapper := &imageStreamMapper{
+			nativeRequest:         nativeImageRequest(c),
 			operation:             op,
 			omitInputUsage:        i > 0,
 			responseFormat:        responseFormat,
@@ -1072,6 +1097,12 @@ func (h *OpenAIImagesAPIHandler) handleMultiStreamingImagesResponse(c *gin.Conte
 		if streamErr != nil {
 			return
 		}
+		if nativeImageRequest(c).NativeResponse() {
+			return
+		}
+		if nativeImageRequest(c) != nil {
+			providers = []string{ChatGPTWeb}
+		}
 		if responseByteLimit > 0 {
 			remainingResponseBytes -= mapper.completedBinaryBytes
 		}
@@ -1108,7 +1139,7 @@ func (h *OpenAIImagesAPIHandler) forwardImagesStream(c *gin.Context, flusher htt
 		WriteDone: func() {
 			observeImageResponseWrite(c, func() {
 				mapper.flush(c.Writer)
-				if mapper.fatalError() == nil {
+				if mapper.fatalError() == nil && !mapper.nativeRequest.NativeResponse() {
 					_, _ = c.Writer.Write([]byte("\n"))
 				}
 			})
@@ -1279,9 +1310,10 @@ func (h *OpenAIImagesAPIHandler) validateImageRequest(req *openAIImageRequest, o
 	if model == "" {
 		model = imageModel
 	}
-	if model != imageModel {
-		return unsupportedImageErrorf("unsupported image model %q; configured image model is %s", req.Model, imageModel)
+	if !h.imageModelSupported(model, op) {
+		return unsupportedImageErrorf("unsupported image model %q; configured image models are %s", req.Model, strings.Join(h.configuredImageModels(), ", "))
 	}
+	req.Model = model
 	if strings.TrimSpace(req.Prompt) == "" {
 		return errors.New("prompt is required")
 	}
@@ -2084,6 +2116,7 @@ func mergeImageUsageValue(current, next any) any {
 }
 
 type imageStreamMapper struct {
+	nativeRequest         *coreexecutor.CodexNativeImageRequest
 	operation             imageOperation
 	parser                imageSSEParser
 	finals                []imageResult
@@ -2101,6 +2134,11 @@ type imageStreamMapper struct {
 }
 
 func (m *imageStreamMapper) writeChunk(w io.Writer, chunk []byte) {
+	if m != nil && m.nativeRequest.NativeResponse() {
+		_, _ = w.Write(chunk)
+		m.forceFlush = true
+		return
+	}
 	if m == nil || m.completed {
 		return
 	}
@@ -2129,6 +2167,12 @@ func (m *imageStreamMapper) consumeForceFlush() bool {
 }
 
 func (m *imageStreamMapper) flush(w io.Writer) {
+	if m != nil && m.nativeRequest.NativeResponse() {
+		// The native executor already validates terminal frames and reports
+		// incomplete streams through StreamChunk.Err.
+		m.completed = true
+		return
+	}
 	if m == nil || m.completed {
 		return
 	}
@@ -2793,7 +2837,7 @@ func (h *OpenAIImagesAPIHandler) nativeImageEndpointConfig(op imageOperation) sd
 
 func nativeImageEndpointConfigWithDefaults(cfg sdkconfig.NativeImageEndpointConfig, defaultMessage string) sdkconfig.NativeImageEndpointConfig {
 	if len(cfg.Models) == 0 {
-		cfg.Models = []string{"gpt-image-2", "gpt-image-1.5"}
+		cfg.Models = sdkconfig.DefaultCodexImageModels()
 	}
 	if cfg.UnsupportedModelStatusCode < http.StatusBadRequest || cfg.UnsupportedModelStatusCode > 599 {
 		cfg.UnsupportedModelStatusCode = http.StatusBadRequest

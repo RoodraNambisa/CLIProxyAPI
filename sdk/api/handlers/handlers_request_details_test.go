@@ -154,3 +154,17 @@ func TestGetRequestDetails_ConfiguredImageModelReturns503(t *testing.T) {
 		t.Fatalf("unexpected error message: %v", errMsg.Error)
 	}
 }
+
+func TestGetRequestDetails_AllConfiguredImageModelsStayImageOnly(t *testing.T) {
+	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{Images: sdkconfig.ImagesConfig{
+		ImageModels: []string{"custom-tool"},
+		ChatGPTWeb:  sdkconfig.ChatGPTWebImageConfig{ImageModels: []string{"web-only"}},
+		Native:      sdkconfig.NativeImagesConfig{Generations: sdkconfig.NativeImageEndpointConfig{Enabled: true}},
+	}}, coreauth.NewManager(nil, nil, nil))
+	for _, model := range []string{"gpt-image-2.5", "gpt-image-2.5-flare", "gpt-image-2.5-sunburst", "gpt-image-1.5", "custom-tool", "web-only"} {
+		_, _, failure := handler.getRequestDetails(model)
+		if failure == nil || failure.StatusCode != http.StatusServiceUnavailable || !strings.Contains(failure.Error.Error(), "only supported on /v1/images/") {
+			t.Fatalf("%s escaped image-only routing: %v", model, failure)
+		}
+	}
+}

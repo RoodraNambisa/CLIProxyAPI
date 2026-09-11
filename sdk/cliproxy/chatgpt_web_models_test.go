@@ -236,8 +236,8 @@ func TestServiceChatGPTWebModelsUsesLastCatalog(t *testing.T) {
 		Models:             []*registry.ModelInfo{chatGPTWebTextModelInfo("remote-model", "", 0, "")},
 	})
 	models := service.chatGPTWebModelsForAuth(auth)
-	if got := registeredModelIDs(models); len(got) != 2 || got[0] != "remote-model" || got[1] != "gpt-image-2" {
-		t.Fatalf("models = %v, want cached remote model and configured image model", got)
+	if got := registeredModelIDs(models); len(got) != 5 || got[0] != "remote-model" || got[1] != "gpt-image-2" || got[4] != "gpt-image-2.5-sunburst" {
+		t.Fatalf("models = %v, want cached remote model and configured image models", got)
 	}
 	models[0].ID = "mutated"
 	again := service.chatGPTWebModelsForAuth(auth)
@@ -1076,8 +1076,13 @@ func TestServiceSyncChatGPTWebCatalogAcceptsAuthoritativeEmptyCatalog(t *testing
 	service.syncAuthModels(context.Background(), auth.ID)
 
 	models := registry.GetGlobalRegistry().GetModelsForClient(auth.ID)
-	if len(models) != 1 || models[0].ID != "gpt-image-2" {
+	if len(models) != len(configuredChatGPTWebImageModels(service.currentConfig())) {
 		t.Fatalf("registered models = %v", registeredModelIDs(models))
+	}
+	for _, model := range models {
+		if model.Type != registry.OpenAIImageModelType {
+			t.Fatalf("empty upstream catalog retained a text model: %s", model.ID)
+		}
 	}
 }
 

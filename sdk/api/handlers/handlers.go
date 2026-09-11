@@ -699,6 +699,9 @@ func requestExecutionMetadata(ctx context.Context) map[string]any {
 	if snapshot, ok := chatGPTWebImageConfigSnapshot(ctx); ok {
 		meta[coreexecutor.ChatGPTWebImageConfigSnapshotMetadataKey] = snapshot
 	}
+	if request := coreexecutor.CodexNativeImageRequestFromContext(ctx); request != nil {
+		meta[coreexecutor.CodexNativeImageRequestMetadataKey] = request
+	}
 	if ctx != nil {
 		if interactions, ok := ctx.Value(interactionsAPIMetadataContextKey{}).(interactionsAPIMetadata); ok {
 			if interactions.version != "" {
@@ -746,6 +749,9 @@ func (h *BaseAPIHandler) attachRequestBodyRelease(ctx context.Context, rawJSON [
 		}
 	}
 	ctx = coreexecutor.WithRequestBodyReleaseController(ctx, ctrl)
+	if request := coreexecutor.CodexNativeImageRequestFromContext(ctx); request != nil && !ctrl.LogOnly() {
+		ctrl.RegisterReleaseCallback(func([]byte) { request.Release() })
+	}
 	// ChatGPT Web releases the body itself after its upstream session is
 	// committed and its compact billing projection is safe.
 	if cfg.AfterSeconds > 0 && !force {
@@ -1613,7 +1619,7 @@ func (h *BaseAPIHandler) getRequestDetails(modelName string) (providers []string
 	parsed := thinking.ParseSuffix(resolvedModelName)
 	baseModel := strings.TrimSpace(parsed.ModelName)
 
-	if imageModel := h.imagesConfiguredModel(); imageModel != "" && strings.EqualFold(baseModel, imageModel) {
+	if h.isConfiguredImageModel(baseModel) {
 		return nil, "", &interfaces.ErrorMessage{
 			StatusCode: http.StatusServiceUnavailable,
 			Error:      fmt.Errorf("model %s is only supported on /v1/images/generations and /v1/images/edits", baseModel),
@@ -1640,13 +1646,27 @@ func (h *BaseAPIHandler) getRequestDetails(modelName string) (providers []string
 	return providers, resolvedModelName, nil
 }
 
-func (h *BaseAPIHandler) imagesConfiguredModel() string {
+func (h *BaseAPIHandler) isConfiguredImageModel(model string) bool {
+	var cfg config.ImagesConfig
 	if h != nil && h.Cfg != nil {
-		if model := strings.TrimSpace(h.Cfg.Images.ImageModel); model != "" {
-			return model
+		cfg = h.Cfg.Images
+	}
+	models := append(cfg.ResolvedImageModels(), cfg.ResolvedChatGPTWebImageModels()...)
+	for _, endpoint := range []config.NativeImageEndpointConfig{cfg.Native.Generations, cfg.Native.Edits} {
+		if endpoint.Enabled {
+			nativeModels := endpoint.Models
+			if len(nativeModels) == 0 {
+				nativeModels = config.DefaultCodexImageModels()
+			}
+			models = append(models, nativeModels...)
 		}
 	}
-	return "gpt-image-2"
+	for _, candidate := range models {
+		if strings.EqualFold(strings.TrimSpace(candidate), model) {
+			return true
+		}
+	}
+	return false
 }
 
 func cloneBytes(src []byte) []byte {

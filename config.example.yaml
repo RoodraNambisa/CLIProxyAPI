@@ -536,7 +536,8 @@ nonstream-keepalive-interval: 0
 # OpenAI Images API compatibility backed by Codex Responses image_generation tool.
 # images:
 #   codex-model: "gpt-5.4"          # Outer Responses model used to invoke the image tool.
-#   image-model: "gpt-image-2"      # image_generation tool model exposed by /v1/images/*.
+#   image-model: "gpt-image-2"      # Default when the request omits model; retained for older configurations.
+#   image-models: ["gpt-image-2", "gpt-image-2.5", "gpt-image-2.5-flare", "gpt-image-2.5-sunburst"] # Codex tool models; the requested model is forwarded, not rotated.
 #   enable-free-plan-image-model: false # Allow Codex free-plan auths to register/use the image model.
 #   enable-n-aggregation: false     # Split n > 1 into multiple Codex image calls and aggregate results.
 #   unsupported-status-code: 400    # Status code for unsupported image options such as response_format=url.
@@ -549,7 +550,8 @@ nonstream-keepalive-interval: 0
 #   stream-flush-interval-ms: 0      # Image-specific flush interval. 0 falls back to streaming.stream-flush-interval-ms.
 #   stream-flush-min-bytes: 0        # Image-specific byte threshold. 0 falls back to streaming.stream-flush-min-bytes.
 #   chatgpt-web:
-#     upstream-model: "gpt-5-5"      # Web conversation model used to invoke picture_v2.
+#     upstream-model: "auto"       # Web conversation router used with picture_v2; explicit saved values are preserved.
+#     image-models: ["gpt-image-2", "gpt-image-2.5", "gpt-image-2.5-flare", "gpt-image-2.5-sunburst"] # Independent public aliases, not upstream image engine selectors. All share quota.
 #     remote-image-url-enabled: false # Fetch public HTTP(S) image_url inputs with SSRF and 50 MiB safeguards.
 #     remote-image-url-download-mode: direct # direct or credential-proxy; missing credential proxy falls back to direct.
 #     ignore-unsupported-params: false # Drop unsupported size/quality/etc. instead of excluding Web routing.
@@ -576,14 +578,14 @@ nonstream-keepalive-interval: 0
 #     memory-finalizer-concurrency: 1   # Disk-spooled heavy finalizers (recommended: 1-64), also bounded by staging and memory.
 #   native:
 #     generations:
-#       enabled: false
-#       models: ["gpt-image-2", "gpt-image-1.5"]
+#       enabled: false             # Codex only; compatible Web credentials remain eligible.
+#       models: ["gpt-image-2", "gpt-image-1.5", "gpt-image-2.5", "gpt-image-2.5-flare", "gpt-image-2.5-sunburst"]
 #       param-rules: []              # Native-only rules. "n" deletes, "n=1" overrides, JSON values keep JSON types.
 #       unsupported-model-status-code: 400
 #       unsupported-model-message: "Native image generation is not enabled for model {model}"
 #     edits:
-#       enabled: false
-#       models: ["gpt-image-2", "gpt-image-1.5"]
+#       enabled: false             # Codex only; compatible Web credentials remain eligible.
+#       models: ["gpt-image-2", "gpt-image-1.5", "gpt-image-2.5", "gpt-image-2.5-flare", "gpt-image-2.5-sunburst"]
 #       param-rules: []
 #       unsupported-model-status-code: 400
 #       unsupported-model-message: "Native image edit is not enabled for model {model}"

@@ -415,6 +415,12 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	if oldCfg.Images.ChatGPTWeb.ResolvedUpstreamModel() != newCfg.Images.ChatGPTWeb.ResolvedUpstreamModel() {
 		changes = append(changes, fmt.Sprintf("images.chatgpt-web.upstream-model: %s -> %s", oldCfg.Images.ChatGPTWeb.ResolvedUpstreamModel(), newCfg.Images.ChatGPTWeb.ResolvedUpstreamModel()))
 	}
+	if strings.Join(oldCfg.Images.ResolvedImageModels(), "\x00") != strings.Join(newCfg.Images.ResolvedImageModels(), "\x00") {
+		changes = append(changes, fmt.Sprintf("images.image-models: %v -> %v", oldCfg.Images.ResolvedImageModels(), newCfg.Images.ResolvedImageModels()))
+	}
+	if strings.Join(oldCfg.Images.ResolvedChatGPTWebImageModels(), "\x00") != strings.Join(newCfg.Images.ResolvedChatGPTWebImageModels(), "\x00") {
+		changes = append(changes, fmt.Sprintf("images.chatgpt-web.image-models: %v -> %v", oldCfg.Images.ResolvedChatGPTWebImageModels(), newCfg.Images.ResolvedChatGPTWebImageModels()))
+	}
 	if oldCfg.Images.ChatGPTWeb.IgnoreUnsupportedParams != newCfg.Images.ChatGPTWeb.IgnoreUnsupportedParams {
 		changes = append(changes, fmt.Sprintf("images.chatgpt-web.ignore-unsupported-params: %t -> %t", oldCfg.Images.ChatGPTWeb.IgnoreUnsupportedParams, newCfg.Images.ChatGPTWeb.IgnoreUnsupportedParams))
 	}

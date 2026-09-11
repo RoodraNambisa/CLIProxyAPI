@@ -58,7 +58,7 @@ const (
 	MaxChatGPTWebUsageCacheMegabytes           = (1<<63 - 1) >> 20
 	DefaultChatGPTWebAutoOutputQuality         = "medium"
 	DefaultChatGPTWebFallbackOutputImageTokens = 2000
-	DefaultChatGPTWebImageUpstreamModel        = "gpt-5-5"
+	DefaultChatGPTWebImageUpstreamModel        = "auto"
 	DefaultChatGPTWebAutoReloginMaxRetries     = 3
 	DefaultChatGPTWebAutoReloginJitterPercent  = 20
 	DefaultChatGPTWebAutoReloginWorkers        = 4
@@ -2369,6 +2369,8 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	if cfg.Images.ImageModel == "" {
 		cfg.Images.ImageModel = "gpt-image-2"
 	}
+	cfg.Images.ImageModels = normalizeImageModelIDs(cfg.Images.ImageModels)
+	cfg.Images.ChatGPTWeb.ImageModels = normalizeImageModelIDs(cfg.Images.ChatGPTWeb.ImageModels)
 	cfg.Images.ChatGPTWeb.UpstreamModel = cfg.Images.ChatGPTWeb.ResolvedUpstreamModel()
 	if err = cfg.Images.ChatGPTWeb.Validate(); err != nil {
 		return nil, err
@@ -2634,7 +2636,7 @@ func validateChatGPTWebSentinelYAML(data []byte) error {
 }
 
 func defaultNativeImageModels() []string {
-	return []string{"gpt-image-2", "gpt-image-1.5"}
+	return DefaultCodexImageModels()
 }
 
 func normalizeNativeImageEndpointConfig(endpoint *NativeImageEndpointConfig, defaultMessage string) {

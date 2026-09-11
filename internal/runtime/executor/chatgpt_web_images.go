@@ -861,7 +861,7 @@ func (e *ChatGPTWebExecutor) beginChatGPTWebImage(ctx context.Context, client *c
 		}
 		uploads = append(uploads, uploaded)
 		prepared.usageProjection.AddImage(helps.ChatGPTWebUsageImage{
-			Model: imageRequest.Model, Detail: "high", Use: "image_generation_input",
+			Model: chatgptwebauth.ImageModel, Detail: "high", Use: "image_generation_input",
 			Width: uploaded.Width, Height: uploaded.Height,
 		})
 		inputIDs[uploaded.FileID] = struct{}{}
@@ -1069,11 +1069,13 @@ func (e *ChatGPTWebExecutor) finishChatGPTWebImage(ctx context.Context, client *
 	}
 	encodeStarted := time.Now()
 	setChatGPTWebImageTaskStage(ctx, "encoding")
+	// Public Web aliases do not select an image engine. Retain the existing
+	// usage estimate while reporting the requested alias separately.
 	outputImages, err := prepareChatGPTWebImageOutputsWithContextAndCompression(
 		ctx,
 		imageRequest.OutputFormat,
 		outputCompression,
-		imageRequest.Model,
+		chatgptwebauth.ImageModel,
 		imageRequest.Quality,
 		images,
 		prepared.imageSizeMatch,

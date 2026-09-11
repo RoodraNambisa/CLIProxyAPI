@@ -4,6 +4,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 )
@@ -361,7 +362,7 @@ func TestLoadConfigOptionalDefaultsNativeImagesDisabled(t *testing.T) {
 	if cfg.Images.Native.Edits.Enabled {
 		t.Fatal("Native.Edits.Enabled = true, want false")
 	}
-	if got := cfg.Images.Native.Generations.Models; len(got) != 2 || got[0] != "gpt-image-2" || got[1] != "gpt-image-1.5" {
+	if got := cfg.Images.Native.Generations.Models; !slices.Equal(got, DefaultCodexImageModels()) {
 		t.Fatalf("native generation models = %#v", got)
 	}
 	if cfg.Images.Native.Generations.UnsupportedModelStatusCode != 400 {
@@ -417,7 +418,7 @@ func TestLoadConfigOptionalNativeImagesSettings(t *testing.T) {
 	if !edit.Enabled {
 		t.Fatal("edit native enabled = false, want true")
 	}
-	if got := edit.Models; len(got) != 2 || got[0] != "gpt-image-2" || got[1] != "gpt-image-1.5" {
+	if got := edit.Models; !slices.Equal(got, DefaultCodexImageModels()) {
 		t.Fatalf("edit default models = %#v", got)
 	}
 	if edit.UnsupportedModelStatusCode != 400 {

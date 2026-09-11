@@ -46,12 +46,12 @@ type chatGPTWebModelFetcher interface {
 	FetchModels(context.Context, *coreauth.Auth) ([]chatgptwebauth.CatalogModel, error)
 }
 
-func chatGPTWebBuiltinModels(imageModel string) []*registry.ModelInfo {
+func chatGPTWebBuiltinModels(imageModels ...string) []*registry.ModelInfo {
 	models := make([]*registry.ModelInfo, 0, len(chatGPTWebFallbackModelIDs)+1)
 	for _, modelID := range chatGPTWebFallbackModelIDs {
 		models = append(models, chatGPTWebTextModelInfo(modelID, modelID, 0, "openai"))
 	}
-	return chatGPTWebModelsWithImageModel(models, imageModel)
+	return chatGPTWebModelsWithImageModel(models, imageModels...)
 }
 
 func chatGPTWebTextModelInfo(modelID, displayName string, created int64, ownedBy string) *registry.ModelInfo {
@@ -103,14 +103,18 @@ func chatGPTWebImageModelInfo(modelID string) *registry.ModelInfo {
 	}
 }
 
-func chatGPTWebCatalogModelInfos(models []chatgptwebauth.CatalogModel, imageModel string) []*registry.ModelInfo {
+func chatGPTWebCatalogModelInfos(models []chatgptwebauth.CatalogModel, imageModels ...string) []*registry.ModelInfo {
 	output := make([]*registry.ModelInfo, 0, len(models)+1)
 	seen := make(map[string]struct{}, len(models))
-	imageModelKey := strings.ToLower(strings.TrimSpace(imageModel))
+	imageModelKeys := make(map[string]bool, len(imageModels)+1)
+	imageModelKeys[strings.ToLower(chatgptwebauth.ImageModel)] = true
+	for _, imageModel := range imageModels {
+		imageModelKeys[strings.ToLower(strings.TrimSpace(imageModel))] = true
+	}
 	for _, model := range models {
 		modelID := strings.TrimSpace(model.Slug)
 		key := strings.ToLower(modelID)
-		if key == "" || key == strings.ToLower(chatgptwebauth.ImageModel) || key == imageModelKey {
+		if key == "" || imageModelKeys[key] {
 			continue
 		}
 		if _, exists := seen[key]; exists {
@@ -121,10 +125,10 @@ func chatGPTWebCatalogModelInfos(models []chatgptwebauth.CatalogModel, imageMode
 			output = append(output, info)
 		}
 	}
-	return chatGPTWebModelsWithImageModel(output, imageModel)
+	return chatGPTWebModelsWithImageModel(output, imageModels...)
 }
 
-func chatGPTWebModelsWithImageModel(models []*registry.ModelInfo, imageModel string) []*registry.ModelInfo {
+func chatGPTWebModelsWithImageModel(models []*registry.ModelInfo, imageModels ...string) []*registry.ModelInfo {
 	filtered := make([]*registry.ModelInfo, 0, len(models)+1)
 	for _, model := range models {
 		if model == nil || model.Type == registry.OpenAIImageModelType {
@@ -132,7 +136,14 @@ func chatGPTWebModelsWithImageModel(models []*registry.ModelInfo, imageModel str
 		}
 		filtered = append(filtered, model)
 	}
-	return upsertModelInfo(filtered, chatGPTWebImageModelInfo(imageModel))
+	imageModels = normalizeModelIDs(imageModels)
+	if len(imageModels) == 0 {
+		imageModels = []string{chatgptwebauth.ImageModel}
+	}
+	for _, imageModel := range imageModels {
+		filtered = upsertModelInfo(filtered, chatGPTWebImageModelInfo(imageModel))
+	}
+	return filtered
 }
 
 func (s *Service) chatGPTWebModelsForAuth(auth *coreauth.Auth) []*registry.ModelInfo {
@@ -154,13 +165,13 @@ func (s *Service) chatGPTWebModelsForAuth(auth *coreauth.Auth) []*registry.Model
 			}
 			return chatGPTWebModelsWithImageModel(
 				cloneChatGPTWebModelInfos(entry.Models),
-				configuredImagesImageModel(s.currentConfig()),
+				configuredChatGPTWebImageModels(s.currentConfig())...,
 			)
 		} else if okEntry && entry != nil {
 			s.chatGPTWebModelCatalog.CompareAndDelete(auth.ID, entry)
 		}
 	}
-	return chatGPTWebBuiltinModels(configuredImagesImageModel(s.currentConfig()))
+	return chatGPTWebBuiltinModels(configuredChatGPTWebImageModels(s.currentConfig())...)
 }
 
 func chatGPTWebCatalogCredentialIdentity(auth *coreauth.Auth) string {
@@ -276,7 +287,7 @@ func (s *Service) fetchChatGPTWebModelCatalog(ctx context.Context, auth *coreaut
 		log.Warnf("chatgpt web model catalog refresh failed for %s: %v", auth.ID, err)
 		return nil, false
 	}
-	return chatGPTWebCatalogModelInfos(models, configuredImagesImageModel(s.currentConfig())), true
+	return chatGPTWebCatalogModelInfos(models, configuredChatGPTWebImageModels(s.currentConfig())...), true
 }
 
 func (s *Service) currentAuthForChatGPTWebCatalog(source *coreauth.Auth) (*coreauth.Auth, bool) {
