@@ -60,10 +60,8 @@ func TestCodexPromptCachePassthroughIdentityMatrix(t *testing.T) {
 							if gjson.Get(metadata, "prompt_cache_key").Str != key {
 								t.Fatal("metadata cache mirror changed")
 							}
-							if mode == "session" || mode == "full" {
-								if gjson.GetBytes(upstream, "client_metadata.session_id").Str == "body-session" {
-									t.Fatal("cache protection disabled session convergence")
-								}
+							if gjson.GetBytes(upstream, "client_metadata.session_id").Str != "body-session" || httpReq.Header.Get("Session-Id") != "body-session" || httpReq.Header.Get("Session_id") != "body-session" {
+								t.Fatal("final passthrough did not preserve the explicit session above identity projection")
 							}
 							if confuse && gjson.Get(metadata, "turn_id").Str == key {
 								t.Fatal("cache protection disabled turn remapping")
@@ -90,8 +88,10 @@ func TestCodexPromptCachePassthroughWireEntrypoints(t *testing.T) {
 			}
 			t.Run(fmt.Sprintf("%s/stream=%t", endpoint, stream), func(t *testing.T) {
 				captured := make(chan []byte, 1)
+				capturedHeaders := make(chan http.Header, 1)
 				completed := []byte(`{"type":"response.completed","response":{"id":"resp_test","object":"response","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`)
 				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					capturedHeaders <- r.Header.Clone()
 					if endpoint == "websocket" {
 						upgrader := websocket.Upgrader{}
 						conn, err := upgrader.Upgrade(w, r, nil)
@@ -133,7 +133,7 @@ func TestCodexPromptCachePassthroughWireEntrypoints(t *testing.T) {
 				executor := NewCodexExecutor(cfg)
 				auth := &cliproxyauth.Auth{ID: "wire-test", Provider: "codex", Attributes: map[string]string{"api_key": "test-key", "base_url": server.URL}}
 				req := cliproxyexecutor.Request{Model: "gpt-5.4", Payload: []byte(`{"model":"gpt-5.4","input":"hello","messages":[{"role":"user","content":"hello"}],"prompt":"draw","prompt_cache_key":" User Cache Key "}`)}
-				opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai-response"), Stream: stream}
+				opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai-response"), Stream: stream, Headers: http.Header{"Session_id": {"wire-client-session"}}}
 				switch endpoint {
 				case "compact":
 					opts.Alt = "responses/compact"
@@ -177,6 +177,10 @@ func TestCodexPromptCachePassthroughWireEntrypoints(t *testing.T) {
 				case body := <-captured:
 					if gjson.GetBytes(body, "prompt_cache_key").Str != key {
 						t.Fatal("explicit key did not reach the wire")
+					}
+					headers := <-capturedHeaders
+					if headers.Get("Session-Id") != "wire-client-session" || headers.Get("Session_id") != "wire-client-session" {
+						t.Fatal("explicit session did not reach the wire alongside the cache key")
 					}
 				default:
 					t.Fatal("no upstream request captured")

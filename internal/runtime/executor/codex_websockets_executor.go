@@ -354,6 +354,12 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		return resp, err
 	}
 	applyCodexSessionIdentityHeaders(wsHeaders, sessionIdentity, true)
+	upstreamBody, err = preparedIdentity.PromptCacheKey.ApplyFinal(upstreamBody, wsHeaders)
+	if err != nil {
+		invalid := codexStreamStatusErr(http.StatusInternalServerError, err.Error(), "invalid_prompt_cache_key", "invalid_request_error", nil)
+		invalid.skipAuthResult = true
+		return resp, invalid
+	}
 	ensureCodexTurnStateHeader(wsHeaders, opts.Headers)
 	guardCodexTurnStateHeader(e.cfg, auth, wsHeaders)
 	releasedOriginalPayload := slimCodexOriginalPayloadForTranslation(from, originalPayload)
@@ -718,6 +724,12 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		return nil, err
 	}
 	applyCodexSessionIdentityHeaders(wsHeaders, sessionIdentity, true)
+	upstreamBody, err = preparedIdentity.PromptCacheKey.ApplyFinal(upstreamBody, wsHeaders)
+	if err != nil {
+		invalid := codexStreamStatusErr(http.StatusInternalServerError, err.Error(), "invalid_prompt_cache_key", "invalid_request_error", nil)
+		invalid.skipAuthResult = true
+		return nil, invalid
+	}
 	ensureCodexTurnStateHeader(wsHeaders, opts.Headers)
 	guardCodexTurnStateHeader(e.cfg, auth, wsHeaders)
 	releasedOriginalPayload := slimCodexOriginalPayloadForTranslation(from, userPayload)

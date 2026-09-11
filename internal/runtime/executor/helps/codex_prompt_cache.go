@@ -2,16 +2,19 @@ package helps
 
 import (
 	"bytes"
+	"net/http"
 	"strings"
 
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
 
-// CodexPromptCacheKeySnapshot owns only the explicit client key, never the request buffer.
-// An empty Key leaves all legacy cache generation and identity behavior unchanged.
+// CodexPromptCacheKeySnapshot owns client routing identifiers, never request buffers.
+// Empty identifiers leave their corresponding legacy behavior unchanged.
 type CodexPromptCacheKeySnapshot struct {
-	Key string
+	Key       string
+	SessionID string
 }
 
 // CodexResponseIdentityRole keeps equal strings in session and turn roles independent.
@@ -20,17 +23,38 @@ type CodexResponseIdentityRole uint8
 const (
 	CodexResponseSessionIdentity CodexResponseIdentityRole = iota
 	CodexResponseTurnIdentity
+	CodexResponseThreadAndWindowIdentity
 )
 
 // SnapshotCodexPromptCacheKey captures the policy before translation, retries, or body release.
-func SnapshotCodexPromptCacheKey(payload []byte, enabled bool) CodexPromptCacheKeySnapshot {
-	if enabled {
-		key := gjson.GetBytes(payload, "prompt_cache_key")
-		if key.Type == gjson.String && strings.TrimSpace(key.Str) != "" {
-			return CodexPromptCacheKeySnapshot{Key: strings.Clone(key.Str)}
+func SnapshotCodexPromptCacheKey(payload []byte, enabled bool, headers ...http.Header) CodexPromptCacheKeySnapshot {
+	if !enabled {
+		return CodexPromptCacheKeySnapshot{}
+	}
+	snapshot := CodexPromptCacheKeySnapshot{Key: explicitCodexRoutingString(gjson.GetBytes(payload, "prompt_cache_key"))}
+	if util.JSONMayContainAnyField(payload, "client_metadata", "session_id") {
+		metadata := gjson.GetBytes(payload, "client_metadata")
+		turn := codexRoutingTurnObject(metadata.Get("x-codex-turn-metadata"))
+		snapshot.SessionID = firstExplicitCodexRoutingString(turn.Get("session_id"), metadata.Get("session_id"), gjson.GetBytes(payload, "session_id"))
+	}
+	for _, source := range headers {
+		if snapshot.SessionID != "" {
+			break
+		}
+		for _, name := range []string{"Session-Id", "session_id"} {
+			if value := codexRoutingHeader(source, name); strings.TrimSpace(value) != "" {
+				snapshot.SessionID = strings.Clone(value)
+				break
+			}
+		}
+		if snapshot.SessionID == "" {
+			snapshot.SessionID = explicitCodexRoutingString(gjson.Get(codexRoutingHeader(source, "X-Codex-Turn-Metadata"), "session_id"))
 		}
 	}
-	return CodexPromptCacheKeySnapshot{}
+	if snapshot.SessionID == "" {
+		snapshot.SessionID = snapshot.Key
+	}
+	return snapshot
 }
 
 // Apply pins the cache role without assigning the key to any session identity field.
@@ -102,6 +126,9 @@ func replaceCodexJSONIdentityFields(payload []byte, from, to string, role CodexR
 	if role == CodexResponseTurnIdentity {
 		fields = []string{"turn_id", "client_metadata.turn_id"}
 		turnFields = []string{"turn_id"}
+	} else if role == CodexResponseThreadAndWindowIdentity {
+		fields = []string{"thread_id", "window_id", "client_metadata.thread_id", "client_metadata.x-codex-window-id"}
+		turnFields = []string{"thread_id", "window_id"}
 	}
 	for _, prefix := range []string{"", "response."} {
 		for _, field := range fields {

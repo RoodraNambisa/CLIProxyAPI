@@ -430,7 +430,7 @@ func (e *CodexExecutor) PrepareProviderRequest(ctx context.Context, req cliproxy
 		MultiAgentV2:                  helps.SnapshotCodexMultiAgentPolicy(ctx, opts.Headers, e.cfg != nil && e.cfg.Codex.OptimizeMultiAgentV2),
 		StreamBootstrapBuffering:      e.cfg != nil && e.cfg.Codex.StreamBootstrapBuffering,
 		PromptCacheLog:                helps.SnapshotCodexPromptCacheLog(ctx, payload),
-		PromptCacheKey:                helps.SnapshotCodexPromptCacheKey(payload, e.cfg != nil && e.cfg.Codex.PassthroughPromptCacheKey),
+		PromptCacheKey:                helps.SnapshotCodexPromptCacheKey(payload, e.cfg != nil && e.cfg.Codex.PassthroughPromptCacheKey, opts.Headers, incomingHeaders),
 		ResponsesLite:                 helps.SnapshotCodexResponsesLite(payload, liteHeaders, cliproxyexecutor.DownstreamWebsocket(ctx)),
 		OrphanDelegationCompatibility: helps.CodexOrphanDelegationEnabled(ctx, opts.Headers, e.cfg != nil && e.cfg.Codex.OrphanDelegationCompatibility),
 		Enabled:                       codexSpoofSessionIdentityEnabled(e.cfg),
@@ -440,6 +440,11 @@ func (e *CodexExecutor) PrepareProviderRequest(ctx context.Context, req cliproxy
 		AffinityDigest:                affinityDigest,
 		TenantDigest:                  tenantDigest,
 		ClientThreadID:                clientThreadID,
+	}
+	if errValidate := prepared.PromptCacheKey.Validate(); errValidate != nil {
+		invalid := codexStreamStatusErr(http.StatusInternalServerError, errValidate.Error(), "invalid_prompt_cache_key", "invalid_request_error", nil)
+		invalid.skipAuthResult = true
+		return nil, cliproxyexecutor.NewGlobalProviderRequestPreparationError(invalid)
 	}
 	if opts.SourceFormat != sdktranslator.FormatCodex && opts.SourceFormat != sdktranslator.FormatOpenAIResponse {
 		prepared.MultiAgentV2 = helps.CodexMultiAgentPolicy{}
@@ -1934,6 +1939,7 @@ func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*
 
 type codexIdentityConfuseState struct {
 	protectedPromptCacheKey string
+	protectedSessionID      string
 	enabled                 bool
 	authID                  string
 	originalPromptCacheKey  string
@@ -1964,7 +1970,8 @@ func (e *CodexExecutor) applyCodexHTTPSessionIdentity(
 	rawJSON []byte,
 	identityConfuse *codexIdentityConfuseState,
 ) ([]byte, error) {
-	e.codexPreparedSessionIdentity(ctx, req, opts).ResponsesLite.ApplyHeaders(httpReq.Header)
+	prepared := e.codexPreparedSessionIdentity(ctx, req, opts)
+	prepared.ResponsesLite.ApplyHeaders(httpReq.Header)
 	applyCodexSoftwareIdentity(httpReq.Header, auth, e.cfg, req.Model)
 	projected, state, err := e.projectCodexSessionIdentity(ctx, auth, req, opts, rawJSON, identityConfuse)
 	if err != nil {
@@ -1972,15 +1979,20 @@ func (e *CodexExecutor) applyCodexHTTPSessionIdentity(
 		return nil, err
 	}
 	ensureCodexTurnStateHeader(httpReq.Header, opts.Headers)
-	if !state.enabled {
-		guardCodexTurnStateHeader(e.cfg, auth, httpReq.Header)
-		return rawJSON, nil
-	}
-	closeCodexRequestBody(httpReq)
-	bodyReader := cliproxyexecutor.NewReleasableReadCloser(projected, nil)
-	httpReq.Body = bodyReader
-	httpReq.ContentLength = int64(bodyReader.Len())
 	applyCodexSessionIdentityHeaders(httpReq.Header, state, false)
+	projected, err = prepared.PromptCacheKey.ApplyFinal(projected, httpReq.Header)
+	if err != nil {
+		closeCodexRequestBody(httpReq)
+		invalid := codexStreamStatusErr(http.StatusInternalServerError, err.Error(), "invalid_prompt_cache_key", "invalid_request_error", nil)
+		invalid.skipAuthResult = true
+		return nil, invalid
+	}
+	if state.enabled || !bytes.Equal(projected, rawJSON) {
+		closeCodexRequestBody(httpReq)
+		bodyReader := cliproxyexecutor.NewReleasableReadCloser(projected, nil)
+		httpReq.Body = bodyReader
+		httpReq.ContentLength = int64(bodyReader.Len())
+	}
 	guardCodexTurnStateHeader(e.cfg, auth, httpReq.Header)
 	return projected, nil
 }
@@ -2307,6 +2319,7 @@ func applyCodexIdentityConfuseBody(cfg *config.Config, auth *cliproxyauth.Auth, 
 
 func applyCodexPreparedIdentityConfuseBody(cfg *config.Config, auth *cliproxyauth.Auth, userPayload, rawJSON []byte, prepared codexPreparedSessionIdentity) ([]byte, codexIdentityConfuseState) {
 	rawJSON, state := applyCodexIdentityConfuseBodyWithCacheKey(cfg, auth, userPayload, rawJSON, prepared.PromptCacheKey.Key, prepared.TurnID)
+	state.protectedSessionID = prepared.PromptCacheKey.SessionID
 	return prepared.PromptCacheKey.Apply(rawJSON), state
 }
 
@@ -2377,8 +2390,12 @@ func applyCodexTurnMetadataIdentityConfuse(rawTurnMetadata string, state *codexI
 }
 
 func applyCodexIdentityConfuseResponsePayload(payload []byte, state codexIdentityConfuseState) []byte {
-	if state.protectedPromptCacheKey != "" {
-		payload = helps.ReplaceCodexResponseIdentityFields(payload, state.originalPromptCacheKey, state.promptCacheKey, helps.CodexResponseSessionIdentity)
+	if state.protectedPromptCacheKey != "" || state.protectedSessionID != "" {
+		role := helps.CodexResponseSessionIdentity
+		if state.protectedSessionID != "" {
+			role = helps.CodexResponseThreadAndWindowIdentity
+		}
+		payload = helps.ReplaceCodexResponseIdentityFields(payload, state.originalPromptCacheKey, state.promptCacheKey, role)
 		for _, turnID := range state.turnIDs {
 			payload = helps.ReplaceCodexResponseIdentityFields(payload, turnID.original, turnID.confused, helps.CodexResponseTurnIdentity)
 		}
@@ -2392,8 +2409,12 @@ func applyCodexIdentityConfuseResponsePayload(payload []byte, state codexIdentit
 }
 
 func applyCodexIdentityExposeResponsePayload(payload []byte, state codexIdentityConfuseState) []byte {
-	if state.protectedPromptCacheKey != "" {
-		payload = helps.ReplaceCodexResponseIdentityFields(payload, state.promptCacheKey, state.originalPromptCacheKey, helps.CodexResponseSessionIdentity)
+	if state.protectedPromptCacheKey != "" || state.protectedSessionID != "" {
+		role := helps.CodexResponseSessionIdentity
+		if state.protectedSessionID != "" {
+			role = helps.CodexResponseThreadAndWindowIdentity
+		}
+		payload = helps.ReplaceCodexResponseIdentityFields(payload, state.promptCacheKey, state.originalPromptCacheKey, role)
 		for _, turnID := range state.turnIDs {
 			payload = helps.ReplaceCodexResponseIdentityFields(payload, turnID.confused, turnID.original, helps.CodexResponseTurnIdentity)
 		}
