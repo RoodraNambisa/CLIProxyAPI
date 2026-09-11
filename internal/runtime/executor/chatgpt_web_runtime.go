@@ -23,6 +23,7 @@ import (
 	chatgptwebauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/chatgptweb"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/sentinelcompat"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
@@ -72,6 +73,7 @@ func (body *chatGPTWebChallengeInspectingBody) challengeError() error {
 }
 
 type chatGPTWebPreparedRequest struct {
+	sentinelPolicy         *sentinelcompat.Policy
 	baseModel              string
 	routeModel             string
 	responseFormat         sdktranslator.Format
@@ -698,6 +700,12 @@ func (e *ChatGPTWebExecutor) prepareRuntimeRequestTemplate(_ context.Context, re
 		return nil, err
 	}
 	cfg := e.configSnapshot()
+	sentinelPolicy := chatGPTWebSentinelPolicy(cfg)
+	if opaque, ok := cliproxyexecutor.ProviderPreparedRequest(opts, e.Identifier()); ok {
+		if previous, ok := opaque.(*chatGPTWebPreparedRequest); ok {
+			sentinelPolicy = previous.sentinelPolicy
+		}
+	}
 	resolvedImageConfig := config.ChatGPTWebImageConfig{}.Resolved()
 	if cfg != nil {
 		resolvedImageConfig = cfg.Images.ChatGPTWeb.Resolved()
@@ -854,6 +862,7 @@ func (e *ChatGPTWebExecutor) prepareRuntimeRequestTemplate(_ context.Context, re
 	originalPayload := helps.SlimRequestBodyForTranslation(originalSource)
 	canonicalBody = helps.SlimRequestBodyForTranslation(canonicalBody)
 	return &chatGPTWebPreparedRequest{
+		sentinelPolicy:  sentinelPolicy,
 		baseModel:       baseModel,
 		routeModel:      routeModel,
 		responseFormat:  responseFormat,
@@ -1414,7 +1423,7 @@ func (e *ChatGPTWebExecutor) executeChatGPTWebText(ctx context.Context, client *
 }
 
 func (e *ChatGPTWebExecutor) openChatGPTWebConversation(ctx context.Context, client *chatgptwebauth.Client, credential *chatgptwebauth.Credential, prepared *chatGPTWebPreparedRequest) (*fhttp.Response, *helps.ChatGPTWebConversationAccumulator, error) {
-	requirements, err := e.chatGPTWebRequirements(ctx, client, credential)
+	requirements, err := e.chatGPTWebRequirements(ctx, client, credential, prepared.sentinelPolicy)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1466,7 +1475,18 @@ func (e *ChatGPTWebExecutor) openChatGPTWebConversation(ctx context.Context, cli
 	return response, accumulator, nil
 }
 
-func (e *ChatGPTWebExecutor) chatGPTWebRequirements(ctx context.Context, client *chatgptwebauth.Client, credential *chatgptwebauth.Credential) (chatGPTWebRequirements, error) {
+func chatGPTWebSentinelPolicy(cfg *config.Config) *sentinelcompat.Policy {
+	if cfg == nil {
+		return nil
+	}
+	return cfg.ChatGPTWeb.Sentinel.GoVMPolicy
+}
+
+func (e *ChatGPTWebExecutor) chatGPTWebRequirements(ctx context.Context, client *chatgptwebauth.Client, credential *chatgptwebauth.Credential, policies ...*sentinelcompat.Policy) (chatGPTWebRequirements, error) {
+	policy := chatGPTWebSentinelPolicy(e.configSnapshot())
+	if len(policies) > 0 {
+		policy = policies[0]
+	}
 	// Observe on transitions and return so errors and cancellation are included.
 	// These child phases are already included in the image requirements total.
 	phase := ""
@@ -1509,6 +1529,7 @@ func (e *ChatGPTWebExecutor) chatGPTWebRequirements(ctx context.Context, client 
 		sdkResource = chatgptwebauth.DefaultConversationSentinelSDKResource()
 	}
 	sentinelEnvironment := chatgptwebauth.ConversationTurnstileEnvironment{
+		Compatibility:      policy,
 		Persona:            credential.Persona,
 		BrowserEnvironment: chatgptwebauth.ResolveCredentialBrowserEnvironment(credential, ""),
 		DeviceID:           credential.DeviceID,

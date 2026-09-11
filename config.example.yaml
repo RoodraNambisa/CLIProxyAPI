@@ -186,6 +186,18 @@ chatgpt-web:
     # Number of retries after the initial failed refresh.
     max-retries: 3
   sentinel:
+    # Data-only compatibility rules for new page properties. Changes apply to
+    # new conversation requests; current collector/snapshot pairs keep their rules.
+    go-vm-compatibility:
+      enabled: false
+      # Preserve simple values actually written by the Observer to __oai_so_*.
+      observer-state-auto-extend: true
+      # Additional exact window property names; never supply UUID values here.
+      writable-window-properties: []
+      # New read-only properties: path, type, value, enumerable (default false).
+      # Types: string, boolean, number, null, undefined (omit value for undefined).
+      # Built-in properties, persona fields, methods and credentials are protected.
+      environment-properties: []
     # Keep the Go VM on the hot path and lazily fetch the versioned SDK from the
     # official OpenAI HTTPS endpoint only when required. Bootstrap SRI is enforced
     # when present; set false if remote JavaScript execution is not acceptable.

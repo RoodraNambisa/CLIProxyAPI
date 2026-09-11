@@ -22,6 +22,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/proxypool"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/sentinelcompat"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	log "github.com/sirupsen/logrus"
@@ -261,6 +262,12 @@ func (e *ChatGPTWebExecutor) UpdateConfig(cfg *config.Config) {
 		log.WithError(errValidate).Error("chatgpt web executor: retain previous configuration after image policy validation failure")
 		return
 	}
+	policy, errPolicy := sentinelcompat.Compile(snapshot.ChatGPTWeb.Sentinel.GoVMCompatibility)
+	if errPolicy != nil {
+		log.WithError(errPolicy).Error("chatgpt web executor: retain previous configuration after Sentinel policy validation failure")
+		return
+	}
+	snapshot.ChatGPTWeb.Sentinel.GoVMPolicy = policy
 	e.cfg.Store(snapshot)
 	configureChatGPTWebImageAdmissions(snapshot.Images.ChatGPTWeb.Resolved())
 	if e.backgroundQueue != nil {
@@ -318,6 +325,7 @@ func chatGPTWebSentinelRuntimeConfig(cfg *config.Config) chatgptwebauth.Sentinel
 	}
 	resolved := cfg.ChatGPTWeb.Sentinel.Resolved()
 	return chatgptwebauth.SentinelRuntimeConfig{
+		Compatibility: cfg.ChatGPTWeb.Sentinel.GoVMPolicy,
 		Enabled:       resolved.SDKRuntimeEnabled,
 		Workers:       resolved.SDKWorkers,
 		QueueSize:     resolved.SDKQueueSize,

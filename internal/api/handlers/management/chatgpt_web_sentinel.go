@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	chatgptwebauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/chatgptweb"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/sentinelcompat"
 )
 
 type chatGPTWebSentinelSnapshotter interface {
@@ -21,6 +23,7 @@ type chatGPTWebSentinelConfigUpdater interface {
 }
 
 type chatGPTWebSentinelRequest struct {
+	GoVMCompatibility json.RawMessage `json:"go-vm-compatibility"`
 	SDKRuntimeEnabled json.RawMessage `json:"sdk-runtime-enabled"`
 	SDKWorkers        json.RawMessage `json:"sdk-workers"`
 	SDKQueueSize      json.RawMessage `json:"sdk-queue-size"`
@@ -28,6 +31,11 @@ type chatGPTWebSentinelRequest struct {
 }
 
 type chatGPTWebSentinelResponse struct {
+	GoVMRulesHash          string    `json:"go_vm_rules_hash"`
+	GoVMRuleCount          int       `json:"go_vm_rule_count"`
+	GoVMRulesAppliedAt     time.Time `json:"go_vm_rules_applied_at"`
+	GoVMExtensionUses      uint64    `json:"go_vm_extension_uses"`
+	GoVMExtensionFallbacks uint64    `json:"go_vm_extension_fallbacks"`
 	config.ResolvedChatGPTWebSentinelConfig
 	Initialized                    bool                                    `json:"initialized"`
 	Available                      bool                                    `json:"available"`
@@ -76,6 +84,7 @@ func (h *Handler) GetChatGPTWebSentinel(c *gin.Context) {
 			if snapshotter, okSnapshotter := registered.(chatGPTWebSentinelSnapshotter); okSnapshotter {
 				snapshot = snapshotter.SentinelSnapshot()
 				resolved = config.ResolvedChatGPTWebSentinelConfig{
+					GoVMCompatibility: resolved.GoVMCompatibility,
 					SDKRuntimeEnabled: snapshot.SDKRuntimeEnabled,
 					SDKWorkers:        snapshot.SDKWorkers,
 					SDKQueueSize:      snapshot.SDKQueueSize,
@@ -85,6 +94,11 @@ func (h *Handler) GetChatGPTWebSentinel(c *gin.Context) {
 		}
 	}
 	c.JSON(http.StatusOK, chatGPTWebSentinelResponse{
+		GoVMRulesHash:                    snapshot.GoVMRulesHash,
+		GoVMRuleCount:                    snapshot.GoVMRuleCount,
+		GoVMRulesAppliedAt:               snapshot.GoVMRulesAppliedAt,
+		GoVMExtensionUses:                snapshot.GoVMExtensionUses,
+		GoVMExtensionFallbacks:           snapshot.GoVMExtensionFallbacks,
 		ResolvedChatGPTWebSentinelConfig: resolved,
 		Initialized:                      snapshot.Initialized,
 		Available:                        snapshot.Available,
@@ -148,6 +162,7 @@ func (h *Handler) updateChatGPTWebSentinel(c *gin.Context, replace bool) {
 	candidate := previous
 	if replace {
 		candidate = config.ChatGPTWebSentinelConfig{}
+		candidate.GoVMCompatibility = previous.GoVMCompatibility
 	}
 	if errApply := request.apply(&candidate); errApply != nil {
 		h.mu.Unlock()
@@ -208,6 +223,13 @@ func (request chatGPTWebSentinelRequest) complete() bool {
 func (request chatGPTWebSentinelRequest) apply(candidate *config.ChatGPTWebSentinelConfig) error {
 	if candidate == nil {
 		return fmt.Errorf("configuration unavailable")
+	}
+	if len(request.GoVMCompatibility) > 0 {
+		merged, err := sentinelcompat.Merge(candidate.GoVMCompatibility, request.GoVMCompatibility)
+		if err != nil {
+			return fmt.Errorf("invalid go-vm-compatibility: %w", err)
+		}
+		candidate.GoVMCompatibility = merged
 	}
 	if len(request.SDKRuntimeEnabled) > 0 {
 		value, errValue := decodeSentinelBool(request.SDKRuntimeEnabled)

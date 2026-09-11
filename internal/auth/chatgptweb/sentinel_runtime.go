@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/fastschema/qjs"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/sentinelcompat"
 	wazerosys "github.com/tetratelabs/wazero/sys"
 )
 
@@ -111,6 +112,7 @@ func sentinelSDKAdapterMatchesSource(source []byte, adapter sentinelSDKAdapter) 
 
 // SentinelRuntimeConfig contains effective SDK runtime settings.
 type SentinelRuntimeConfig struct {
+	Compatibility *sentinelcompat.Policy
 	Enabled       bool
 	Workers       int
 	QueueSize     int
@@ -137,6 +139,11 @@ type PersonaOutcomeSnapshot struct {
 
 // SentinelRuntimeSnapshot is safe to expose through the management API.
 type SentinelRuntimeSnapshot struct {
+	GoVMRulesHash                  string                   `json:"go_vm_rules_hash"`
+	GoVMRuleCount                  int                      `json:"go_vm_rule_count"`
+	GoVMRulesAppliedAt             time.Time                `json:"go_vm_rules_applied_at"`
+	GoVMExtensionUses              uint64                   `json:"go_vm_extension_uses"`
+	GoVMExtensionFallbacks         uint64                   `json:"go_vm_extension_fallbacks"`
 	SDKRuntimeEnabled              bool                     `json:"sdk-runtime-enabled"`
 	SDKWorkers                     int                      `json:"sdk-workers"`
 	SDKQueueSize                   int                      `json:"sdk-queue-size"`
@@ -293,12 +300,14 @@ type sentinelSourceFlight struct {
 }
 
 type sentinelPreferredKey struct {
+	rules     string
 	hash      string
 	program   SentinelProgramKind
 	signature string
 }
 
 type sentinelPreferredHintKey struct {
+	rules              string
 	program            SentinelProgramKind
 	dxHash             uint64
 	requirementsHash   uint64
@@ -322,8 +331,11 @@ const (
 // SentinelRuntimeManager owns the lazy SDK scheduler and in-memory caches.
 // It starts no goroutine and creates no QJS runtime until an SDK task is used.
 type SentinelRuntimeManager struct {
-	mu          sync.Mutex
-	lifecycleMu sync.Mutex
+	goVMRulesAppliedAt     time.Time
+	goVMExtensionUses      uint64
+	goVMExtensionFallbacks uint64
+	mu                     sync.Mutex
+	lifecycleMu            sync.Mutex
 
 	config                         SentinelRuntimeConfig
 	workerLimit                    int
@@ -466,6 +478,9 @@ func (manager *SentinelRuntimeManager) UpdateConfig(config SentinelRuntimeConfig
 	config = normalizeSentinelRuntimeConfig(config)
 	manager.mu.Lock()
 	wasEnabled := manager.config.Enabled
+	if manager.goVMRulesAppliedAt.IsZero() || manager.config.Compatibility.Version() != config.Compatibility.Version() {
+		manager.goVMRulesAppliedAt = manager.now()
+	}
 	manager.config = config
 	manager.workerLimit = resolveSentinelWorkerLimit(config.Workers)
 	manager.trimCachesLocked()
@@ -532,10 +547,15 @@ func (manager *SentinelRuntimeManager) Snapshot() SentinelRuntimeSnapshot {
 	defer manager.mu.Unlock()
 	now := manager.now()
 	available := manager.config.Enabled && !manager.closed && !manager.clearWhenIdle
-	if manager.latestHash != "" && manager.circuits[manager.latestHash].After(now) {
+	if manager.latestHash != "" && manager.circuits[sentinelRuleCircuitKey(manager.latestHash, manager.config.Compatibility.Version())].After(now) {
 		available = false
 	}
 	return SentinelRuntimeSnapshot{
+		GoVMRulesHash:                  manager.config.Compatibility.Version(),
+		GoVMRuleCount:                  manager.config.Compatibility.RuleCount(),
+		GoVMRulesAppliedAt:             manager.goVMRulesAppliedAt,
+		GoVMExtensionUses:              manager.goVMExtensionUses,
+		GoVMExtensionFallbacks:         manager.goVMExtensionFallbacks,
 		SDKRuntimeEnabled:              manager.config.Enabled,
 		SDKWorkers:                     manager.config.Workers,
 		SDKQueueSize:                   manager.config.QueueSize,
@@ -844,6 +864,15 @@ func (manager *SentinelRuntimeManager) recordError(generation uint64, code strin
 	manager.mu.Unlock()
 }
 
+func (manager *SentinelRuntimeManager) recordCompatibilityUse(usage *atomic.Bool) {
+	if manager == nil || usage == nil || !usage.Load() {
+		return
+	}
+	manager.mu.Lock()
+	manager.goVMExtensionUses++
+	manager.mu.Unlock()
+}
+
 func (manager *SentinelRuntimeManager) recordSDKTurnstileSuccess(generation uint64, reason sentinelSDKTurnstileReason) {
 	manager.mu.Lock()
 	if manager.generationActiveLocked(generation) {
@@ -874,6 +903,9 @@ func (manager *SentinelRuntimeManager) recordCompatibility(generation uint64, co
 	}
 	manager.mu.Lock()
 	if manager.cacheGeneration == generation && !manager.closed {
+		if strings.HasPrefix(compatibility.Operation, "compatibility_") {
+			manager.goVMExtensionFallbacks++
+		}
 		manager.lastCompatibilityProgram = string(program)
 		manager.lastCompatibilityKind = string(compatibility.Kind)
 		manager.lastCompatibilityOperationHash = operationHash
@@ -912,7 +944,14 @@ func (manager *SentinelRuntimeManager) recordCircuit(generation uint64, hash str
 	manager.mu.Unlock()
 }
 
-func recordSentinelCircuitForError(manager *SentinelRuntimeManager, ctx context.Context, generation uint64, hash string, err error) {
+func sentinelRuleCircuitKey(hash, rules string) string {
+	if hash == "" || rules == "" {
+		return hash
+	}
+	return hash + "\x00" + rules
+}
+
+func recordSentinelCircuitForError(manager *SentinelRuntimeManager, ctx context.Context, generation uint64, hash string, err error, rules ...string) {
 	if manager == nil || err == nil {
 		return
 	}
@@ -926,10 +965,11 @@ func recordSentinelCircuitForError(manager *SentinelRuntimeManager, ctx context.
 	if errors.As(err, &runtimeErr) && runtimeErr.Code == "sentinel_sdk_busy" {
 		return
 	}
-	manager.recordCircuit(generation, hash)
+	manager.recordCircuit(generation, sentinelRuleCircuitKey(hash, sentinelRulesVersion(rules)))
 }
 
-func (manager *SentinelRuntimeManager) circuitRetryAfter(hash string) (time.Duration, bool) {
+func (manager *SentinelRuntimeManager) circuitRetryAfter(hash string, rules ...string) (time.Duration, bool) {
+	hash = sentinelRuleCircuitKey(hash, sentinelRulesVersion(rules))
 	manager.mu.Lock()
 	defer manager.mu.Unlock()
 	expiresAt := manager.circuits[hash]
@@ -1004,7 +1044,7 @@ func (manager *SentinelRuntimeManager) recordSourceFailure(generation uint64, ke
 	return newSentinelRuntimeError("sentinel_sdk_unavailable", retryAfter, err)
 }
 
-func (manager *SentinelRuntimeManager) markPreferred(generation uint64, hash string, program SentinelProgramKind, signature string) {
+func (manager *SentinelRuntimeManager) markPreferred(generation uint64, hash string, program SentinelProgramKind, signature string, rules ...string) {
 	if hash == "" || signature == "" {
 		return
 	}
@@ -1019,7 +1059,7 @@ func (manager *SentinelRuntimeManager) markPreferred(generation uint64, hash str
 			delete(manager.preferred, key)
 		}
 	}
-	key := sentinelPreferredKey{hash: hash, program: program, signature: signature}
+	key := sentinelPreferredKey{hash: hash, program: program, signature: signature, rules: sentinelRulesVersion(rules)}
 	_, exists := manager.preferred[key]
 	if !exists && len(manager.preferred) >= sentinelSDKPreferredMax {
 		var oldestKey sentinelPreferredKey
@@ -1038,7 +1078,7 @@ func (manager *SentinelRuntimeManager) markPreferred(generation uint64, hash str
 		manager.preferred[key] = now.Add(sentinelSDKPreferredTTL)
 	}
 	for hint, entry := range manager.preferredHints {
-		if entry.signature == signature {
+		if entry.signature == signature && hint.rules == key.rules {
 			entry.candidate = true
 			manager.preferredHints[hint] = entry
 		}
@@ -1047,8 +1087,16 @@ func (manager *SentinelRuntimeManager) markPreferred(generation uint64, hash str
 	manager.mu.Unlock()
 }
 
-func sentinelPreferredHint(program SentinelProgramKind, dx, requirementsToken string) sentinelPreferredHintKey {
+func sentinelRulesVersion(rules []string) string {
+	if len(rules) > 0 {
+		return rules[0]
+	}
+	return ""
+}
+
+func sentinelPreferredHint(program SentinelProgramKind, dx, requirementsToken string, rules ...string) sentinelPreferredHintKey {
 	return sentinelPreferredHintKey{
+		rules:              sentinelRulesVersion(rules),
 		program:            program,
 		dxHash:             sentinelStringFingerprint(dx),
 		requirementsHash:   sentinelStringFingerprint(requirementsToken),
@@ -1070,19 +1118,19 @@ func sentinelStringFingerprint(value string) uint64 {
 	return hash
 }
 
-func (manager *SentinelRuntimeManager) markPreferredForChallenge(generation uint64, hash string, program SentinelProgramKind, signature, dx, requirementsToken string) {
+func (manager *SentinelRuntimeManager) markPreferredForChallenge(generation uint64, hash string, program SentinelProgramKind, signature, dx, requirementsToken string, rules ...string) {
 	if hash == "" || signature == "" || dx == "" || requirementsToken == "" {
 		return
 	}
-	manager.markPreferred(generation, hash, program, signature)
-	manager.cacheChallengeSignature(generation, program, signature, dx, requirementsToken, true)
+	manager.markPreferred(generation, hash, program, signature, rules...)
+	manager.cacheChallengeSignature(generation, program, signature, dx, requirementsToken, true, rules...)
 }
 
-func (manager *SentinelRuntimeManager) cacheChallengeSignature(generation uint64, program SentinelProgramKind, signature, dx, requirementsToken string, candidate bool) {
+func (manager *SentinelRuntimeManager) cacheChallengeSignature(generation uint64, program SentinelProgramKind, signature, dx, requirementsToken string, candidate bool, rules ...string) {
 	if signature == "" || dx == "" || requirementsToken == "" {
 		return
 	}
-	hint := sentinelPreferredHint(program, dx, requirementsToken)
+	hint := sentinelPreferredHint(program, dx, requirementsToken, rules...)
 	manager.mu.Lock()
 	if !manager.generationActiveLocked(generation) {
 		manager.mu.Unlock()
@@ -1122,11 +1170,11 @@ func (manager *SentinelRuntimeManager) cacheChallengeSignature(generation uint64
 	manager.mu.Unlock()
 }
 
-func (manager *SentinelRuntimeManager) preferredChallengeSignature(program SentinelProgramKind, dx, requirementsToken string) (string, bool, bool) {
+func (manager *SentinelRuntimeManager) preferredChallengeSignature(program SentinelProgramKind, dx, requirementsToken string, rules ...string) (string, bool, bool) {
 	if dx == "" || requirementsToken == "" {
 		return "", false, false
 	}
-	hint := sentinelPreferredHint(program, dx, requirementsToken)
+	hint := sentinelPreferredHint(program, dx, requirementsToken, rules...)
 	manager.mu.Lock()
 	defer manager.mu.Unlock()
 	entry := manager.preferredHints[hint]
@@ -1137,7 +1185,7 @@ func (manager *SentinelRuntimeManager) preferredChallengeSignature(program Senti
 	return "", false, false
 }
 
-func (manager *SentinelRuntimeManager) isPreferred(hash string, program SentinelProgramKind, signature string) bool {
+func (manager *SentinelRuntimeManager) isPreferred(hash string, program SentinelProgramKind, signature string, rules ...string) bool {
 	if hash == "" || signature == "" {
 		return false
 	}
@@ -1149,7 +1197,7 @@ func (manager *SentinelRuntimeManager) isPreferred(hash string, program Sentinel
 			delete(manager.preferred, candidate)
 		}
 	}
-	key := sentinelPreferredKey{hash: hash, program: program, signature: signature}
+	key := sentinelPreferredKey{hash: hash, program: program, signature: signature, rules: sentinelRulesVersion(rules)}
 	expiresAt := manager.preferred[key]
 	if expiresAt.After(now) {
 		return true
@@ -2330,38 +2378,39 @@ func (manager *SentinelRuntimeManager) runtimeBootstrap(request SentinelSDKReque
 	}
 	languages := personaNavigatorLanguages(persona)
 	payload, err := json.Marshal(map[string]any{
-		"sdk_url":              source.url,
-		"location":             strings.TrimSpace(request.Environment.Location),
-		"device_id":            effectiveDeviceID,
-		"user_agent":           persona.UserAgent,
-		"language":             persona.Language,
-		"languages":            languages,
-		"platform":             persona.Platform,
-		"hardware_concurrency": profile.hardwareConcurrency,
-		"screen_width":         profile.screenWidth,
-		"screen_height":        profile.screenHeight,
-		"screen_avail_left":    profile.availLeft,
-		"screen_avail_top":     profile.availTop,
-		"screen_avail_width":   profile.availWidth,
-		"screen_avail_height":  profile.availHeight,
-		"screen_color_depth":   profile.colorDepth,
-		"inner_width":          profile.innerWidth,
-		"inner_height":         profile.innerHeight,
-		"outer_width":          profile.outerWidth,
-		"outer_height":         profile.outerHeight,
-		"device_pixel_ratio":   profile.devicePixelRatio,
-		"device_memory":        profile.deviceMemory,
-		"max_touch_points":     profile.maxTouchPoints,
-		"js_heap_size_limit":   profile.jsHeapSizeLimit,
-		"webgl_vendor":         profile.webGLVendor,
-		"webgl_renderer":       profile.webGLRenderer,
-		"fingerprint_version":  profile.version,
-		"fingerprint_catalog":  profile.catalogID,
-		"fingerprint_slot":     profile.slot,
-		"page_started_at_ms":   float64(pageStartedAt.UnixNano()) / float64(time.Millisecond),
-		"random_b64":           base64.StdEncoding.EncodeToString(randomBytes),
-		"script_sources":       append([]string(nil), request.Environment.ScriptSources...),
-		"local_storage_keys":   append([]string(nil), request.Environment.LocalStorageKeys...),
+		"compatibility_properties": request.Environment.Compatibility.Properties(),
+		"sdk_url":                  source.url,
+		"location":                 strings.TrimSpace(request.Environment.Location),
+		"device_id":                effectiveDeviceID,
+		"user_agent":               persona.UserAgent,
+		"language":                 persona.Language,
+		"languages":                languages,
+		"platform":                 persona.Platform,
+		"hardware_concurrency":     profile.hardwareConcurrency,
+		"screen_width":             profile.screenWidth,
+		"screen_height":            profile.screenHeight,
+		"screen_avail_left":        profile.availLeft,
+		"screen_avail_top":         profile.availTop,
+		"screen_avail_width":       profile.availWidth,
+		"screen_avail_height":      profile.availHeight,
+		"screen_color_depth":       profile.colorDepth,
+		"inner_width":              profile.innerWidth,
+		"inner_height":             profile.innerHeight,
+		"outer_width":              profile.outerWidth,
+		"outer_height":             profile.outerHeight,
+		"device_pixel_ratio":       profile.devicePixelRatio,
+		"device_memory":            profile.deviceMemory,
+		"max_touch_points":         profile.maxTouchPoints,
+		"js_heap_size_limit":       profile.jsHeapSizeLimit,
+		"webgl_vendor":             profile.webGLVendor,
+		"webgl_renderer":           profile.webGLRenderer,
+		"fingerprint_version":      profile.version,
+		"fingerprint_catalog":      profile.catalogID,
+		"fingerprint_slot":         profile.slot,
+		"page_started_at_ms":       float64(pageStartedAt.UnixNano()) / float64(time.Millisecond),
+		"random_b64":               base64.StdEncoding.EncodeToString(randomBytes),
+		"script_sources":           append([]string(nil), request.Environment.ScriptSources...),
+		"local_storage_keys":       append([]string(nil), request.Environment.LocalStorageKeys...),
 	})
 	if err != nil {
 		return "", fmt.Errorf("encode Sentinel SDK environment: %w", err)
@@ -2377,6 +2426,12 @@ func (manager *SentinelRuntimeManager) SolveTurnstile(
 	sdkRequest SentinelSDKRequest,
 	observer *SentinelObserver,
 ) (string, error) {
+	sdkRequest.Environment.Compatibility = goRequest.Environment.Compatibility
+	if goRequest.Environment.Compatibility != nil && manager != nil {
+		usage := &atomic.Bool{}
+		goRequest.Environment.compatibilityUsage = usage
+		defer manager.recordCompatibilityUse(usage)
+	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -2400,7 +2455,7 @@ func (manager *SentinelRuntimeManager) SolveTurnstile(
 
 	var prepared *conversationTurnstilePreparedProgram
 	if sdkFallbackAllowed && manager.hasActivePreferred() {
-		signature, candidate, exactHint := manager.preferredChallengeSignature(SentinelProgramTurnstile, goRequest.DX, goRequest.RequirementsToken)
+		signature, candidate, exactHint := manager.preferredChallengeSignature(SentinelProgramTurnstile, goRequest.DX, goRequest.RequirementsToken, goRequest.Environment.Compatibility.Version())
 		if exactHint && !candidate {
 			signature = ""
 		}
@@ -2418,7 +2473,7 @@ func (manager *SentinelRuntimeManager) SolveTurnstile(
 				expectedHashes, hashErr := expectedSentinelHashes(sdkRequest)
 				if hashErr == nil {
 					if cached := manager.latestSourceForURL(sourceURL, expectedHashes); cached != nil {
-						preferred = manager.isPreferred(cached.hash, SentinelProgramTurnstile, signature)
+						preferred = manager.isPreferred(cached.hash, SentinelProgramTurnstile, signature, goRequest.Environment.Compatibility.Version())
 						if preferred {
 							return manager.solveTurnstileWithSDK(ctx, sdkRequest, cached, signature, sentinelSDKPreferredHit, observer, goRequest.DX, goRequest.RequirementsToken)
 						}
@@ -2426,7 +2481,7 @@ func (manager *SentinelRuntimeManager) SolveTurnstile(
 				}
 			}
 			if !preferred {
-				manager.cacheChallengeSignature(generation, SentinelProgramTurnstile, signature, goRequest.DX, goRequest.RequirementsToken, false)
+				manager.cacheChallengeSignature(generation, SentinelProgramTurnstile, signature, goRequest.DX, goRequest.RequirementsToken, false, goRequest.Environment.Compatibility.Version())
 			}
 		}
 	}
@@ -2491,7 +2546,7 @@ func (manager *SentinelRuntimeManager) solveTurnstileWithSDK(
 			}
 			observer.mu.Unlock()
 			if signature != "" {
-				manager.markPreferredForChallenge(generation, hash, SentinelProgramTurnstile, signature, dx, requirementsToken)
+				manager.markPreferredForChallenge(generation, hash, SentinelProgramTurnstile, signature, dx, requirementsToken, request.Environment.Compatibility.Version())
 			}
 			manager.recordSDKTurnstileSuccess(generation, reason)
 			return token, nil
@@ -2509,7 +2564,7 @@ func (manager *SentinelRuntimeManager) solveTurnstileWithSDK(
 			}
 			observer.mu.Unlock()
 			if hasObserverRuntime {
-				recordSentinelCircuitForError(manager, ctx, generation, hash, err)
+				recordSentinelCircuitForError(manager, ctx, generation, hash, err, request.Environment.Compatibility.Version())
 				var runtimeErr *SentinelRuntimeError
 				if errors.As(err, &runtimeErr) {
 					return "", err
@@ -2535,7 +2590,7 @@ func (manager *SentinelRuntimeManager) solveTurnstileWithSDK(
 		}
 		source = loadedSource
 	}
-	if retryAfter, open := manager.circuitRetryAfter(source.hash); open {
+	if retryAfter, open := manager.circuitRetryAfter(source.hash, request.Environment.Compatibility.Version()); open {
 		return "", newSentinelRuntimeError("sentinel_sdk_unavailable", retryAfter, errors.New("Sentinel SDK circuit breaker is open"))
 	}
 	lease, err := manager.acquire(ctx, sentinelPriorityFallback)
@@ -2553,7 +2608,7 @@ func (manager *SentinelRuntimeManager) solveTurnstileWithSDK(
 	}
 	instance, err := manager.newSDKInstance(ctx, lease, request, source, bytecode)
 	if err != nil {
-		recordSentinelCircuitForError(manager, ctx, source.generation, source.hash, err)
+		recordSentinelCircuitForError(manager, ctx, source.generation, source.hash, err, request.Environment.Compatibility.Version())
 		var runtimeErr *SentinelRuntimeError
 		if errors.As(err, &runtimeErr) {
 			return "", err
@@ -2566,17 +2621,17 @@ func (manager *SentinelRuntimeManager) solveTurnstileWithSDK(
 		"requirements_token": request.RequirementsToken,
 	})
 	if err != nil {
-		recordSentinelCircuitForError(manager, ctx, source.generation, source.hash, err)
+		recordSentinelCircuitForError(manager, ctx, source.generation, source.hash, err, request.Environment.Compatibility.Version())
 		return "", newSentinelRuntimeError("sentinel_sdk_unavailable", 0, errors.New("Sentinel SDK Turnstile solve failed"))
 	}
 	token = strings.TrimSpace(token)
 	if token == "" {
 		err = errors.New("Sentinel SDK Turnstile token is empty")
-		recordSentinelCircuitForError(manager, ctx, source.generation, source.hash, err)
+		recordSentinelCircuitForError(manager, ctx, source.generation, source.hash, err, request.Environment.Compatibility.Version())
 		return "", newSentinelRuntimeError("sentinel_sdk_unavailable", 0, err)
 	}
 	if signature != "" {
-		manager.markPreferredForChallenge(source.generation, source.hash, SentinelProgramTurnstile, signature, dx, requirementsToken)
+		manager.markPreferredForChallenge(source.generation, source.hash, SentinelProgramTurnstile, signature, dx, requirementsToken, request.Environment.Compatibility.Version())
 	}
 	manager.recordSDKTurnstileSuccess(source.generation, reason)
 	return token, nil
@@ -2584,6 +2639,7 @@ func (manager *SentinelRuntimeManager) solveTurnstileWithSDK(
 
 // SentinelObserver retains one request-scoped Go VM or SDK instance.
 type SentinelObserver struct {
+	compatibilityUsage *atomic.Bool
 	manager            *SentinelRuntimeManager
 	generation         uint64
 	request            SentinelSDKRequest
@@ -2623,6 +2679,11 @@ func (manager *SentinelRuntimeManager) BeginObserver(ctx context.Context, reques
 		ctx:     observerCtx,
 		cancel:  cancel,
 		ready:   make(chan struct{}),
+	}
+	if request.Environment.Compatibility != nil {
+		observer.compatibilityUsage = &atomic.Bool{}
+		request.Environment.compatibilityUsage = observer.compatibilityUsage
+		observer.request = request
 	}
 	manager.mu.Lock()
 	if manager.closed {
@@ -2745,7 +2806,7 @@ func (observer *SentinelObserver) startSDK(ctx context.Context, lease *sentinelR
 		}
 		return nil, nil, newSentinelRuntimeError("sentinel_sdk_unavailable", 0, errors.New("Sentinel SDK source is unavailable"))
 	}
-	if retryAfter, open := observer.manager.circuitRetryAfter(source.hash); open {
+	if retryAfter, open := observer.manager.circuitRetryAfter(source.hash, observer.request.Environment.Compatibility.Version()); open {
 		return nil, nil, newSentinelRuntimeError("sentinel_sdk_unavailable", retryAfter, errors.New("Sentinel SDK circuit breaker is open"))
 	}
 	bytecode, err := observer.manager.bytecodeWithLease(ctx, source, sentinelPriorityObserverCollector, lease)
@@ -2758,7 +2819,7 @@ func (observer *SentinelObserver) startSDK(ctx context.Context, lease *sentinelR
 	}
 	instance, err := observer.manager.newSDKInstance(ctx, lease, observer.request, source, bytecode)
 	if err != nil {
-		recordSentinelCircuitForError(observer.manager, ctx, source.generation, source.hash, err)
+		recordSentinelCircuitForError(observer.manager, ctx, source.generation, source.hash, err, observer.request.Environment.Compatibility.Version())
 		var runtimeErr *SentinelRuntimeError
 		if errors.As(err, &runtimeErr) {
 			return nil, nil, err
@@ -2771,7 +2832,7 @@ func (observer *SentinelObserver) startSDK(ctx context.Context, lease *sentinelR
 		"requirements_token": observer.request.RequirementsToken,
 	}); err != nil {
 		instance.close()
-		recordSentinelCircuitForError(observer.manager, ctx, source.generation, source.hash, err)
+		recordSentinelCircuitForError(observer.manager, ctx, source.generation, source.hash, err, observer.request.Environment.Compatibility.Version())
 		return nil, nil, newSentinelRuntimeError("sentinel_sdk_unavailable", 0, errors.New("Sentinel SDK collector failed"))
 	}
 	return instance, source, nil
@@ -2983,7 +3044,7 @@ func (observer *SentinelObserver) Snapshot(ctx context.Context) (string, error) 
 		observer.mu.Unlock()
 		snapshot, err = instance.call(callCtx, "snapshotObserver", map[string]any{"challenge": request.Challenge})
 		if err != nil {
-			recordSentinelCircuitForError(observer.manager, callCtx, generation, hash, err)
+			recordSentinelCircuitForError(observer.manager, callCtx, generation, hash, err, observer.request.Environment.Compatibility.Version())
 			return "", newSentinelRuntimeError("sentinel_session_observer_unavailable", 0, errors.New("Sentinel SDK snapshot failed"))
 		}
 	}
@@ -3050,6 +3111,7 @@ func (observer *SentinelObserver) Close() {
 		if goVM != nil {
 			goVM.Close()
 		}
+		observer.manager.recordCompatibilityUse(observer.compatibilityUsage)
 		if lease != nil {
 			lease.release()
 		}

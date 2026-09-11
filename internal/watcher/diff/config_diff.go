@@ -353,6 +353,9 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	if oldCfg.ChatGPTWeb.TokenUsageEstimationEnabled() != newCfg.ChatGPTWeb.TokenUsageEstimationEnabled() {
 		changes = append(changes, fmt.Sprintf("chatgpt-web.estimate-token-usage: %t -> %t", oldCfg.ChatGPTWeb.TokenUsageEstimationEnabled(), newCfg.ChatGPTWeb.TokenUsageEstimationEnabled()))
 	}
+	if !reflect.DeepEqual(oldCfg.ChatGPTWeb.Sentinel.GoVMCompatibility.Resolved(), newCfg.ChatGPTWeb.Sentinel.GoVMCompatibility.Resolved()) {
+		changes = append(changes, "chatgpt-web.sentinel.go-vm-compatibility: updated (property values omitted)")
+	}
 	oldUsageCache := oldCfg.ChatGPTWeb.UsageCache.Resolved()
 	newUsageCache := newCfg.ChatGPTWeb.UsageCache.Resolved()
 	if oldUsageCache.Enabled != newUsageCache.Enabled {

@@ -688,6 +688,16 @@
   host.fetch = async () => { throw new Error("Sentinel SDK network access is disabled"); };
   defineValue(host, "__sentinel_init_pending", [], { enumerable: false });
   defineValue(host, "__sentinel_token_pending", [], { enumerable: false });
+  for (const property of config.compatibility_properties || []) {
+    const parts = property.path.split(".");
+    const key = parts.pop();
+    const parent = parts.join(".");
+    const target = parent === "window" ? host : parent === "window.document" ? document
+      : parent === "window.navigator" ? navigator : parent === "window.screen" ? screen : null;
+    if (!target || key in target) throw new Error("Sentinel compatibility property conflicts with host");
+    const value = property.type === "undefined" ? undefined : property.value;
+    defineValue(target, key, value, { configurable: false, writable: false, enumerable: property.enumerable === true });
+  }
   Math.random = randomNumber;
 })(globalThis.__sentinelBootstrap || {}, globalThis);
 

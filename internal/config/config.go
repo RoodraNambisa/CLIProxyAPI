@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/sentinelcompat"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/proxyutil"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/crypto/bcrypt"
@@ -1258,10 +1259,12 @@ func (cfg ChatGPTWebAccountInfoConfig) Validate() error {
 // ChatGPTWebSentinelConfig preserves whether values were explicitly configured.
 // This matters because disabled and zero-length queue are both valid overrides.
 type ChatGPTWebSentinelConfig struct {
-	SDKRuntimeEnabled *bool `yaml:"sdk-runtime-enabled,omitempty" json:"sdk-runtime-enabled,omitempty"`
-	SDKWorkers        *int  `yaml:"sdk-workers,omitempty" json:"sdk-workers,omitempty"`
-	SDKQueueSize      *int  `yaml:"sdk-queue-size,omitempty" json:"sdk-queue-size,omitempty"`
-	SDKCacheVersions  *int  `yaml:"sdk-cache-versions,omitempty" json:"sdk-cache-versions,omitempty"`
+	GoVMCompatibility sentinelcompat.Config  `yaml:"go-vm-compatibility,omitempty" json:"go-vm-compatibility,omitempty"`
+	GoVMPolicy        *sentinelcompat.Policy `yaml:"-" json:"-"`
+	SDKRuntimeEnabled *bool                  `yaml:"sdk-runtime-enabled,omitempty" json:"sdk-runtime-enabled,omitempty"`
+	SDKWorkers        *int                   `yaml:"sdk-workers,omitempty" json:"sdk-workers,omitempty"`
+	SDKQueueSize      *int                   `yaml:"sdk-queue-size,omitempty" json:"sdk-queue-size,omitempty"`
+	SDKCacheVersions  *int                   `yaml:"sdk-cache-versions,omitempty" json:"sdk-cache-versions,omitempty"`
 }
 
 // UnmarshalYAML distinguishes an omitted setting from an explicit null value.
@@ -1291,7 +1294,7 @@ func validateChatGPTWebSentinelMappingFields(node *yaml.Node) error {
 	}
 	for name, value := range effective {
 		switch name {
-		case "sdk-runtime-enabled", "sdk-workers", "sdk-queue-size", "sdk-cache-versions":
+		case "sdk-runtime-enabled", "sdk-workers", "sdk-queue-size", "sdk-cache-versions", "go-vm-compatibility":
 			if value == nil {
 				return fmt.Errorf("chatgpt-web.sentinel.%s must not be null", name)
 			}
@@ -1304,15 +1307,17 @@ func validateChatGPTWebSentinelMappingFields(node *yaml.Node) error {
 
 // ResolvedChatGPTWebSentinelConfig contains effective runtime values.
 type ResolvedChatGPTWebSentinelConfig struct {
-	SDKRuntimeEnabled bool `json:"sdk-runtime-enabled"`
-	SDKWorkers        int  `json:"sdk-workers"`
-	SDKQueueSize      int  `json:"sdk-queue-size"`
-	SDKCacheVersions  int  `json:"sdk-cache-versions"`
+	GoVMCompatibility sentinelcompat.Config `json:"go-vm-compatibility"`
+	SDKRuntimeEnabled bool                  `json:"sdk-runtime-enabled"`
+	SDKWorkers        int                   `json:"sdk-workers"`
+	SDKQueueSize      int                   `json:"sdk-queue-size"`
+	SDKCacheVersions  int                   `json:"sdk-cache-versions"`
 }
 
 // Resolved returns the effective Sentinel SDK configuration.
 func (cfg ChatGPTWebSentinelConfig) Resolved() ResolvedChatGPTWebSentinelConfig {
 	out := ResolvedChatGPTWebSentinelConfig{
+		GoVMCompatibility: cfg.GoVMCompatibility.Resolved(),
 		SDKRuntimeEnabled: true,
 		SDKQueueSize:      DefaultChatGPTWebSentinelSDKQueueSize,
 		SDKCacheVersions:  DefaultChatGPTWebSentinelSDKCacheVersions,
@@ -1334,6 +1339,9 @@ func (cfg ChatGPTWebSentinelConfig) Resolved() ResolvedChatGPTWebSentinelConfig 
 
 // Validate rejects structurally invalid Sentinel SDK values.
 func (cfg ChatGPTWebSentinelConfig) Validate() error {
+	if _, err := sentinelcompat.Compile(cfg.GoVMCompatibility); err != nil {
+		return fmt.Errorf("chatgpt-web.sentinel.go-vm-compatibility: %w", err)
+	}
 	resolved := cfg.Resolved()
 	if resolved.SDKWorkers < 0 {
 		return fmt.Errorf("chatgpt-web.sentinel.sdk-workers must not be negative")
@@ -4397,6 +4405,9 @@ func isKnownDefaultValue(path []string, node *yaml.Node) bool {
 }
 
 func preservesExplicitChatGPTWebValue(fullPath string, node *yaml.Node) bool {
+	if fullPath == "chatgpt-web.sentinel.go-vm-compatibility" || strings.HasPrefix(fullPath, "chatgpt-web.sentinel.go-vm-compatibility.") {
+		return true
+	}
 	if node == nil {
 		return false
 	}

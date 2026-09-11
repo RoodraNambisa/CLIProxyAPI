@@ -83,7 +83,7 @@ func (e *ChatGPTWebExecutor) beginChatGPTWebSearch(ctx context.Context, client *
 	if err != nil {
 		return nil, err
 	}
-	requirements, err := e.chatGPTWebRequirements(ctx, client, credential)
+	requirements, err := e.chatGPTWebRequirements(ctx, client, credential, prepared.sentinelPolicy)
 	if err != nil {
 		return nil, err
 	}
