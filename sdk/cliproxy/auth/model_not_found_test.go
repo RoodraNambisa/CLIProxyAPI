@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	core "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 )
 
@@ -176,5 +177,42 @@ func TestModelNotFoundRotatesAllManagerEntrypoints(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestNotFoundCooldownKeepsRouteForRecovery(t *testing.T) {
+	manager := NewManager(nil, &FillFirstSelector{}, nil)
+	exec := &authFallbackExecutor{id: "codex"}
+	manager.RegisterExecutor(exec)
+	const model = "not-found-recovery-model"
+	const id = "not-found-recovery-auth"
+	registerFallbackAuthForModel(t, manager, &Auth{ID: id, Provider: "codex"}, model)
+	manager.MarkResult(t.Context(), Result{AuthID: id, Provider: "codex", Model: model, Error: &Error{HTTPStatus: 404, Message: modelNotFoundFixture}})
+	reg := registry.GetGlobalRegistry()
+	if len(reg.GetModelProviders(model)) != 1 {
+		t.Fatal("temporary model cooldown hid its provider and prevented later recovery")
+	}
+	listed := false
+	for _, item := range reg.GetAvailableModels("openai") {
+		listed = listed || item["id"] == model
+	}
+	if !listed {
+		t.Fatal("temporary model cooldown removed the model from the client catalog")
+	}
+	if _, err := manager.Execute(t.Context(), []string{"codex"}, core.Request{Model: model}, core.Options{}); err == nil || len(exec.ExecuteCalls()) != 0 {
+		t.Fatal("keeping the route bypassed active model cooling")
+	}
+	manager.mu.Lock()
+	current := manager.auths[id]
+	current.ModelStates[model].NextRetryAfter = time.Now().Add(-time.Second)
+	current.NextRetryAfter = current.ModelStates[model].NextRetryAfter
+	snapshot := current.Clone()
+	manager.mu.Unlock()
+	manager.scheduler.upsertAuth(snapshot)
+	if _, err := manager.Execute(t.Context(), []string{"codex"}, core.Request{Model: model}, core.Options{}); err != nil {
+		t.Fatalf("expired model cooldown required manual recovery: %v", err)
+	}
+	if len(exec.ExecuteCalls()) != 1 || len(reg.GetModelProviders(model)) != 1 {
+		t.Fatal("recovery did not restore normal routing")
 	}
 }

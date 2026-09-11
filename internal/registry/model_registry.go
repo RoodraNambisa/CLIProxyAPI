@@ -969,8 +969,10 @@ func (r *ModelRegistry) buildAvailableModelsLocked(handlerType string, now time.
 
 		cooldownSuspended := 0
 		otherSuspended := 0
+		hasNotFoundCooldown := false
 		if registration.SuspendedClients != nil {
 			for _, reason := range registration.SuspendedClients {
+				hasNotFoundCooldown = hasNotFoundCooldown || modelSuspensionIsNotFound(reason)
 				if strings.EqualFold(reason, "quota") {
 					cooldownSuspended++
 					continue
@@ -984,7 +986,7 @@ func (r *ModelRegistry) buildAvailableModelsLocked(handlerType string, now time.
 			effectiveClients = 0
 		}
 
-		if effectiveClients > 0 || (availableClients > 0 && (expiredClients > 0 || cooldownSuspended > 0) && otherSuspended == 0) {
+		if effectiveClients > 0 || (availableClients > 0 && hasNotFoundCooldown) || (availableClients > 0 && (expiredClients > 0 || cooldownSuspended > 0) && otherSuspended == 0) {
 			model := r.convertModelToMap(registration.Info, handlerType)
 			if model != nil {
 				models = append(models, model)
@@ -1217,10 +1219,12 @@ func providerHasCatalogAvailability(
 		}
 	}
 	hasOtherUnavailable := false
+	hasNotFoundCooldown := false
 	for clientID, reason := range registration.SuspendedClients {
 		if clientProviders[clientID] != provider {
 			continue
 		}
+		hasNotFoundCooldown = hasNotFoundCooldown || modelSuspensionIsNotFound(reason)
 		if modelSuspensionIsQuotaOnly(reason) {
 			unavailableClients[clientID] = struct{}{}
 			hasQuotaUnavailable = true
@@ -1233,8 +1237,19 @@ func providerHasCatalogAvailability(
 	if effectiveClients < 0 {
 		effectiveClients = 0
 	}
-	return effectiveClients > 0 ||
+	return effectiveClients > 0 || hasNotFoundCooldown ||
 		(availableClients > 0 && hasQuotaUnavailable && !hasOtherUnavailable)
+}
+
+// Timed model-not-found failures retain catalog routes so the auth manager can
+// enforce the cooldown and retry the model after its deadline without a restart.
+func modelSuspensionIsNotFound(reason string) bool {
+	switch strings.ToLower(strings.TrimSpace(reason)) {
+	case "not_found", "model_not_found":
+		return true
+	default:
+		return false
+	}
 }
 
 func modelSuspensionIsQuotaOnly(reason string) bool {
