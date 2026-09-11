@@ -44,6 +44,9 @@ func ExtractExplicitIdentity(headers http.Header, payload []byte, executionID st
 			return identityWithParent(field[1], id, "", roots), true
 		}
 	}
+	if id := promptCacheIdentity(roots[0].Get("prompt_cache_key")); id != "" {
+		return Identity{SessionID: id}, true
+	}
 	if id := explicitID(executionID); id != "" {
 		return Identity{SessionID: "execution:" + id}, true
 	}

@@ -1771,7 +1771,7 @@ type RoutingConfig struct {
 	// SessionAffinity enables universal session-sticky routing for all clients.
 	// Session IDs are extracted from multiple sources:
 	// metadata.user_id, X-Session-ID, Session-Id/Session_id, X-Client-Request-Id,
-	// conversation_id, or message hash.
+	// conversation_id, prompt_cache_key, or message hash.
 	SessionAffinity bool `yaml:"session-affinity,omitempty" json:"session-affinity,omitempty"`
 
 	// SessionAffinityAcrossPriorities keeps an eligible existing binding when a

@@ -21,6 +21,7 @@ func TestExplicitIdentityNativeAndGenericSources(t *testing.T) {
 		{"conversation", `{"conversation":{"id":"root"}}`, "", nil, Identity{SessionID: "conv:root"}},
 		{"user", `{"metadata":{"user_id":"fixture-user"}}`, "", nil, Identity{SessionID: "user:fixture-user"}},
 		{"execution", `{}`, "fixture-connection", nil, Identity{SessionID: "execution:fixture-connection"}},
+		{"cache before execution", `{"prompt_cache_key":"shared-prefix"}`, "fixture-connection", nil, Identity{SessionID: PromptCacheIdentity([]byte(`{"prompt_cache_key":"shared-prefix"}`))}},
 		{"self reference", `{"session_id":"root","parent_session_id":"root"}`, "", nil, Identity{SessionID: "session:root"}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -31,11 +32,11 @@ func TestExplicitIdentityNativeAndGenericSources(t *testing.T) {
 		})
 	}
 	for _, body := range []string{
-		`{"prompt_cache_key":"shared-prefix"}`, `{"session_id":42}`, `{"metadata":{"user_id":{"session_id":"nested-business"}}}`,
+		`{"prompt_cache_key":42}`, `{"session_id":42}`, `{"metadata":{"user_id":{"session_id":"nested-business"}}}`,
 		`{"input":[{"arguments":{"session_id":"business","parent_session_id":"business-parent"}}]}`,
 	} {
 		if got, ok := ExtractExplicitIdentity(nil, []byte(body), ""); ok || got != (Identity{}) {
-			t.Fatal("cache key, invalid type or arbitrary business JSON established an identity")
+			t.Fatal("invalid type or arbitrary business JSON established an identity")
 		}
 	}
 }

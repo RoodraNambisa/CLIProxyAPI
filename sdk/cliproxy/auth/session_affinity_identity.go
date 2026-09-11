@@ -14,6 +14,38 @@ import (
 )
 
 const affinityIdentityMetadataKey = "session_affinity_identity_snapshot"
+const basicAffinityIdentityMetadataKey = "basic_session_affinity_identity_snapshot"
+
+type basicAffinityIdentity struct {
+	selector          *SessionAffinitySelector
+	primary, fallback string
+}
+
+// Capture basic identities before provider translation and automatic cache keys.
+// Keep cross-client-key binding semantics and retain only detached identifiers.
+func (s *SessionAffinitySelector) withBasicAffinityIdentity(ctx context.Context, req core.Request, opts core.Options) core.Options {
+	if captured, ok := opts.Metadata[basicAffinityIdentityMetadataKey].(basicAffinityIdentity); ok && captured.selector == s {
+		return opts
+	}
+	headers := opts.Headers
+	if headers == nil && ctx != nil {
+		if c, _ := ctx.Value("gin").(*gin.Context); c != nil && c.Request != nil {
+			headers = c.Request.Header
+		}
+	}
+	payload := opts.OriginalRequest
+	if len(payload) == 0 {
+		payload = req.Payload
+	}
+	primary, fallback := extractSessionIDs(headers, payload, opts.Metadata)
+	metadata := make(map[string]any, len(opts.Metadata)+1)
+	for key, value := range opts.Metadata {
+		metadata[key] = value
+	}
+	metadata[basicAffinityIdentityMetadataKey] = basicAffinityIdentity{selector: s, primary: strings.Clone(primary), fallback: strings.Clone(fallback)}
+	opts.Metadata = metadata
+	return opts
+}
 
 type affinityRequestIdentity struct {
 	scope          string
@@ -90,6 +122,9 @@ func scopedAffinityID(scope, id string) string {
 }
 
 func (s *SessionAffinitySelector) sessionIDs(ctx context.Context, opts core.Options) (string, string) {
+	if captured, ok := opts.Metadata[basicAffinityIdentityMetadataKey].(basicAffinityIdentity); ok && captured.selector == s {
+		return captured.primary, captured.fallback
+	}
 	if s != nil && (s.subagents || s.lcp) {
 		captured := captureAffinityIdentity(ctx, core.Request{}, opts, s.lcp)
 		if captured.scope != "" {

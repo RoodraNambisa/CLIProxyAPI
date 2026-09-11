@@ -1039,7 +1039,8 @@ func NewSessionAffinitySelectorWithConfig(cfg SessionAffinityConfig) *SessionAff
 //  4. X-Client-Request-Id header (PI)
 //  5. metadata.user_id (non-Claude Code format)
 //  6. conversation_id field
-//  7. Hash-based fallback from messages
+//  7. Explicit prompt_cache_key
+//  8. Hash-based fallback from messages
 //
 // Note: The cache key includes provider, session ID, and model to handle cases where
 // a session uses multiple models (e.g., gemini-2.5-pro and gemini-3-flash-preview)
@@ -1336,7 +1337,8 @@ func (s *SessionAffinitySelector) InvalidateAuth(authID string) {
 //  4. X-Client-Request-Id header (PI)
 //  5. metadata.user_id (non-Claude Code format)
 //  6. conversation_id field in request body
-//  7. Stable hash from first few messages content (fallback)
+//  7. Explicit prompt_cache_key
+//  8. Stable hash from first few messages content (fallback)
 func ExtractSessionID(headers http.Header, payload []byte, metadata map[string]any) string {
 	primary, _ := extractSessionIDs(headers, payload, metadata)
 	return primary
@@ -1404,7 +1406,12 @@ func extractSessionIDs(headers http.Header, payload []byte, metadata map[string]
 		return "conv:" + convID, ""
 	}
 
-	// 7. Hash-based fallback from message content
+	// 7. Preserve explicit conversation identifiers ahead of the cache key.
+	if id := session.PromptCacheIdentity(payload); id != "" {
+		return id, ""
+	}
+
+	// 8. Hash-based fallback from message content
 	return extractMessageHashIDs(payload)
 }
 
