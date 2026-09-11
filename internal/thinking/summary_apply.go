@@ -31,7 +31,13 @@ func applySummaryConfigForModel(body []byte, format, model string, modelInfo *re
 // dialects whose visibility controls are not part of the OpenAI wire format.
 func applySummaryConfigForProvider(body []byte, format, model, provider string, modelInfo *registry.ModelInfo, config SummaryConfig) []byte {
 	normalized := strings.ToLower(strings.TrimSpace(format))
-	if config.Mode == SummaryUnspecified || !summaryFormatSupported(normalized) || len(body) == 0 || !gjson.ValidBytes(body) {
+	if config.Mode == SummaryUnspecified || !summaryFormatSupported(normalized) || len(body) == 0 {
+		return body
+	}
+	if normalized == "openai-response" || normalized == "codex" {
+		return applyResponsesSummaryConfig(body, config)
+	}
+	if !gjson.ValidBytes(body) {
 		return body
 	}
 
@@ -80,8 +86,6 @@ func applySummaryConfigForProvider(body []byte, format, model, provider string, 
 		}
 		body, _ = sjson.SetBytes(body, "generation_config.thinking_summaries", value)
 		body, _ = sjson.DeleteBytes(body, "generation_config.thinkingSummaries")
-	case "openai-response", "codex":
-		body = applyResponsesSummaryConfig(body, config)
 	}
 	return body
 }
@@ -94,8 +98,21 @@ func applyResponsesSummaryConfig(body []byte, config SummaryConfig) []byte {
 	reasoning := gjson.Get(unsafe.String(unsafe.SliceData(body), len(body)), "reasoning")
 	summary := reasoning.Get("summary")
 	legacy := reasoning.Get("generate_summary")
+	detail := normalizedSummaryDetail(config.Detail)
+	emptyReasoning := reasoning.IsObject() && len(reasoning.Raw) >= 2 && strings.TrimSpace(reasoning.Raw[1:len(reasoning.Raw)-1]) == ""
+	needsSummaryChange := summary.Exists() || emptyReasoning
 	if config.Mode == SummaryEnabled {
-		detail := normalizedSummaryDetail(config.Detail)
+		needsSummaryChange = summary.Raw != `"`+detail+`"`
+	}
+	if !needsSummaryChange && !legacy.Exists() {
+		return body
+	}
+	// A no-op above already preserves invalid input verbatim. Any real change
+	// must still validate the complete original document before writing.
+	if !gjson.ValidBytes(body) {
+		return body
+	}
+	if config.Mode == SummaryEnabled {
 		if summary.Raw != `"`+detail+`"` {
 			body, _ = sjson.SetBytes(body, "reasoning.summary", detail)
 		}

@@ -43,6 +43,8 @@ func TestResponsesSummaryApplyKeepsMutationSemantics(t *testing.T) {
 		`{"reasoning":{"summary":" CONCISE "},"metadata":{"reasoning":{"summary":"auto"}}}`,
 		`{"reasoning":{"effort":"high"}}`, `{"reasoning": { } }`, `[]`, `null`,
 		`{"reasoning":{"summary":"auto"},"input":invalid}`,
+		`{"reasoning":{`, `{"reasoning":{"summary":"auto"},"input":"unterminated}`,
+		`{"reasoning":{"effort":"high"}}junk`,
 	} {
 		for _, config := range []SummaryConfig{{}, {Mode: SummaryDisabled}, {Mode: SummaryEnabled}, {Mode: SummaryEnabled, Detail: "detailed"}} {
 			body := []byte(fixture)
@@ -112,11 +114,11 @@ func BenchmarkResponsesSummaryApplyLargeBody(b *testing.B) {
 }
 
 func FuzzResponsesSummaryApplyKeepsMutationSemantics(f *testing.F) {
-	for _, body := range []string{`{}`, `{"reasoning":null,"reasoning":{"summary":"auto"}}`, `{"reasoning":{"summary":null,"summary":"auto","generate_summary":"auto"}}`, `{"rea\u0073oning":{"summary":"\u0061uto"}}`} {
+	for _, body := range []string{`{}`, `{"reasoning":null,"reasoning":{"summary":"auto"}}`, `{"reasoning":{"summary":null,"summary":"auto","generate_summary":"auto"}}`, `{"rea\u0073oning":{"summary":"\u0061uto"}}`, `{"reasoning":{`, `{"reasoning":{"summary":"auto"}}junk`} {
 		f.Add([]byte(body))
 	}
 	f.Fuzz(func(t *testing.T, body []byte) {
-		if len(body) > 1<<20 || !gjson.ValidBytes(body) {
+		if len(body) > 1<<20 {
 			return
 		}
 		for _, config := range []SummaryConfig{{Mode: SummaryEnabled}, {Mode: SummaryDisabled}} {

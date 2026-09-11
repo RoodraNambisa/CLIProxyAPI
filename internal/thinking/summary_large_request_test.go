@@ -153,3 +153,14 @@ func FuzzChatSummaryProjectionKeepsExplicitIntent(f *testing.F) {
 		}
 	})
 }
+
+func TestChatSummaryIgnoresContainersWithoutVisibilityLeaves(t *testing.T) {
+	body := []byte(`{"extra_body":{"unrelated":"` + strings.Repeat("x", 1<<20) + `"},"reasoning":{"effort":"high"},"thinking":{"budget_tokens":2048}}`)
+	if allocations := testing.AllocsPerRun(5, func() {
+		if got := ExtractSummaryConfig(body, "openai"); got != (SummaryConfig{}) {
+			t.Fatalf("containers inferred visibility: %+v", got)
+		}
+	}); allocations != 0 {
+		t.Fatalf("containers without summary parameters allocated %g times", allocations)
+	}
+}

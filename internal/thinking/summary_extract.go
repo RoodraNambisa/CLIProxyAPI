@@ -146,7 +146,9 @@ func ExtractExplicitSummaryConfig(body []byte, format string) SummaryConfig {
 }
 
 func openAISummaryMayBeSpecified(body []byte) bool {
-	return util.JSONMayContainAnyField(body, "extra_body", "google", "thinking", "reasoning", "generationConfig", "generation_config", "include_reasoning", "reasoning_effort")
+	// Containers alone do not request summaries. Every supported alias ends
+	// at one of these leaf fields; scope and precedence are parsed afterwards.
+	return util.JSONMayContainAnyField(body, "includeThoughts", "include_thoughts", "summary", "generate_summary", "exclude", "include_reasoning", "enabled", "reasoning_effort")
 }
 
 // openAISummaryFields keeps unrelated messages out of repeated alias lookups.
