@@ -47,7 +47,9 @@ func convertOpenAIResponsesRequestToCodexFastPath(inputRawJSON []byte) ([]byte, 
 	hasStore := false
 	hasParallelToolCalls := false
 	hasInclude := false
-	supported := true
+	var firstInput gjson.Result
+	hasInput := false
+	var additionalInputs []gjson.Result
 
 	root.ForEach(func(key, value gjson.Result) bool {
 		field := key.String()
@@ -55,12 +57,12 @@ func convertOpenAIResponsesRequestToCodexFastPath(inputRawJSON []byte) ([]byte, 
 		case "max_output_tokens", "max_completion_tokens", "temperature", "top_p", "truncation", "context_management", "prompt_cache_options", "user":
 			return true
 		case "input":
-			output = appendJSONObjectFieldName(output, field, &wroteField)
-			var ok bool
-			output, ok = appendNormalizedOpenAIResponsesInput(output, value)
-			if !ok {
-				supported = false
-				return false
+			// Emit request controls before large history so later protocol
+			// lookups do not repeatedly scan it. Keep duplicate input order.
+			if hasInput {
+				additionalInputs = append(additionalInputs, value)
+			} else {
+				firstInput, hasInput = value, true
 			}
 			return true
 		case "stream":
@@ -104,10 +106,6 @@ func convertOpenAIResponsesRequestToCodexFastPath(inputRawJSON []byte) ([]byte, 
 		}
 	})
 
-	if !supported {
-		return nil, false
-	}
-
 	if !hasStream {
 		output = appendJSONObjectFieldName(output, "stream", &wroteField)
 		output = append(output, "true"...)
@@ -123,6 +121,20 @@ func convertOpenAIResponsesRequestToCodexFastPath(inputRawJSON []byte) ([]byte, 
 	if !hasInclude {
 		output = appendJSONObjectFieldName(output, "include", &wroteField)
 		output = append(output, codexResponsesIncludeRaw...)
+	}
+	appendInput := func(value gjson.Result) bool {
+		output = appendJSONObjectFieldName(output, "input", &wroteField)
+		var ok bool
+		output, ok = appendNormalizedOpenAIResponsesInput(output, value)
+		return ok
+	}
+	if hasInput && !appendInput(firstInput) {
+		return nil, false
+	}
+	for _, value := range additionalInputs {
+		if !appendInput(value) {
+			return nil, false
+		}
 	}
 
 	output = append(output, '}')

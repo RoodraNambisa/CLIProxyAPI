@@ -46,6 +46,32 @@ func TestCodexResponsesFastPathOwnsResultAfterSourceRelease(t *testing.T) {
 	}
 }
 
+func TestCodexResponsesControlsPrecedeHistoryWithoutChangingValues(t *testing.T) {
+	body := []byte(`{"input":[{"type":"message","id":"msg_first","content":"text"}],"reasoning":{"summary":"auto","effort":"high"},"input":[{"type":"function_call_output","call_id":"pair","output":{"id":"business"}}],"prompt_cache_key":" keep ","reasoning":{"summary":"none"}}`)
+	out := ConvertOpenAIResponsesRequestToCodex("fixture", body, true)
+	var fields []string
+	var inputs, reasoning []string
+	gjson.ParseBytes(out).ForEach(func(key, value gjson.Result) bool {
+		fields = append(fields, key.Str)
+		switch key.Str {
+		case "input":
+			inputs = append(inputs, value.Raw)
+		case "reasoning":
+			reasoning = append(reasoning, value.Raw)
+		}
+		return true
+	})
+	if len(inputs) != 2 || inputs[0] != `[{"type":"message","id":"msg_first","content":"text"}]` || inputs[1] != `[{"type":"function_call_output","call_id":"pair","output":{"id":"business"}}]` {
+		t.Fatal("moving controls changed input values, order, or pairing")
+	}
+	if len(reasoning) != 2 || reasoning[0] != `{"summary":"auto","effort":"high"}` || reasoning[1] != `{"summary":"none"}` || gjson.GetBytes(out, "prompt_cache_key").Str != " keep " {
+		t.Fatal("moving controls changed duplicate precedence or cache identity")
+	}
+	if fields[len(fields)-2] != "input" || fields[len(fields)-1] != "input" {
+		t.Fatal("request controls require traversing input history")
+	}
+}
+
 func BenchmarkCodexResponsesOwnedRequest(b *testing.B) {
 	for _, size := range []int{1 << 20, 10 << 20} {
 		b.Run(fmt.Sprintf("bytes=%d", size), func(b *testing.B) {
