@@ -4033,10 +4033,46 @@ func (vm *conversationTurnstileVM) call(target any, args []any) (any, error) {
 			}
 			object[key] = args[2]
 			return true, nil
+		case conversationTurnstileObjectRef:
+			return vm.reflectSetObjectRefProperty(object, args[1], args[2])
 		}
 		return false, nil
 	default:
 		return nil, conversationTurnstileTypeError("value is not callable")
+	}
+}
+
+func (vm *conversationTurnstileVM) reflectSetObjectRefProperty(object conversationTurnstileObjectRef, key, value any) (bool, error) {
+	if object.path != "window" {
+		return false, nil
+	}
+	propertyKey, err := vm.toPropertyKey(key)
+	if err != nil {
+		return false, err
+	}
+	keyText, err := vm.runtimeString(propertyKey)
+	if err != nil {
+		return false, err
+	}
+	if !conversationTurnstileWritableWindowState(keyText) {
+		return false, nil
+	}
+	path := object.path + "." + keyText
+	if _, exists := vm.environment[path]; !exists {
+		if err = vm.reserveRuntimeBytes(len(path) + 64); err != nil {
+			return false, err
+		}
+	}
+	vm.environment[path] = value
+	return true, nil
+}
+
+func conversationTurnstileWritableWindowState(key string) bool {
+	switch key {
+	case "__oai_so_owner", "__oai_so_uk", "__oai_so_uin", "__oai_so_ui":
+		return true
+	default:
+		return false
 	}
 }
 

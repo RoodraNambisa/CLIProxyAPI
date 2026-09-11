@@ -1,6 +1,7 @@
 package chatgptweb
 
 import (
+	"encoding/base64"
 	"errors"
 	"testing"
 	"time"
@@ -90,6 +91,47 @@ func TestConversationSentinelObserverVMSupportsCurrentPageState(t *testing.T) {
 	}
 	if snapshot != "MHwwfDA=" {
 		t.Fatalf("Snapshot() = %q", snapshot)
+	}
+}
+
+func TestConversationSentinelObserverVMPreservesCollectorOwner(t *testing.T) {
+	const (
+		requirementsToken = "requirements"
+		owner             = "11111111-2222-4333-8444-555555555555"
+	)
+	collectorDX := encodeConversationTurnstileProgram(t, requirementsToken, []any{
+		[]any{2, 40, "Reflect"},
+		[]any{6, 41, 10, 40},
+		[]any{2, 42, "set"},
+		[]any{6, 43, 41, 42},
+		[]any{2, 44, "__oai_so_owner"},
+		[]any{2, 45, owner},
+		[]any{7, 43, 10, 44, 45},
+	})
+	snapshotDX := encodeConversationTurnstileProgram(t, requirementsToken, []any{
+		[]any{2, 46, "__oai_so_owner"},
+		[]any{6, 47, 10, 46},
+		[]any{7, 3, 47},
+	})
+	observer, err := newConversationSentinelObserverVM(
+		t.Context(),
+		collectorDX,
+		snapshotDX,
+		requirementsToken,
+		ConversationTurnstileEnvironment{Persona: DefaultPersona()},
+		zeroReader{},
+		func() time.Time { return time.Unix(1_700_000_000, 0) },
+	)
+	if err != nil {
+		t.Fatalf("newConversationSentinelObserverVM() error = %v", err)
+	}
+	defer observer.Close()
+	snapshot, err := observer.Snapshot(t.Context())
+	if err != nil {
+		t.Fatalf("Snapshot() error = %v", err)
+	}
+	if want := base64.StdEncoding.EncodeToString([]byte(owner)); snapshot != want {
+		t.Fatalf("Snapshot() = %q, want %q", snapshot, want)
 	}
 }
 

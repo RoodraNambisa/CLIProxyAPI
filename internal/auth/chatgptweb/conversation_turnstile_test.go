@@ -296,6 +296,33 @@ func TestConversationTurnstilePropertyKeyUsesStringHint(t *testing.T) {
 	}
 }
 
+func TestConversationTurnstileReflectSetRestrictsWindowState(t *testing.T) {
+	vm := &conversationTurnstileVM{
+		environment:     make(map[string]any),
+		memoryBudget:    &conversationTurnstileMemoryBudget{},
+		executionBudget: &conversationTurnstileExecutionBudget{maxSteps: defaultConversationTurnstileMaxSteps},
+	}
+	window := conversationTurnstileObjectRef{path: "window"}
+	reflectSet := conversationTurnstileObjectRef{path: "window.Reflect.set"}
+	const owner = "11111111-2222-4333-8444-555555555555"
+
+	set, err := vm.call(reflectSet, []any{window, "__oai_so_owner", owner})
+	if err != nil || set != true {
+		t.Fatalf("Reflect.set(window, owner) = %#v, error = %v", set, err)
+	}
+	if got := vm.environment["window.__oai_so_owner"]; got != owner {
+		t.Fatalf("window owner = %#v, want %q", got, owner)
+	}
+
+	set, err = vm.call(reflectSet, []any{window, "unmodeled", "value"})
+	if err != nil || set != false {
+		t.Fatalf("Reflect.set(window, unmodeled) = %#v, error = %v", set, err)
+	}
+	if _, exists := vm.environment["window.unmodeled"]; exists {
+		t.Fatal("unmodeled window property was persisted")
+	}
+}
+
 func TestConversationTurnstileSubroutineCatchesPropertyTypeError(t *testing.T) {
 	requirementsToken := "requirements"
 	dx := encodeConversationTurnstileProgram(t, requirementsToken, []any{
