@@ -30,6 +30,7 @@ import (
 //   - []byte: The transformed request data in OpenAI Responses API format
 func ConvertOpenAIRequestToCodex(modelName string, inputRawJSON []byte, stream bool) []byte {
 	rawJSON := inputRawJSON
+	rawView := unsafe.String(unsafe.SliceData(rawJSON), len(rawJSON))
 	// Start with empty JSON object
 	out := []byte(`{"instructions":""}`)
 
@@ -74,7 +75,7 @@ func ConvertOpenAIRequestToCodex(modelName string, inputRawJSON []byte, stream b
 	// Extract system instructions from first system message (string or text object)
 	// Borrow history only while building independently owned output items.
 	// GetBytes would copy the complete message array before conversion.
-	messages := gjson.Get(unsafe.String(unsafe.SliceData(rawJSON), len(rawJSON)), "messages")
+	messages := gjson.Get(rawView, "messages")
 	// if messages.IsArray() {
 	// 	arr := messages.Array()
 	// 	for i := 0; i < len(arr); i++ {
@@ -232,9 +233,23 @@ func ConvertOpenAIRequestToCodex(modelName string, inputRawJSON []byte, stream b
 		}
 	}
 
+	// Keep borrowed control views inside this conversion, just like history.
+	rf := gjson.Get(rawView, "response_format")
+	text := gjson.Get(rawView, "text")
+	tools := gjson.Get(rawView, "tools")
+	tc := gjson.Get(rawView, "tool_choice")
+	inputBytes := 0
+	for _, item := range inputItems {
+		inputBytes += len(item)
+	}
+	// Filling tiny history last would copy a large schema unnecessarily.
+	// Defer history only when it is larger than the controls being edited.
+	if inputBytes <= len(rf.Raw)+len(text.Raw)+len(tools.Raw)+len(tc.Raw) {
+		out = translatorcommon.SetRawArrayItems(out, "input", inputItems)
+		inputItems = nil
+	}
+
 	// Map response_format and text settings to Responses API text.format
-	rf := gjson.GetBytes(rawJSON, "response_format")
-	text := gjson.GetBytes(rawJSON, "text")
 	if rf.Exists() {
 		// Always create text object when response_format provided
 		if !gjson.GetBytes(out, "text").Exists() {
@@ -278,7 +293,6 @@ func ConvertOpenAIRequestToCodex(modelName string, inputRawJSON []byte, stream b
 	}
 
 	// Map tools (flatten function fields)
-	tools := gjson.GetBytes(rawJSON, "tools")
 	if tools.IsArray() && len(tools.Array()) > 0 {
 		out, _ = sjson.SetRawBytes(out, "tools", []byte(`[]`))
 		arr := tools.Array()
@@ -337,7 +351,7 @@ func ConvertOpenAIRequestToCodex(modelName string, inputRawJSON []byte, stream b
 	// Map tool_choice when present.
 	// Chat Completions: "tool_choice" can be a string ("auto"/"none") or an object (e.g. {"type":"function","function":{"name":"..."}}).
 	// Responses API: keep built-in tool choices as-is; flatten function choice to {"type":"function","name":"..."}.
-	if tc := gjson.GetBytes(rawJSON, "tool_choice"); tc.Exists() {
+	if tc.Exists() {
 		switch {
 		case tc.Type == gjson.String:
 			out, _ = sjson.SetBytes(out, "tool_choice", tc.String())
@@ -374,7 +388,7 @@ func ConvertOpenAIRequestToCodex(modelName string, inputRawJSON []byte, stream b
 	}
 
 	out, _ = sjson.SetBytes(out, "store", false)
-	// Fill history after control edits so they do not copy the full content.
+	// Fill any deferred history once after all control edits.
 	return translatorcommon.SetRawArrayItems(out, "input", inputItems)
 }
 

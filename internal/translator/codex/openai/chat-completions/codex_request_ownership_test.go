@@ -46,11 +46,19 @@ func BenchmarkCodexChatOwnedRequest(b *testing.B) {
 
 func TestCodexChatControlEditsKeepHistoryAndSchema(t *testing.T) {
 	body := []byte(`{"messages":[{"role":"user","content":"keep"}],"tools":[{"type":"function","function":{"name":"read","strict":true,"parameters":{"type":"object","properties":{"input":{"type":"string"}},"required":["input"]}}}],"tool_choice":{"type":"function","function":{"name":"read"}},"response_format":{"type":"json_schema","json_schema":{"name":"answer","strict":true,"schema":{"type":"object","properties":{"input":{"type":"string"}},"required":["input"],"additionalProperties":false}}},"text":{"verbosity":"low"},"store":true}`)
-	out := ConvertOpenAIRequestToCodex("fixture", body, true)
-	if gjson.GetBytes(out, "input.0.content.0.text").Str != "keep" || gjson.GetBytes(out, "store").Bool() || gjson.GetBytes(out, "tool_choice.name").Str != "read" || !gjson.GetBytes(out, "tools.0.strict").Bool() {
-		t.Fatal("control edits changed input, storage or tool selection")
-	}
-	if gjson.GetBytes(out, "text.format.schema.properties.input.type").Str != "string" || !gjson.GetBytes(out, "text.format.strict").Bool() || gjson.GetBytes(out, "text.verbosity").Str != "low" || gjson.GetBytes(out, "tools.0.parameters.required.0").Str != "input" {
-		t.Fatal("history fill changed similarly named fields in schemas")
+	for _, content := range []string{"keep", strings.Repeat("keep", 1024)} {
+		source := bytes.Replace(body, []byte(`"keep"`), []byte(fmt.Sprintf("%q", content)), 1)
+		out := ConvertOpenAIRequestToCodex("fixture", source, true)
+		if gjson.GetBytes(out, "input.0.content.0.text").Str != content || gjson.GetBytes(out, "store").Bool() || gjson.GetBytes(out, "tool_choice.name").Str != "read" || !gjson.GetBytes(out, "tools.0.strict").Bool() {
+			t.Fatal("control edits changed input, storage or tool selection")
+		}
+		if gjson.GetBytes(out, "text.format.schema.properties.input.type").Str != "string" || !gjson.GetBytes(out, "text.format.strict").Bool() || gjson.GetBytes(out, "text.verbosity").Str != "low" || gjson.GetBytes(out, "tools.0.parameters.required.0").Str != "input" {
+			t.Fatal("history fill changed similarly named fields in schemas")
+		}
+		want := bytes.Clone(out)
+		clear(source)
+		if !bytes.Equal(out, want) {
+			t.Fatal("converted controls retained the released source")
+		}
 	}
 }
