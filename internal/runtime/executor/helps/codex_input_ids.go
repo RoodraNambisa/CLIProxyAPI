@@ -1,11 +1,13 @@
 package helps
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"strconv"
 	"strings"
 	"unicode/utf8"
+	"unsafe"
 
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -35,7 +37,13 @@ func codexInputIdentity(item gjson.Result, id, kind string) codexInputItemIdenti
 // Existing valid IDs reserve their names before replacements are allocated.
 // call_id is a separate tool-pairing key and is never rewritten here.
 func SanitizeCodexInputItemIDs(body []byte) []byte {
-	input := gjson.GetBytes(body, "input")
+	// A JSON key can spell id literally or use Unicode escapes. Without either
+	// representation no item can need ID repair.
+	if !bytes.Contains(body, []byte(`"id"`)) && !bytes.Contains(body, []byte(`\u`)) {
+		return body
+	}
+	// Parsed views stay in this call; changed output is rebuilt into owned bytes.
+	input := gjson.Get(unsafe.String(unsafe.SliceData(body), len(body)), "input")
 	if !input.IsArray() {
 		return body
 	}

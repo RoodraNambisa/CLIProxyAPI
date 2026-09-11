@@ -1,6 +1,7 @@
 package helps
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
@@ -12,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unsafe"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
@@ -79,7 +81,13 @@ func ReasoningReplayNamespace(ctx context.Context, provider, authID string, inst
 // values and non-replayable store IDs while preserving the reasoning item.
 // Configured compatibility endpoints may retain empty string placeholders.
 func SanitizeCodexReasoningEncryptedContent(ctx context.Context, provider string, body []byte, preserveEmpty ...bool) []byte {
-	input := gjson.GetBytes(body, "input")
+	// Unicode escapes may occur in field names. Keep the existing parser for
+	// those requests and skip only bodies that cannot contain a mutable field.
+	if !bytes.Contains(body, []byte(`"id"`)) && !bytes.Contains(body, []byte(`"encrypted_content"`)) && !bytes.Contains(body, []byte(`\u`)) {
+		return body
+	}
+	// The borrowed input is never retained; any changed body is rebuilt below.
+	input := gjson.Get(unsafe.String(unsafe.SliceData(body), len(body)), "input")
 	if !input.IsArray() {
 		return body
 	}
