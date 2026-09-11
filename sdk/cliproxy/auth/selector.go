@@ -5,7 +5,6 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
-	"hash/fnv"
 	"math"
 	"math/rand/v2"
 	"net/http"
@@ -21,6 +20,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/session"
 )
@@ -1349,8 +1349,8 @@ func ExtractSessionID(headers http.Header, payload []byte, metadata map[string]a
 // fallbackID: short hash without assistant (used to inherit binding from first turn)
 func extractSessionIDs(headers http.Header, payload []byte, metadata map[string]any) (string, string) {
 	// 1. metadata.user_id with Claude Code session format (highest priority)
+	userID := affinityBodyField(payload, "metadata.user_id").String()
 	if len(payload) > 0 {
-		userID := gjson.GetBytes(payload, "metadata.user_id").String()
 		if userID != "" {
 			// Old format: user_{hash}_account__session_{uuid}
 			if matches := sessionPattern.FindStringSubmatch(userID); len(matches) >= 2 {
@@ -1396,30 +1396,39 @@ func extractSessionIDs(headers http.Header, payload []byte, metadata map[string]
 	}
 
 	// 5. metadata.user_id (non-Claude Code format)
-	userID := gjson.GetBytes(payload, "metadata.user_id").String()
 	if userID != "" {
 		return "user:" + userID, ""
 	}
 
 	// 6. conversation_id field
-	if convID := gjson.GetBytes(payload, "conversation_id").String(); convID != "" {
+	if convID := affinityBodyField(payload, "conversation_id").String(); convID != "" {
 		return "conv:" + convID, ""
 	}
 
 	// 7. Preserve explicit conversation identifiers ahead of the cache key.
-	if id := session.PromptCacheIdentity(payload); id != "" {
-		return id, ""
+	if util.JSONMayContainAnyField(payload, "prompt_cache_key") {
+		if id := session.PromptCacheIdentity(payload); id != "" {
+			return id, ""
+		}
 	}
 
 	// 8. Hash-based fallback from message content
 	return extractMessageHashIDs(payload)
 }
 
+func affinityBodyField(payload []byte, path string) gjson.Result {
+	field, _, _ := strings.Cut(path, ".")
+	if !util.JSONMayContainAnyField(payload, field) {
+		return gjson.Result{}
+	}
+	return gjson.GetBytes(payload, path)
+}
+
 func extractMessageHashIDs(payload []byte) (primaryID, fallbackID string) {
 	var systemPrompt, firstUserMsg, firstAssistantMsg string
 
 	// OpenAI/Claude messages format
-	messages := gjson.GetBytes(payload, "messages")
+	messages := affinityBodyField(payload, "messages")
 	if messages.Exists() && messages.IsArray() {
 		messages.ForEach(func(_, msg gjson.Result) bool {
 			role := msg.Get("role").String()
@@ -1431,15 +1440,15 @@ func extractMessageHashIDs(payload []byte) (primaryID, fallbackID string) {
 			switch role {
 			case "system":
 				if systemPrompt == "" {
-					systemPrompt = truncateString(content, 100)
+					systemPrompt = content
 				}
 			case "user":
 				if firstUserMsg == "" {
-					firstUserMsg = truncateString(content, 100)
+					firstUserMsg = content
 				}
 			case "assistant":
 				if firstAssistantMsg == "" {
-					firstAssistantMsg = truncateString(content, 100)
+					firstAssistantMsg = content
 				}
 			}
 
@@ -1452,36 +1461,36 @@ func extractMessageHashIDs(payload []byte) (primaryID, fallbackID string) {
 
 	// Claude API: top-level "system" field (array or string)
 	if systemPrompt == "" {
-		topSystem := gjson.GetBytes(payload, "system")
+		topSystem := affinityBodyField(payload, "system")
 		if topSystem.Exists() {
 			if topSystem.IsArray() {
 				topSystem.ForEach(func(_, part gjson.Result) bool {
 					if text := part.Get("text").String(); text != "" && systemPrompt == "" {
-						systemPrompt = truncateString(text, 100)
+						systemPrompt = text
 						return false
 					}
 					return true
 				})
 			} else if topSystem.Type == gjson.String {
-				systemPrompt = truncateString(topSystem.String(), 100)
+				systemPrompt = topSystem.String()
 			}
 		}
 	}
 
 	// Gemini format
 	if systemPrompt == "" && firstUserMsg == "" {
-		sysInstr := gjson.GetBytes(payload, "systemInstruction.parts")
+		sysInstr := affinityBodyField(payload, "systemInstruction.parts")
 		if sysInstr.Exists() && sysInstr.IsArray() {
 			sysInstr.ForEach(func(_, part gjson.Result) bool {
 				if text := part.Get("text").String(); text != "" && systemPrompt == "" {
-					systemPrompt = truncateString(text, 100)
+					systemPrompt = text
 					return false
 				}
 				return true
 			})
 		}
 
-		contents := gjson.GetBytes(payload, "contents")
+		contents := affinityBodyField(payload, "contents")
 		if contents.Exists() && contents.IsArray() {
 			contents.ForEach(func(_, msg gjson.Result) bool {
 				role := msg.Get("role").String()
@@ -1493,11 +1502,11 @@ func extractMessageHashIDs(payload []byte) (primaryID, fallbackID string) {
 					switch role {
 					case "user":
 						if firstUserMsg == "" {
-							firstUserMsg = truncateString(text, 100)
+							firstUserMsg = text
 						}
 					case "model":
 						if firstAssistantMsg == "" {
-							firstAssistantMsg = truncateString(text, 100)
+							firstAssistantMsg = text
 						}
 					}
 					return false
@@ -1512,12 +1521,14 @@ func extractMessageHashIDs(payload []byte) (primaryID, fallbackID string) {
 
 	// OpenAI Responses API format (v1/responses)
 	if systemPrompt == "" && firstUserMsg == "" {
-		if instr := gjson.GetBytes(payload, "instructions").String(); instr != "" {
-			systemPrompt = truncateString(instr, 100)
+		if instr := affinityBodyField(payload, "instructions").String(); instr != "" {
+			systemPrompt = instr
 		}
 
-		input := gjson.GetBytes(payload, "input")
-		if input.Exists() && input.IsArray() {
+		input := affinityBodyField(payload, "input")
+		if input.Type == gjson.String {
+			firstUserMsg = input.Str
+		} else if input.IsArray() {
 			input.ForEach(func(_, item gjson.Result) bool {
 				itemType := item.Get("type").String()
 				if itemType == "reasoning" {
@@ -1549,15 +1560,15 @@ func extractMessageHashIDs(payload []byte) (primaryID, fallbackID string) {
 				switch role {
 				case "developer", "system":
 					if systemPrompt == "" {
-						systemPrompt = truncateString(text, 100)
+						systemPrompt = text
 					}
 				case "user":
 					if firstUserMsg == "" {
-						firstUserMsg = truncateString(text, 100)
+						firstUserMsg = text
 					}
 				case "assistant":
 					if firstAssistantMsg == "" {
-						firstAssistantMsg = truncateString(text, 100)
+						firstAssistantMsg = text
 					}
 				}
 
@@ -1569,38 +1580,48 @@ func extractMessageHashIDs(payload []byte) (primaryID, fallbackID string) {
 		}
 	}
 
-	if systemPrompt == "" && firstUserMsg == "" {
+	// Shared templates alone do not identify a conversation.
+	if firstUserMsg == "" {
 		return "", ""
 	}
 
-	shortHash := computeSessionHash(systemPrompt, firstUserMsg, "")
-	if firstAssistantMsg == "" {
+	return messageHashIDs(systemPrompt, firstUserMsg, firstAssistantMsg)
+}
+
+func messageHashIDs(systemPrompt, userMsg, assistantMsg string) (string, string) {
+	// Fixed role slots and presence bits prevent text from forging a role
+	// boundary. Hash each complete initial message once without concatenating
+	// large strings, and reuse the first-turn digest for binding inheritance.
+	var framed [1 + 3*sha256.Size]byte
+	for role, text := range [...]string{systemPrompt, userMsg} {
+		if text != "" {
+			framed[0] |= 1 << role
+			digest := messageTextDigest(text)
+			copy(framed[1+role*sha256.Size:], digest[:])
+		}
+	}
+	shortHash := fmt.Sprintf("msg:%x", sha256.Sum256(framed[:]))
+	if assistantMsg == "" {
 		return shortHash, ""
 	}
-
-	fullHash := computeSessionHash(systemPrompt, firstUserMsg, firstAssistantMsg)
-	return fullHash, shortHash
+	framed[0] |= 1 << 2
+	digest := messageTextDigest(assistantMsg)
+	copy(framed[1+2*sha256.Size:], digest[:])
+	return fmt.Sprintf("msg:%x", sha256.Sum256(framed[:])), shortHash
 }
 
-func computeSessionHash(systemPrompt, userMsg, assistantMsg string) string {
-	h := fnv.New64a()
-	if systemPrompt != "" {
-		h.Write([]byte("sys:" + systemPrompt + "\n"))
+func messageTextDigest(text string) (digest [sha256.Size]byte) {
+	// Converting an entire long string to []byte for sha256.Sum256 allocates a
+	// second copy. A bounded scratch buffer keeps that cost independent of size.
+	hasher := sha256.New()
+	var scratch [4096]byte
+	for len(text) > 0 {
+		n := copy(scratch[:], text)
+		_, _ = hasher.Write(scratch[:n])
+		text = text[n:]
 	}
-	if userMsg != "" {
-		h.Write([]byte("usr:" + userMsg + "\n"))
-	}
-	if assistantMsg != "" {
-		h.Write([]byte("ast:" + assistantMsg + "\n"))
-	}
-	return fmt.Sprintf("msg:%016x", h.Sum64())
-}
-
-func truncateString(s string, maxLen int) string {
-	if len(s) > maxLen {
-		return s[:maxLen]
-	}
-	return s
+	hasher.Sum(digest[:0])
+	return digest
 }
 
 // extractMessageContent extracts text content from a message content field.
