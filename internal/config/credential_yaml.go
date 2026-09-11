@@ -11,6 +11,7 @@ import (
 )
 
 var credentialYAMLTypes = map[string]reflect.Type{
+	"api-key-groups":              reflect.TypeFor[APIKeyGroup](),
 	"codex":                       reflect.TypeFor[CodexConfig](),
 	"gemini-api-key":              reflect.TypeFor[GeminiKey](),
 	"interactions-api-key":        reflect.TypeFor[GeminiKey](),
@@ -72,6 +73,8 @@ func matchCredentialYAMLSequenceElement(original []*yaml.Node, used []bool, targ
 	}
 	var primary, secondary string
 	switch credentialYAMLMappingType(path) {
+	case reflect.TypeFor[APIKeyGroup]():
+		primary = "api-key"
 	case reflect.TypeFor[RequestScopedErrorRule]():
 		return matchRequestScopedErrorYAMLRule(original, used, target), true
 	case reflect.TypeFor[GeminiKey](), reflect.TypeFor[ClaudeKey](), reflect.TypeFor[CodexKey](), reflect.TypeFor[VertexCompatKey]():
