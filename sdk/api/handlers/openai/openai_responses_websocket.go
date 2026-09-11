@@ -1187,7 +1187,14 @@ func shouldReleaseResponsesWebsocketPinnedAuth(errMsg *interfaces.ErrorMessage) 
 			}
 		}
 	}
-	switch handlers.OriginalErrorStatusCode(errMsg) {
+	status := handlers.OriginalErrorStatusCode(errMsg)
+	if status == http.StatusNotFound {
+		original := &coreauth.Error{HTTPStatus: status, Message: handlers.OriginalErrorText(errMsg)}
+		if !coreauth.IsRequestFaultError(original) {
+			return true
+		}
+	}
+	switch status {
 	case http.StatusUnauthorized, http.StatusPaymentRequired, http.StatusForbidden, http.StatusRequestTimeout, http.StatusTooManyRequests, http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
 		return true
 	}
