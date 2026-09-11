@@ -533,6 +533,9 @@ routing:
   # is unavailable or the request fails. Set false for strict sticky sessions.
   session-affinity-failover: true # default: true
   # How long session-to-auth bindings are retained. Default: 1h
+  # Unrelated updates, request limits and priority overrides retain bindings.
+  # Changing the selector or affinity settings starts a new binding cache;
+  # in-flight requests keep their earlier selector and policy.
   session-affinity-ttl: "1h"
 
 # When true, enable authentication for the WebSocket API (/v1/ws).

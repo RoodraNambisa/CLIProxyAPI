@@ -4932,7 +4932,11 @@ func (s *Service) applyRuntimeConfigState(ctx context.Context, previousCfg, next
 	previousUsageEnabled := previousCfg != nil && previousCfg.UsageStatisticsEnabled
 	previousUsageSettings := usagePersistenceSettingsForConfig(previousCfg)
 
-	if s.coreManager != nil {
+	if s.coreManager != nil && previousCfg != nil && routingSelectorSettingsForConfig(previousCfg) == routingSelectorSettingsForConfig(nextCfg) {
+		// Preserve active bindings and their maintenance while publishing updated
+		// request policy. In-flight requests still retain their earlier policy.
+		s.coreManager.SetConfig(nextCfg)
+	} else if s.coreManager != nil {
 		var selector coreauth.Selector
 		switch normalizeRuntimeRoutingStrategy(nextCfg.Routing.Strategy) {
 		case "fill-first":
