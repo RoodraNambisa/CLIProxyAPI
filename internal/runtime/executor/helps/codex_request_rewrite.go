@@ -139,6 +139,15 @@ func codexRequestField(rawKey []byte) codexRequestFieldKind {
 }
 
 func visitCodexTopLevelFields(payload []byte, visit func(rawKey, rawValue []byte)) error {
+	return visitCodexTopLevelFieldsUntil(payload, func(rawKey, rawValue []byte) bool {
+		visit(rawKey, rawValue)
+		return true
+	})
+}
+
+// visitCodexTopLevelFieldsUntil can stop after selected fields are found. It
+// scans raw values without decoding unrelated text or nested objects.
+func visitCodexTopLevelFieldsUntil(payload []byte, visit func(rawKey, rawValue []byte) bool) error {
 	index := 1
 	for {
 		index = skipCodexJSONSpace(payload, index)
@@ -160,7 +169,9 @@ func visitCodexTopLevelFields(payload []byte, visit func(rawKey, rawValue []byte
 		if !ok {
 			return fmt.Errorf("codex request payload contains an invalid object value")
 		}
-		visit(payload[keyStart:keyEnd], payload[valueStart:valueEnd])
+		if !visit(payload[keyStart:keyEnd], payload[valueStart:valueEnd]) {
+			return nil
+		}
 		index = skipCodexJSONSpace(payload, valueEnd)
 		if index >= len(payload) {
 			return fmt.Errorf("codex request payload ended before the object closed")

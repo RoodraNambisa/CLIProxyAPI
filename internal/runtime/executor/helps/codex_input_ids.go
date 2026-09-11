@@ -21,6 +21,36 @@ type codexInputItemIdentity struct {
 	callID string
 }
 
+// readCodexInputItemHeader reads the first ID and type in one pass. The views
+// borrow item.Raw and remain inside the request normalizer's lifetime.
+func readCodexInputItemHeader(item gjson.Result) (id, kind string) {
+	if !item.IsObject() {
+		return item.Get("id").Str, item.Get("type").Str
+	}
+	seenID, seenKind := false, false
+	payload := unsafe.Slice(unsafe.StringData(item.Raw), len(item.Raw))
+	err := visitCodexTopLevelFieldsUntil(payload, func(rawKey, rawValue []byte) bool {
+		key := gjson.Parse(unsafe.String(unsafe.SliceData(rawKey), len(rawKey))).Str
+		switch key {
+		case "id":
+			if !seenID {
+				id = gjson.Parse(unsafe.String(unsafe.SliceData(rawValue), len(rawValue))).Str
+				seenID = true
+			}
+		case "type":
+			if !seenKind {
+				kind = gjson.Parse(unsafe.String(unsafe.SliceData(rawValue), len(rawValue))).Str
+				seenKind = true
+			}
+		}
+		return !seenID || !seenKind
+	})
+	if err != nil {
+		return item.Get("id").Str, item.Get("type").Str
+	}
+	return id, kind
+}
+
 func codexInputIdentity(item gjson.Result, id, kind string) codexInputItemIdentity {
 	identity := codexInputItemIdentity{id: id, kind: kind}
 	if identity.kind == "" && item.Get("role").Str != "" {
@@ -51,26 +81,25 @@ func SanitizeCodexInputItemIDs(body []byte) []byte {
 	owners := make(map[string]codexInputItemIdentity, len(items))
 	needsRewrite := false
 	for _, item := range items {
-		id := item.Get("id")
-		if id.Type != gjson.String || id.Str == "" {
+		id, kind := readCodexInputItemHeader(item)
+		if id == "" {
 			continue
 		}
-		if dropCodexEncryptedReasoningID(item, id) {
+		if dropCodexEncryptedReasoningID(item, id, kind) {
 			needsRewrite = true
 			continue
 		}
-		kind := item.Get("type").Str
-		normalized := normalizeCodexInputItemID(kind, id.Str)
+		normalized := normalizeCodexInputItemID(kind, id)
 		tooLong := utf8.RuneCountInString(normalized) > codexInputItemIDLimit
-		needsRewrite = needsRewrite || normalized != id.Str || tooLong
-		identity := codexInputIdentity(item, id.Str, kind)
+		needsRewrite = needsRewrite || normalized != id || tooLong
+		identity := codexInputIdentity(item, id, kind)
 		owner, exists := owners[normalized]
 		if exists && owner != identity {
 			needsRewrite = true
 		}
 		// Prefer an existing canonical ID over one that only gains this name
 		// through prefix normalization. Otherwise the first identity owns it.
-		if !exists || (owner.id != normalized && id.Str == normalized) {
+		if !exists || (owner.id != normalized && id == normalized) {
 			owners[normalized] = identity
 		}
 	}
@@ -83,16 +112,15 @@ func SanitizeCodexInputItemIDs(body []byte) []byte {
 	rebuilt := make([]string, 0, len(items))
 	changed := false
 	for _, item := range items {
-		id := item.Get("id")
-		if dropCodexEncryptedReasoningID(item, id) {
+		id, kind := readCodexInputItemHeader(item)
+		if dropCodexEncryptedReasoningID(item, id, kind) {
 			changed = true
 			continue
 		}
 		raw := item.Raw
-		if id.Type == gjson.String && id.Str != "" {
-			kind := item.Get("type").Str
-			normalized := normalizeCodexInputItemID(kind, id.Str)
-			identity := codexInputIdentity(item, id.Str, kind)
+		if id != "" {
+			normalized := normalizeCodexInputItemID(kind, id)
+			identity := codexInputIdentity(item, id, kind)
 			needsSuffix := utf8.RuneCountInString(normalized) > codexInputItemIDLimit || owners[normalized] != identity
 			if needsSuffix {
 				replacement, ok := mapped[identity]
@@ -108,7 +136,7 @@ func SanitizeCodexInputItemIDs(body []byte) []byte {
 				}
 				normalized = replacement
 			}
-			if normalized != id.Str {
+			if normalized != id {
 				if updated, err := sjson.Set(raw, "id", normalized); err == nil {
 					raw = updated
 					changed = true
@@ -149,8 +177,8 @@ func normalizeCodexInputItemID(kind, id string) string {
 	return prefix + "_" + id
 }
 
-func dropCodexEncryptedReasoningID(item, id gjson.Result) bool {
-	if id.Type != gjson.String || utf8.RuneCountInString(id.Str) <= codexInputItemIDLimit || item.Get("type").Str != "reasoning" {
+func dropCodexEncryptedReasoningID(item gjson.Result, id, kind string) bool {
+	if kind != "reasoning" || utf8.RuneCountInString(id) <= codexInputItemIDLimit {
 		return false
 	}
 	encrypted := item.Get("encrypted_content")
