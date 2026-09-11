@@ -2,6 +2,7 @@ package thinking
 
 import (
 	"strings"
+	"unsafe"
 
 	"github.com/tidwall/gjson"
 )
@@ -50,6 +51,7 @@ func ExtractSummaryConfig(body []byte, format string) SummaryConfig {
 
 	switch normalized {
 	case "openai":
+		body = openAISummaryFields(body)
 		if config, ok := extractOpenAIExplicitSummaryConfig(body); ok {
 			return config
 		}
@@ -129,8 +131,39 @@ func ExtractExplicitSummaryConfig(body []byte, format string) SummaryConfig {
 	if len(body) == 0 || !gjson.ValidBytes(body) {
 		return SummaryConfig{}
 	}
-	config, _ := extractOpenAIExplicitSummaryConfig(body)
+	config, _ := extractOpenAIExplicitSummaryConfig(openAISummaryFields(body))
 	return config
+}
+
+// openAISummaryFields keeps unrelated messages out of repeated alias lookups.
+// Callers validate the original document first. Preserve duplicate fields and
+// their original encoding so deep-path lookup semantics remain unchanged.
+func openAISummaryFields(body []byte) []byte {
+	// The borrowed view is confined to this call. Selected values are copied
+	// into the small result; no reference to the caller's body escapes.
+	root := gjson.Parse(unsafe.String(unsafe.SliceData(body), len(body)))
+	if !root.IsObject() {
+		return nil
+	}
+	var fields []byte
+	root.ForEach(func(key, value gjson.Result) bool {
+		switch key.String() {
+		case "extra_body", "google", "thinking", "reasoning", "generationConfig", "generation_config", "include_reasoning", "reasoning_effort":
+			if len(fields) == 0 {
+				fields = append(fields, '{')
+			} else {
+				fields = append(fields, ',')
+			}
+			fields = append(fields, key.Raw...)
+			fields = append(fields, ':')
+			fields = append(fields, value.Raw...)
+		}
+		return true
+	})
+	if len(fields) > 0 {
+		fields = append(fields, '}')
+	}
+	return fields
 }
 
 // summaryFormatSupported reports whether a protocol carries summary visibility
