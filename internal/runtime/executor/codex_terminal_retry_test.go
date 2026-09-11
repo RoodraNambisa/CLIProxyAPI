@@ -20,18 +20,8 @@ func TestCodexTerminalRetainsQuotaResetAndParameter(t *testing.T) {
 				}
 				payload := []byte(fmt.Sprintf(`{"type":%q%s,"response":{"status":"failed","error":%s},"error":%s}`, event, status, node, node))
 				err, ok := codexTerminalStreamError(payload)
-				want := 429
-				if explicit {
-					want = 500
-				}
-				if !ok || err.StatusCode() != want || gjson.Get(err.Error(), "error.param").String() != "input[0]" {
+				if !ok || err.StatusCode() != 429 || gjson.Get(err.Error(), "error.param").String() != "input[0]" {
 					t.Fatal("terminal lost quota classification or the error parameter")
-				}
-				if explicit {
-					if err.RetryAfter() != nil {
-						t.Fatal("non-quota status acquired a quota reset")
-					}
-					return
 				}
 				if err.RetryAfter() == nil || *err.RetryAfter() != 7*time.Second || err.Headers().Get("Retry-After") != "7" {
 					t.Fatal("terminal dropped the upstream's explicit reset interval")

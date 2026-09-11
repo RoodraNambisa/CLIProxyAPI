@@ -413,7 +413,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		if respHS != nil {
 			helps.RecordAPIWebsocketUpgradeRejection(ctx, e.cfg, websocketUpgradeRequestLog(wsReqLog), respHS.StatusCode, respHS.Header.Clone(), bodyErr)
 		}
-		if respHS != nil && respHS.StatusCode == http.StatusUpgradeRequired {
+		if respHS != nil && respHS.StatusCode == http.StatusUpgradeRequired && !helps.IsCodexUsageLimitError(bodyErr) {
 			fallbackReq, fallbackOpts := req, opts
 			fallbackReq.Payload = fallbackPayloadRef.Bytes()
 			fallbackOpts.OriginalRequest = fallbackOriginalRef.Bytes()
@@ -795,7 +795,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		if respHS != nil {
 			helps.RecordAPIWebsocketUpgradeRejection(ctx, e.cfg, websocketUpgradeRequestLog(wsReqLog), respHS.StatusCode, respHS.Header.Clone(), bodyErr)
 		}
-		if respHS != nil && respHS.StatusCode == http.StatusUpgradeRequired {
+		if respHS != nil && respHS.StatusCode == http.StatusUpgradeRequired && !helps.IsCodexUsageLimitError(bodyErr) {
 			fallbackReq, fallbackOpts := req, opts
 			fallbackReq.Payload = fallbackPayloadRef.Bytes()
 			fallbackOpts.OriginalRequest = fallbackOriginalRef.Bytes()
@@ -1713,6 +1713,9 @@ func codexWebsocketErrorWithSanitizedMessage(original error, payload []byte) err
 }
 
 func newCodexWebsocketStatusErr(status int, body []byte) statusErr {
+	if helps.IsCodexUsageLimitError(body) {
+		return statusErr{code: http.StatusTooManyRequests, msg: string(body), retryAfter: parseCodexRetryAfter(http.StatusTooManyRequests, body, time.Now())}
+	}
 	return statusErr{
 		code:           status,
 		msg:            string(body),
@@ -1722,9 +1725,7 @@ func newCodexWebsocketStatusErr(status int, body []byte) statusErr {
 
 func newCodexWebsocketHandshakeStatusErr(status int, body []byte, headers http.Header) statusErrWithHeaders {
 	statusError := newCodexWebsocketStatusErr(status, body)
-	if retryAfter := parseCodexRetryAfter(status, body, time.Now()); retryAfter != nil {
-		statusError.retryAfter = retryAfter
-	} else if status == http.StatusTooManyRequests {
+	if statusError.retryAfter == nil && statusError.code == http.StatusTooManyRequests {
 		statusError.retryAfter = parseXAIRetryAfterHeader(headers.Get("Retry-After"), time.Now())
 	}
 	return statusErrWithHeaders{statusErr: statusError, headers: headers.Clone()}
@@ -1745,6 +1746,9 @@ func parseCodexWebsocketError(payload []byte) (error, bool) {
 		return nil, false
 	}
 	status := helps.CodexTerminalHTTPStatus(payload)
+	if helps.IsCodexUsageLimitError(payload) {
+		status = http.StatusTooManyRequests
+	}
 	if status == 0 {
 		return nil, false
 	}
@@ -1753,7 +1757,7 @@ func parseCodexWebsocketError(payload []byte) (error, bool) {
 	headers := parseCodexWebsocketErrorHeaders(payload)
 	statusError := newCodexWebsocketStatusErr(status, out)
 	statusError.responseBody = string(payload)
-	if retryAfter := parseCodexRetryAfter(status, out, time.Now()); retryAfter != nil {
+	if retryAfter := parseCodexRetryAfter(status, payload, time.Now()); retryAfter != nil {
 		statusError.retryAfter = retryAfter
 	} else if isCodexWebsocketConnectionLimitError(payload) {
 		retryAfter := time.Duration(0)
@@ -1779,6 +1783,11 @@ func buildCodexWebsocketErrorPayload(payload []byte, status int) []byte {
 
 	if errNode := gjson.GetBytes(payload, "error"); errNode.Exists() {
 		out, _ = sjson.SetRawBytes(out, "error", []byte(errNode.Raw))
+		return out
+	}
+	if helps.IsCodexUsageLimitError(payload) {
+		out, _ = sjson.SetBytes(out, "error.type", "usage_limit_reached")
+		out, _ = sjson.SetBytes(out, "error.message", gjson.GetBytes(payload, "message").String())
 		return out
 	}
 
