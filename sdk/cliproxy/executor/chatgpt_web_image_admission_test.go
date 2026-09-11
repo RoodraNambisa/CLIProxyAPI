@@ -445,6 +445,22 @@ func TestImageRequestPhaseSnapshotUsesNamedBuckets(t *testing.T) {
 	}
 }
 
+func TestImageRequestPhaseRegistersRequirementsSubphases(t *testing.T) {
+	observer := newImageRequestPhaseObserver()
+	for _, phase := range []string{
+		ImagePhaseRequirementsBootstrap, ImagePhaseRequirementsLocal, ImagePhaseRequirementsPrepare,
+		ImagePhaseRequirementsParse, ImagePhaseRequirementsObserver, ImagePhaseRequirementsProof,
+		ImagePhaseRequirementsTurnstile, ImagePhaseRequirementsFinalize,
+		ImagePhaseRequirementsSnapshot, ImagePhaseRequirementsCleanup,
+	} {
+		observer.ObserveRequestPhase(phase, 11*time.Second)
+		metric := observer.metrics[phase]
+		if metric == nil || metric.count.Load() != 1 || metric.buckets[5].Load() != 1 {
+			t.Errorf("requirements subphase was not recorded: %s", phase)
+		}
+	}
+}
+
 func TestImageRequestPhaseRollingSamplerReturnsWindowDeltas(t *testing.T) {
 	sampler := newImageRequestPhaseRollingSampler(time.Minute, 4)
 	started := time.Unix(100, 0)

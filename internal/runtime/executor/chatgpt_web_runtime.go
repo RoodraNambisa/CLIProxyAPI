@@ -1467,6 +1467,20 @@ func (e *ChatGPTWebExecutor) openChatGPTWebConversation(ctx context.Context, cli
 }
 
 func (e *ChatGPTWebExecutor) chatGPTWebRequirements(ctx context.Context, client *chatgptwebauth.Client, credential *chatgptwebauth.Credential) (chatGPTWebRequirements, error) {
+	// Observe on transitions and return so errors and cancellation are included.
+	// These child phases are already included in the image requirements total.
+	phase := ""
+	phaseStarted := time.Now()
+	setPhase := func(name string) {
+		if phase != "" {
+			cliproxyexecutor.ObserveRequestPhaseContext(ctx, phase, phaseStarted)
+		}
+		phase = name
+		phaseStarted = time.Now()
+		setChatGPTWebImageTaskStage(ctx, name)
+	}
+	defer func() { cliproxyexecutor.ObserveRequestPhaseContext(ctx, phase, phaseStarted) }()
+	setPhase(cliproxyexecutor.ImagePhaseRequirementsBootstrap)
 	baseURL := e.chatGPTWebBaseURL()
 	bootstrapPath := "/"
 	bootstrapHeaders := e.chatGPTWebHeaders(credential, bootstrapPath, map[string]string{
@@ -1488,6 +1502,7 @@ func (e *ChatGPTWebExecutor) chatGPTWebRequirements(ctx context.Context, client 
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		return chatGPTWebRequirements{}, newChatGPTWebStatusError(response.StatusCode, bootstrapPath, bootstrap, response.Header)
 	}
+	setPhase(cliproxyexecutor.ImagePhaseRequirementsLocal)
 	sources, dataBuild := chatgptwebauth.ParseConversationPoWResources(bootstrap)
 	sdkResource := chatgptwebauth.ParseConversationSentinelSDKResource(bootstrap)
 	if sdkResource.URL == "" {
@@ -1509,10 +1524,12 @@ func (e *ChatGPTWebExecutor) chatGPTWebRequirements(ctx context.Context, client 
 		)
 	}
 	preparePath := "/backend-api/sentinel/chat-requirements/prepare"
+	setPhase(cliproxyexecutor.ImagePhaseRequirementsPrepare)
 	_, prepareData, err := e.doChatGPTWebJSON(ctx, client, credential, preparePath, map[string]any{"p": pToken})
 	if err != nil {
 		return chatGPTWebRequirements{}, err
 	}
+	setPhase(cliproxyexecutor.ImagePhaseRequirementsParse)
 	var prepare map[string]any
 	if err := json.Unmarshal(prepareData, &prepare); err != nil {
 		return chatGPTWebRequirements{}, chatGPTWebLocalProtocolError(
@@ -1548,6 +1565,7 @@ func (e *ChatGPTWebExecutor) chatGPTWebRequirements(ctx context.Context, client 
 	var observerErr error
 	soRequired := requiredJSONFlag(prepare, "so", "required")
 	if e.sentinelRuntime != nil {
+		setPhase(cliproxyexecutor.ImagePhaseRequirementsObserver)
 		observer, err = e.sentinelRuntime.BeginObserver(ctx, sdkRequest)
 		if err != nil {
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || (ctx != nil && ctx.Err() != nil) {
@@ -1557,10 +1575,14 @@ func (e *ChatGPTWebExecutor) chatGPTWebRequirements(ctx context.Context, client 
 		}
 	}
 	if observer != nil {
-		defer observer.Close()
+		defer func() {
+			setPhase(cliproxyexecutor.ImagePhaseRequirementsCleanup)
+			observer.Close()
+		}()
 	}
 	proofToken := ""
 	if requiredJSONFlag(prepare, "proofofwork", "required") {
+		setPhase(cliproxyexecutor.ImagePhaseRequirementsProof)
 		proof, _ := prepare["proofofwork"].(map[string]any)
 		proofToken, err = chatgptwebauth.BuildConversationProofTokenWithEnvironment(
 			ctx,
@@ -1580,6 +1602,7 @@ func (e *ChatGPTWebExecutor) chatGPTWebRequirements(ctx context.Context, client 
 	}
 	turnstileToken := ""
 	if requiredJSONFlag(prepare, "turnstile", "required") {
+		setPhase(cliproxyexecutor.ImagePhaseRequirementsTurnstile)
 		turnstile, _ := prepare["turnstile"].(map[string]any)
 		dx := chatGPTWebAnyString(turnstile["dx"])
 		if dx == "" {
@@ -1616,6 +1639,7 @@ func (e *ChatGPTWebExecutor) chatGPTWebRequirements(ctx context.Context, client 
 		}
 	}
 	finalizePath := "/backend-api/sentinel/chat-requirements/finalize"
+	setPhase(cliproxyexecutor.ImagePhaseRequirementsFinalize)
 	_, finalizeData, err := e.doChatGPTWebJSON(ctx, client, credential, finalizePath, map[string]any{
 		"prepare_token":   chatGPTWebAnyString(prepare["prepare_token"]),
 		"proof_token":     proofToken,
@@ -1636,6 +1660,7 @@ func (e *ChatGPTWebExecutor) chatGPTWebRequirements(ctx context.Context, client 
 		}
 		return chatGPTWebRequirements{}, err
 	}
+	setPhase(cliproxyexecutor.ImagePhaseRequirementsParse)
 	var finalize map[string]any
 	if err := json.Unmarshal(finalizeData, &finalize); err != nil {
 		return chatGPTWebRequirements{}, chatGPTWebLocalProtocolError(
@@ -1670,6 +1695,7 @@ func (e *ChatGPTWebExecutor) chatGPTWebRequirements(ctx context.Context, client 
 				Err:  errors.New("Sentinel Session Observer is unavailable"),
 			})
 		}
+		setPhase(cliproxyexecutor.ImagePhaseRequirementsSnapshot)
 		soToken, err = observer.Snapshot(ctx)
 		if err != nil {
 			if ctx != nil && ctx.Err() != nil {

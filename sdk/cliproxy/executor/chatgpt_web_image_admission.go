@@ -23,6 +23,16 @@ const (
 	ImagePhaseRequestSlot            = "route_request_slot"
 	ImagePhaseInputUpload            = "web_input_upload"
 	ImagePhaseRequirements           = "web_requirements"
+	ImagePhaseRequirementsBootstrap  = "web_requirements_bootstrap"
+	ImagePhaseRequirementsLocal      = "web_requirements_local_prepare"
+	ImagePhaseRequirementsPrepare    = "web_requirements_prepare"
+	ImagePhaseRequirementsParse      = "web_requirements_parse"
+	ImagePhaseRequirementsObserver   = "web_requirements_observer_init"
+	ImagePhaseRequirementsProof      = "web_requirements_proof"
+	ImagePhaseRequirementsTurnstile  = "web_requirements_turnstile"
+	ImagePhaseRequirementsFinalize   = "web_requirements_finalize"
+	ImagePhaseRequirementsSnapshot   = "web_requirements_observer_snapshot"
+	ImagePhaseRequirementsCleanup    = "web_requirements_observer_cleanup"
 	ImagePhaseConversationPrepare    = "web_conversation_prepare"
 	ImagePhaseUpstreamInitial        = "web_upstream_initial"
 	ImagePhaseStreamSettle           = "web_stream_settle"
@@ -592,6 +602,10 @@ func newImageRequestPhaseObserver() *imageRequestPhaseObserver {
 		ImagePhaseRequestTotal, ImagePhaseInputAdmission, ImagePhaseInputParse,
 		ImagePhaseExecutionAdmission, ImagePhaseCredentialSelection, ImagePhaseRequestSlot,
 		ImagePhaseInputUpload, ImagePhaseRequirements, ImagePhaseConversationPrepare,
+		ImagePhaseRequirementsBootstrap, ImagePhaseRequirementsLocal, ImagePhaseRequirementsPrepare,
+		ImagePhaseRequirementsParse, ImagePhaseRequirementsObserver, ImagePhaseRequirementsProof,
+		ImagePhaseRequirementsTurnstile, ImagePhaseRequirementsFinalize,
+		ImagePhaseRequirementsSnapshot, ImagePhaseRequirementsCleanup,
 		ImagePhaseUpstreamInitial, ImagePhaseStreamSettle, ImagePhasePollSlotWait,
 		ImagePhasePollRequest, ImagePhaseFinalizerWait, ImagePhaseDownload,
 		ImagePhaseWebResponseEncode, ImagePhaseResponseEncode, ImagePhaseResponseWriteOperation,
