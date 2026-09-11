@@ -18,6 +18,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1890,7 +1891,10 @@ func TestChatGPTWebImagePollingStopsAfterLocalMemoryCapacityError(t *testing.T) 
 	for _, testCase := range testCases {
 		t.Run(testCase.name, func(t *testing.T) {
 			capacity := helps.ChatGPTWebImageMemorySnapshot().CapacityBytes
-			releaseCapacity, err := helps.AcquireChatGPTWebImageMemory(t.Context(), capacity-64)
+			// Leave room for the healthy sibling poll and its decoded snapshot.
+			// Only the designated large response should exhaust the budget.
+			const availableMemory = 1 << 20
+			releaseCapacity, err := helps.AcquireChatGPTWebImageMemory(t.Context(), capacity-availableMemory)
 			if err != nil {
 				t.Fatalf("reserve image memory: %v", err)
 			}
@@ -1900,6 +1904,7 @@ func TestChatGPTWebImagePollingStopsAfterLocalMemoryCapacityError(t *testing.T) 
 			var conversationPolls atomic.Int32
 			memoryResponseClosed := make(chan struct{})
 			var memoryResponseClosedOnce sync.Once
+			var memoryResponseStarted atomic.Bool
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 				switch request.URL.Path {
 				case "/backend-api/tasks":
@@ -1911,7 +1916,8 @@ func TestChatGPTWebImagePollingStopsAfterLocalMemoryCapacityError(t *testing.T) 
 					return
 				}
 				if request.URL.Path == testCase.memoryPath {
-					w.Header().Set("Content-Length", "4096")
+					memoryResponseStarted.Store(true)
+					w.Header().Set("Content-Length", strconv.Itoa(2*availableMemory))
 					w.WriteHeader(http.StatusOK)
 					if flusher, ok := w.(http.Flusher); ok {
 						flusher.Flush()
@@ -1920,11 +1926,13 @@ func TestChatGPTWebImagePollingStopsAfterLocalMemoryCapacityError(t *testing.T) 
 					memoryResponseClosedOnce.Do(func() { close(memoryResponseClosed) })
 					return
 				}
+				payload := `{"mapping":{}}`
 				if request.URL.Path == "/backend-api/tasks" {
-					_, _ = io.WriteString(w, `{"tasks":[]}`)
-					return
+					payload = `{"tasks":[]}`
 				}
-				_, _ = io.WriteString(w, `{"mapping":{}}`)
+				// Unknown lengths reserve the maximum polling-body allowance.
+				w.Header().Set("Content-Length", strconv.Itoa(len(payload)))
+				_, _ = io.WriteString(w, payload)
 			}))
 			defer server.Close()
 
@@ -1978,7 +1986,7 @@ func TestChatGPTWebImagePollingStopsAfterLocalMemoryCapacityError(t *testing.T) 
 			select {
 			case <-memoryResponseClosed:
 			case <-time.After(time.Second):
-				t.Fatal("poll response body was not closed")
+				t.Fatalf("poll response body was not closed: started=%t task=%d conversation=%d", memoryResponseStarted.Load(), taskPolls.Load(), conversationPolls.Load())
 			}
 			if got := cliproxyexecutor.ChatGPTWebImagePollAdmissionSnapshot().Active; got != pollSlotsBefore {
 				t.Fatalf("poll slots in use = %d, want %d", got, pollSlotsBefore)
