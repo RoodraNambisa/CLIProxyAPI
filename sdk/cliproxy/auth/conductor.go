@@ -2488,7 +2488,7 @@ func (m *Manager) wrapStreamResult(ctx, resultCtx context.Context, auth *Auth, a
 					result.availabilityNeutral = isResponsesCompactAvailabilityNeutralError(opts, chunk.Err)
 					action, matchedAction := m.matchRequestScopedErrorAction(ctx, auth, opts, chunk.Err)
 					applyRequestScopedActionToResult(action, matchedAction, &result)
-					m.markExecutionResult(resultCtx, result)
+					m.markExecutionResult(resultCtx, result, opts)
 					chunk.Err = wrapRequestScopedAction(chunk.Err, action, matchedAction)
 				}
 			}
@@ -2648,7 +2648,7 @@ func (m *Manager) executeStreamWithModelPool(ctx, resultCtx context.Context, exe
 			action, matchedAction := m.matchRequestScopedErrorAction(ctx, auth, replayOpts, errStream)
 			applyRequestScopedActionToResult(action, matchedAction, &result)
 			if !skipAuthResultForError(errStream) && (matchedAction || !deferUnauthorizedStreamResult(auth, errStream)) {
-				m.markExecutionResult(ctx, result)
+				m.markExecutionResult(ctx, result, replayOpts)
 			}
 			errStream = wrapRequestScopedAction(errStream, action, matchedAction)
 			if isResponsesCompactRequestFaultError(opts, errStream) || m.isRequestInvalidError(errStream, ctx) {
@@ -2687,7 +2687,7 @@ func (m *Manager) executeStreamWithModelPool(ctx, resultCtx context.Context, exe
 				result.availabilityNeutral = isResponsesCompactAvailabilityNeutralError(opts, bootstrapErr)
 				applyRequestScopedActionToResult(action, matchedAction, &result)
 				if !skipAuthResultForError(bootstrapErr) && (matchedAction || !deferUnauthorizedStreamResult(auth, bootstrapErr)) {
-					m.markExecutionResult(ctx, result)
+					m.markExecutionResult(ctx, result, replayOpts)
 				}
 				discardStreamChunks(ctx, streamResult.Chunks)
 				if matchedAction {
@@ -2707,7 +2707,7 @@ func (m *Manager) executeStreamWithModelPool(ctx, resultCtx context.Context, exe
 				result.availabilityNeutral = isResponsesCompactAvailabilityNeutralError(opts, bootstrapErr)
 				applyRequestScopedActionToResult(action, matchedAction, &result)
 				if !skipAuthResultForError(bootstrapErr) && (matchedAction || !deferUnauthorizedStreamResult(auth, bootstrapErr)) {
-					m.markExecutionResult(ctx, result)
+					m.markExecutionResult(ctx, result, replayOpts)
 				}
 				discardStreamChunks(ctx, streamResult.Chunks)
 				lastErr = bootstrapErr
@@ -2724,7 +2724,7 @@ func (m *Manager) executeStreamWithModelPool(ctx, resultCtx context.Context, exe
 			result.availabilityNeutral = isResponsesCompactAvailabilityNeutralError(opts, bootstrapErr)
 			applyRequestScopedActionToResult(action, matchedAction, &result)
 			if !skipAuthResultForError(bootstrapErr) && (matchedAction || !deferUnauthorizedStreamResult(auth, bootstrapErr)) {
-				m.markExecutionResult(ctx, result)
+				m.markExecutionResult(ctx, result, replayOpts)
 			}
 			discardStreamChunks(ctx, streamResult.Chunks)
 			return nil, newStreamBootstrapError(bootstrapErr, streamResult.Headers)
@@ -5940,7 +5940,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			}
 			applyRequestScopedActionToResult(action, matchedAction, &result)
 			if !skipAuthResultForError(errExec) {
-				m.markExecutionResult(execCtx, result)
+				m.markExecutionResult(execCtx, result, opts)
 			}
 			if matchedAction && (action == internalconfig.RequestScopedActionStop || action == internalconfig.RequestScopedActionStopAndCooldown) {
 				return cliproxyexecutor.Response{}, withAuthErrorResponseSource(&requestScopedActionError{error: errExec, action: action}, auth, provider)
@@ -6213,7 +6213,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			}
 			applyRequestScopedActionToResult(action, matchedAction, &result)
 			if !skipAuthResultForError(errExec) {
-				m.markExecutionResult(execCtx, result)
+				m.markExecutionResult(execCtx, result, opts)
 			}
 			if matchedAction && (action == internalconfig.RequestScopedActionStop || action == internalconfig.RequestScopedActionStopAndCooldown) {
 				return cliproxyexecutor.Response{}, withAuthErrorResponseSource(&requestScopedActionError{error: errExec, action: action}, auth, provider)
@@ -7960,7 +7960,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	m.markResult(ctx, result, "", nil, 0, nil, false, false)
 }
 
-func (m *Manager) markExecutionResult(ctx context.Context, result executionResult) {
+func (m *Manager) markExecutionResult(ctx context.Context, result executionResult, requestOptions ...cliproxyexecutor.Options) {
 	m.markResult(
 		ctx,
 		result.Result,
@@ -7971,6 +7971,9 @@ func (m *Manager) markExecutionResult(ctx context.Context, result executionResul
 		result.quotaProjectionOnly,
 		result.availabilityNeutral,
 	)
+	if len(requestOptions) > 0 {
+		m.releaseNotFoundSessionBinding(ctx, result, requestOptions[0])
+	}
 }
 
 func (m *Manager) markResult(

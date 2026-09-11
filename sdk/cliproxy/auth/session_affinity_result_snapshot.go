@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"net/http"
 	"sync"
 
 	core "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
@@ -70,4 +71,36 @@ func (s *sessionBindingSnapshot) bind(authID string) sessionMutation {
 		s.version = mutation.bindingVersion
 	}
 	return mutation
+}
+
+func (s *sessionBindingSnapshot) release(authID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.cache.invalidateBindingIfVersion(s.key, authID, s.version) {
+		s.version = 0
+	}
+}
+
+func (m *Manager) releaseNotFoundSessionBinding(ctx context.Context, result executionResult, opts core.Options) {
+	if result.Success || result.availabilityNeutral || result.Error == nil || result.Model == "" || result.authInstanceID == "" || isKnownRequestFault(result.Error) {
+		return
+	}
+	if result.Error.HTTPStatus != http.StatusNotFound && !IsModelNotFoundError(result.Error) {
+		return
+	}
+	selector, ok := m.selectorForContext(ctx).(*SessionAffinitySelector)
+	if !ok || selector == nil || !selector.failover {
+		return
+	}
+	snapshot := sessionBindingSnapshotFromOptions(opts, selector.cache)
+	if snapshot == nil {
+		return
+	}
+	// Keep retirement and replacement atomic with the conditional cache removal.
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	current := m.auths[result.AuthID]
+	if current != nil && current.instanceID == result.authInstanceID && !m.sessionCleanupPendingLocked(result.AuthID) {
+		snapshot.release(result.AuthID)
+	}
 }

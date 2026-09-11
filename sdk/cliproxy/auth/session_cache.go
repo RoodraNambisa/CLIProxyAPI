@@ -175,6 +175,20 @@ func (c *SessionCache) invalidateIfVersion(sessionID string, version uint64) {
 	c.mu.Unlock()
 }
 
+func (c *SessionCache) invalidateBindingIfVersion(sessionID, authID string, version uint64) bool {
+	if sessionID == "" || authID == "" || version == 0 {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entry, ok := c.entries[sessionID]
+	if !ok || entry.authID != authID || entry.bindingVersion != version {
+		return false
+	}
+	delete(c.entries, sessionID)
+	return true
+}
+
 func (c *SessionCache) rollback(sessionID string, mutation sessionMutation) {
 	if sessionID == "" || mutation.version == 0 {
 		return
