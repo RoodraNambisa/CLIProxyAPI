@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+
+	"github.com/tidwall/gjson"
 )
 
 func TestChatSummaryLargeRequestBoundaries(t *testing.T) {
@@ -90,4 +92,64 @@ func BenchmarkChatSummaryLargeRequest(b *testing.B) {
 			})
 		}
 	}
+}
+
+func TestChatSummaryProjectionExcludesUnrelatedNestedPayloads(t *testing.T) {
+	large, err := json.Marshal(strings.Repeat("unrelated", 1<<17))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, fixture := range []struct {
+		name, fields string
+		want         SummaryConfig
+	}{
+		{"extra body", `"extra_body":{"unrelated_blob":` + string(large) + `}`, SummaryConfig{}},
+		{"nested extra body", `"extra_body":{"extra_body":{"unrelated_blob":` + string(large) + `,"google":{"thinking_config":{"include_thoughts":true}}}}`, SummaryConfig{Mode: SummaryEnabled, Detail: "auto"}},
+		{"google unrelated", `"google":{"unrelated_blob":` + string(large) + `,"thinking_config":{"includeThoughts":false}}`, SummaryConfig{Mode: SummaryDisabled}},
+		{"reasoning unrelated", `"reasoning":{"unrelated_blob":` + string(large) + `,"summary":"concise"}`, SummaryConfig{Mode: SummaryEnabled, Detail: "concise"}},
+		{"thinking unrelated", `"thinking":{"unrelated_blob":` + string(large) + `,"includeThoughts":true}`, SummaryConfig{Mode: SummaryEnabled, Detail: "auto"}},
+		{"generation unrelated", `"generationConfig":{"thinkingConfig":{"unrelated_blob":` + string(large) + `,"includeThoughts":false}}`, SummaryConfig{Mode: SummaryDisabled}},
+		{"nonobject duplicate", `"extra_body":` + string(large) + `,"extra_body":{"google":{"thinking_config":{"include_thoughts":false}}}`, SummaryConfig{Mode: SummaryDisabled}},
+		{"duplicate leaf", `"reasoning":{"unrelated_blob":` + string(large) + `,"summary":null,"summary":"auto"}`, SummaryConfig{Mode: SummaryDisabled}},
+		{"escaped container", `"extra_\u0062ody":{"unrelated_blob":` + string(large) + `,"google":{"thinking_config":{"include_thoughts":true}}}`, SummaryConfig{Mode: SummaryEnabled, Detail: "auto"}},
+	} {
+		t.Run(fixture.name, func(t *testing.T) {
+			body := []byte(`{"messages":[],` + fixture.fields + `}`)
+			original := bytes.Clone(body)
+			projected := openAISummaryFields(body)
+			if len(projected) > 1024 {
+				t.Fatalf("summary metadata copied unrelated payload: %d bytes", len(projected))
+			}
+			if got := ExtractSummaryConfig(body, "openai"); got != fixture.want {
+				t.Fatalf("summary=%+v, want %+v", got, fixture.want)
+			}
+			if got := ExtractExplicitSummaryConfig(body, "openai"); got != fixture.want {
+				t.Fatalf("explicit summary=%+v, want %+v", got, fixture.want)
+			}
+			if !bytes.Equal(body, original) {
+				t.Fatal("projection changed the source request")
+			}
+		})
+	}
+}
+
+func FuzzChatSummaryProjectionKeepsExplicitIntent(f *testing.F) {
+	for _, body := range []string{
+		`{"extra_body":{"google":null,"google":{"thinking_config":{"include_thoughts":true}}}}`,
+		`{"reasoning":null,"reasoning":{"summary":"auto"}}`,
+		`{"reasoning":{"summary":null,"summary":"none","enabled":true}}`,
+		`{"extra_\u0062ody":{"extra_body":{"google":{"thinking_config":{"includeThoughts":false}}}}}`,
+		`{"thinking":{"includeThoughts":false},"include_reasoning":true}`,
+	} {
+		f.Add([]byte(body))
+	}
+	f.Fuzz(func(t *testing.T, body []byte) {
+		if len(body) > 1<<20 || !gjson.ValidBytes(body) {
+			return
+		}
+		want, _ := extractOpenAIExplicitSummaryConfig(body)
+		if got := ExtractExplicitSummaryConfig(body, "openai"); got != want {
+			t.Fatalf("projected intent=%+v, original intent=%+v for %s", got, want, body)
+		}
+	})
 }

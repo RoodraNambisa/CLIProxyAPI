@@ -159,25 +159,96 @@ func openAISummaryFields(body []byte) []byte {
 	if !root.IsObject() {
 		return nil
 	}
-	var fields []byte
+	return appendOpenAISummaryObject(nil, root, summaryProjectionRoot)
+}
+
+type summaryProjectionKind uint8
+
+const (
+	summaryProjectionOmit summaryProjectionKind = iota
+	summaryProjectionValue
+	summaryProjectionRoot
+	summaryProjectionExtraBody
+	summaryProjectionNestedExtraBody
+	summaryProjectionGoogle
+	summaryProjectionGeneration
+	summaryProjectionThoughts
+	summaryProjectionReasoning
+)
+
+func summaryProjectionFieldKind(parent summaryProjectionKind, field string) summaryProjectionKind {
+	switch parent {
+	case summaryProjectionRoot:
+		switch field {
+		case "include_reasoning", "reasoning_effort":
+			return summaryProjectionValue
+		case "extra_body":
+			return summaryProjectionExtraBody
+		case "google":
+			return summaryProjectionGoogle
+		case "thinking":
+			return summaryProjectionThoughts
+		case "reasoning":
+			return summaryProjectionReasoning
+		case "generationConfig", "generation_config":
+			return summaryProjectionGeneration
+		}
+	case summaryProjectionExtraBody:
+		if field == "extra_body" {
+			return summaryProjectionNestedExtraBody
+		}
+		if field == "google" {
+			return summaryProjectionGoogle
+		}
+	case summaryProjectionNestedExtraBody:
+		if field == "google" {
+			return summaryProjectionGoogle
+		}
+	case summaryProjectionGoogle, summaryProjectionGeneration:
+		if field == "thinkingConfig" || field == "thinking_config" {
+			return summaryProjectionThoughts
+		}
+	case summaryProjectionThoughts:
+		if field == "includeThoughts" || field == "include_thoughts" {
+			return summaryProjectionValue
+		}
+	case summaryProjectionReasoning:
+		switch field {
+		case "includeThoughts", "include_thoughts", "summary", "generate_summary", "exclude", "enabled":
+			return summaryProjectionValue
+		}
+	}
+	return summaryProjectionOmit
+}
+
+// appendOpenAISummaryObject copies only supported parameter paths. Retain all
+// occurrences of a key so GJSON's nested duplicate lookup order is unchanged.
+func appendOpenAISummaryObject(dst []byte, root gjson.Result, kind summaryProjectionKind) []byte {
+	dst = append(dst, '{')
+	written := false
 	root.ForEach(func(key, value gjson.Result) bool {
-		switch key.String() {
-		case "extra_body", "google", "thinking", "reasoning", "generationConfig", "generation_config", "include_reasoning", "reasoning_effort":
-			if len(fields) == 0 {
-				fields = append(fields, '{')
-			} else {
-				fields = append(fields, ',')
-			}
-			fields = append(fields, key.Raw...)
-			fields = append(fields, ':')
-			fields = append(fields, value.Raw...)
+		fieldKind := summaryProjectionFieldKind(kind, key.String())
+		if fieldKind == summaryProjectionOmit {
+			return true
+		}
+		if written {
+			dst = append(dst, ',')
+		}
+		written = true
+		dst = append(dst, key.Raw...)
+		dst = append(dst, ':')
+		if fieldKind == summaryProjectionValue {
+			dst = append(dst, value.Raw...)
+		} else if value.IsObject() {
+			dst = appendOpenAISummaryObject(dst, value, fieldKind)
+		} else {
+			// Container paths cannot descend into scalar or array values. A null
+			// placeholder keeps duplicate-field behavior without copying them.
+			dst = append(dst, "null"...)
 		}
 		return true
 	})
-	if len(fields) > 0 {
-		fields = append(fields, '}')
-	}
-	return fields
+	return append(dst, '}')
 }
 
 // summaryFormatSupported reports whether a protocol carries summary visibility
