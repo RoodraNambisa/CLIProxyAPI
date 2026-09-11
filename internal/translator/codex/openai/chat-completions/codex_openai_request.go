@@ -9,6 +9,7 @@ package chat_completions
 import (
 	"strconv"
 	"strings"
+	"unsafe"
 
 	translatorcommon "github.com/router-for-me/CLIProxyAPI/v6/internal/translator/common"
 	"github.com/tidwall/gjson"
@@ -71,7 +72,9 @@ func ConvertOpenAIRequestToCodex(modelName string, inputRawJSON []byte, stream b
 	var toolBatch codexOpenAIToolBatch
 
 	// Extract system instructions from first system message (string or text object)
-	messages := gjson.GetBytes(rawJSON, "messages")
+	// Borrow history only while building independently owned output items.
+	// GetBytes would copy the complete message array before conversion.
+	messages := gjson.Get(unsafe.String(unsafe.SliceData(rawJSON), len(rawJSON)), "messages")
 	// if messages.IsArray() {
 	// 	arr := messages.Array()
 	// 	for i := 0; i < len(arr); i++ {
