@@ -1,6 +1,10 @@
 package auth
 
-import "testing"
+import (
+	"fmt"
+	"strings"
+	"testing"
+)
 
 func TestPayloadHasImageGenerationTool(t *testing.T) {
 	tests := []struct {
@@ -174,6 +178,9 @@ func TestAdditionalImageToolsPreserveSelectionAndArrayBoundaries(t *testing.T) {
 		has, may, forced bool
 	}{
 		{"additional required", `{"input":[{"type":"additional_tools","tools":[{"type":"image_generation"}]}],"tool_choice":"required"}`, true, true, true},
+		{"escaped root tools", `{"to\u006fls":[{"type":"image_generation"}],"tool_choice":"required"}`, true, true, true},
+		{"escaped additional tools", `{"in\u0070ut":[{"type":"additional_tools","to\u006fls":[{"type":"image_generation"}]}],"tool_choice":"required"}`, true, true, true},
+		{"first duplicate tools", `{"tools":null,"tools":[{"type":"image_generation"}],"tool_choice":"required"}`, false, false, false},
 		{"additional none", `{"input":[{"type":"additional_tools","tools":[{"type":"image_generation"}]}],"tool_choice":"none"}`, true, false, false},
 		{"mixed required", `{"tools":[{"type":"function","name":"read"}],"input":[{"type":"additional_tools","tools":[{"type":"image_generation"}]}],"tool_choice":"required"}`, true, true, false},
 		{"invalid root tools", `{"tools":{"type":"image_generation"},"tool_choice":"required"}`, false, false, false},
@@ -186,5 +193,42 @@ func TestAdditionalImageToolsPreserveSelectionAndArrayBoundaries(t *testing.T) {
 				t.Fatal("additional image selection or declared array boundary changed")
 			}
 		})
+	}
+}
+
+func TestImageToolDeclarationScanAvoidsPlainTextAllocations(t *testing.T) {
+	body := []byte(`{"input":[{"role":"user","content":"` + strings.Repeat("x", 1<<20) + `"}]}`)
+	for name, detect := range map[string]func([]byte) bool{
+		"has":        PayloadHasImageGenerationTool,
+		"may select": PayloadMaySelectImageGenerationTool,
+		"forced":     PayloadExplicitlySelectsImageGenerationTool,
+	} {
+		t.Run(name, func(t *testing.T) {
+			var image bool
+			allocations := testing.AllocsPerRun(5, func() { image = detect(body) })
+			if image || allocations != 0 {
+				t.Fatalf("plain text selected images=%t or allocated %.0f times", image, allocations)
+			}
+		})
+	}
+}
+
+func BenchmarkImageToolDeclarationScan(b *testing.B) {
+	for _, size := range []int{128, 1 << 20, 10 << 20} {
+		for _, declared := range []bool{false, true} {
+			b.Run(fmt.Sprintf("bytes=%d/tools=%t", size, declared), func(b *testing.B) {
+				body := []byte(`{"input":[{"role":"user","content":"` + strings.Repeat("x", size) + `"}]`)
+				if declared {
+					body = append(body, `,"tools":[{"type":"function","name":"read"}]`...)
+				}
+				body = append(body, '}')
+				b.SetBytes(int64(len(body)))
+				b.ReportAllocs()
+				b.ResetTimer()
+				for range b.N {
+					PayloadHasImageGenerationTool(body)
+				}
+			})
+		}
 	}
 }

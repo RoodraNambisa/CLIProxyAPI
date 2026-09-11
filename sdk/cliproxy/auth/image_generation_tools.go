@@ -1,7 +1,9 @@
 package auth
 
 import (
+	"bytes"
 	"strings"
+	"unsafe"
 
 	"github.com/tidwall/gjson"
 )
@@ -97,11 +99,18 @@ func toolChoiceForcesImageGeneration(payload []byte, choice gjson.Result) bool {
 }
 
 func imageToolDeclarationLists(payload []byte) []gjson.Result {
+	// No tool declaration can exist without a literal or escaped tools key.
+	if !bytes.Contains(payload, []byte(`"tools"`)) && !bytes.Contains(payload, []byte(`\u`)) {
+		return nil
+	}
+	// Only the synchronous boolean queries above consume these views. They do
+	// not retain declarations or expose references to the caller's request.
+	body := unsafe.String(unsafe.SliceData(payload), len(payload))
 	var lists []gjson.Result
-	if tools := gjson.GetBytes(payload, "tools"); tools.IsArray() {
+	if tools := gjson.Get(body, "tools"); tools.IsArray() {
 		lists = append(lists, tools)
 	}
-	input := gjson.GetBytes(payload, "input")
+	input := gjson.Get(body, "input")
 	if !input.IsArray() {
 		return lists
 	}

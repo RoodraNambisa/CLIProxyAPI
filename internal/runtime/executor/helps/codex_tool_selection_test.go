@@ -18,7 +18,10 @@ func TestCodexToolSelectionKeepsDeclarationsAndRequestOwnership(t *testing.T) {
 		{`{"tools":[]}`, false},
 		{`{"tools":null,"input":{}}`, false},
 		{`{"tools":[{"type":"function","name":"fixture"}]}`, true},
+		{`{"to\u006fls":[{"type":"function","name":"fixture"}]}`, true},
+		{`{"tools":null,"tools":[{"type":"function","name":"fixture"}]}`, false},
 		{`{"input":[{"type":"additional_tools","tools":[{"type":"custom","name":"fixture"}]}]}`, true},
+		{`{"in\u0070ut":[{"type":"additional_tools","to\u006fls":[{"type":"custom","name":"fixture"}]}]}`, true},
 		{`{"input":[{"type":"additional_tools","tools":[]}]}`, false},
 		{`{"input":[{"type":"additio\u006eal_tools","tools":[{}]}]}`, true},
 		{`{"input":[{"type":"message","content":"additional_tools"}]}`, false},
@@ -45,6 +48,29 @@ func TestCodexToolSelectionKeepsDeclarationsAndRequestOwnership(t *testing.T) {
 	}
 	if HasCodexToolDeclarations(nil) || NormalizeCodexToolSelection(nil) != nil {
 		t.Fatal("nil body handling changed")
+	}
+}
+
+func TestCodexToolDeclarationScanAvoidsPlainTextAllocations(t *testing.T) {
+	body := []byte(`{"input":[{"role":"user","content":"` + strings.Repeat("x", 1<<20) + `"}]}`)
+	var declared bool
+	allocations := testing.AllocsPerRun(5, func() { declared = HasCodexToolDeclarations(body) })
+	if declared || allocations != 0 {
+		t.Fatalf("plain text declared tools=%t or allocated %.0f times", declared, allocations)
+	}
+}
+
+func BenchmarkCodexToolDeclarationScan(b *testing.B) {
+	for _, size := range []int{128, 1 << 20, 10 << 20} {
+		b.Run(fmt.Sprintf("bytes=%d", size), func(b *testing.B) {
+			body := []byte(`{"input":[{"role":"user","content":"` + strings.Repeat("x", size) + `"}]}`)
+			b.SetBytes(int64(len(body)))
+			b.ReportAllocs()
+			b.ResetTimer()
+			for range b.N {
+				HasCodexToolDeclarations(body)
+			}
+		})
 	}
 }
 

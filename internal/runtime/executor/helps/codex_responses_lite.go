@@ -1,6 +1,7 @@
 package helps
 
 import (
+	"bytes"
 	"net/http"
 	"strconv"
 	"strings"
@@ -66,6 +67,11 @@ func (snapshot CodexResponsesLiteSnapshot) ApplyBody(body []byte, websocket bool
 // HasCodexToolDeclarations includes the in-history declaration channel used by Lite.
 func HasCodexToolDeclarations(body []byte) bool {
 	if len(body) == 0 {
+		return false
+	}
+	// Both root and historical declarations require a tools field. Escaped
+	// field names still use the full parser below.
+	if !bytes.Contains(body, []byte(`"tools"`)) && !bytes.Contains(body, []byte(`\u`)) {
 		return false
 	}
 	// The read-only view and all parsed results stay within this call. Only the
