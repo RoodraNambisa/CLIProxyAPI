@@ -2,6 +2,7 @@ package helps
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"net/http"
 	"testing"
@@ -105,5 +106,18 @@ func TestCodexProtectedSessionSurvivesEqualIdentityRoles(t *testing.T) {
 	}
 	if gjson.GetBytes(got, "thread_id").Str != "mapped" || gjson.GetBytes(got, "window_id").Str != "mapped:0" || gjson.GetBytes(got, "turn_id").Str != "turn" {
 		t.Fatal("protecting session disabled other identity mappings")
+	}
+}
+
+func TestCodexCacheSessionDigestDoesNotLeakBetweenTurns(t *testing.T) {
+	first := WithCodexCacheSession(t.Context(), CodexPromptCacheKeySnapshot{SessionID: "first"})
+	if CodexCacheSessionDigest(first) == ([sha256.Size]byte{}) {
+		t.Fatal("enabled session did not constrain connection reuse")
+	}
+	if same := WithCodexCacheSession(first, CodexPromptCacheKeySnapshot{SessionID: "first"}); same != first {
+		t.Fatal("unchanged identity allocated another context wrapper")
+	}
+	if next := WithCodexCacheSession(first, CodexPromptCacheKeySnapshot{}); CodexCacheSessionDigest(next) != ([sha256.Size]byte{}) {
+		t.Fatal("disabled or missing identity inherited a previous turn's policy")
 	}
 }

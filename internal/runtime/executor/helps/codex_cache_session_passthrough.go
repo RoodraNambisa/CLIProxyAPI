@@ -2,6 +2,8 @@ package helps
 
 import (
 	"bytes"
+	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -11,6 +13,32 @@ import (
 	"github.com/tidwall/sjson"
 	"golang.org/x/net/http/httpguts"
 )
+
+type codexCacheSessionDigestKey struct{}
+
+// WithCodexCacheSession freezes the connection reuse identity for this turn.
+// A zero digest also clears a previous turn's opt-in policy without retaining IDs.
+func WithCodexCacheSession(ctx context.Context, snapshot CodexPromptCacheKeySnapshot) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	var digest [sha256.Size]byte
+	if snapshot.SessionID != "" {
+		digest = sha256.Sum256([]byte(snapshot.SessionID))
+	}
+	if CodexCacheSessionDigest(ctx) == digest {
+		return ctx
+	}
+	return context.WithValue(ctx, codexCacheSessionDigestKey{}, digest)
+}
+
+func CodexCacheSessionDigest(ctx context.Context) [sha256.Size]byte {
+	if ctx == nil {
+		return [sha256.Size]byte{}
+	}
+	digest, _ := ctx.Value(codexCacheSessionDigestKey{}).([sha256.Size]byte)
+	return digest
+}
 
 func explicitCodexRoutingString(value gjson.Result) string {
 	if value.Type != gjson.String || strings.TrimSpace(value.Str) == "" {

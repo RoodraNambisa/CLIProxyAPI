@@ -67,14 +67,15 @@ type codexWebsocketSession struct {
 
 	reqMu sync.Mutex
 
-	connMu           sync.Mutex
-	conn             *websocket.Conn
-	wsURL            string
-	authID           string
-	authInstanceID   string
-	proxyBindingID   string
-	proxyIdentity    string
-	softwareIdentity codexauth.SoftwareIdentity
+	connMu             sync.Mutex
+	conn               *websocket.Conn
+	wsURL              string
+	authID             string
+	authInstanceID     string
+	proxyBindingID     string
+	proxyIdentity      string
+	softwareIdentity   codexauth.SoftwareIdentity
+	cacheSessionDigest [sha256.Size]byte
 	// multiAgentResponse describes only the tools committed on the current conn.
 	// It is guarded by connMu and contains no request bodies or connection pointer.
 	multiAgentResponse helps.CodexMultiAgentResponsePolicy
@@ -360,6 +361,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		invalid.skipAuthResult = true
 		return resp, invalid
 	}
+	ctx = helps.WithCodexCacheSession(ctx, preparedIdentity.PromptCacheKey)
 	ensureCodexTurnStateHeader(wsHeaders, opts.Headers)
 	guardCodexTurnStateHeader(e.cfg, auth, wsHeaders)
 	releasedOriginalPayload := slimCodexOriginalPayloadForTranslation(from, originalPayload)
@@ -730,6 +732,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		invalid.skipAuthResult = true
 		return nil, invalid
 	}
+	ctx = helps.WithCodexCacheSession(ctx, preparedIdentity.PromptCacheKey)
 	ensureCodexTurnStateHeader(wsHeaders, opts.Headers)
 	guardCodexTurnStateHeader(e.cfg, auth, wsHeaders)
 	releasedOriginalPayload := slimCodexOriginalPayloadForTranslation(from, userPayload)
@@ -2010,21 +2013,26 @@ func (e *CodexWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *
 	currentProxyIdentity := strings.TrimSpace(sess.proxyIdentity)
 	currentWSURL := strings.TrimSpace(sess.wsURL)
 	currentSoftwareIdentity := sess.softwareIdentity
+	currentCacheSessionDigest := sess.cacheSessionDigest
 	sess.connMu.Unlock()
 	requestedAuthID := strings.TrimSpace(authID)
 	requestedAuthInstanceID := auth.RuntimeInstanceID()
 	requestedProxyBindingID := auth.EffectiveProxyBindingID()
 	requestedProxyIdentity := websocketProxyIdentity(e.cfg, auth)
 	requestedWSURL := strings.TrimSpace(wsURL)
+	requestedCacheSessionDigest := helps.CodexCacheSessionDigest(ctx)
+	cacheSessionChanged := conn != nil && currentCacheSessionDigest != requestedCacheSessionDigest
 	softwareChanged := conn != nil && len(models) > 0 && codexEnforceSoftwareIdentity(e.cfg) && !codexAuthUsesAPIKey(auth) &&
 		!codexauth.SoftwareIdentitySupportsModel(currentSoftwareIdentity, thinking.ParseSuffix(models[0]).ModelName)
-	if cliproxyexecutor.RequiredUpstreamWebsocket(ctx) && (conn == nil || currentAuthID != requestedAuthID || currentAuthInstanceID != requestedAuthInstanceID || currentProxyBindingID != requestedProxyBindingID || currentProxyIdentity != requestedProxyIdentity || currentWSURL != requestedWSURL || softwareChanged) {
+	if cliproxyexecutor.RequiredUpstreamWebsocket(ctx) && (conn == nil || currentAuthID != requestedAuthID || currentAuthInstanceID != requestedAuthInstanceID || currentProxyBindingID != requestedProxyBindingID || currentProxyIdentity != requestedProxyIdentity || currentWSURL != requestedWSURL || softwareChanged || cacheSessionChanged) {
 		return nil, nil, cliproxyexecutor.NewUpstreamWebsocketReplayRequiredError()
 	}
-	if conn != nil && (currentAuthID != requestedAuthID || currentAuthInstanceID != requestedAuthInstanceID || currentProxyBindingID != requestedProxyBindingID || currentProxyIdentity != requestedProxyIdentity || currentWSURL != requestedWSURL || softwareChanged) {
+	if conn != nil && (currentAuthID != requestedAuthID || currentAuthInstanceID != requestedAuthInstanceID || currentProxyBindingID != requestedProxyBindingID || currentProxyIdentity != requestedProxyIdentity || currentWSURL != requestedWSURL || softwareChanged || cacheSessionChanged) {
 		reason := "auth_changed"
 		if softwareChanged {
 			reason = "software_version"
+		} else if cacheSessionChanged {
+			reason = "cache_session_changed"
 		}
 		e.invalidateUpstreamConnWithoutDisconnectNotify(sess, conn, reason, nil)
 		conn = nil
@@ -2116,6 +2124,7 @@ func (e *CodexWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *
 	sess.authInstanceID = auth.RuntimeInstanceID()
 	sess.proxyBindingID = requestedProxyBindingID
 	sess.proxyIdentity = requestedProxyIdentity
+	sess.cacheSessionDigest = requestedCacheSessionDigest
 	sess.softwareIdentity = codexauth.SoftwareIdentity{
 		UserAgent:  headers.Get("User-Agent"),
 		Version:    headers.Get("Version"),
