@@ -180,6 +180,7 @@ func TestAdditionalImageToolsPreserveSelectionAndArrayBoundaries(t *testing.T) {
 		{"additional required", `{"input":[{"type":"additional_tools","tools":[{"type":"image_generation"}]}],"tool_choice":"required"}`, true, true, true},
 		{"escaped root tools", `{"to\u006fls":[{"type":"image_generation"}],"tool_choice":"required"}`, true, true, true},
 		{"escaped additional tools", `{"in\u0070ut":[{"type":"additional_tools","to\u006fls":[{"type":"image_generation"}]}],"tool_choice":"required"}`, true, true, true},
+		{"escaped additional type", `{"input":[{"type":"additiona\u006c_tools","tools":[{"type":"image_generation"}]}],"tool_choice":"required"}`, true, true, true},
 		{"first duplicate tools", `{"tools":null,"tools":[{"type":"image_generation"}],"tool_choice":"required"}`, false, false, false},
 		{"additional none", `{"input":[{"type":"additional_tools","tools":[{"type":"image_generation"}]}],"tool_choice":"none"}`, true, false, false},
 		{"mixed required", `{"tools":[{"type":"function","name":"read"}],"input":[{"type":"additional_tools","tools":[{"type":"image_generation"}]}],"tool_choice":"required"}`, true, true, false},
@@ -229,6 +230,22 @@ func BenchmarkImageToolDeclarationScan(b *testing.B) {
 					PayloadHasImageGenerationTool(body)
 				}
 			})
+		}
+	}
+}
+
+func TestImageToolDeclarationScanSkipsHistoryWithoutAdditionalTools(t *testing.T) {
+	rootOnly := []byte(`{"tools":[{"type":"function","name":"read"}]}`)
+	withHistory := []byte(`{"input":[{"role":"user","content":"` + strings.Repeat("x", 1<<20) + `"}],"tools":[{"type":"function","name":"read"}]}`)
+	for _, detect := range []func([]byte) bool{PayloadHasImageGenerationTool, PayloadMaySelectImageGenerationTool, PayloadExplicitlySelectsImageGenerationTool} {
+		base := testing.AllocsPerRun(5, func() { detect(rootOnly) })
+		withInput := testing.AllocsPerRun(5, func() {
+			if detect(withHistory) {
+				t.Fatal("ordinary tool history selected image generation")
+			}
+		})
+		if withInput > base {
+			t.Fatalf("history without additional tools added allocations: %g vs %g", withInput, base)
 		}
 	}
 }

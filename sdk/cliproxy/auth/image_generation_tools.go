@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"bytes"
 	"strings"
 	"unsafe"
 
@@ -109,6 +110,11 @@ func imageToolDeclarationLists(payload []byte) []gjson.Result {
 	var lists []gjson.Result
 	if tools := gjson.Get(body, "tools"); tools.IsArray() {
 		lists = append(lists, tools)
+	}
+	// Historical declarations require this exact type. Unicode escapes may
+	// encode it, so those requests retain the original input traversal.
+	if !bytes.Contains(payload, []byte("additional_tools")) && !bytes.Contains(payload, []byte(`\u`)) {
+		return lists
 	}
 	input := gjson.Get(body, "input")
 	if !input.IsArray() {
