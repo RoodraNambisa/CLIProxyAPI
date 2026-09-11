@@ -722,6 +722,8 @@ func TestCodexWebsocketsUpstreamDisconnectChanSignalsOnInvalidate(t *testing.T) 
 
 	exec := NewCodexWebsocketsExecutor(&config.Config{})
 	sessionID := "sess-1"
+	exec.store = &codexWebsocketSessionStore{}
+	t.Cleanup(func() { exec.CloseExecutionSession(sessionID) })
 	disconnectCh := exec.UpstreamDisconnectChan(sessionID)
 	if disconnectCh == nil {
 		t.Fatal("expected disconnect channel")
@@ -744,10 +746,11 @@ func TestCodexWebsocketsUpstreamDisconnectChanSignalsOnInvalidate(t *testing.T) 
 	upstreamErr := errors.New("upstream gone")
 	exec.invalidateUpstreamConn(sess, conn, "test_invalidate", upstreamErr)
 	sess.connMu.Lock()
-	if sess.authID != "" || sess.authInstanceID != "" || sess.proxyBindingID != "" || sess.proxyIdentity != "" || sess.wsURL != "" {
-		t.Fatalf("invalidated identity = (%q, %q, %q, %q, %q), want empty", sess.authID, sess.authInstanceID, sess.proxyBindingID, sess.proxyIdentity, sess.wsURL)
-	}
+	authID, authInstanceID, proxyBindingID, proxyIdentity, upstreamURL := sess.authID, sess.authInstanceID, sess.proxyBindingID, sess.proxyIdentity, sess.wsURL
 	sess.connMu.Unlock()
+	if authID != "" || authInstanceID != "" || proxyBindingID != "" || proxyIdentity != "" || upstreamURL != "" {
+		t.Fatalf("invalidated identity = (%q, %q, %q, %q, %q), want empty", authID, authInstanceID, proxyBindingID, proxyIdentity, upstreamURL)
+	}
 
 	select {
 	case errRead, ok := <-disconnectCh:
