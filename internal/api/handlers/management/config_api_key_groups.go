@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -179,7 +180,19 @@ func (h *Handler) GetAPIKeyGroups(c *gin.Context) {
 	if cfg := h.currentConfig(); cfg != nil {
 		groups = cloneAPIKeyGroups(cfg.APIKeyGroups)
 	}
-	c.JSON(http.StatusOK, gin.H{"api-key-groups": groups})
+	priorities := []int{0}
+	h.mu.Lock()
+	manager := h.authManager
+	h.mu.Unlock()
+	if manager != nil {
+		priorities = manager.ClientAPIKeyPriorityChoices()
+	}
+	for _, group := range groups {
+		priorities = append(priorities, group.AllowedPriorities...)
+		priorities = append(priorities, group.ExcludedPriorities...)
+	}
+	slices.Sort(priorities)
+	c.JSON(http.StatusOK, gin.H{"api-key-groups": groups, "available-priorities": slices.Compact(priorities)})
 }
 
 // PutAPIKeyGroups replaces all API key provider restrictions.
@@ -202,20 +215,46 @@ func (h *Handler) PutAPIKeyGroups(c *gin.Context) {
 
 // PatchAPIKeyGroups adds, updates, or clears one API key provider restriction.
 func (h *Handler) PatchAPIKeyGroups(c *gin.Context) {
-	var group config.APIKeyGroup
-	if err := c.ShouldBindJSON(&group); err != nil || strings.TrimSpace(group.APIKey) == "" {
+	var patch struct {
+		APIKey    string          `json:"api-key"`
+		Providers json.RawMessage `json:"providers"`
+		Allowed   json.RawMessage `json:"allowed-priorities"`
+		Excluded  json.RawMessage `json:"excluded-priorities"`
+	}
+	if err := c.ShouldBindJSON(&patch); err != nil || strings.TrimSpace(patch.APIKey) == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
 		return
 	}
 
 	h.mu.Lock()
-	key := strings.TrimSpace(group.APIKey)
+	key := strings.TrimSpace(patch.APIKey)
 	if !containsAPIKey(h.cfg.APIKeys, key) {
 		h.mu.Unlock()
 		c.JSON(http.StatusNotFound, gin.H{"error": "api key not found"})
 		return
 	}
-	normalized, errNormalize := config.NormalizeAPIKeyGroups([]config.APIKeyGroup{{APIKey: key, Providers: group.Providers}}, h.cfg.APIKeys)
+	group := config.APIKeyGroup{APIKey: key}
+	for _, existing := range cloneAPIKeyGroups(h.cfg.APIKeyGroups) {
+		if strings.TrimSpace(existing.APIKey) == key {
+			group = existing
+			break
+		}
+	}
+	for _, field := range []struct {
+		raw    json.RawMessage
+		target any
+	}{
+		{patch.Providers, &group.Providers}, {patch.Allowed, &group.AllowedPriorities}, {patch.Excluded, &group.ExcludedPriorities},
+	} {
+		if field.raw != nil {
+			if err := json.Unmarshal(field.raw, field.target); err != nil {
+				h.mu.Unlock()
+				c.JSON(http.StatusBadRequest, gin.H{"error": "invalid API key restriction: " + err.Error()})
+				return
+			}
+		}
+	}
+	normalized, errNormalize := config.NormalizeAPIKeyGroups([]config.APIKeyGroup{group}, h.cfg.APIKeys)
 	if errNormalize != nil {
 		h.mu.Unlock()
 		c.JSON(http.StatusBadRequest, gin.H{"error": errNormalize.Error()})
@@ -306,7 +345,7 @@ func cloneAPIKeyGroups(groups []config.APIKeyGroup) []config.APIKeyGroup {
 	}
 	cloned := make([]config.APIKeyGroup, len(groups))
 	for index, group := range groups {
-		cloned[index] = config.APIKeyGroup{APIKey: group.APIKey, Providers: append([]string(nil), group.Providers...)}
+		cloned[index] = config.APIKeyGroup{APIKey: group.APIKey, Providers: slices.Clone(group.Providers), AllowedPriorities: slices.Clone(group.AllowedPriorities), ExcludedPriorities: slices.Clone(group.ExcludedPriorities)}
 	}
 	return cloned
 }
@@ -360,8 +399,10 @@ func copyAPIKeyGroup(groups []config.APIKeyGroup, oldKey, newKey string) []confi
 		return groups
 	}
 	return append(groups, config.APIKeyGroup{
-		APIKey:    newKey,
-		Providers: append([]string(nil), groups[oldIndex].Providers...),
+		APIKey:             newKey,
+		Providers:          append([]string(nil), groups[oldIndex].Providers...),
+		AllowedPriorities:  slices.Clone(groups[oldIndex].AllowedPriorities),
+		ExcludedPriorities: slices.Clone(groups[oldIndex].ExcludedPriorities),
 	})
 }
 

@@ -9,6 +9,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v6/sdk/access"
+	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 )
 
 // AuthenticateClientSecret checks only local credentials. Callers should try
@@ -45,6 +46,7 @@ func (h *Handler) ApplyClientSecretAuthorization(c *gin.Context, authorization C
 	c.Set("apiKey", authorization.principal)
 	c.Set("accessProvider", "codex-live-client-secret")
 	c.Set("accessMetadata", map[string]string{sdkaccess.MetadataAllowedProviders: "codex"})
+	c.Set(auth.ClientAPIKeyScopeContextKey, authorization.priorityScope)
 	return true
 }
 

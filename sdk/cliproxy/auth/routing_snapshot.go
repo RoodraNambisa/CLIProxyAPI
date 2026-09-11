@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"crypto/sha256"
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
@@ -10,18 +11,19 @@ import (
 // routingRequestPolicy freezes selection choices, not credential availability or
 // limiter generations. Retired instances and current capacity remain authoritative.
 type routingRequestPolicy struct {
-	manager            *Manager
-	selector           Selector
-	strategy           schedulerStrategy
-	strategies         map[int]schedulerStrategy
-	fillRange          int
-	fillRPM            int
-	priorityRange      map[int]int
-	priorityRPM        map[int]int
-	priorityMaxRetries map[int]int
-	strictAffinity     bool
-	observeCodexQuota  bool
-	oauthErrorRules    map[string]*config.CompiledRequestScopedErrors
+	manager             *Manager
+	selector            Selector
+	strategy            schedulerStrategy
+	strategies          map[int]schedulerStrategy
+	fillRange           int
+	fillRPM             int
+	priorityRange       map[int]int
+	priorityRPM         map[int]int
+	priorityMaxRetries  map[int]int
+	strictAffinity      bool
+	observeCodexQuota   bool
+	oauthErrorRules     map[string]*config.CompiledRequestScopedErrors
+	clientKeyPriorities map[[sha256.Size]byte]clientKeyPriorityPolicy
 }
 
 type routingRequestPolicyKey struct{}
@@ -115,10 +117,11 @@ func (m *Manager) WithRoutingPolicySnapshot(ctx context.Context) context.Context
 	}
 	ctx = m.withRetrySettingsSnapshot(ctx)
 	if p := routingPolicyFromContext(ctx); p != nil && p.manager == m {
-		return ctx
+		return m.withClientKeyPrioritySnapshot(ctx, p)
 	}
 	if p := m.routingPolicy.Load(); p != nil {
-		return context.WithValue(ctx, routingRequestPolicyKey{}, p)
+		ctx = context.WithValue(ctx, routingRequestPolicyKey{}, p)
+		return m.withClientKeyPrioritySnapshot(ctx, p)
 	}
 	return ctx
 }

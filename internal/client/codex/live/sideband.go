@@ -60,6 +60,10 @@ func (h *Handler) HandleSideband(c *gin.Context) {
 		return
 	}
 	defer h.calls.release(call)
+	if !h.manager.ClientAPIKeyAllowsCredential(r.ctx, call.lease.CloneAuth()) {
+		r.fail(c, nil, nil, http.StatusServiceUnavailable, "Realtime call credential does not match this API key's priority restrictions", "server_error", "auth_not_available", nil, nil)
+		return
+	}
 	relayCtx, cancelRelay := context.WithCancelCause(r.ctx)
 	stopLease := context.AfterFunc(call.lease.Context(), func() { cancelRelay(context.Cause(call.lease.Context())) })
 	defer func() { stopLease(); cancelRelay(nil) }()

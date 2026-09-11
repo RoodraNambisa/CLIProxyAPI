@@ -1176,6 +1176,7 @@ func (m *Manager) SetSelector(selector Selector) {
 	policy.observeCodexQuota = cfg != nil && cfg.Codex.ObserveQuota
 	if previous := m.routingPolicy.Load(); previous != nil {
 		policy.oauthErrorRules = previous.oauthErrorRules
+		policy.clientKeyPriorities = previous.clientKeyPriorities
 	}
 	m.routingPolicy.Store(policy)
 	m.mu.Unlock()
@@ -1288,6 +1289,10 @@ func (m *Manager) SetConfig(cfg *internalconfig.Config) {
 	if m == nil {
 		return
 	}
+	if cfg.ValidateAPIKeyPriorities() != nil {
+		log.Warn("ignoring invalid client API key priority configuration")
+		return
+	}
 	if errModels := cfg.ValidateModelContextLengths(); errModels != nil {
 		log.WithError(errModels).Warn("ignoring invalid model context length configuration")
 		return
@@ -1313,6 +1318,10 @@ func (m *Manager) SetConfig(cfg *internalconfig.Config) {
 // Existing request snapshots keep their selector and priority rules together.
 func (m *Manager) SetConfigAndSelector(cfg *internalconfig.Config, selector Selector) {
 	if m == nil {
+		return
+	}
+	if cfg.ValidateAPIKeyPriorities() != nil {
+		log.Warn("ignoring invalid client API key priority configuration")
 		return
 	}
 	if errModels := cfg.ValidateModelContextLengths(); errModels != nil {
@@ -1366,6 +1375,7 @@ func (m *Manager) setConfigLocked(cfg *internalconfig.Config) {
 	policy := newRoutingRequestPolicy(m, m.selector, cfg.Routing)
 	policy.observeCodexQuota = cfg.Codex.ObserveQuota
 	policy.oauthErrorRules = oauthErrorRules
+	policy.clientKeyPriorities = compileClientKeyPriorities(cfg)
 	m.routingPolicy.Store(policy)
 	if m.backingPathAuthDir != strings.TrimSpace(cfg.AuthDir) {
 		m.rebuildBackingPathIndexLocked(cfg)
@@ -6832,7 +6842,7 @@ func (m *Manager) pickAntigravityCreditsAtPriority(ctx context.Context, opts cli
 func (m *Manager) pickAntigravityCreditsCandidate(ctx context.Context, routeModel string, opts cliproxyexecutor.Options, roundState *requestRoundState, maxRetryCredentials int) (*creditsCandidateEntry, error) {
 	roundState = roundState.ensure()
 	candidates := m.collectAntigravityCreditsCandidateAuths(routeModel, opts)
-	pickAllowed := m.roundPickAllowed(roundState, maxRetryCredentials, ctx)
+	pickAllowed := clientKeyPriorityFilter(ctx, m.roundPickAllowed(roundState, maxRetryCredentials, ctx))
 	var lastPickErr error
 	var earliestBlocker error
 	for start := 0; start < len(candidates); {
@@ -9737,7 +9747,7 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		if candidate.Provider != provider || candidate.Disabled || m.sessionCleanupPendingLocked(candidate.ID) {
 			continue
 		}
-		if !credentialSupportsExecutionFormat(candidate, opts.SourceFormat) {
+		if !credentialSupportsExecutionFormat(candidate, opts.SourceFormat) || !clientKeyPriorityAllowed(ctx, candidate) {
 			continue
 		}
 		if pinnedAuthID != "" && candidate.ID != pinnedAuthID {
@@ -9872,21 +9882,23 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 }
 
 func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, error) {
+	ctx = m.WithRoutingPolicySnapshot(ctx)
 	if ctx != nil && ctx.Err() != nil {
 		return nil, nil, ctx.Err()
 	}
-	m.triggerDueChatGPTWebImageQuotaRefreshes([]string{provider}, model, opts, tried, nil, false)
+	allowed := clientKeyPriorityFilter(ctx, nil)
+	m.triggerDueChatGPTWebImageQuotaRefreshes([]string{provider}, model, opts, tried, allowed, false)
 	if !m.useSchedulerFastPath(ctx) {
 		auth, executor, errPick := m.pickNextLegacy(ctx, provider, model, opts, tried)
 		if errPick != nil {
-			errPick = m.preferChatGPTWebImageQuotaError(errPick, []string{provider}, model, opts, tried, nil)
+			errPick = m.preferChatGPTWebImageQuotaError(errPick, []string{provider}, model, opts, tried, allowed)
 		}
 		return auth, executor, errPick
 	}
 	if m.routeAwareSelectionRequiredForProviders([]string{provider}, model, tried) {
 		auth, executor, errPick := m.pickNextLegacy(ctx, provider, model, opts, tried)
 		if errPick != nil {
-			errPick = m.preferChatGPTWebImageQuotaError(errPick, []string{provider}, model, opts, tried, nil)
+			errPick = m.preferChatGPTWebImageQuotaError(errPick, []string{provider}, model, opts, tried, allowed)
 		}
 		return auth, executor, errPick
 	}
@@ -9900,7 +9912,7 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 		selected, errPick = m.scheduler.pickSingle(ctx, provider, model, opts, tried)
 	}
 	if errPick != nil {
-		return nil, nil, m.preferChatGPTWebImageQuotaError(errPick, []string{provider}, model, opts, tried, nil)
+		return nil, nil, m.preferChatGPTWebImageQuotaError(errPick, []string{provider}, model, opts, tried, allowed)
 	}
 	if selected == nil {
 		return nil, nil, &Error{Code: "auth_not_found", Message: "selector returned no auth"}
@@ -9953,7 +9965,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		if candidate == nil || candidate.Disabled || m.sessionCleanupPendingLocked(candidate.ID) {
 			continue
 		}
-		if !credentialSupportsExecutionFormat(candidate, opts.SourceFormat) {
+		if !credentialSupportsExecutionFormat(candidate, opts.SourceFormat) || !clientKeyPriorityAllowed(ctx, candidate) {
 			continue
 		}
 		if pinnedAuthID != "" && candidate.ID != pinnedAuthID {
@@ -10112,6 +10124,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 }
 
 func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}, pickAllowed ...func(*Auth) bool) (*Auth, ProviderExecutor, string, error) {
+	ctx = m.WithRoutingPolicySnapshot(ctx)
 	if ctx != nil && ctx.Err() != nil {
 		return nil, nil, "", ctx.Err()
 	}
@@ -10119,6 +10132,7 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 	if len(pickAllowed) > 0 {
 		allowed = pickAllowed[0]
 	}
+	allowed = clientKeyPriorityFilter(ctx, allowed)
 	m.triggerDueChatGPTWebImageQuotaRefreshes(providers, model, opts, tried, allowed, false)
 	if !m.useSchedulerFastPath(ctx) {
 		auth, executor, provider, errPick := m.pickNextMixedLegacy(ctx, providers, model, opts, tried, allowed)

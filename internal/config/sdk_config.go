@@ -116,10 +116,13 @@ type ProxyRuleConfig struct {
 	Priorities []int                   `yaml:"priorities,omitempty" json:"priorities,omitempty"`
 }
 
-// APIKeyGroup restricts one configured API key to a set of runtime provider IDs.
+// APIKeyGroup restricts one configured client key to providers and credential priorities.
 type APIKeyGroup struct {
 	APIKey    string   `yaml:"api-key" json:"api-key"`
 	Providers []string `yaml:"providers" json:"providers"`
+	// Empty allow lists impose no priority restriction; exclusions always win.
+	AllowedPriorities  APIKeyPriorityList `yaml:"allowed-priorities,omitempty" json:"allowed-priorities,omitempty"`
+	ExcludedPriorities APIKeyPriorityList `yaml:"excluded-priorities,omitempty" json:"excluded-priorities,omitempty"`
 }
 
 // ErrorResponseRewriteRule projects a matching final error to a client-facing status or JSON body.

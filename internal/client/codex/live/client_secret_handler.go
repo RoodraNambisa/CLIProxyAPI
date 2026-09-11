@@ -59,6 +59,7 @@ func (h *Handler) createClientSecret(c *gin.Context, legacy bool) {
 			r.fail(c, errPrepare, nil, http.StatusInternalServerError, "Failed to create realtime credential", "server_error", "realtime_client_secret_failed", nil, nil)
 			return
 		}
+		authorization.priorityScope = h.manager.ClientAPIKeyPriorityScope(r.ctx)
 		session, errSession := clientSecretSessionResponse(authorization)
 		if errSession != nil {
 			r.fail(c, errSession, nil, http.StatusInternalServerError, "Failed to encode realtime session", "server_error", "realtime_session_failed", nil, nil)

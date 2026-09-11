@@ -15,6 +15,10 @@ const MaxModelThinkingBudget = internalconfig.MaxModelThinkingBudget
 
 type SDKConfig = internalconfig.SDKConfig
 type APIKeyGroup = internalconfig.APIKeyGroup
+type APIKeyPriorityList = internalconfig.APIKeyPriorityList
+
+const APIKeyPriorityLimit = internalconfig.APIKeyPriorityLimit
+
 type ProxyPoolConfig = internalconfig.ProxyPoolConfig
 type ProxyPoolEntryConfig = internalconfig.ProxyPoolEntryConfig
 type ProxyRuleConfig = internalconfig.ProxyRuleConfig

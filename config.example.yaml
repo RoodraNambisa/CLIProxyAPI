@@ -199,11 +199,18 @@ chatgpt-web:
     # Number of SDK source and bytecode versions retained in memory.
     sdk-cache-versions: 3
 
-# Optional provider restrictions for client API keys. Keys without a mapping can use all providers.
+# Optional provider and credential-priority restrictions for client API keys.
+# Empty allow/exclude lists preserve unrestricted priority routing. Exclusions always win.
+# Priority 0 includes credentials without an explicit priority; negative priorities are supported.
+# Values must be exact integers in [-9007199254740991, 9007199254740991]; invalid saves are rejected.
+# New logical requests capture updated restrictions; retries keep their initial snapshot.
+# A restricted key never falls back to priorities outside its allowed set.
 # Provider IDs are matched exactly after trimming and lowercasing; use "xai" for Grok credentials.
 # api-key-groups:
 #   - api-key: "your-api-key-1"
 #     providers: ["codex", "xai"]
+#     allowed-priorities: [1, 2]
+#     excluded-priorities: [2]
 
 # Enable debug logging
 debug: false
