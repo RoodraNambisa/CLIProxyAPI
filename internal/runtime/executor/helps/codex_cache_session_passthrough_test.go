@@ -76,7 +76,7 @@ func TestCodexCacheSessionFinalProjection(t *testing.T) {
 }
 
 func TestCodexCacheSessionValidation(t *testing.T) {
-	for _, key := range []string{" leading", "trailing ", "line\nbreak", "line\rbreak", "control\x00", "delete\x7f"} {
+	for _, key := range []string{" leading", "trailing ", "   ", "\t", "line\nbreak", "line\rbreak", "control\x00", "delete\x7f"} {
 		payload, _ := json.Marshal(map[string]string{"prompt_cache_key": key})
 		if SnapshotCodexPromptCacheKey(payload, true).Validate() == nil {
 			t.Fatal("invalid fallback session accepted")
@@ -119,5 +119,30 @@ func TestCodexCacheSessionDigestDoesNotLeakBetweenTurns(t *testing.T) {
 	}
 	if next := WithCodexCacheSession(first, CodexPromptCacheKeySnapshot{}); CodexCacheSessionDigest(next) != ([sha256.Size]byte{}) {
 		t.Fatal("disabled or missing identity inherited a previous turn's policy")
+	}
+}
+
+func TestCodexCacheSessionSurvivesNativeHeaderOrdering(t *testing.T) {
+	snapshot := CodexPromptCacheKeySnapshot{Key: "final-cache", SessionID: "final-session"}
+	headers := http.Header{"Session_id": {"converged-session"}, "Thread-Id": {"converged-thread"}}
+	body, err := snapshot.ApplyFinal([]byte(`{"prompt_cache_key":"final-cache"}`), headers)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := http.NewRequest(http.MethodPost, "https://example.invalid/responses", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header = headers
+	var wire bytes.Buffer
+	if err := writeOrderedHTTP1Request(req, &wire, body, codexHTTP1HeaderOrder, true); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(wire.Bytes(), []byte("session-id: final-session\r\n")) || bytes.Contains(wire.Bytes(), []byte("converged-session")) {
+		t.Fatal("native header serialization changed the final session identity")
+	}
+	ws, err := reorderHTTP1HeaderBlock([]byte("GET /responses HTTP/1.1\r\nHost: example.invalid\r\nSession-Id: final-session\r\nsession_id: final-session\r\n\r\n"), codexWebsocketHeaderOrder)
+	if err != nil || !bytes.Contains(ws, []byte("session-id: final-session\r\n")) {
+		t.Fatal("websocket header ordering changed the final session identity")
 	}
 }

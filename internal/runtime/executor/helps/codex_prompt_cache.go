@@ -42,7 +42,7 @@ func SnapshotCodexPromptCacheKey(payload []byte, enabled bool, headers ...http.H
 			break
 		}
 		for _, name := range []string{"Session-Id", "session_id"} {
-			if value := codexRoutingHeader(source, name); strings.TrimSpace(value) != "" {
+			if value := codexRoutingHeader(source, name); value != "" {
 				snapshot.SessionID = strings.Clone(value)
 				break
 			}

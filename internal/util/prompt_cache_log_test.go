@@ -70,7 +70,7 @@ func TestPromptCacheLogRedactorHeadersAndResourceBound(t *testing.T) {
 	if string(stream.Write([]byte("first"), false)) != PromptCacheLogMarker || len(stream.Write([]byte("second"), true)) != 0 {
 		t.Fatal("oversized key retained or repeated body details")
 	}
-	for _, body := range []string{`{}`, `{"prompt_cache_key":null}`, `{"prompt_cache_key":42}`, `{"prompt_cache_key":" "}`} {
+	for _, body := range []string{`{}`, `{"prompt_cache_key":null}`, `{"prompt_cache_key":42}`, `{"prompt_cache_key":""}`} {
 		if PromptCacheLogRedactorForRequest([]byte(body)) != nil {
 			t.Fatal("invalid key changed logging")
 		}

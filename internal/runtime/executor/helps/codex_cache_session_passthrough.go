@@ -41,7 +41,7 @@ func CodexCacheSessionDigest(ctx context.Context) [sha256.Size]byte {
 }
 
 func explicitCodexRoutingString(value gjson.Result) string {
-	if value.Type != gjson.String || strings.TrimSpace(value.Str) == "" {
+	if value.Type != gjson.String || value.Str == "" {
 		return ""
 	}
 	return strings.Clone(value.Str)

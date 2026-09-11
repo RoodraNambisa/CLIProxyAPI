@@ -44,7 +44,7 @@ func TestCodexPromptCacheProtectionRetainsSessionProjection(t *testing.T) {
 }
 
 func TestCodexPromptCacheSnapshotPreservesOnlyExplicitStrings(t *testing.T) {
-	for _, raw := range []string{`{}`, `{"prompt_cache_key":null}`, `{"prompt_cache_key":42}`, `{"prompt_cache_key":true}`, `{"prompt_cache_key":{}}`, `{"prompt_cache_key":""}`, `{"prompt_cache_key":"  "}`} {
+	for _, raw := range []string{`{}`, `{"prompt_cache_key":null}`, `{"prompt_cache_key":42}`, `{"prompt_cache_key":true}`, `{"prompt_cache_key":{}}`, `{"prompt_cache_key":""}`} {
 		if got := SnapshotCodexPromptCacheKey([]byte(raw), true); got.Key != "" {
 			t.Fatalf("unexpected protected key for %s", raw)
 		}

@@ -16,7 +16,7 @@ type codexPromptCacheLogKey struct{}
 // passthrough flag and never retains the source request buffer.
 func SnapshotCodexPromptCacheLog(ctx context.Context, payload []byte) *util.PromptCacheLogRedactor {
 	key := gjson.GetBytes(payload, "prompt_cache_key")
-	if key.Type != gjson.String || strings.TrimSpace(key.Str) == "" {
+	if key.Type != gjson.String || key.Str == "" {
 		return nil
 	}
 	if ctx != nil {

@@ -31,7 +31,7 @@ type PromptCacheLogRedactor struct {
 
 func PromptCacheLogRedactorForRequest(payload []byte) *PromptCacheLogRedactor {
 	key := gjson.GetBytes(payload, "prompt_cache_key")
-	if key.Type != gjson.String || strings.TrimSpace(key.Str) == "" {
+	if key.Type != gjson.String || key.Str == "" {
 		return nil
 	}
 	return NewPromptCacheLogRedactor(key.Str)

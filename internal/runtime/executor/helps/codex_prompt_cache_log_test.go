@@ -38,6 +38,17 @@ func TestCodexPromptCacheLogPolicySnapshotSurvivesLaterGinTurns(t *testing.T) {
 	}
 }
 
+func TestCodexPromptCacheLogProtectsWhitespaceBeforeValidation(t *testing.T) {
+	for _, key := range []string{" ", "   ", "\t"} {
+		body, _ := json.Marshal(map[string]string{"prompt_cache_key": key})
+		for _, redactor := range []*util.PromptCacheLogRedactor{util.PromptCacheLogRedactorForRequest(body), SnapshotCodexPromptCacheLog(nil, body)} {
+			if !redactor.ProtectsKey(key) || redactor.Redact(key) != util.PromptCacheLogMarker || redactor.Redact(string(body)) == string(body) {
+				t.Fatal("diagnostics lost protection for a nonempty whitespace cache string")
+			}
+		}
+	}
+}
+
 func TestCodexPromptCacheLogRedactionDoesNotChangeWireData(t *testing.T) {
 	for _, key := range []string{"client-cache", "client\"cache\\key"} {
 		ginCtx, _ := gin.CreateTestContext(httptest.NewRecorder())

@@ -27,6 +27,8 @@ func TestCodexCacheSessionValidationStopsLocalRetry(t *testing.T) {
 			{"uuid", "019e417b-e000-7000-8000-000000000001", "", true, false},
 			{"non_uuid", "ordinary-cache-key", "", true, false},
 			{"surrounding_space", " cache-key ", "", true, true},
+			{"whitespace_only_key", "   ", "", true, true},
+			{"whitespace_only_session", "valid-cache", "  ", true, true},
 			{"newline", "cache\nkey", "", true, true},
 			{"bad_session", "valid-cache", "bad\nsession", true, true},
 			{"independent_session", " cache-key ", "valid-session", true, false},
