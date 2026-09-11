@@ -7,6 +7,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"weak"
 )
 
 type orderedBlockingUsagePlugin struct {
@@ -19,6 +20,72 @@ type orderedBlockingUsagePlugin struct {
 
 	mu    sync.Mutex
 	order []string
+}
+
+func TestManagerReleasesDeliveredRequestContext(t *testing.T) {
+	manager := NewManager(0)
+	// A burst commonly leaves spare capacity in the queue's backing array.
+	manager.queue = make([]queueItem, 0, 8)
+	plugin := &orderedBlockingUsagePlugin{
+		firstStarted: make(chan struct{}), firstRelease: make(chan struct{}),
+		secondStarted: make(chan struct{}), secondRelease: make(chan struct{}),
+		thirdStarted: make(chan struct{}), thirdRelease: make(chan struct{}),
+	}
+	manager.Register(plugin)
+	t.Cleanup(func() {
+		for _, release := range []chan struct{}{plugin.firstRelease, plugin.secondRelease, plugin.thirdRelease} {
+			select {
+			case <-release:
+			default:
+				close(release)
+			}
+		}
+		manager.Stop()
+	})
+	wait := func(started <-chan struct{}) {
+		t.Helper()
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatal("usage dispatcher did not reach the expected record")
+		}
+	}
+	manager.Publish(context.Background(), Record{Model: "first"})
+	wait(plugin.firstStarted)
+	// Keep the only strong reference in the queued request context. The large
+	// object cannot share a tiny-allocation slot with unrelated live values.
+	publishContext := func() weak.Pointer[[1 << 20]byte] {
+		payload := new([1 << 20]byte)
+		ref := weak.Make(payload)
+		ctx := context.WithValue(context.Background(), struct{}{}, payload)
+		manager.Publish(ctx, Record{Model: "payload"})
+		return ref
+	}
+	ref := publishContext()
+	manager.Publish(context.Background(), Record{Model: "second"})
+	manager.Publish(context.Background(), Record{Model: "third"})
+	close(plugin.firstRelease)
+	wait(plugin.secondStarted)
+	for range 5 {
+		runtime.GC()
+	}
+	if ref.Value() != nil {
+		t.Fatal("delivered usage retained its request context while later records remained queued")
+	}
+	close(plugin.secondRelease)
+	wait(plugin.thirdStarted)
+	close(plugin.thirdRelease)
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	if err := manager.Barrier(ctx); err != nil {
+		t.Fatal(err)
+	}
+	manager.mu.Lock()
+	released := manager.queue == nil
+	manager.mu.Unlock()
+	if !released {
+		t.Fatal("drained usage queue retained its backing storage")
+	}
 }
 
 func (p *orderedBlockingUsagePlugin) HandleUsage(_ context.Context, record Record) {

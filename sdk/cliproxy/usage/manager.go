@@ -228,7 +228,14 @@ func (m *Manager) run(ctx context.Context) {
 			return
 		}
 		item := m.queue[0]
-		m.queue = m.queue[1:]
+		// Delivered contexts may own large request data. Do not retain them in
+		// consumed slots, and release the burst buffer when the queue is empty.
+		m.queue[0] = queueItem{}
+		if len(m.queue) == 1 {
+			m.queue = nil
+		} else {
+			m.queue = m.queue[1:]
+		}
 		m.mu.Unlock()
 		if item.barrier != nil {
 			close(item.barrier)
