@@ -7,6 +7,8 @@
 package codex
 
 import (
+	"unsafe"
+
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
 	"github.com/tidwall/gjson"
@@ -59,8 +61,7 @@ func (a *Applier) Apply(body []byte, config thinking.ThinkingConfig, modelInfo *
 	}
 
 	if config.Mode == thinking.ModeLevel {
-		result, _ := sjson.SetBytes(body, "reasoning.effort", string(config.Level))
-		return result, nil
+		return setCodexEffortIfDifferent(body, string(config.Level)), nil
 	}
 
 	effort := ""
@@ -80,8 +81,7 @@ func (a *Applier) Apply(body []byte, config thinking.ThinkingConfig, modelInfo *
 		return body, nil
 	}
 
-	result, _ := sjson.SetBytes(body, "reasoning.effort", effort)
-	return result, nil
+	return setCodexEffortIfDifferent(body, effort), nil
 }
 
 func applyCompatibleCodex(body []byte, config thinking.ThinkingConfig) ([]byte, error) {
@@ -115,6 +115,16 @@ func applyCompatibleCodex(body []byte, config thinking.ThinkingConfig) ([]byte, 
 		return body, nil
 	}
 
+	return setCodexEffortIfDifferent(body, effort), nil
+}
+
+// setCodexEffortIfDifferent follows SJSON's first-parent lookup. Its callers
+// already validated or replaced the body; borrowed fields never escape.
+func setCodexEffortIfDifferent(body []byte, effort string) []byte {
+	reasoning := gjson.Get(unsafe.String(unsafe.SliceData(body), len(body)), "reasoning")
+	if reasoning.Get("effort").Raw == `"`+effort+`"` {
+		return body
+	}
 	result, _ := sjson.SetBytes(body, "reasoning.effort", effort)
-	return result, nil
+	return result
 }
