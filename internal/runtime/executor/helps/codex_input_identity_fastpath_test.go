@@ -81,3 +81,41 @@ func BenchmarkCodexPlainTextReasoningCheck(b *testing.B) {
 		})
 	}
 }
+
+func TestCodexMessageIDsDoNotTriggerReasoningAllocation(t *testing.T) {
+	body := codexIDBenchmarkPayload(1<<20, true)
+	body = append(body[:len(body)-1], `,"reasoning":{"summary":"auto"},"include":["reasoning.encrypted_content"]}`...)
+	if allocations := testing.AllocsPerRun(5, func() {
+		out := SanitizeCodexReasoningEncryptedContent(context.Background(), "fixture", body)
+		if len(out) != len(body) || &out[0] != &body[0] {
+			t.Fatal("ordinary message ID changed during reasoning cleanup")
+		}
+	}); allocations != 0 {
+		t.Fatalf("ordinary message ID allocated %g times during reasoning cleanup", allocations)
+	}
+}
+
+func TestCodexReasoningTypeHintKeepsEscapedAndPaddedItems(t *testing.T) {
+	for _, kind := range []string{`"reasoning"`, `"re\u0061soning"`, `" reasoning "`, `"\treasoning\n"`, "\"reasoning\u00a0\""} {
+		body := []byte(`{"input":[{"type":"message","id":"msg_keep","content":"reasoning.encrypted_content"},{"type":` + kind + `,"id":"rs_drop","encrypted_content":null}],"include":["reasoning.encrypted_content"]}`)
+		out := SanitizeCodexReasoningEncryptedContent(context.Background(), "fixture", body)
+		if gjson.GetBytes(out, "input.0.id").String() != "msg_keep" || gjson.GetBytes(out, "input.1.id").Exists() || gjson.GetBytes(out, "input.1.encrypted_content").Exists() {
+			t.Fatalf("type %s bypassed reasoning cleanup or changed the message", kind)
+		}
+	}
+}
+
+func BenchmarkCodexMessageIDReasoningCheck(b *testing.B) {
+	for _, size := range []int{128, 1 << 20, 10 << 20} {
+		b.Run(fmt.Sprintf("bytes=%d", size), func(b *testing.B) {
+			body := codexIDBenchmarkPayload(size, true)
+			body = append(body[:len(body)-1], `,"include":["reasoning.encrypted_content"]}`...)
+			b.SetBytes(int64(len(body)))
+			b.ReportAllocs()
+			b.ResetTimer()
+			for range b.N {
+				SanitizeCodexReasoningEncryptedContent(context.Background(), "fixture", body)
+			}
+		})
+	}
+}

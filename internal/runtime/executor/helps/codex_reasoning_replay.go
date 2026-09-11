@@ -1,6 +1,7 @@
 package helps
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
@@ -85,6 +86,9 @@ func SanitizeCodexReasoningEncryptedContent(ctx context.Context, provider string
 	if !util.JSONMayContainAnyField(body, "id", "encrypted_content") {
 		return body
 	}
+	if !codexMayContainReasoningType(body) {
+		return body
+	}
 	// The borrowed input is never retained; any changed body is rebuilt below.
 	input := gjson.Get(unsafe.String(unsafe.SliceData(body), len(body)), "input")
 	if !input.IsArray() {
@@ -157,6 +161,32 @@ func SanitizeCodexReasoningEncryptedContent(ctx context.Context, provider string
 		return body
 	}
 	return updated
+}
+
+// codexMayContainReasoningType is only an exclusion hint. Object keys and dotted
+// selectors such as include:["reasoning.encrypted_content"] are not item types.
+// Keep escaped and whitespace-padded values on the original parser path.
+func codexMayContainReasoningType(body []byte) bool {
+	if bytes.Contains(body, []byte(`\u`)) {
+		return true
+	}
+	for {
+		index := bytes.Index(body, []byte("reasoning"))
+		if index < 0 {
+			return false
+		}
+		body = body[index+len("reasoning"):]
+		if len(body) > 0 && body[0] == '"' {
+			afterQuote := skipCodexJSONSpace(body, 1)
+			if afterQuote < len(body) && body[afterQuote] == ':' {
+				body = body[afterQuote+1:]
+				continue
+			}
+		}
+		if len(body) == 0 || body[0] != '.' {
+			return true
+		}
+	}
 }
 
 // ApplyCodexReasoningReplay injects cached Claude-origin reasoning and matching
