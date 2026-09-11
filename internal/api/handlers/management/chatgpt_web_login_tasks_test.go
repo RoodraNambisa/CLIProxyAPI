@@ -2584,6 +2584,26 @@ func waitForChatGPTWebLoginTask(t *testing.T, router http.Handler, id string) ch
 	return chatGPTWebLoginTask{}
 }
 
+func TestWaitForChatGPTWebManualReloginOperationWaitsForDurableResult(t *testing.T) {
+	calls := 0
+	router := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		operation := chatGPTWebManualReloginOperationSnapshot{
+			OperationID:   "durable-fixture",
+			Status:        chatGPTWebManualReloginOperationCompleted,
+			Outcome:       "succeeded",
+			ResultDurable: calls >= 2,
+		}
+		if err := json.NewEncoder(w).Encode(operation); err != nil {
+			t.Fatal(err)
+		}
+	})
+	operation := waitForChatGPTWebManualReloginOperation(t, router, "durable-fixture")
+	if calls != 2 || !operation.ResultDurable {
+		t.Fatal("completion polling returned before the result was durable")
+	}
+}
+
 func waitForChatGPTWebManualReloginOperation(t *testing.T, router http.Handler, id string) chatGPTWebManualReloginOperationSnapshot {
 	t.Helper()
 	deadline := time.Now().Add(3 * time.Second)
@@ -2594,12 +2614,13 @@ func waitForChatGPTWebManualReloginOperation(t *testing.T, router http.Handler, 
 		}
 		var operation chatGPTWebManualReloginOperationSnapshot
 		decodeChatGPTWebManagementResponse(t, recorder, &operation)
-		if !chatGPTWebManualReloginOperationActive(operation.Status) {
+		// Completion is visible while its journal append is still in progress.
+		if !chatGPTWebManualReloginOperationActive(operation.Status) && operation.ResultDurable {
 			return operation
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatalf("manual re-login operation %s did not complete", id)
+	t.Fatalf("manual re-login operation %s did not complete durably", id)
 	return chatGPTWebManualReloginOperationSnapshot{}
 }
 
