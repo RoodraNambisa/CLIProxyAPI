@@ -356,6 +356,9 @@ func executionResultErrorCode(err error) string {
 	if errors.As(err, &target) && target != nil {
 		return strings.TrimSpace(target.ExecutionResultErrorCode())
 	}
+	if IsModelNotFoundError(err) {
+		return "model_not_found"
+	}
 	return ""
 }
 
@@ -7983,6 +7986,11 @@ func (m *Manager) markResult(
 	if result.AuthID == "" {
 		return
 	}
+	modelNotFound := IsModelNotFoundError(result.Error)
+	if modelNotFound && result.Error.Code != "model_not_found" {
+		result.Error = cloneError(result.Error)
+		result.Error.Code = "model_not_found"
+	}
 	modelKey := canonicalModelKey(result.Model)
 	if ctx == nil {
 		ctx = context.Background()
@@ -8106,6 +8114,9 @@ func (m *Manager) markResult(
 		now = time.Now()
 		dynamicFixedCooldown, hasDynamicFixedCooldown := m.fixedErrorCooldownForResult(result.Error, ctx)
 		resultStatusCode := statusCodeFromResult(result.Error)
+		if modelNotFound || resultStatusCode == http.StatusNotFound {
+			dynamicFixedCooldown.scope = cooldownScopeModel
+		}
 		chatGPTWebImageQuotaResult := result.Error != nil &&
 			strings.EqualFold(strings.TrimSpace(result.Error.Code), "chatgpt_web_image_quota")
 		chatGPTWebImage429Result := resultStatusCode == http.StatusTooManyRequests &&
@@ -8206,6 +8217,9 @@ func (m *Manager) markResult(
 
 					statusCode := statusCodeFromResult(result.Error)
 					fixedCooldown, hasFixedCooldown := m.fixedErrorCooldownForResult(result.Error, ctx)
+					if modelNotFound || statusCode == http.StatusNotFound {
+						fixedCooldown.scope = cooldownScopeModel
+					}
 					if (chatGPTWebImageQuotaResult || chatGPTWebImage429Result) && hasFixedCooldown {
 						fixedCooldown.scope = cooldownScopeModel
 					}
@@ -8216,7 +8230,11 @@ func (m *Manager) markResult(
 					} else if !skipCooling {
 						state.Unavailable = true
 					}
-					if isModelSupportResultError(result.Error) && !skipCooling {
+					if modelNotFound && !skipCooling {
+						state.NextRetryAfter = cooldownTime(now, notFoundCooldown, fixedCooldown, hasFixedCooldown, disableCooling)
+						suspendReason = "model_not_found"
+						shouldSuspendModel = !disableCooling
+					} else if isModelSupportResultError(result.Error) && !skipCooling {
 						next := cooldownTime(now, 12*time.Hour, fixedCooldown, hasFixedCooldown, disableCooling)
 						state.NextRetryAfter = next
 						suspendReason = "model_not_supported"
@@ -8245,7 +8263,7 @@ func (m *Manager) markResult(
 							if disableCooling {
 								state.NextRetryAfter = time.Time{}
 							} else {
-								next := cooldownTime(now, 12*time.Hour, fixedCooldown, hasFixedCooldown, disableCooling)
+								next := cooldownTime(now, notFoundCooldown, fixedCooldown, hasFixedCooldown, disableCooling)
 								state.NextRetryAfter = next
 								suspendReason = "not_found"
 								shouldSuspendModel = true
@@ -9121,6 +9139,9 @@ func isModelSupportError(err error) bool {
 	if err == nil {
 		return false
 	}
+	if IsModelNotFoundError(err) {
+		return true
+	}
 	status := statusCodeFromError(err)
 	if status != http.StatusBadRequest && status != http.StatusUnprocessableEntity {
 		return false
@@ -9176,6 +9197,9 @@ func disableAuthForInvalidGrant(auth *Auth, resultErr *Error, now time.Time) {
 func isModelSupportResultError(err *Error) bool {
 	if err == nil {
 		return false
+	}
+	if IsModelNotFoundError(err) {
+		return true
 	}
 	status := statusCodeFromResult(err)
 	if status != http.StatusBadRequest && status != http.StatusUnprocessableEntity {
@@ -9364,7 +9388,9 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 			auth.StatusMessage = resultErr.Message
 		}
 	}
-	if skipCooling {
+	if skipCooling || statusCodeFromResult(resultErr) == http.StatusNotFound || IsModelNotFoundError(resultErr) {
+		// Without a model key, a model availability failure cannot justify
+		// cooling every model on the credential.
 		return
 	}
 	disableCooling := quotaCooldownDisabledForAuth(auth)
@@ -9385,13 +9411,6 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 			auth.NextRetryAfter = time.Time{}
 		} else {
 			auth.NextRetryAfter = cooldownTime(now, 30*time.Minute, fixed, hasFixed, disableCooling)
-		}
-	case 404:
-		auth.StatusMessage = "not_found"
-		if disableCooling {
-			auth.NextRetryAfter = time.Time{}
-		} else {
-			auth.NextRetryAfter = cooldownTime(now, 12*time.Hour, fixed, hasFixed, disableCooling)
 		}
 	case 429:
 		auth.StatusMessage = "quota exhausted"
