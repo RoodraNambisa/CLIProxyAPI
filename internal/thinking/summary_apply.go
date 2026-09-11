@@ -2,6 +2,7 @@ package thinking
 
 import (
 	"strings"
+	"unsafe"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/tidwall/gjson"
@@ -80,18 +81,40 @@ func applySummaryConfigForProvider(body []byte, format, model, provider string, 
 		body, _ = sjson.SetBytes(body, "generation_config.thinking_summaries", value)
 		body, _ = sjson.DeleteBytes(body, "generation_config.thinkingSummaries")
 	case "openai-response", "codex":
-		if enabled {
-			body, _ = sjson.SetBytes(body, "reasoning.summary", normalizedSummaryDetail(config.Detail))
-			body, _ = sjson.DeleteBytes(body, "reasoning.generate_summary")
-			break
+		body = applyResponsesSummaryConfig(body, config)
+	}
+	return body
+}
+
+// applyResponsesSummaryConfig skips mutations that would only copy the body.
+// Read each path segment separately to match SJSON's first-parent lookup when
+// duplicate reasoning objects exist. Borrowed views stay within this call;
+// changed output is still independently owned by the original SJSON writers.
+func applyResponsesSummaryConfig(body []byte, config SummaryConfig) []byte {
+	reasoning := gjson.Get(unsafe.String(unsafe.SliceData(body), len(body)), "reasoning")
+	summary := reasoning.Get("summary")
+	legacy := reasoning.Get("generate_summary")
+	if config.Mode == SummaryEnabled {
+		detail := normalizedSummaryDetail(config.Detail)
+		if summary.Raw != `"`+detail+`"` {
+			body, _ = sjson.SetBytes(body, "reasoning.summary", detail)
 		}
-		// Omitting the field is the documented way to disable summaries; an
-		// explicit null is not accepted by every Responses-compatible backend.
+	} else if summary.Exists() {
+		// Omission disables summaries; explicit null is not accepted by every
+		// Responses-compatible backend.
 		body, _ = sjson.DeleteBytes(body, "reasoning.summary")
+	}
+	if legacy.Exists() {
 		body, _ = sjson.DeleteBytes(body, "reasoning.generate_summary")
-		if reasoning := gjson.GetBytes(body, "reasoning"); reasoning.IsObject() && len(reasoning.Map()) == 0 {
-			body, _ = sjson.DeleteBytes(body, "reasoning")
-		}
+	}
+	if config.Mode == SummaryEnabled {
+		return body
+	}
+	if summary.Exists() || legacy.Exists() {
+		reasoning = gjson.Get(unsafe.String(unsafe.SliceData(body), len(body)), "reasoning")
+	}
+	if reasoning.IsObject() && strings.TrimSpace(reasoning.Raw[1:len(reasoning.Raw)-1]) == "" {
+		body, _ = sjson.DeleteBytes(body, "reasoning")
 	}
 	return body
 }
