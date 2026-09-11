@@ -557,7 +557,7 @@ type CodexConfig struct {
 	EstimateClaudeInputTokens bool `yaml:"estimate-claude-input-tokens" json:"estimate-claude-input-tokens"`
 	// ObserveQuota records passive Codex quota signals without changing availability.
 	ObserveQuota bool `yaml:"observe-quota" json:"observe-quota"`
-	// PassthroughPromptCacheKey preserves explicit client cache keys independently of session identity.
+	// PassthroughPromptCacheKey pins client cache keys and session IDs after identity projection.
 	PassthroughPromptCacheKey bool                 `yaml:"passthrough-prompt-cache-key" json:"passthrough-prompt-cache-key"`
 	IdentityConfuse           bool                 `yaml:"identity-confuse" json:"identity-confuse"`
 	SpoofSessionIdentity      bool                 `yaml:"spoof-session-identity" json:"spoof-session-identity"`

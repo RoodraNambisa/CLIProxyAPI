@@ -775,9 +775,14 @@ nonstream-keepalive-interval: 0
 #     # These secrets are retained in YAML and omitted from config JSON responses.
 #     ice-servers: []
 #   identity-confuse: false
-#   # Preserve explicit non-empty string prompt_cache_key values across identity remapping.
-#   # Defaults to false. Missing/invalid keys keep existing generation behavior.
-#   # Hot updates affect the next logical request (or next WebSocket turn), never its retries.
+#   # Preserve explicit prompt_cache_key and Session-Id/session_id after all identity projections.
+#   # A missing client Session ID uses the explicit cache key; other identity fields stay independent.
+#   # Defaults to false. Without an explicit key, existing cache generation is unchanged.
+#   # When enabled, a Session ID (including its cache-key fallback) containing surrounding whitespace
+#   # or invalid HTTP header characters is rejected locally with HTTP 500 / invalid_prompt_cache_key.
+#   # UUIDs and other valid strings pass unchanged. A valid independent Session ID permits any cache string.
+#   # Hot updates affect the next request/WS turn, never its retries. Changed WS identities require reconnect
+#   # and complete replay context; no additional retry budget is introduced.
 #   passthrough-prompt-cache-key: false
 #   # Buffer up to 16 pre-output metadata events / 64 KiB to detect overloads before
 #   # committing the stream. Uses the existing retry budget and requires a replayable request.
