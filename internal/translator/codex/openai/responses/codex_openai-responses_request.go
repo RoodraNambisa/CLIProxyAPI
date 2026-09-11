@@ -5,12 +5,16 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"unsafe"
 
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
 
 const codexResponsesIncludeRaw = `["reasoning.encrypted_content"]`
+const codexResponsesDefaultControlsGrowth = len(`,"stream":true,"store":false,"parallel_tool_calls":true,"include":`) + len(codexResponsesIncludeRaw)
+const codexResponsesInputTextPrefix = `[{"type":"message","role":"user","content":[{"type":"input_text","text":`
+const codexResponsesInputTextSuffix = `}]}]`
 
 func ConvertOpenAIResponsesRequestToCodex(_ string, inputRawJSON []byte, _ bool) []byte {
 	if len(inputRawJSON) == 0 {
@@ -29,12 +33,14 @@ func ConvertOpenAIResponsesRequestToCodex(_ string, inputRawJSON []byte, _ bool)
 }
 
 func convertOpenAIResponsesRequestToCodexFastPath(inputRawJSON []byte) ([]byte, bool) {
-	root := gjson.ParseBytes(inputRawJSON)
+	// Parsed views stay within this conversion. The output builder copies all
+	// retained fields, so no reference to mutable input escapes to the caller.
+	root := gjson.Parse(unsafe.String(unsafe.SliceData(inputRawJSON), len(inputRawJSON)))
 	if !root.IsObject() {
 		return nil, false
 	}
 
-	output := make([]byte, 0, len(inputRawJSON)+96)
+	output := make([]byte, 0, len(inputRawJSON)+codexResponsesDefaultControlsGrowth+len(codexResponsesInputTextPrefix)+len(codexResponsesInputTextSuffix))
 	output = append(output, '{')
 	wroteField := false
 	hasStream := false
@@ -137,9 +143,9 @@ func appendJSONObjectFieldName(dst []byte, field string, wroteField *bool) []byt
 func appendNormalizedOpenAIResponsesInput(dst []byte, input gjson.Result) ([]byte, bool) {
 	switch input.Type {
 	case gjson.String:
-		dst = append(dst, `[{"type":"message","role":"user","content":[{"type":"input_text","text":`...)
+		dst = append(dst, codexResponsesInputTextPrefix...)
 		dst = append(dst, input.Raw...)
-		dst = append(dst, `}]}]`...)
+		dst = append(dst, codexResponsesInputTextSuffix...)
 		return dst, true
 	case gjson.JSON:
 		if !input.IsArray() {
