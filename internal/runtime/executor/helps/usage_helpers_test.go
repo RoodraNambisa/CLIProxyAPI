@@ -17,13 +17,22 @@ import (
 type usageReporterTestPlugin struct {
 	authID  string
 	records chan usage.Record
+	done    <-chan struct{}
 }
 
 func (p *usageReporterTestPlugin) HandleUsage(_ context.Context, record usage.Record) {
 	if record.AuthID != p.authID {
 		return
 	}
-	p.records <- record
+	select {
+	case <-p.done:
+		return
+	default:
+	}
+	select {
+	case p.records <- record:
+	case <-p.done:
+	}
 }
 
 func TestParseOpenAIUsageChatCompletions(t *testing.T) {
@@ -302,7 +311,7 @@ func TestUsageReporterAdditionalModelSkipsZeroUsage(t *testing.T) {
 func TestUsageReporterObservedAdditionalModelPublishesAuxiliaryRecord(t *testing.T) {
 	const authID = "usage-reporter-observed-additional"
 	records := make(chan usage.Record, 2)
-	usage.RegisterPlugin(&usageReporterTestPlugin{authID: authID, records: records})
+	usage.RegisterPlugin(&usageReporterTestPlugin{authID: authID, records: records, done: t.Context().Done()})
 	reporter := NewUsageReporter(context.Background(), "codex", "gpt-5.4", &cliproxyauth.Auth{ID: authID})
 	reporter.ObserveAdditionalModel("gpt-image-2", usage.Detail{OutputTokens: 48})
 	reporter.EnsurePublished(context.Background())
@@ -328,7 +337,7 @@ func TestUsageReporterObservedAdditionalModelPublishesAuxiliaryRecord(t *testing
 func TestUsageReporterObservedUsageDoesNotHideTerminalFailure(t *testing.T) {
 	const authID = "usage-reporter-observed-terminal-failure"
 	records := make(chan usage.Record, 2)
-	usage.RegisterPlugin(&usageReporterTestPlugin{authID: authID, records: records})
+	usage.RegisterPlugin(&usageReporterTestPlugin{authID: authID, records: records, done: t.Context().Done()})
 	reporter := NewUsageReporter(context.Background(), "codex", "gpt-5.4", &cliproxyauth.Auth{ID: authID})
 	reporter.Observe(usage.Detail{InputTokens: 3, OutputTokens: 4})
 	reporter.PublishFailure(context.Background(), context.Canceled)
@@ -355,7 +364,7 @@ func TestUsageReporterObservedUsageDoesNotHideTerminalFailure(t *testing.T) {
 func TestUsageReporterPublishesExecutionDiagnosticsSnapshot(t *testing.T) {
 	const authID = "usage-reporter-execution-diagnostics"
 	records := make(chan usage.Record, 1)
-	usage.RegisterPlugin(&usageReporterTestPlugin{authID: authID, records: records})
+	usage.RegisterPlugin(&usageReporterTestPlugin{authID: authID, records: records, done: t.Context().Done()})
 	diagnostics := &cliproxyexecutor.RequestExecutionDiagnostics{}
 	reservation := &usageReporterTestReservation{consumed: true}
 	slot := &cliproxyexecutor.AuthRequestSlot{}
@@ -386,7 +395,7 @@ func TestUsageReporterPublishesExecutionDiagnosticsSnapshot(t *testing.T) {
 func TestUsageReporterStagesFrozenFailureSnapshot(t *testing.T) {
 	const authID = "usage-reporter-frozen-failure"
 	records := make(chan usage.Record, 1)
-	usage.RegisterPlugin(&usageReporterTestPlugin{authID: authID, records: records})
+	usage.RegisterPlugin(&usageReporterTestPlugin{authID: authID, records: records, done: t.Context().Done()})
 	diagnostics := &cliproxyexecutor.RequestExecutionDiagnostics{}
 	outcome := &cliproxyexecutor.RequestUsageOutcome{}
 	diagnostics.SetFailure("selection", "proxy_unavailable")
@@ -412,7 +421,7 @@ func TestUsageReporterStagesFrozenFailureSnapshot(t *testing.T) {
 func TestUsageReporterSupersededFailurePublishesOnlySuccess(t *testing.T) {
 	const authID = "usage-reporter-retry-success"
 	records := make(chan usage.Record, 2)
-	usage.RegisterPlugin(&usageReporterTestPlugin{authID: authID, records: records})
+	usage.RegisterPlugin(&usageReporterTestPlugin{authID: authID, records: records, done: t.Context().Done()})
 	diagnostics := &cliproxyexecutor.RequestExecutionDiagnostics{}
 	outcome := &cliproxyexecutor.RequestUsageOutcome{}
 	diagnostics.SetFailure("upstream", "http_500")

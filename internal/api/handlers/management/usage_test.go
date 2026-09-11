@@ -416,6 +416,13 @@ func TestClearUsageStatisticsWaitsForQueuedRecords(t *testing.T) {
 		release: make(chan struct{}),
 	}
 	coreusage.RegisterPlugin(blocker)
+	t.Cleanup(func() {
+		select {
+		case <-blocker.release:
+		default:
+			close(blocker.release)
+		}
+	})
 	coreusage.PublishRecord(context.Background(), coreusage.Record{APIKey: "first", Model: "model-a"})
 	select {
 	case <-blocker.entered:

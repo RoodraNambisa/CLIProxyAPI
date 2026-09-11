@@ -124,11 +124,20 @@ func (e *mixedProviderUsageExecutor) HttpRequest(context.Context, *cliproxyauth.
 type mixedProviderUsagePlugin struct {
 	authIDs map[string]struct{}
 	records chan coreusage.Record
+	done    <-chan struct{}
 }
 
 func (p *mixedProviderUsagePlugin) HandleUsage(_ context.Context, record coreusage.Record) {
 	if _, ok := p.authIDs[record.AuthID]; ok {
-		p.records <- record
+		select {
+		case <-p.done:
+			return
+		default:
+		}
+		select {
+		case p.records <- record:
+		case <-p.done:
+		}
 	}
 }
 
@@ -175,6 +184,7 @@ func TestManagerMixedProviderFailureThenSuccessPublishesOnePrimaryUsageRecord(t 
 	coreusage.RegisterPlugin(&mixedProviderUsagePlugin{
 		authIDs: map[string]struct{}{failedID: {}, succeededID: {}},
 		records: records,
+		done:    t.Context().Done(),
 	})
 	manager := cliproxyauth.NewManager(nil, &cliproxyauth.FillFirstSelector{}, nil)
 	manager.SetRetryConfig(0, 0, 0)
@@ -206,6 +216,7 @@ func TestManagerMixedProviderFailuresPublishOnlyFinalPrimaryUsageRecord(t *testi
 	coreusage.RegisterPlugin(&mixedProviderUsagePlugin{
 		authIDs: map[string]struct{}{webID: {}, nonWebID: {}},
 		records: records,
+		done:    t.Context().Done(),
 	})
 	manager := cliproxyauth.NewManager(nil, &cliproxyauth.FillFirstSelector{}, nil)
 	manager.SetRetryConfig(0, 0, 0)
@@ -235,6 +246,7 @@ func TestManagerStreamBootstrapFailureThenSuccessPublishesOnlySuccess(t *testing
 	coreusage.RegisterPlugin(&mixedProviderUsagePlugin{
 		authIDs: map[string]struct{}{failedID: {}, succeededID: {}},
 		records: records,
+		done:    t.Context().Done(),
 	})
 	manager := cliproxyauth.NewManager(nil, &cliproxyauth.FillFirstSelector{}, nil)
 	manager.SetRetryConfig(0, 0, 0)
@@ -271,6 +283,7 @@ func TestManagerLateFailureFromSupersededStreamDoesNotOverrideAcceptedSuccess(t 
 	coreusage.RegisterPlugin(&mixedProviderUsagePlugin{
 		authIDs: map[string]struct{}{failedID: {}, succeededID: {}},
 		records: records,
+		done:    t.Context().Done(),
 	})
 	releaseLateFailure := make(chan struct{})
 	lateFailureDone := make(chan struct{})
@@ -326,6 +339,7 @@ func TestManagerAcceptedStreamEarlyFailurePublishesOneFailure(t *testing.T) {
 	coreusage.RegisterPlugin(&mixedProviderUsagePlugin{
 		authIDs: map[string]struct{}{authID: {}},
 		records: records,
+		done:    t.Context().Done(),
 	})
 	manager := cliproxyauth.NewManager(nil, &cliproxyauth.FillFirstSelector{}, nil)
 	manager.SetRetryConfig(0, 0, 0)
