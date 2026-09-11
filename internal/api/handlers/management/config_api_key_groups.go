@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
+	configaccess "github.com/router-for-me/CLIProxyAPI/v6/internal/access/config_access"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 )
 
@@ -17,7 +18,7 @@ func (h *Handler) GetAPIKeys(c *gin.Context) {
 	if cfg := h.currentConfig(); cfg != nil {
 		keys = append([]string(nil), cfg.APIKeys...)
 	}
-	c.JSON(http.StatusOK, gin.H{"api-keys": keys})
+	c.JSON(http.StatusOK, gin.H{"api-keys": keys, "last-used": configaccess.APIKeyLastUsed(keys)})
 }
 
 // PutAPIKeys replaces client API keys and removes group mappings for deleted keys.

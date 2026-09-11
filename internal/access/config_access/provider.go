@@ -4,33 +4,45 @@ import (
 	"context"
 	"net/http"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v6/sdk/access"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
 )
 
+var registerMu sync.Mutex
+
 // Register ensures the config-access provider is available to the access manager.
 func Register(cfg *sdkconfig.SDKConfig) {
+	registerMu.Lock()
+	defer registerMu.Unlock()
 	if cfg == nil {
+		configuredKeyUsage.reconcile(nil)
 		sdkaccess.UnregisterProvider(sdkaccess.AccessProviderTypeConfigAPIKey)
 		return
 	}
 
 	keys := normalizeKeys(cfg.APIKeys)
 	if len(keys) == 0 {
+		configuredKeyUsage.reconcile(nil)
 		sdkaccess.UnregisterProvider(sdkaccess.AccessProviderTypeConfigAPIKey)
 		return
 	}
 
+	next := newProvider(sdkaccess.DefaultAccessProviderName, keys, cfg.APIKeyGroups)
+	next.lastUsed = configuredKeyUsage.reconcile(keys)
 	sdkaccess.RegisterProvider(
 		sdkaccess.AccessProviderTypeConfigAPIKey,
-		newProvider(sdkaccess.DefaultAccessProviderName, keys, cfg.APIKeyGroups),
+		next,
 	)
 }
 
 type provider struct {
-	name string
-	keys map[string][]string
+	name     string
+	keys     map[string][]string
+	lastUsed map[string]*atomic.Int64
 }
 
 func newProvider(name string, keys []string, groups []sdkconfig.APIKeyGroup) *provider {
@@ -101,6 +113,7 @@ func (p *provider) Authenticate(_ context.Context, r *http.Request) (*sdkaccess.
 			continue
 		}
 		if allowedProviders, ok := p.keys[candidate.value]; ok {
+			noteAPIKeyUse(p.lastUsed[candidate.value], time.Now())
 			metadata := map[string]string{"source": candidate.source}
 			if len(allowedProviders) > 0 {
 				metadata[sdkaccess.MetadataAllowedProviders] = strings.Join(allowedProviders, ",")
