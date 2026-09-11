@@ -1334,9 +1334,24 @@ type ChatGPTWebImageReference struct {
 // conversation. A terminal task result is authoritative only when every
 // matching task has reached a terminal state.
 type ChatGPTWebImageTaskState struct {
-	Matched  int
-	Terminal int
-	Targets  []ChatGPTWebImageTaskTarget
+	Matched     int
+	Terminal    int
+	Targets     []ChatGPTWebImageTaskTarget
+	Diagnostics ChatGPTWebImageTaskPageDiagnostics
+}
+
+// ChatGPTWebImageTaskPageDiagnostics describes parsing without retaining IDs or
+// payloads. Record counts are per page observation, not unique task counts.
+type ChatGPTWebImageTaskPageDiagnostics struct {
+	Recognized               bool
+	Records                  int
+	InvalidRecords           int
+	ImageRecords             int
+	MatchedRecords           int
+	OtherConversationRecords int
+	IdentityMismatchRecords  int
+	MissingTaskIDRecords     int
+	MissingResponseIDRecords int
 }
 
 // ChatGPTWebImageTaskTarget identifies one exact official image task stream.
@@ -2840,7 +2855,10 @@ func CaptureChatGPTWebImageTasks(payload []byte, conversationID string, accumula
 	if err := decoder.Decode(&root); err != nil {
 		return ChatGPTWebImageTaskState{}, fmt.Errorf("decode chatgpt web image tasks: %w", err)
 	}
-	tasks, _ := root["tasks"].([]any)
+	tasks, recognized := root["tasks"].([]any)
+	state := ChatGPTWebImageTaskState{Diagnostics: ChatGPTWebImageTaskPageDiagnostics{
+		Recognized: recognized, Records: len(tasks),
+	}}
 	fallbackCreatedAt, hasFallbackCreatedAt := chatGPTWebImageTaskTurnBoundary(tasks, conversationID, accumulator)
 	snapshot := &ChatGPTWebImageAccumulator{ConversationID: conversationID, Turn: accumulator.Turn}
 	for _, taskID := range accumulator.TaskIDs {
@@ -2853,19 +2871,34 @@ func CaptureChatGPTWebImageTasks(payload []byte, conversationID string, accumula
 			return ChatGPTWebImageTaskState{}, err
 		}
 	}
-	state := ChatGPTWebImageTaskState{}
 	for _, rawTask := range tasks {
 		task, _ := rawTask.(map[string]any)
-		if task == nil || !chatGPTWebImageTaskMatchesCurrent(task, conversationID, accumulator, fallbackCreatedAt, hasFallbackCreatedAt) {
+		if task == nil {
+			state.Diagnostics.InvalidRecords++
 			continue
 		}
 		message, imageTask := chatGPTWebImageTaskMessage(task)
 		if !imageTask {
 			continue
 		}
+		state.Diagnostics.ImageRecords++
+		if !chatGPTWebImageTaskMatchesCurrent(task, conversationID, accumulator, fallbackCreatedAt, hasFallbackCreatedAt) {
+			if chatGPTWebImageTaskMatchesConversation(task, conversationID) {
+				state.Diagnostics.IdentityMismatchRecords++
+			} else {
+				state.Diagnostics.OtherConversationRecords++
+			}
+			continue
+		}
 		state.Matched++
+		state.Diagnostics.MatchedRecords++
 		taskID := chatGPTWebImageTaskID(task)
 		responseMessageID := chatGPTWebImageTaskResponseMessageID(task)
+		if taskID == "" {
+			state.Diagnostics.MissingTaskIDRecords++
+		} else if responseMessageID == "" {
+			state.Diagnostics.MissingResponseIDRecords++
+		}
 		if err := snapshot.appendTaskID(taskID); err != nil {
 			return ChatGPTWebImageTaskState{}, err
 		}

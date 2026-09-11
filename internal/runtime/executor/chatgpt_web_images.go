@@ -84,6 +84,17 @@ var chatGPTWebImageProtocolMetrics struct {
 	hiddenOutputsIgnored             atomic.Uint64
 	incompletePointersObserved       atomic.Uint64
 	allSourcesExhaustedWithoutOutput atomic.Uint64
+	taskPagesEmpty                   atomic.Uint64
+	taskPagesUnrecognized            atomic.Uint64
+	taskPageParseErrors              atomic.Uint64
+	taskRecords                      atomic.Uint64
+	taskInvalidRecords               atomic.Uint64
+	taskImageRecords                 atomic.Uint64
+	taskMatchedRecords               atomic.Uint64
+	taskOtherConversationRecords     atomic.Uint64
+	taskIdentityMismatchRecords      atomic.Uint64
+	taskMissingIDRecords             atomic.Uint64
+	taskMissingResponseIDRecords     atomic.Uint64
 }
 
 // ChatGPTWebImagePollRuntimeSnapshot contains only aggregate poll-slot data.
@@ -130,15 +141,32 @@ func ChatGPTWebImagePollSnapshot() ChatGPTWebImagePollRuntimeSnapshot {
 // ChatGPTWebImageProtocolRuntimeSnapshot contains only aggregate image
 // convergence counters. It never contains task, conversation, or asset IDs.
 type ChatGPTWebImageProtocolRuntimeSnapshot struct {
-	TaskIDsObserved                  uint64 `json:"task_ids_observed"`
-	ExactStreamsStarted              uint64 `json:"exact_streams_started"`
-	ExactStreamsCompleted            uint64 `json:"exact_streams_completed"`
-	ExactStreamFallbacks             uint64 `json:"exact_stream_fallbacks"`
-	FinalMessagesCaptured            uint64 `json:"final_messages_captured"`
-	TaskPagesFetched                 uint64 `json:"task_pages_fetched"`
-	HiddenOutputsIgnored             uint64 `json:"hidden_outputs_ignored"`
-	IncompletePointersObserved       uint64 `json:"incomplete_pointers_observed"`
-	AllSourcesExhaustedWithoutOutput uint64 `json:"all_sources_exhausted_without_output"`
+	TaskIDsObserved                  uint64                                 `json:"task_ids_observed"`
+	ExactStreamsStarted              uint64                                 `json:"exact_streams_started"`
+	ExactStreamsCompleted            uint64                                 `json:"exact_streams_completed"`
+	ExactStreamFallbacks             uint64                                 `json:"exact_stream_fallbacks"`
+	FinalMessagesCaptured            uint64                                 `json:"final_messages_captured"`
+	TaskPagesFetched                 uint64                                 `json:"task_pages_fetched"`
+	HiddenOutputsIgnored             uint64                                 `json:"hidden_outputs_ignored"`
+	IncompletePointersObserved       uint64                                 `json:"incomplete_pointers_observed"`
+	AllSourcesExhaustedWithoutOutput uint64                                 `json:"all_sources_exhausted_without_output"`
+	TaskDiagnostics                  ChatGPTWebImageTaskDiagnosticsSnapshot `json:"task_diagnostics"`
+}
+
+// ChatGPTWebImageTaskDiagnosticsSnapshot distinguishes empty responses from
+// unrecognized shapes and records excluded by the current-turn identity checks.
+type ChatGPTWebImageTaskDiagnosticsSnapshot struct {
+	EmptyPages               uint64 `json:"empty_pages"`
+	UnrecognizedPages        uint64 `json:"unrecognized_pages"`
+	ParseErrors              uint64 `json:"parse_errors"`
+	Records                  uint64 `json:"records"`
+	InvalidRecords           uint64 `json:"invalid_records"`
+	ImageRecords             uint64 `json:"image_records"`
+	MatchedRecords           uint64 `json:"matched_records"`
+	OtherConversationRecords uint64 `json:"other_conversation_records"`
+	IdentityMismatchRecords  uint64 `json:"identity_mismatch_records"`
+	MissingTaskIDRecords     uint64 `json:"missing_task_id_records"`
+	MissingResponseIDRecords uint64 `json:"missing_response_id_records"`
 }
 
 // ChatGPTWebImageProtocolSnapshot returns process-wide image convergence
@@ -154,7 +182,43 @@ func ChatGPTWebImageProtocolSnapshot() ChatGPTWebImageProtocolRuntimeSnapshot {
 		HiddenOutputsIgnored:             chatGPTWebImageProtocolMetrics.hiddenOutputsIgnored.Load(),
 		IncompletePointersObserved:       chatGPTWebImageProtocolMetrics.incompletePointersObserved.Load(),
 		AllSourcesExhaustedWithoutOutput: chatGPTWebImageProtocolMetrics.allSourcesExhaustedWithoutOutput.Load(),
+		TaskDiagnostics: ChatGPTWebImageTaskDiagnosticsSnapshot{
+			EmptyPages:               chatGPTWebImageProtocolMetrics.taskPagesEmpty.Load(),
+			UnrecognizedPages:        chatGPTWebImageProtocolMetrics.taskPagesUnrecognized.Load(),
+			ParseErrors:              chatGPTWebImageProtocolMetrics.taskPageParseErrors.Load(),
+			Records:                  chatGPTWebImageProtocolMetrics.taskRecords.Load(),
+			InvalidRecords:           chatGPTWebImageProtocolMetrics.taskInvalidRecords.Load(),
+			ImageRecords:             chatGPTWebImageProtocolMetrics.taskImageRecords.Load(),
+			MatchedRecords:           chatGPTWebImageProtocolMetrics.taskMatchedRecords.Load(),
+			OtherConversationRecords: chatGPTWebImageProtocolMetrics.taskOtherConversationRecords.Load(),
+			IdentityMismatchRecords:  chatGPTWebImageProtocolMetrics.taskIdentityMismatchRecords.Load(),
+			MissingTaskIDRecords:     chatGPTWebImageProtocolMetrics.taskMissingIDRecords.Load(),
+			MissingResponseIDRecords: chatGPTWebImageProtocolMetrics.taskMissingResponseIDRecords.Load(),
+		},
 	}
+}
+
+func observeChatGPTWebImageTaskPage(state helps.ChatGPTWebImageTaskState, err error) {
+	if err != nil {
+		chatGPTWebImageProtocolMetrics.taskPageParseErrors.Add(1)
+		return
+	}
+	diagnostics := state.Diagnostics
+	if !diagnostics.Recognized {
+		chatGPTWebImageProtocolMetrics.taskPagesUnrecognized.Add(1)
+		return
+	}
+	if diagnostics.Records == 0 {
+		chatGPTWebImageProtocolMetrics.taskPagesEmpty.Add(1)
+	}
+	chatGPTWebImageProtocolMetrics.taskRecords.Add(uint64(diagnostics.Records))
+	chatGPTWebImageProtocolMetrics.taskInvalidRecords.Add(uint64(diagnostics.InvalidRecords))
+	chatGPTWebImageProtocolMetrics.taskImageRecords.Add(uint64(diagnostics.ImageRecords))
+	chatGPTWebImageProtocolMetrics.taskMatchedRecords.Add(uint64(diagnostics.MatchedRecords))
+	chatGPTWebImageProtocolMetrics.taskOtherConversationRecords.Add(uint64(diagnostics.OtherConversationRecords))
+	chatGPTWebImageProtocolMetrics.taskIdentityMismatchRecords.Add(uint64(diagnostics.IdentityMismatchRecords))
+	chatGPTWebImageProtocolMetrics.taskMissingIDRecords.Add(uint64(diagnostics.MissingTaskIDRecords))
+	chatGPTWebImageProtocolMetrics.taskMissingResponseIDRecords.Add(uint64(diagnostics.MissingResponseIDRecords))
 }
 
 func observeChatGPTWebImageProtocolAccumulator(accumulator *helps.ChatGPTWebImageAccumulator) {
@@ -853,6 +917,7 @@ func chatGPTWebImageUpstreamPrompt(prompt, action string, match *helps.ChatGPTWe
 }
 
 func (e *ChatGPTWebExecutor) finishChatGPTWebImage(ctx context.Context, client *chatgptwebauth.Client, credential *chatgptwebauth.Credential, prepared *chatGPTWebPreparedRequest, execution *chatGPTWebImageExecution) (payload []byte, err error) {
+	ctx, _ = withChatGPTWebImageExactStreamRegistry(ctx)
 	failureStage := "settle"
 	settleStarted := time.Now()
 	settleObserved := false
@@ -2207,10 +2272,47 @@ type chatGPTWebImageTaskPollResult struct {
 }
 
 type chatGPTWebImageExactStreamRegistry struct {
-	mu        sync.Mutex
-	observed  map[string]struct{}
-	attempted map[string]struct{}
-	completed map[string]*helps.ChatGPTWebImageAccumulator
+	mu             sync.Mutex
+	observed       map[string]struct{}
+	attempted      map[string]struct{}
+	completed      map[string]*helps.ChatGPTWebImageAccumulator
+	primaryTaskIDs []string
+}
+
+type chatGPTWebImageExactStreamContextKey struct{}
+
+func withChatGPTWebImageExactStreamRegistry(ctx context.Context) (context.Context, *chatGPTWebImageExactStreamRegistry) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if registry, _ := ctx.Value(chatGPTWebImageExactStreamContextKey{}).(*chatGPTWebImageExactStreamRegistry); registry != nil {
+		return ctx, registry
+	}
+	registry := &chatGPTWebImageExactStreamRegistry{}
+	return context.WithValue(ctx, chatGPTWebImageExactStreamContextKey{}, registry), registry
+}
+
+func (registry *chatGPTWebImageExactStreamRegistry) observePrimary(taskIDs []string) {
+	registry.mu.Lock()
+	// The primary accumulator is append-only and already bounds these IDs.
+	previous := len(registry.primaryTaskIDs)
+	if len(taskIDs) <= previous {
+		registry.mu.Unlock()
+		return
+	}
+	registry.primaryTaskIDs = append([]string(nil), taskIDs...)
+	registry.mu.Unlock()
+	registry.observe(taskIDs[previous:]...)
+}
+
+func (registry *chatGPTWebImageExactStreamRegistry) seed(source *helps.ChatGPTWebImageAccumulator) *helps.ChatGPTWebImageAccumulator {
+	seed := chatGPTWebImageTaskSeed(source)
+	registry.mu.Lock()
+	defer registry.mu.Unlock()
+	if len(registry.primaryTaskIDs) > 0 {
+		seed.TaskIDs = append([]string(nil), registry.primaryTaskIDs...)
+	}
+	return seed
 }
 
 func (registry *chatGPTWebImageExactStreamRegistry) observe(taskIDs ...string) {
@@ -2364,6 +2466,7 @@ func (e *ChatGPTWebExecutor) fetchChatGPTWebImageTaskPages(ctx context.Context, 
 			TaskIDs:        append([]string(nil), knownTaskIDs...),
 		}
 		pageState, errCapture := helps.CaptureChatGPTWebImageTasks(payload, conversationID, pageAccumulator)
+		observeChatGPTWebImageTaskPage(pageState, errCapture)
 		if errCapture != nil {
 			result.err = errCapture
 			result.protocolError = true
@@ -2421,6 +2524,11 @@ func (e *ChatGPTWebExecutor) fetchChatGPTWebImageTaskPages(ctx context.Context, 
 		}
 		if errExact != nil {
 			if ctx != nil && ctx.Err() != nil {
+				// A completed primary SSE cancels its watcher. The subsequent
+				// poll phase must be able to resume an interrupted exact stream.
+				exactStreams.mu.Lock()
+				delete(exactStreams.attempted, target.TaskID)
+				exactStreams.mu.Unlock()
 				result.err = ctx.Err()
 				return result
 			}
@@ -2640,6 +2748,11 @@ func (e *ChatGPTWebExecutor) startChatGPTWebImageConversationPollForTurn(ctx con
 			pollResult.err = helps.CaptureChatGPTWebImageConversation(payload, pollResult.accumulator)
 			pollResult.protocolError = pollResult.err != nil
 			observeChatGPTWebImageProtocolAccumulator(pollResult.accumulator)
+			if ctx != nil {
+				if registry, _ := ctx.Value(chatGPTWebImageExactStreamContextKey{}).(*chatGPTWebImageExactStreamRegistry); registry != nil {
+					registry.observe(pollResult.accumulator.TaskIDs...)
+				}
+			}
 		}
 		select {
 		case result <- pollResult:
@@ -2684,11 +2797,17 @@ type chatGPTWebImageTaskPollContext struct {
 func (chatGPTWebImageTaskPollContext) Value(any) any { return nil }
 
 func newChatGPTWebImageTaskPollContext(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	taskHandle := chatGPTWebImageTaskHandleFromContext(ctx)
 	base := context.Context(chatGPTWebImageTaskPollContext{Context: ctx})
 	base = cliproxyexecutor.WithRequestPhaseObserver(base, cliproxyexecutor.RequestPhaseObserverFromContext(ctx))
 	base = helps.WithChatGPTWebImageMemoryLeaseSet(base, helps.ChatGPTWebImageMemoryLeaseSetFromContext(ctx))
 	base = withChatGPTWebImageTaskHandle(base, taskHandle)
+	if registry, _ := ctx.Value(chatGPTWebImageExactStreamContextKey{}).(*chatGPTWebImageExactStreamRegistry); registry != nil {
+		base = context.WithValue(base, chatGPTWebImageExactStreamContextKey{}, registry)
+	}
 	return base
 }
 
@@ -2697,9 +2816,7 @@ func (e *ChatGPTWebExecutor) consumeChatGPTWebImageStreamWithTaskPolling(ctx con
 }
 
 func (e *ChatGPTWebExecutor) consumeChatGPTWebImageStreamWithTaskPollingForTurn(ctx context.Context, client *chatgptwebauth.Client, credential *chatgptwebauth.Credential, response *fhttp.Response, turn helps.ChatGPTWebImageTurn, budgets ...*chatGPTWebPollResponseBudget) (*helps.ChatGPTWebImageAccumulator, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
+	ctx, exactStreams := withChatGPTWebImageExactStreamRegistry(ctx)
 	accumulator := &helps.ChatGPTWebImageAccumulator{Turn: turn}
 	streamBody := &chatGPTWebImageWatchBody{ReadCloser: response.Body}
 	stopContextRead := make(chan struct{})
@@ -2720,6 +2837,7 @@ func (e *ChatGPTWebExecutor) consumeChatGPTWebImageStreamWithTaskPollingForTurn(
 	pollBudget := chatGPTWebSharedPollResponseBudget(budgets)
 	watchStarted := false
 	onProgress := func() {
+		exactStreams.observePrimary(accumulator.TaskIDs)
 		conversationID := strings.TrimSpace(accumulator.ConversationID)
 		if conversationID == "" {
 			return
@@ -2749,6 +2867,7 @@ func (e *ChatGPTWebExecutor) consumeChatGPTWebImageStreamWithTaskPollingForTurn(
 		onProgress,
 	)
 	observeChatGPTWebImageProtocolAccumulator(accumulator)
+	exactStreams.observePrimary(accumulator.TaskIDs)
 	cancelWatch()
 	if watchStarted {
 		<-watchDone
@@ -2780,9 +2899,7 @@ func (e *ChatGPTWebExecutor) consumeChatGPTWebImageStreamWithTaskPollingForTurn(
 }
 
 func (e *ChatGPTWebExecutor) watchChatGPTWebImageTasks(ctx context.Context, client *chatgptwebauth.Client, credential *chatgptwebauth.Credential, conversationID string, turn helps.ChatGPTWebImageTurn, streamBody *chatGPTWebImageWatchBody, result chan<- chatGPTWebImageTaskWatchResult, progress <-chan struct{}, lastStreamProgress *atomic.Int64, pollBudget *chatGPTWebPollResponseBudget) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
+	ctx, exactStreams := withChatGPTWebImageExactStreamRegistry(ctx)
 	if err := waitForChatGPTWebImageIdle(ctx, e.imageInitialWait, progress); err != nil {
 		return
 	}
@@ -2819,7 +2936,6 @@ func (e *ChatGPTWebExecutor) watchChatGPTWebImageTasks(ctx context.Context, clie
 	taskFallbackAt := time.Time{}
 	taskFallbackNeedsConversationRefresh := false
 	taskFallbackConversationRefreshed := false
-	exactStreams := &chatGPTWebImageExactStreamRegistry{}
 	lastConversationTerminalSignature := ""
 	stableConversationTerminalSnapshots := 0
 	conversationSettleAt := time.Time{}
@@ -2901,7 +3017,10 @@ func (e *ChatGPTWebExecutor) watchChatGPTWebImageTasks(ctx context.Context, clie
 			}
 		}
 		if tasksEnabled && taskPoll == nil && taskPolls < maxPolls && !now.Before(nextTaskPollAt) {
-			seed := chatGPTWebImageTaskSeed(taskSnapshot)
+			seed := exactStreams.seed(taskSnapshot)
+			if len(seed.TaskIDs) == 0 && conversationSnapshot != nil {
+				seed.TaskIDs = append([]string(nil), conversationSnapshot.TaskIDs...)
+			}
 			seed.ConversationID = conversationID
 			seed.Turn = turn
 			taskPoll = e.startChatGPTWebImageTaskPollForAccumulator(pollContext, client, credential, seed, pollBudget, exactStreams)
@@ -3196,9 +3315,7 @@ func (e *ChatGPTWebExecutor) publishChatGPTWebImageTaskWatchResult(ctx context.C
 }
 
 func (e *ChatGPTWebExecutor) pollChatGPTWebImageConversation(ctx context.Context, client *chatgptwebauth.Client, credential *chatgptwebauth.Credential, accumulator *helps.ChatGPTWebImageAccumulator, inputIDs map[string]struct{}, hasInitialOutput bool, budgets ...*chatGPTWebPollResponseBudget) error {
-	if ctx == nil {
-		ctx = context.Background()
-	}
+	ctx, exactStreams := withChatGPTWebImageExactStreamRegistry(ctx)
 	if hasInitialOutput {
 		if err := waitForChatGPTWebPoll(ctx, e.imageSettleWait); err != nil {
 			return err
@@ -3241,7 +3358,6 @@ func (e *ChatGPTWebExecutor) pollChatGPTWebImageConversation(ctx context.Context
 	lastTaskFailure := ""
 	var lastConversationErr error
 	conversationTerminal := false
-	exactStreams := &chatGPTWebImageExactStreamRegistry{}
 	baseAccumulator, errClone := helps.MergeChatGPTWebImageAccumulators(nil, accumulator)
 	if errClone != nil {
 		return errClone
