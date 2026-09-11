@@ -232,8 +232,6 @@ func ConvertOpenAIRequestToCodex(modelName string, inputRawJSON []byte, stream b
 		}
 	}
 
-	out = translatorcommon.SetRawArrayItems(out, "input", inputItems)
-
 	// Map response_format and text settings to Responses API text.format
 	rf := gjson.GetBytes(rawJSON, "response_format")
 	text := gjson.GetBytes(rawJSON, "text")
@@ -376,7 +374,8 @@ func ConvertOpenAIRequestToCodex(modelName string, inputRawJSON []byte, stream b
 	}
 
 	out, _ = sjson.SetBytes(out, "store", false)
-	return out
+	// Fill history after control edits so they do not copy the full content.
+	return translatorcommon.SetRawArrayItems(out, "input", inputItems)
 }
 
 // shortenNameIfNeeded applies the simple shortening rule for a single name.
