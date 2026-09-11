@@ -194,16 +194,22 @@ func scanCodexJSONString(payload []byte, start int) (int, bool) {
 	if start >= len(payload) || payload[start] != '"' {
 		return start, false
 	}
-	for index := start + 1; index < len(payload); index++ {
-		switch payload[index] {
-		case '\\':
-			index++
-			if index >= len(payload) {
-				return index, false
-			}
-		case '"':
-			return index + 1, true
+	for offset := start + 1; offset < len(payload); {
+		next := bytes.IndexByte(payload[offset:], '"')
+		if next < 0 {
+			break
 		}
+		quote := offset + next
+		// A quote closes the string only after an even run of backslashes.
+		// IndexByte skips ordinary content using the runtime's byte search.
+		slashes := 0
+		for index := quote - 1; index > start && payload[index] == '\\'; index-- {
+			slashes++
+		}
+		if slashes%2 == 0 {
+			return quote + 1, true
+		}
+		offset = quote + 1
 	}
 	return len(payload), false
 }
