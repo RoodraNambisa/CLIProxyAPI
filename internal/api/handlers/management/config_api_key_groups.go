@@ -41,9 +41,7 @@ func (h *Handler) PutAPIKeys(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": errNormalize.Error()})
 		return
 	}
-	h.cfg.APIKeys = append([]string(nil), keys...)
-	h.cfg.APIKeyGroups = groups
-	h.persistLocked(c)
+	h.persistAPIKeyAccessLocked(c, keys, groups)
 	h.mu.Unlock()
 }
 
@@ -127,9 +125,7 @@ func (h *Handler) PatchAPIKeys(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": errNormalize.Error()})
 		return
 	}
-	h.cfg.APIKeys = keys
-	h.cfg.APIKeyGroups = groups
-	h.persistLocked(c)
+	h.persistAPIKeyAccessLocked(c, keys, groups)
 	h.mu.Unlock()
 }
 
@@ -168,13 +164,11 @@ func (h *Handler) DeleteAPIKeys(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": errNormalize.Error()})
 		return
 	}
-	h.cfg.APIKeys = keys
-	h.cfg.APIKeyGroups = groups
-	h.persistLocked(c)
+	h.persistAPIKeyAccessLocked(c, keys, groups)
 	h.mu.Unlock()
 }
 
-// GetAPIKeyGroups returns provider restrictions for configured API keys.
+// GetAPIKeyGroups returns access restrictions and known credential priorities.
 func (h *Handler) GetAPIKeyGroups(c *gin.Context) {
 	var groups []config.APIKeyGroup
 	if cfg := h.currentConfig(); cfg != nil {
@@ -195,7 +189,7 @@ func (h *Handler) GetAPIKeyGroups(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"api-key-groups": groups, "available-priorities": slices.Compact(priorities)})
 }
 
-// PutAPIKeyGroups replaces all API key provider restrictions.
+// PutAPIKeyGroups replaces all client API key access restrictions.
 func (h *Handler) PutAPIKeyGroups(c *gin.Context) {
 	groups, ok := parseAPIKeyGroupsBody(c)
 	if !ok {
@@ -208,12 +202,11 @@ func (h *Handler) PutAPIKeyGroups(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": errNormalize.Error()})
 		return
 	}
-	h.cfg.APIKeyGroups = normalized
-	h.persistLocked(c)
+	h.persistAPIKeyAccessLocked(c, h.cfg.APIKeys, normalized)
 	h.mu.Unlock()
 }
 
-// PatchAPIKeyGroups adds, updates, or clears one API key provider restriction.
+// PatchAPIKeyGroups updates only the supplied access restriction fields.
 func (h *Handler) PatchAPIKeyGroups(c *gin.Context) {
 	var patch struct {
 		APIKey    string          `json:"api-key"`
@@ -264,12 +257,11 @@ func (h *Handler) PatchAPIKeyGroups(c *gin.Context) {
 	if len(normalized) > 0 {
 		groups = append(groups, normalized[0])
 	}
-	h.cfg.APIKeyGroups = groups
-	h.persistLocked(c)
+	h.persistAPIKeyAccessLocked(c, h.cfg.APIKeys, groups)
 	h.mu.Unlock()
 }
 
-// DeleteAPIKeyGroups clears one API key provider restriction.
+// DeleteAPIKeyGroups clears one client API key's access restrictions.
 func (h *Handler) DeleteAPIKeyGroups(c *gin.Context) {
 	key := strings.TrimSpace(c.Query("api-key"))
 	if key == "" {
@@ -277,9 +269,21 @@ func (h *Handler) DeleteAPIKeyGroups(c *gin.Context) {
 		return
 	}
 	h.mu.Lock()
-	h.cfg.APIKeyGroups = deleteAPIKeyGroup(h.cfg.APIKeyGroups, key)
-	h.persistLocked(c)
+	h.persistAPIKeyAccessLocked(c, h.cfg.APIKeys, deleteAPIKeyGroup(h.cfg.APIKeyGroups, key))
 	h.mu.Unlock()
+}
+
+// persistAPIKeyAccessLocked prevents rejected changes from leaking into a later save.
+// The caller holds h.mu; management middleware serializes complete mutations.
+func (h *Handler) persistAPIKeyAccessLocked(c *gin.Context, keys []string, groups []config.APIKeyGroup) {
+	previousKeys := slices.Clone(h.cfg.APIKeys)
+	previousGroups := cloneAPIKeyGroups(h.cfg.APIKeyGroups)
+	h.cfg.APIKeys = slices.Clone(keys)
+	h.cfg.APIKeyGroups = cloneAPIKeyGroups(groups)
+	if !h.persistLocked(c) {
+		h.cfg.APIKeys = previousKeys
+		h.cfg.APIKeyGroups = previousGroups
+	}
 }
 
 func parseAPIKeyListBody(c *gin.Context) ([]string, bool) {
