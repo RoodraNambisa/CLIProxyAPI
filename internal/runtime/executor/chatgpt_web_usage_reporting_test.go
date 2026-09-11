@@ -19,6 +19,7 @@ import (
 type chatGPTWebUsageReportingPlugin struct {
 	authID  string
 	records chan coreusage.Record
+	done    <-chan struct{}
 }
 
 type chatGPTWebUsageTestReservation struct {
@@ -57,14 +58,22 @@ func (reservation *chatGPTWebUsageTestReservation) Consumed() bool {
 
 func (plugin *chatGPTWebUsageReportingPlugin) HandleUsage(_ context.Context, record coreusage.Record) {
 	if record.AuthID == plugin.authID {
-		plugin.records <- record
+		select {
+		case <-plugin.done:
+			return
+		default:
+		}
+		select {
+		case plugin.records <- record:
+		case <-plugin.done:
+		}
 	}
 }
 
 func TestPublishChatGPTWebTerminalUsageIncludesImageToolModel(t *testing.T) {
 	const authID = "chatgpt-web-image-usage-reporting"
 	records := make(chan coreusage.Record, 2)
-	coreusage.RegisterPlugin(&chatGPTWebUsageReportingPlugin{authID: authID, records: records})
+	coreusage.RegisterPlugin(&chatGPTWebUsageReportingPlugin{authID: authID, records: records, done: t.Context().Done()})
 	reporter := helps.NewUsageReporter(context.Background(), "chatgpt-web", "gpt-5.4", &cliproxyauth.Auth{ID: authID})
 	prepared := &chatGPTWebPreparedRequest{request: helps.ChatGPTWebRequest{Image: &helps.ChatGPTWebImageRequest{Model: "gpt-image-2"}}}
 	completed := []byte(`{"response":{"usage":{"input_tokens":11,"output_tokens":2,"total_tokens":13},"tool_usage":{"image_gen":{"input_tokens":3,"output_tokens":7024,"total_tokens":7027}}}}`)
@@ -109,7 +118,7 @@ func TestChatGPTWebImageFailureStagePersistsInUsage(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			authID := "chatgpt-web-image-failure-stage-" + strings.ReplaceAll(test.name, " ", "-")
 			records := make(chan coreusage.Record, 1)
-			coreusage.RegisterPlugin(&chatGPTWebUsageReportingPlugin{authID: authID, records: records})
+			coreusage.RegisterPlugin(&chatGPTWebUsageReportingPlugin{authID: authID, records: records, done: t.Context().Done()})
 			diagnostics := &cliproxyexecutor.RequestExecutionDiagnostics{}
 			err := withChatGPTWebFailureStage(test.stage, test.err)
 			recordChatGPTWebExecutionFailure(diagnostics, err)
@@ -232,7 +241,7 @@ func TestChatGPTWebStreamSetupFailurePublishesSingleUsageRecord(t *testing.T) {
 				test.prepareAuth(auth)
 			}
 			records := make(chan coreusage.Record, 2)
-			coreusage.RegisterPlugin(&chatGPTWebUsageReportingPlugin{authID: auth.ID, records: records})
+			coreusage.RegisterPlugin(&chatGPTWebUsageReportingPlugin{authID: auth.ID, records: records, done: t.Context().Done()})
 
 			executor := NewChatGPTWebExecutor(nil, nil)
 			var server *httptest.Server
@@ -281,5 +290,32 @@ func TestChatGPTWebStreamSetupFailurePublishesSingleUsageRecord(t *testing.T) {
 			case <-time.After(50 * time.Millisecond):
 			}
 		})
+	}
+}
+
+func TestChatGPTWebUsageCollectorStopsDeliveryAfterTestEnds(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	records := make(chan coreusage.Record, 1)
+	plugin := &chatGPTWebUsageReportingPlugin{authID: "collector-lifecycle", records: records, done: ctx.Done()}
+	first := coreusage.Record{AuthID: plugin.authID, Model: "first"}
+	plugin.HandleUsage(ctx, first)
+	finished := make(chan struct{})
+	go func() {
+		plugin.HandleUsage(context.Background(), coreusage.Record{AuthID: plugin.authID, Model: "blocked"})
+		close(finished)
+	}()
+	cancel()
+	select {
+	case <-finished:
+	case <-time.After(time.Second):
+		t.Fatal("ended test left its usage collector blocked")
+	}
+	if got := <-records; got.Model != first.Model {
+		t.Fatal("test shutdown changed the already delivered record")
+	}
+	plugin.HandleUsage(context.Background(), coreusage.Record{AuthID: plugin.authID, Model: "late"})
+	if len(records) != 0 {
+		t.Fatal("ended test still accepted later usage records")
 	}
 }
