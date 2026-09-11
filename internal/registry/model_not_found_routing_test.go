@@ -28,3 +28,23 @@ func TestNotFoundRoutesKeepProviderBoundaries(t *testing.T) {
 		})
 	}
 }
+
+func TestNotFoundRoutesUseLatestSuspensionReason(t *testing.T) {
+	r := newTestModelRegistry()
+	r.RegisterClient("changing", "codex", []*ModelInfo{{ID: "changing-model"}})
+	r.SuspendClientModel("changing", "changing-model", "unauthorized")
+	if len(r.GetModelProviders("changing-model")) != 0 {
+		t.Fatal("authentication suspension unexpectedly retained a route")
+	}
+	r.SuspendClientModel("changing", "changing-model", "model_not_found")
+	if len(r.GetModelProviders("changing-model")) != 1 {
+		t.Fatal("old suspension reason hid the new recoverable 404 route")
+	}
+	if len(r.GetAvailableModels("openai")) != 1 {
+		t.Fatal("cached catalog retained the old suspension reason")
+	}
+	r.SuspendClientModel("changing", "changing-model", "disabled")
+	if len(r.GetModelProviders("changing-model")) != 0 || len(r.GetAvailableModels("openai")) != 0 {
+		t.Fatal("new nonrecoverable suspension kept the old 404 route")
+	}
+}

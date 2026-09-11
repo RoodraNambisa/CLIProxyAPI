@@ -187,6 +187,8 @@ func TestNotFoundCooldownKeepsRouteForRecovery(t *testing.T) {
 	const model = "not-found-recovery-model"
 	const id = "not-found-recovery-auth"
 	registerFallbackAuthForModel(t, manager, &Auth{ID: id, Provider: "codex"}, model)
+	// Concurrent requests can report a different failure before this 404 arrives.
+	manager.MarkResult(t.Context(), Result{AuthID: id, Provider: "codex", Model: model, Error: &Error{HTTPStatus: 401, Message: "authentication fixture"}})
 	manager.MarkResult(t.Context(), Result{AuthID: id, Provider: "codex", Model: model, Error: &Error{HTTPStatus: 404, Message: modelNotFoundFixture}})
 	reg := registry.GetGlobalRegistry()
 	if len(reg.GetModelProviders(model)) != 1 {

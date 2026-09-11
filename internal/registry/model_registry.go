@@ -833,7 +833,7 @@ func (r *ModelRegistry) ClearModelQuotaExceeded(clientID, modelID string) {
 // Parameters:
 //   - clientID: The client to suspend
 //   - modelID: The model affected by the suspension
-//   - reason: Optional description for observability
+//   - reason: Current suspension reason, replacing any previous reason
 func (r *ModelRegistry) SuspendClientModel(clientID, modelID, reason string) {
 	if clientID == "" || modelID == "" {
 		return
@@ -849,7 +849,7 @@ func (r *ModelRegistry) SuspendClientModel(clientID, modelID, reason string) {
 	if registration.SuspendedClients == nil {
 		registration.SuspendedClients = make(map[string]string)
 	}
-	if _, already := registration.SuspendedClients[clientID]; already {
+	if previous, already := registration.SuspendedClients[clientID]; already && previous == reason {
 		return
 	}
 	registration.SuspendedClients[clientID] = reason
