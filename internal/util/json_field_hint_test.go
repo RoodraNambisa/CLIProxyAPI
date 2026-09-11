@@ -62,6 +62,51 @@ func BenchmarkJSONFieldHint(b *testing.B) {
 	}
 }
 
+func TestJSONFieldHintSeparatesQuotedColonsFromKeys(t *testing.T) {
+	for _, body := range []string{
+		`{"content":"\"tools\":[], \"summary\" : null, https://example.invalid:443"}`,
+		`{"content":"\\\": \\\"tools\\\" : false", "ordinary":null}`,
+		`{"content":"key with \"quote\" and colon: tools"}`,
+	} {
+		if !json.Valid([]byte(body)) {
+			t.Fatal("invalid fixture")
+		}
+		if JSONMayContainAnyField([]byte(body), "tools", "summary") {
+			t.Fatalf("value text was treated as a field: %s", body)
+		}
+		for _, field := range []string{`"tools"`, `"to\u006fls"`} {
+			withKey := []byte(body[:len(body)-1] + "," + field + " \t\r\n : null}")
+			if !JSONMayContainAnyField(withKey, "tools") {
+				t.Fatalf("missed field after value text: %s", withKey)
+			}
+		}
+	}
+	for _, key := range []string{`"quote\"tools"`, `"colon:to\u006fls"`, `"backslash\\"`} {
+		if !JSONMayContainAnyField([]byte("{"+key+":null}"), "tools") {
+			t.Fatal("escaped key must keep the parser fallback")
+		}
+	}
+}
+
+func BenchmarkJSONFieldHintEscapedText(b *testing.B) {
+	for _, fragment := range []string{"中文 \"quoted\" \\path\n", "\"field\":value https://example.invalid:443 \"id\":false \\u0061\n"} {
+		b.Run(fmt.Sprintf("colons=%t", strings.Contains(fragment, ":")), func(b *testing.B) {
+			content, err := json.Marshal(strings.Repeat(fragment, (10<<20)/len(fragment)))
+			if err != nil {
+				b.Fatal(err)
+			}
+			body := append([]byte(`{"input":[{"content":`), content...)
+			body = append(body, `}]}`...)
+			b.SetBytes(int64(len(body)))
+			b.ReportAllocs()
+			b.ResetTimer()
+			for range b.N {
+				JSONMayContainAnyField(body, "tools", "summary", "generate_summary")
+			}
+		})
+	}
+}
+
 func FuzzJSONFieldHintDoesNotMissDecodedKeys(f *testing.F) {
 	for _, body := range []string{
 		`{"tools":[]}`, `{"in\u0070ut":[{"\u0069d":"value"}]}`,
