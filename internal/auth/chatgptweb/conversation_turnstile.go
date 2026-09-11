@@ -17,10 +17,13 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 	"unicode"
 	"unicode/utf16"
 	"unicode/utf8"
+
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/sentinelcompat"
 )
 
 const (
@@ -145,6 +148,8 @@ type conversationTurnstileLocationRef struct {
 // compact Sentinel challenge. ScriptSources should come from the same bootstrap
 // document used to create the requirements token.
 type ConversationTurnstileEnvironment struct {
+	Compatibility      *sentinelcompat.Policy
+	compatibilityUsage *atomic.Bool
 	Persona            Persona
 	BrowserEnvironment BrowserEnvironmentIdentity
 	DeviceID           string
@@ -473,6 +478,8 @@ func (matcher *conversationTurnstileTrailingLookaheadRegexp) findReaderSubmatchI
 }
 
 type conversationTurnstileVM struct {
+	compatibilityState   *conversationCompatibilityState
+	compatibilityUsed    bool
 	ctx                  context.Context
 	values               map[string]any
 	result               string
@@ -644,6 +651,9 @@ func newConversationTurnstileVM(ctx context.Context, prepared *conversationTurns
 	}
 	vm.environment["window.document.body"] = documentBody
 	vm.initializeLocalStorage()
+	if err := vm.initializeCompatibilityProperties(); err != nil {
+		return nil, err
+	}
 	vm.initialize(prepared.program, prepared.requirementsToken)
 	return vm, nil
 }
@@ -3923,6 +3933,9 @@ func (vm *conversationTurnstileVM) call(target any, args []any) (any, error) {
 			if value.path == "window.localStorage" {
 				return vm.localStorageKeyArray()
 			}
+			if vm.compatibilityHasTarget(value.path) {
+				return nil, vm.compatibilityError(SentinelCompatibilityUnsupportedValue, "compatibility_property_enumeration", fmt.Errorf("host enumeration requires SDK"))
+			}
 			return conversationTurnstileArrayValue(nil), nil
 		case string:
 			if err := vm.chargeRuntimeWork(len(value)); err != nil {
@@ -4055,7 +4068,7 @@ func (vm *conversationTurnstileVM) reflectSetObjectRefProperty(object conversati
 		return false, err
 	}
 	if !conversationTurnstileWritableWindowState(keyText) {
-		return false, nil
+		return vm.setCompatibilityWindowProperty(keyText, value)
 	}
 	path := object.path + "." + keyText
 	if _, exists := vm.environment[path]; !exists {
@@ -4819,6 +4832,9 @@ func (vm *conversationTurnstileVM) propertyWithKey(object, propertyKey any) (any
 			return browserValue, browserErr
 		}
 		if environmentValue, exists := vm.environment[path]; exists {
+			if _, extended := vm.challengeEnvironment.Compatibility.Property(path); extended {
+				vm.markCompatibilityUsed()
+			}
 			return environmentValue, nil
 		}
 		if conversationTurnstileNativeObjectPath(path) {
