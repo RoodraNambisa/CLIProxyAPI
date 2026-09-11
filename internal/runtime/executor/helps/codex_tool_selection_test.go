@@ -60,6 +60,21 @@ func TestCodexToolDeclarationScanAvoidsPlainTextAllocations(t *testing.T) {
 	}
 }
 
+func TestCodexToolControlHintsKeepScopeAndEscapedKeys(t *testing.T) {
+	for _, test := range []struct{ input, output string }{
+		{`{"input":[{"tool_choice":"required","parallel_tool_calls":true}]}`, `{"input":[{"tool_choice":"required","parallel_tool_calls":true}]}`},
+		{`{"tool_cho\u0069ce":"required","parallel_tool_ca\u006cls":true}`, `{}`},
+		{`{"tool_choice":null,"tool_choice":"required"}`, `{"tool_choice":"required"}`},
+		{`{"parallel_tool_calls":false,"parallel_tool_calls":true}`, `{"parallel_tool_calls":true}`},
+		{`{"input":"\"tool_choice\": true, \"parallel_tool_calls\": false"}`, `{"input":"\"tool_choice\": true, \"parallel_tool_calls\": false"}`},
+	} {
+		out := NormalizeCodexToolSelection([]byte(test.input))
+		if string(out) != test.output {
+			t.Fatalf("input=%s got=%s want=%s", test.input, out, test.output)
+		}
+	}
+}
+
 func BenchmarkCodexToolDeclarationScan(b *testing.B) {
 	for _, size := range []int{128, 1 << 20, 10 << 20} {
 		b.Run(fmt.Sprintf("bytes=%d", size), func(b *testing.B) {
