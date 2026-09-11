@@ -1,10 +1,10 @@
 package auth
 
 import (
-	"bytes"
 	"strings"
 	"unsafe"
 
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	"github.com/tidwall/gjson"
 )
 
@@ -100,7 +100,7 @@ func toolChoiceForcesImageGeneration(payload []byte, choice gjson.Result) bool {
 
 func imageToolDeclarationLists(payload []byte) []gjson.Result {
 	// No tool declaration can exist without a literal or escaped tools key.
-	if !bytes.Contains(payload, []byte(`"tools"`)) && !bytes.Contains(payload, []byte(`\u`)) {
+	if !util.JSONMayContainAnyField(payload, "tools") {
 		return nil
 	}
 	// Only the synchronous boolean queries above consume these views. They do

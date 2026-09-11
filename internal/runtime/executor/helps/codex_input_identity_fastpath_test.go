@@ -11,7 +11,7 @@ import (
 )
 
 func TestCodexInputIdentityChecksAvoidPlainTextAllocations(t *testing.T) {
-	body := []byte(`{"input":[{"type":"message","content":"` + strings.Repeat("x", 1<<20) + `"}],"include":["reasoning.encrypted_content"]}`)
+	body := []byte(`{"input":[{"type":"message","content":"` + strings.Repeat(`text \u4f60\u597d `, 1<<16) + `"}],"include":["reasoning.encrypted_content"]}`)
 	for name, sanitize := range map[string]func([]byte) []byte{
 		"IDs": SanitizeCodexInputItemIDs,
 		"reasoning": func(body []byte) []byte {

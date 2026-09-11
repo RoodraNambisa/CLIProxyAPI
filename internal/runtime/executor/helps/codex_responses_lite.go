@@ -1,12 +1,12 @@
 package helps
 
 import (
-	"bytes"
 	"net/http"
 	"strconv"
 	"strings"
 	"unsafe"
 
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -71,7 +71,7 @@ func HasCodexToolDeclarations(body []byte) bool {
 	}
 	// Both root and historical declarations require a tools field. Escaped
 	// field names still use the full parser below.
-	if !bytes.Contains(body, []byte(`"tools"`)) && !bytes.Contains(body, []byte(`\u`)) {
+	if !util.JSONMayContainAnyField(body, "tools") {
 		return false
 	}
 	// The read-only view and all parsed results stay within this call. Only the

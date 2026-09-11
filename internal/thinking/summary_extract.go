@@ -4,6 +4,7 @@ import (
 	"strings"
 	"unsafe"
 
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	"github.com/tidwall/gjson"
 )
 
@@ -33,6 +34,9 @@ type SummaryConfig struct {
 func ExtractSummaryConfig(body []byte, format string) SummaryConfig {
 	normalized := strings.ToLower(strings.TrimSpace(format))
 	if normalized == "codex" || normalized == "openai-response" {
+		if !util.JSONMayContainAnyField(body, "summary", "generate_summary") {
+			return SummaryConfig{}
+		}
 		config, ok := responsesSummaryConfig(body, "reasoning.summary")
 		if !ok {
 			config, ok = responsesSummaryConfig(body, "reasoning.generate_summary")
@@ -42,6 +46,9 @@ func ExtractSummaryConfig(body []byte, format string) SummaryConfig {
 		if ok && gjson.ValidBytes(body) {
 			return config
 		}
+		return SummaryConfig{}
+	}
+	if normalized == "openai" && !openAISummaryMayBeSpecified(body) {
 		return SummaryConfig{}
 	}
 	// Check the format first so unsupported targets skip whole-body validation.
@@ -128,11 +135,18 @@ func ExtractExplicitSummaryConfig(body []byte, format string) SummaryConfig {
 	if normalized != "openai" {
 		return ExtractSummaryConfig(body, normalized)
 	}
+	if !openAISummaryMayBeSpecified(body) {
+		return SummaryConfig{}
+	}
 	if len(body) == 0 || !gjson.ValidBytes(body) {
 		return SummaryConfig{}
 	}
 	config, _ := extractOpenAIExplicitSummaryConfig(openAISummaryFields(body))
 	return config
+}
+
+func openAISummaryMayBeSpecified(body []byte) bool {
+	return util.JSONMayContainAnyField(body, "extra_body", "google", "thinking", "reasoning", "generationConfig", "generation_config", "include_reasoning", "reasoning_effort")
 }
 
 // openAISummaryFields keeps unrelated messages out of repeated alias lookups.

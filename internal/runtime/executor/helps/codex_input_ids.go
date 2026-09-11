@@ -1,7 +1,6 @@
 package helps
 
 import (
-	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"strconv"
@@ -9,6 +8,7 @@ import (
 	"unicode/utf8"
 	"unsafe"
 
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -39,7 +39,7 @@ func codexInputIdentity(item gjson.Result, id, kind string) codexInputItemIdenti
 func SanitizeCodexInputItemIDs(body []byte) []byte {
 	// A JSON key can spell id literally or use Unicode escapes. Without either
 	// representation no item can need ID repair.
-	if !bytes.Contains(body, []byte(`"id"`)) && !bytes.Contains(body, []byte(`\u`)) {
+	if !util.JSONMayContainAnyField(body, "id") {
 		return body
 	}
 	// Parsed views stay in this call; changed output is rebuilt into owned bytes.

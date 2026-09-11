@@ -1,7 +1,6 @@
 package helps
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
@@ -83,7 +82,7 @@ func ReasoningReplayNamespace(ctx context.Context, provider, authID string, inst
 func SanitizeCodexReasoningEncryptedContent(ctx context.Context, provider string, body []byte, preserveEmpty ...bool) []byte {
 	// Unicode escapes may occur in field names. Keep the existing parser for
 	// those requests and skip only bodies that cannot contain a mutable field.
-	if !bytes.Contains(body, []byte(`"id"`)) && !bytes.Contains(body, []byte(`"encrypted_content"`)) && !bytes.Contains(body, []byte(`\u`)) {
+	if !util.JSONMayContainAnyField(body, "id", "encrypted_content") {
 		return body
 	}
 	// The borrowed input is never retained; any changed body is rebuilt below.

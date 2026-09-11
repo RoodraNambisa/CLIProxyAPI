@@ -9,7 +9,7 @@ import (
 )
 
 func TestChatSummaryLargeRequestBoundaries(t *testing.T) {
-	content, err := json.Marshal(strings.Repeat("text \"reasoning\": null\n ", 8192))
+	content, err := json.Marshal(strings.Repeat("text \"reasoning\": null\n \\u0061 ", 8192))
 	if err != nil {
 		t.Fatal(err)
 	}
