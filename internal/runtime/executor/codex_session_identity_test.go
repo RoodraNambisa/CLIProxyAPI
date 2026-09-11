@@ -34,6 +34,51 @@ func TestCodexPrepareProviderRequestDisabled(t *testing.T) {
 	}
 }
 
+func TestCodexPreparedAffinityPayloadHintPreservesFieldPriority(t *testing.T) {
+	const id = "11111111-1111-4111-8111-111111111111"
+	for _, test := range []struct{ body, kind, value, thread string }{
+		{`{"input":"client_metadata and prompt_cache_key are ordinary text"}`, "turn", "turn-fixture", ""},
+		{`{"prompt_cache_key":" cache "}`, "prompt_cache_key", "cache", ""},
+		{`{"prompt_cache_\u006bey":"cache"}`, "prompt_cache_key", "cache", ""},
+		{`{"client_metadata":{"thread_id":"` + id + `"},"prompt_cache_key":"cache"}`, "thread_id", id, id},
+		{`{"client_meta\u0064ata":{"threa\u0064_id":"` + id + `"}}`, "thread_id", id, id},
+		{`{"client_metadata":null,"client_metadata":{"thread_id":"later"}}`, "thread_id", "later", ""},
+		{`{"client_metadata":{"x-codex-turn-metadata":"{\"thread_id\":\"nested\"}","thread_id":"direct","session_id":"session"}}`, "thread_id", "nested", ""},
+		{`{"client_metadata":{"session_id":"session"},"prompt_cache_key":"cache"}`, "prompt_cache_key", "cache", ""},
+		{`{"input":[{"client_metadata":{"thread_id":"business"},"prompt_cache_key":"business"}]}`, "turn", "turn-fixture", ""},
+	} {
+		body := []byte(test.body)
+		kind, value, tenant, thread, spoof := codexPreparedRequestAffinity(context.Background(), cliproxyexecutor.Options{}, body, "turn-fixture")
+		if kind != test.kind || value != codexFingerprintDigest(test.value) || tenant != "anonymous" || thread != test.thread || spoof != test.thread || string(body) != test.body {
+			t.Fatalf("affinity changed for %s: kind=%s thread=%s spoof=%s", test.body, kind, thread, spoof)
+		}
+	}
+	for _, body := range []string{`{}`, `{"generate":true}`, `{"generate":false}`, `{"genera\u0074e":false}`} {
+		want := "turn"
+		if strings.Contains(body, "false") {
+			want = "prewarm"
+		}
+		if got := codexSessionRequestKind(cliproxyexecutor.Options{}, []byte(body)); got != want {
+			t.Fatalf("request kind=%s want %s", got, want)
+		}
+	}
+}
+
+func BenchmarkCodexPreparedAffinityLargePayload(b *testing.B) {
+	for _, size := range []int{128, 1 << 20, 10 << 20} {
+		b.Run(fmt.Sprintf("bytes=%d", size), func(b *testing.B) {
+			body := []byte(`{"input":"` + strings.Repeat("x", size) + `"}`)
+			b.SetBytes(int64(len(body)))
+			b.ReportAllocs()
+			b.ResetTimer()
+			for range b.N {
+				codexPreparedRequestAffinity(context.Background(), cliproxyexecutor.Options{}, body, "turn-fixture")
+				codexSessionRequestKind(cliproxyexecutor.Options{}, body)
+			}
+		})
+	}
+}
+
 func TestCodexPreparedSessionIdentitySnapshotsEnabledState(t *testing.T) {
 	auth := &cliproxyauth.Auth{Provider: "codex", Metadata: map[string]any{"access_token": "oauth-token"}}
 	req := cliproxyexecutor.Request{Payload: []byte(`{"prompt_cache_key":"cache-key"}`)}

@@ -465,21 +465,29 @@ func (e *CodexExecutor) PrepareProviderRequest(ctx context.Context, req cliproxy
 
 func codexPreparedRequestAffinity(ctx context.Context, opts cliproxyexecutor.Options, payload []byte, turnID string) (string, string, string, string, string) {
 	client := codexClientSessionIdentitySource(ctx, opts)
-	bodyTurnMetadata := gjson.GetBytes(payload, "client_metadata.x-codex-turn-metadata").String()
+	var bodyTurnMetadata, bodyThreadID, bodySessionID string
+	if util.JSONMayContainAnyField(payload, "client_metadata") {
+		bodyTurnMetadata = gjson.GetBytes(payload, "client_metadata.x-codex-turn-metadata").String()
+		bodyThreadID = gjson.GetBytes(payload, "client_metadata.thread_id").String()
+		bodySessionID = gjson.GetBytes(payload, "client_metadata.session_id").String()
+	}
 	clientTurnMetadata := client.TurnMetadata
 	threadID := firstCodexPreparedIdentityValue(
 		gjson.Get(bodyTurnMetadata, "thread_id").String(),
-		gjson.GetBytes(payload, "client_metadata.thread_id").String(),
+		bodyThreadID,
 		gjson.Get(clientTurnMetadata, "thread_id").String(),
 		client.ThreadID,
 	)
 	sessionID := firstCodexPreparedIdentityValue(
 		gjson.Get(bodyTurnMetadata, "session_id").String(),
-		gjson.GetBytes(payload, "client_metadata.session_id").String(),
+		bodySessionID,
 		gjson.Get(clientTurnMetadata, "session_id").String(),
 		client.SessionID,
 	)
-	promptCacheKey := strings.TrimSpace(gjson.GetBytes(payload, "prompt_cache_key").String())
+	promptCacheKey := ""
+	if util.JSONMayContainAnyField(payload, "prompt_cache_key") {
+		promptCacheKey = strings.TrimSpace(gjson.GetBytes(payload, "prompt_cache_key").String())
+	}
 	executionSessionID := executionSessionIDFromOptions(opts)
 
 	affinityKind := "turn"
@@ -533,8 +541,10 @@ func codexSessionRequestKind(opts cliproxyexecutor.Options, payload []byte) stri
 	if strings.EqualFold(strings.Trim(strings.TrimSpace(opts.Alt), "/"), "responses/compact") {
 		return "compaction"
 	}
-	if generate := gjson.GetBytes(payload, "generate"); generate.Exists() && !generate.Bool() {
-		return "prewarm"
+	if util.JSONMayContainAnyField(payload, "generate") {
+		if generate := gjson.GetBytes(payload, "generate"); generate.Exists() && !generate.Bool() {
+			return "prewarm"
+		}
 	}
 	return "turn"
 }
