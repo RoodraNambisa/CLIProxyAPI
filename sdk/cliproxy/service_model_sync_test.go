@@ -2441,6 +2441,9 @@ func TestInstallAuthMaintenanceHookRegistersPreloadedCodexModels(t *testing.T) {
 	if processed := service.installAuthMaintenanceHook(t.Context()); processed != 1 {
 		t.Fatalf("processed auths = %d, want 1", processed)
 	}
+	if _, registered := manager.Executor("codex"); !registered {
+		t.Fatal("preloaded Codex auth has no executor after bootstrap")
+	}
 
 	models := registry.GetGlobalRegistry().GetModelsForClient(auth.ID)
 	if len(models) == 0 {

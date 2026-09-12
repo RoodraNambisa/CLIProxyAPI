@@ -1637,6 +1637,7 @@ func (s *Service) installAuthMaintenanceHook(ctx context.Context) int64 {
 				if !ok {
 					continue
 				}
+				s.ensureExecutorsForAuth(auth)
 				hook.OnAuthUpdated(ctx, auth)
 				processed.Add(1)
 			}
