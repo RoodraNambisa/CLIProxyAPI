@@ -42,6 +42,8 @@ type LiveLogEvent struct {
 	RequestID             string `json:"request_id,omitempty"`
 	Provider              string `json:"provider,omitempty"`
 	AuthIndex             string `json:"auth_index,omitempty"`
+	AuthName              string `json:"auth_name,omitempty"`
+	UpstreamRequestID     string `json:"upstream_request_id,omitempty"`
 	Stage                 string `json:"stage,omitempty"`
 	Code                  string `json:"code,omitempty"`
 	Status                int    `json:"status,omitempty"`
@@ -415,7 +417,7 @@ func (filter LiveLogFilter) matches(event LiveLogEvent) bool {
 		}
 	}
 	if filter.Contains != "" {
-		haystack := strings.ToLower(strings.Join([]string{event.Message, event.RequestID, event.Provider, event.AuthIndex, event.Stage, event.Code, event.Method, event.Path, event.ResponseBody}, " "))
+		haystack := strings.ToLower(strings.Join([]string{event.Message, event.RequestID, event.UpstreamRequestID, event.Provider, event.AuthIndex, event.AuthName, event.Stage, event.Code, event.Method, event.Path, event.ResponseBody}, " "))
 		if !strings.Contains(haystack, filter.Contains) {
 			return false
 		}
@@ -456,6 +458,9 @@ func managementLiveLogEvent(entry *log.Entry, detailLevel string) LiveLogEvent {
 	event.RequestID = safeLiveLogField(entry.Data, detailLevel, liveLogMaxFieldValueBytes, "request_id")
 	event.Provider = safeLiveLogField(entry.Data, detailLevel, liveLogMaxFieldValueBytes, "provider")
 	event.AuthIndex = safeLiveLogField(entry.Data, detailLevel, liveLogMaxFieldValueBytes, "auth_index", "authIndex")
+	// Credential names are deliberate operator-facing identifiers, not error-body content.
+	event.AuthName = safeLiveLogField(entry.Data, managementdiag.DetailLevelFull, 512, "auth_name")
+	event.UpstreamRequestID = safeLiveLogField(entry.Data, detailLevel, 128, "upstream_request_id")
 	event.Stage = safeLiveLogField(entry.Data, detailLevel, liveLogMaxFieldValueBytes, "stage", "failure_stage")
 	event.Code = safeLiveLogField(entry.Data, detailLevel, liveLogMaxFieldValueBytes, "code", "error_code")
 	event.Status = safeLiveLogStatus(entry.Data)

@@ -17,6 +17,22 @@ type blockingLiveLogValue struct {
 	release <-chan struct{}
 }
 
+func TestLiveLogCredentialNameRemainsRecognizableInSafeMode(t *testing.T) {
+	entry := log.NewEntry(log.New())
+	entry.Data = log.Fields{"auth_name": "codex-fixture@example.test.json", "auth_index": "index-fixture", "upstream_request_id": "upstream-fixture"}
+	entry.Message = "error for fixture@example.test"
+	event := managementLiveLogEvent(entry, managementdiag.DetailLevelSafe)
+	if event.AuthName != "codex-fixture@example.test.json" || event.AuthIndex != "index-fixture" || event.UpstreamRequestID != "upstream-fixture" {
+		t.Fatal("lost log identity")
+	}
+	if strings.Contains(event.Message, "fixture@example.test") {
+		t.Fatal("identity change loosened error text redaction")
+	}
+	if !(LiveLogFilter{Contains: "codex-fixture@example.test.json"}).matches(event) {
+		t.Fatal("credential name is not searchable")
+	}
+}
+
 func (value blockingLiveLogValue) String() string {
 	value.started <- struct{}{}
 	<-value.release

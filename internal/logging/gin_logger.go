@@ -51,6 +51,7 @@ func GinLogrusLogger() gin.HandlerFunc {
 		}
 
 		response := &errorResponseWriter{ResponseWriter: c.Writer}
+		c.Request = c.Request.WithContext(withRequestCredential(c.Request.Context()))
 		c.Writer = response
 		c.Next()
 		if (util.IsRetiredAmpPath(path) || util.IsRetiredGeminiCLIPath(path)) && c.FullPath() == "" {
@@ -82,6 +83,12 @@ func GinLogrusLogger() gin.HandlerFunc {
 		}
 
 		fields := log.Fields{"request_id": requestID, "status": statusCode, "method": method, "path": path}
+		identity := requestCredentialIdentity(c.Request.Context())
+		if identity.Index != "" {
+			fields["provider"] = identity.Provider
+			fields["auth_index"] = identity.Index
+			fields["auth_name"] = identity.Name
+		}
 		levelStatus := statusCode
 		var diagnostic responseErrorDiagnostic
 		if value, exists := c.Get(responseErrorContextKey); exists {

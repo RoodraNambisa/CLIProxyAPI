@@ -30,7 +30,7 @@ var (
 type LogFormatter struct{}
 
 // logFieldOrder defines the display order for common log fields.
-var logFieldOrder = []string{"provider", "model", "version", "mode", "budget", "level", "original_mode", "original_value", "min", "max", "clamped_to", "error"}
+var logFieldOrder = []string{"request_id", "provider", "auth_name", "auth_index", "model", "stage", "code", "status", "upstream_status", "upstream_request_id", "version", "mode", "budget", "level", "original_mode", "original_value", "min", "max", "clamped_to", "error"}
 
 // Format renders a single log entry with custom formatting.
 func (m *LogFormatter) Format(entry *log.Entry) ([]byte, error) {
@@ -61,6 +61,12 @@ func (m *LogFormatter) Format(entry *log.Entry) ([]byte, error) {
 		var fields []string
 		for _, k := range logFieldOrder {
 			if v, ok := entry.Data[k]; ok {
+				if k == "auth_name" || k == "request_id" || k == "upstream_request_id" {
+					if value := fmt.Sprint(v); value != "" && value != "--------" {
+						fields = append(fields, fmt.Sprintf("%s=%q", k, value))
+					}
+					continue
+				}
 				fields = append(fields, fmt.Sprintf("%s=%v", k, v))
 			}
 		}

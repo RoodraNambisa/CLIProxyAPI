@@ -146,10 +146,11 @@ func populateUsageFailure(ctx context.Context, record *usage.Record, cause error
 	}
 }
 
-func logUsageAttemptFailure(ctx context.Context, record usage.Record) {
+func logUsageAttemptFailure(ctx context.Context, record usage.Record, authName string) {
 	fields := log.Fields{
 		"request_id": record.RequestID, "provider": record.Provider, "auth_index": record.AuthIndex,
-		"stage": record.FailureStage, "code": record.ErrorCode, "status": record.StatusCode,
+		"auth_name": authName,
+		"stage":     record.FailureStage, "code": record.ErrorCode, "status": record.StatusCode,
 		"error_type":      record.ErrorType,
 		"upstream_status": record.UpstreamStatusCode, "upstream_request_id": record.UpstreamRequestID,
 	}

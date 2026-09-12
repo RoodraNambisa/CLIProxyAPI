@@ -14,11 +14,37 @@ import (
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
+	logtest "github.com/sirupsen/logrus/hooks/test"
 )
 
 type diagnosticStatusError struct {
 	status int
 	body   string
+}
+
+func TestUsageFailureFreezesCredentialNameAcrossAttempts(t *testing.T) {
+	hook := logtest.NewGlobal()
+	defer hook.Reset()
+	ctx := logging.WithRequestID(t.Context(), "a5c2bae8")
+	auth := &cliproxyauth.Auth{ID: "first", Provider: "codex", FileName: "/auths/first@example.test.json"}
+	first := NewUsageReporter(ctx, "codex", "model", auth)
+	auth.FileName = "/auths/renamed.json"
+	second := NewUsageReporter(ctx, "codex", "model", &cliproxyauth.Auth{ID: "second", FileName: "second.json"})
+	cause := diagnosticStatusError{429, `{"error":{"message":"quota exceeded"}}`}
+	first.PublishFailure(ctx, cause)
+	second.PublishFailure(ctx, cause)
+	entries := hook.AllEntries()
+	if len(entries) != 2 {
+		t.Fatalf("entries = %d", len(entries))
+	}
+	if entries[0].Data["auth_name"] != "first@example.test.json" || entries[1].Data["auth_name"] != "second.json" || entries[0].Data["auth_index"] == entries[1].Data["auth_index"] {
+		t.Fatal("attempt credential snapshot drifted")
+	}
+	for _, entry := range entries {
+		if entry.Data["request_id"] != "a5c2bae8" {
+			t.Fatal("lost request ID")
+		}
+	}
 }
 
 func (e diagnosticStatusError) Error() string   { return e.body }

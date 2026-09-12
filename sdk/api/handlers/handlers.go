@@ -934,6 +934,7 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
 			parentCtx = logging.WithRequestID(parentCtx, requestID)
 		}
 	}
+	parentCtx = logging.WithRequestCredentialFrom(parentCtx, requestCtx)
 	newCtx, cancel := context.WithCancel(parentCtx)
 	cancelCtx := newCtx
 	if requestCtx != nil && requestCtx != parentCtx {

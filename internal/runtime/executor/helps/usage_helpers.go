@@ -24,6 +24,7 @@ type UsageReporter struct {
 	model                string
 	authID               string
 	authIndex            string
+	authName             string
 	apiKey               string
 	source               string
 	requestServiceTier   string
@@ -88,6 +89,7 @@ func NewUsageReporter(ctx context.Context, provider, model string, auth *cliprox
 	if auth != nil {
 		reporter.authID = auth.ID
 		reporter.authIndex = auth.EnsureIndex()
+		reporter.authName = auth.LogIdentity().Name
 		for _, name := range []string{"api_key", "access_token", "refresh_token", "id_token"} {
 			if value := auth.Attributes[name]; value != "" {
 				reporter.diagnosticSecrets = append(reporter.diagnosticSecrets, value)
@@ -321,7 +323,7 @@ func (r *UsageReporter) publishWithOutcome(ctx context.Context, detail usage.Det
 			}
 		}
 		populateUsageFailure(ctx, &primaryRecord, cause, r.diagnosticSecrets...)
-		logUsageAttemptFailure(ctx, primaryRecord)
+		logUsageAttemptFailure(ctx, primaryRecord, r.authName)
 	}
 	additionalRecords := make([]usage.Record, 0, len(additional))
 	if !failed {

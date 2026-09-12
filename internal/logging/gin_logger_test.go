@@ -38,6 +38,38 @@ func TestGinLogrusLoggerSkipsRetiredAmpOAuthPath(t *testing.T) {
 	}
 }
 
+func TestGinAccessLogCapturesRequestCredentialAndKeepsRequestsIsolated(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	hook := logtest.NewGlobal()
+	defer hook.Reset()
+	engine := gin.New()
+	engine.Use(GinLogrusLogger())
+	engine.POST("/v1/responses", func(c *gin.Context) {
+		if c.Query("selected") != "" {
+			ctx := c.Request.Context()
+			SetRequestCredential(ctx, CredentialIdentity{Provider: "codex", Index: "first", Name: "first.json"})
+			SetRequestCredential(ctx, CredentialIdentity{Provider: "codex", Index: "second", Name: "second.json"})
+		}
+		c.JSON(500, gin.H{"error": gin.H{"message": "fixture overload"}})
+	})
+	for _, query := range []string{"?selected=yes", ""} {
+		engine.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/responses"+query, nil))
+	}
+	entries := hook.AllEntries()
+	if len(entries) != 2 {
+		t.Fatalf("entries = %d", len(entries))
+	}
+	if entries[0].Data["auth_name"] != "second.json" || entries[0].Data["auth_index"] != "second" || entries[0].Data["request_id"] == "" {
+		t.Fatal("final access log lost credential or request identity")
+	}
+	if _, exists := entries[1].Data["auth_index"]; exists {
+		t.Fatal("credential leaked into unrelated request")
+	}
+	if entries[0].Data["request_id"] == entries[1].Data["request_id"] {
+		t.Fatal("request IDs not isolated")
+	}
+}
+
 func TestGinLogrusLoggerSkipsRetiredGeminiCLICallbackQuery(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	hook := logtest.NewGlobal()

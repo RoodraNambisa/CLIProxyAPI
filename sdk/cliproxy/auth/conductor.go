@@ -5772,7 +5772,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 
 		entry := logEntryWithRequestID(ctx)
 		debugLogAuthSelection(entry, auth, provider, req.Model)
-		publishSelectedAuthMetadata(opts.Metadata, auth, provider)
+		publishSelectedAuthMetadata(ctx, opts.Metadata, auth, provider)
 		opts = withSelectedAuthInstanceMetadata(opts, auth)
 
 		execCtx := ctx
@@ -6056,7 +6056,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 
 		entry := logEntryWithRequestID(ctx)
 		debugLogAuthSelection(entry, auth, provider, req.Model)
-		publishSelectedAuthMetadata(opts.Metadata, auth, provider)
+		publishSelectedAuthMetadata(ctx, opts.Metadata, auth, provider)
 		opts = withSelectedAuthInstanceMetadata(opts, auth)
 
 		execCtx := ctx
@@ -6333,7 +6333,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 
 		entry := logEntryWithRequestID(ctx)
 		debugLogAuthSelection(entry, auth, provider, req.Model)
-		publishSelectedAuthMetadata(opts.Metadata, auth, provider)
+		publishSelectedAuthMetadata(ctx, opts.Metadata, auth, provider)
 		opts = withSelectedAuthInstanceMetadata(opts, auth)
 
 		execCtx := ctx
@@ -7006,7 +7006,7 @@ func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxy
 		}
 		carryRuntimeProxy(c.auth, preparedAuth)
 		c.auth = preparedAuth
-		publishSelectedAuthMetadata(creditsOpts.Metadata, c.auth, c.provider)
+		publishSelectedAuthMetadata(creditsCtx, creditsOpts.Metadata, c.auth, c.provider)
 		creditsOpts = withSelectedAuthInstanceMetadata(creditsOpts, c.auth)
 		models := m.executionModelCandidates(c.auth, routeModel)
 		if len(models) == 0 {
@@ -7111,7 +7111,7 @@ func (m *Manager) tryAntigravityCreditsExecuteStream(ctx context.Context, req cl
 		}
 		carryRuntimeProxy(c.auth, preparedAuth)
 		c.auth = preparedAuth
-		publishSelectedAuthMetadata(creditsOpts.Metadata, c.auth, c.provider)
+		publishSelectedAuthMetadata(creditsCtx, creditsOpts.Metadata, c.auth, c.provider)
 		creditsOpts = withSelectedAuthInstanceMetadata(creditsOpts, c.auth)
 		models := m.executionModelCandidates(c.auth, routeModel)
 		if len(models) == 0 {
@@ -7246,7 +7246,14 @@ func pinnedAuthIDFromMetadata(meta map[string]any) string {
 	}
 }
 
-func publishSelectedAuthMetadata(meta map[string]any, auth *Auth, fallbackProvider string) {
+func publishSelectedAuthMetadata(ctx context.Context, meta map[string]any, auth *Auth, fallbackProvider string) {
+	if auth != nil {
+		identity := auth.LogIdentity()
+		if identity.Provider == "" {
+			identity.Provider = fallbackProvider
+		}
+		logging.SetRequestCredential(ctx, identity)
+	}
 	if len(meta) == 0 {
 		return
 	}
