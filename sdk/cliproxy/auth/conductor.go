@@ -4573,7 +4573,8 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 	}
 	defer releaseProducer()
 	opts = m.ensureExecutionDiagnostics(opts)
-	ctx = cliproxyexecutor.WithRequestUsageOutcome(ctx, opts.UsageOutcome)
+	ctx = cliproxyexecutor.WithRequestUsageOutcome(
+		cliproxyexecutor.WithRequestExecutionDiagnostics(ctx, opts.ExecutionDiagnostics), opts.UsageOutcome)
 	defer func() {
 		err = upstreamErrors.preferred(err)
 		if timeout := cliproxyexecutor.ImageRequestContextError(ctx, nil); timeout != nil {
@@ -4672,7 +4673,8 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 	}
 	defer releaseProducer()
 	opts = m.ensureExecutionDiagnostics(opts)
-	ctx = cliproxyexecutor.WithRequestUsageOutcome(ctx, opts.UsageOutcome)
+	ctx = cliproxyexecutor.WithRequestUsageOutcome(
+		cliproxyexecutor.WithRequestExecutionDiagnostics(ctx, opts.ExecutionDiagnostics), opts.UsageOutcome)
 	defer func() {
 		err = upstreamErrors.preferred(err)
 		if err != nil {
@@ -4766,7 +4768,8 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 		}
 	}()
 	opts = m.ensureExecutionDiagnostics(opts)
-	ctx = cliproxyexecutor.WithRequestUsageOutcome(ctx, opts.UsageOutcome)
+	ctx = cliproxyexecutor.WithRequestUsageOutcome(
+		cliproxyexecutor.WithRequestExecutionDiagnostics(ctx, opts.ExecutionDiagnostics), opts.UsageOutcome)
 	defer func() {
 		err = upstreamErrors.preferred(err)
 		if timeout := cliproxyexecutor.ImageRequestContextError(ctx, nil); timeout != nil {

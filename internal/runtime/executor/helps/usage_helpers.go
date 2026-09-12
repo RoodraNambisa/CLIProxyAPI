@@ -40,6 +40,7 @@ type UsageReporter struct {
 	executionDiagnostics *cliproxyexecutor.RequestExecutionDiagnostics
 	requestUsageOutcome  *cliproxyexecutor.RequestUsageOutcome
 	requestUsageAttempt  *cliproxyexecutor.RequestUsageAttempt
+	diagnosticSecrets    []string
 }
 
 type observedModelUsage struct {
@@ -69,20 +70,29 @@ func NewUsageReporter(ctx context.Context, provider, model string, auth *cliprox
 	}
 	apiKey := APIKeyFromContext(ctx)
 	reporter := &UsageReporter{
-		provider:            provider,
-		model:               model,
-		requestedAt:         time.Now(),
-		apiKey:              apiKey,
-		source:              resolveUsageSource(auth, apiKey),
-		requestServiceTier:  usage.ServiceTierFromContext(ctx),
-		stream:              usage.StreamFromContext(ctx),
-		generate:            usage.GenerateFromContext(ctx),
-		requestUsageOutcome: cliproxyexecutor.RequestUsageOutcomeFromContext(ctx),
-		requestUsageAttempt: cliproxyexecutor.RequestUsageAttemptFromContext(ctx),
+		provider:             provider,
+		model:                model,
+		requestedAt:          time.Now(),
+		apiKey:               apiKey,
+		source:               resolveUsageSource(auth, apiKey),
+		requestServiceTier:   usage.ServiceTierFromContext(ctx),
+		stream:               usage.StreamFromContext(ctx),
+		generate:             usage.GenerateFromContext(ctx),
+		requestUsageOutcome:  cliproxyexecutor.RequestUsageOutcomeFromContext(ctx),
+		requestUsageAttempt:  cliproxyexecutor.RequestUsageAttemptFromContext(ctx),
+		executionDiagnostics: cliproxyexecutor.RequestExecutionDiagnosticsFromContext(ctx),
 	}
 	if auth != nil {
 		reporter.authID = auth.ID
 		reporter.authIndex = auth.EnsureIndex()
+		for _, name := range []string{"api_key", "access_token", "refresh_token", "id_token"} {
+			if value := auth.Attributes[name]; value != "" {
+				reporter.diagnosticSecrets = append(reporter.diagnosticSecrets, value)
+			}
+			if value, ok := auth.Metadata[name].(string); ok && value != "" {
+				reporter.diagnosticSecrets = append(reporter.diagnosticSecrets, value)
+			}
+		}
 	}
 	return reporter
 }
@@ -238,14 +248,14 @@ func (r *UsageReporter) buildAdditionalModelRecord(model string, detail usage.De
 	return record, true
 }
 
-func (r *UsageReporter) PublishFailure(ctx context.Context, _ ...error) {
-	r.publishWithOutcome(ctx, usage.Detail{}, true, true)
+func (r *UsageReporter) PublishFailure(ctx context.Context, causes ...error) {
+	r.publishWithOutcome(ctx, usage.Detail{}, true, true, causes...)
 }
 
 // PublishFailureWithUsage preserves token counts explicitly reported by an
 // upstream error response while retaining the final request failure outcome.
-func (r *UsageReporter) PublishFailureWithUsage(ctx context.Context, detail usage.Detail) {
-	r.publishWithOutcome(ctx, detail, true, true)
+func (r *UsageReporter) PublishFailureWithUsage(ctx context.Context, detail usage.Detail, causes ...error) {
+	r.publishWithOutcome(ctx, detail, true, true, causes...)
 }
 
 func (r *UsageReporter) TrackFailure(ctx context.Context, errPtr *error) {
@@ -253,11 +263,11 @@ func (r *UsageReporter) TrackFailure(ctx context.Context, errPtr *error) {
 		return
 	}
 	if *errPtr != nil {
-		r.PublishFailure(ctx)
+		r.PublishFailure(ctx, *errPtr)
 	}
 }
 
-func (r *UsageReporter) publishWithOutcome(ctx context.Context, detail usage.Detail, failed, explicitDetail bool) {
+func (r *UsageReporter) publishWithOutcome(ctx context.Context, detail usage.Detail, failed, explicitDetail bool, causes ...error) {
 	if r == nil {
 		return
 	}
@@ -279,6 +289,17 @@ func (r *UsageReporter) publishWithOutcome(ctx context.Context, detail usage.Det
 		r.executionDiagnostics.ClearFailure()
 	}
 	primaryRecord := r.buildRecord(detail, failed)
+	if failed {
+		var cause error
+		for _, candidate := range causes {
+			if candidate != nil {
+				cause = candidate
+				break
+			}
+		}
+		populateUsageFailure(ctx, &primaryRecord, cause, r.diagnosticSecrets...)
+		logUsageAttemptFailure(ctx, primaryRecord)
+	}
 	additionalRecords := make([]usage.Record, 0, len(additional))
 	if !failed {
 		for i := range additional {

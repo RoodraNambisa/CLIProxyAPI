@@ -38,7 +38,6 @@ func (e *mixedProviderStreamUsageExecutor) Execute(context.Context, *cliproxyaut
 
 func (e *mixedProviderStreamUsageExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
 	reporter := helps.NewExecutorUsageReporter(ctx, e, req.Model, auth)
-	reporter.SetExecutionDiagnostics(opts.ExecutionDiagnostics)
 	chunks := make(chan cliproxyexecutor.StreamChunk, 2)
 	if streamErr := e.bootstrap[auth.ID]; streamErr != nil {
 		chunks <- cliproxyexecutor.StreamChunk{Err: streamErr}
@@ -93,7 +92,6 @@ func (e *mixedProviderUsageExecutor) Identifier() string { return e.id }
 
 func (e *mixedProviderUsageExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (response cliproxyexecutor.Response, err error) {
 	reporter := helps.NewExecutorUsageReporter(ctx, e, req.Model, auth)
-	reporter.SetExecutionDiagnostics(opts.ExecutionDiagnostics)
 	if e.id == "chatgpt-web" {
 		reporter.SetRequestUsageOutcome(opts.UsageOutcome)
 	}
@@ -232,6 +230,9 @@ func TestManagerMixedProviderFailuresPublishOnlyFinalPrimaryUsageRecord(t *testi
 	got := collectMixedProviderUsageRecords(t, records)
 	if len(got) != 1 || !got[0].Failed || got[0].AuthID != nonWebID {
 		t.Fatalf("usage records = %+v, want one final failure", got)
+	}
+	if !got[0].CredentialSelected || got[0].StatusCode != http.StatusBadGateway || got[0].ErrorCode != "nonweb_failed" || got[0].ErrorMessage != "failed" {
+		t.Fatal("manager did not propagate the final provider error and ownership diagnostics")
 	}
 }
 

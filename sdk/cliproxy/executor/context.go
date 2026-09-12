@@ -4,6 +4,23 @@ import "context"
 
 type downstreamWebsocketContextKey struct{}
 type requiredUpstreamWebsocketContextKey struct{}
+type requestExecutionDiagnosticsContextKey struct{}
+
+// WithRequestExecutionDiagnostics makes ownership evidence available to all provider reporters.
+func WithRequestExecutionDiagnostics(ctx context.Context, diagnostics *RequestExecutionDiagnostics) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, requestExecutionDiagnosticsContextKey{}, diagnostics)
+}
+
+func RequestExecutionDiagnosticsFromContext(ctx context.Context) *RequestExecutionDiagnostics {
+	if ctx == nil {
+		return nil
+	}
+	diagnostics, _ := ctx.Value(requestExecutionDiagnosticsContextKey{}).(*RequestExecutionDiagnostics)
+	return diagnostics
+}
 
 // WithDownstreamWebsocket marks the current request as coming from a downstream websocket connection.
 func WithDownstreamWebsocket(ctx context.Context) context.Context {

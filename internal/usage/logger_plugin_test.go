@@ -50,6 +50,12 @@ func TestRequestStatisticsRecordIncludesExecutionDiagnostics(t *testing.T) {
 		Failed:                  true,
 		FailureStage:            "upstream",
 		ErrorCode:               "rate_limit_exceeded",
+		StatusCode:              429,
+		ErrorType:               "quota_error",
+		ErrorMessage:            "capacity exhausted",
+		ErrorResponse:           `{"error":{"code":"rate_limit_exceeded"}}`,
+		RequestID:               "local-fixture",
+		UpstreamRequestID:       "upstream-fixture",
 		CredentialSelected:      true,
 		UpstreamCommitted:       true,
 		AuthRequestSlotConsumed: true,
@@ -65,6 +71,17 @@ func TestRequestStatisticsRecordIncludesExecutionDiagnostics(t *testing.T) {
 	}
 	if !detail.CredentialSelected || !detail.UpstreamCommitted || !detail.AuthRequestSlotConsumed {
 		t.Fatalf("execution ownership diagnostics = %+v", detail)
+	}
+	encoded, err := json.Marshal(detail)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var restored RequestDetail
+	if err := json.Unmarshal(encoded, &restored); err != nil {
+		t.Fatal(err)
+	}
+	if restored.StatusCode != 429 || restored.ErrorType != "quota_error" || restored.ErrorMessage != "capacity exhausted" || restored.RequestID != "local-fixture" || restored.UpstreamRequestID != "upstream-fixture" || restored.ErrorResponse != detail.ErrorResponse {
+		t.Fatal("failure details did not survive the storage format")
 	}
 }
 

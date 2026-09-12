@@ -38,6 +38,12 @@ type Record struct {
 	Auxiliary               bool
 	FailureStage            string
 	ErrorCode               string
+	StatusCode              int
+	ErrorType               string
+	ErrorMessage            string
+	ErrorResponse           string
+	RequestID               string
+	UpstreamRequestID       string
 	CredentialSelected      bool
 	UpstreamCommitted       bool
 	AuthRequestSlotConsumed bool

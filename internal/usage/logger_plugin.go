@@ -190,6 +190,12 @@ type RequestDetail struct {
 	Auxiliary               bool       `json:"auxiliary,omitempty"`
 	FailureStage            string     `json:"failure_stage,omitempty"`
 	ErrorCode               string     `json:"error_code,omitempty"`
+	StatusCode              int        `json:"status_code,omitempty"`
+	ErrorType               string     `json:"error_type,omitempty"`
+	ErrorMessage            string     `json:"error_message,omitempty"`
+	ErrorResponse           string     `json:"error_response,omitempty"`
+	RequestID               string     `json:"request_id,omitempty"`
+	UpstreamRequestID       string     `json:"upstream_request_id,omitempty"`
 	CredentialSelected      bool       `json:"credential_selected"`
 	UpstreamCommitted       bool       `json:"upstream_committed"`
 	AuthRequestSlotConsumed bool       `json:"auth_request_slot_consumed"`
@@ -318,6 +324,12 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 		Auxiliary:               record.Auxiliary,
 		FailureStage:            strings.TrimSpace(record.FailureStage),
 		ErrorCode:               strings.TrimSpace(record.ErrorCode),
+		StatusCode:              record.StatusCode,
+		ErrorType:               record.ErrorType,
+		ErrorMessage:            record.ErrorMessage,
+		ErrorResponse:           record.ErrorResponse,
+		RequestID:               record.RequestID,
+		UpstreamRequestID:       record.UpstreamRequestID,
 		CredentialSelected:      record.CredentialSelected,
 		UpstreamCommitted:       record.UpstreamCommitted,
 		AuthRequestSlotConsumed: record.AuthRequestSlotConsumed,
