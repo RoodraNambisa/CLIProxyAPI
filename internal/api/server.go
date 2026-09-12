@@ -220,7 +220,8 @@ type Server struct {
 	loggerToggle  func(bool)
 
 	// configFilePath is the absolute path to the YAML config file for persistence.
-	configFilePath string
+	configFilePath  string
+	managementPanel managementasset.FileServer
 
 	// currentPath is the absolute path to the current working directory.
 	currentPath string
@@ -1121,7 +1122,7 @@ func (s *Server) serveManagementControlPanel(c *gin.Context) {
 		}
 	}
 
-	c.File(filePath)
+	s.managementPanel.ServeFile(c.Writer, c.Request, filePath)
 }
 
 func (s *Server) enableKeepAlive(timeout time.Duration, onTimeout func()) {
