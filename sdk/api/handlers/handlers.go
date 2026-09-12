@@ -1837,6 +1837,7 @@ func (h *BaseAPIHandler) WriteErrorResponse(c *gin.Context, msg *interfaces.Erro
 	}
 
 	body := BuildErrorResponseBodyForMessage(status, errText, msg)
+	logging.RecordResponseError(c, status, body)
 	// Append first to preserve upstream response logs, then drop duplicate payloads if already recorded.
 	var previous []byte
 	if existing, exists := c.Get("API_RESPONSE"); exists {
@@ -1861,9 +1862,24 @@ func (h *BaseAPIHandler) WriteErrorResponse(c *gin.Context, msg *interfaces.Erro
 	_, _ = c.Writer.Write(body)
 }
 
+func (h *BaseAPIHandler) recordResponseError(c *gin.Context, msg *interfaces.ErrorMessage) {
+	if c == nil || msg == nil || msg.StatusCode == 499 || (msg.StatusCode < 400 && errors.Is(msg.Error, context.Canceled)) {
+		return
+	}
+	body, projected := h.BuildPublicErrorResponseBody(c, msg)
+	status := http.StatusInternalServerError
+	if projected != nil && projected.StatusCode > 0 {
+		status = projected.StatusCode
+	}
+	logging.RecordResponseError(c, status, body)
+}
+
 func (h *BaseAPIHandler) LoggingAPIResponseError(ctx context.Context, err *interfaces.ErrorMessage) {
 	if ctx == nil {
 		return
+	}
+	if c, ok := ctx.Value("gin").(*gin.Context); ok {
+		h.recordResponseError(c, err)
 	}
 	if cfg := h.ConfigSnapshot(); cfg != nil && cfg.RequestLog {
 		if ginContext, ok := ctx.Value("gin").(*gin.Context); ok && ginContext != nil {

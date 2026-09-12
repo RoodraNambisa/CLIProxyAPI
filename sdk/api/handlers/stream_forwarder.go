@@ -554,6 +554,7 @@ func (h *BaseAPIHandler) ForwardStream(c *gin.Context, flusher http.Flusher, can
 		}
 		flushPending()
 		if opts.WriteTerminalError != nil {
+			h.recordResponseError(c, errMsg)
 			opts.WriteTerminalError(errMsg)
 		}
 		flusher.Flush()

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/managementdiag"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	log "github.com/sirupsen/logrus"
 )
@@ -49,6 +50,8 @@ func GinLogrusLogger() gin.HandlerFunc {
 			c.Request = c.Request.WithContext(ctx)
 		}
 
+		response := &errorResponseWriter{ResponseWriter: c.Writer}
+		c.Writer = response
 		c.Next()
 		if (util.IsRetiredAmpPath(path) || util.IsRetiredGeminiCLIPath(path)) && c.FullPath() == "" {
 			return
@@ -68,7 +71,7 @@ func GinLogrusLogger() gin.HandlerFunc {
 		statusCode := c.Writer.Status()
 		clientIP := ResolveClientIP(c)
 		method := c.Request.Method
-		errorMessage := c.Errors.ByType(gin.ErrorTypePrivate).String()
+		errorMessage, _ := safeResponseErrorText(c, c.Errors.ByType(gin.ErrorTypePrivate).String(), 1024)
 
 		if requestID == "" {
 			requestID = "--------"
@@ -78,12 +81,32 @@ func GinLogrusLogger() gin.HandlerFunc {
 			logLine = logLine + " | " + errorMessage
 		}
 
-		entry := log.WithField("request_id", requestID)
+		fields := log.Fields{"request_id": requestID, "status": statusCode, "method": method, "path": path}
+		levelStatus := statusCode
+		var diagnostic responseErrorDiagnostic
+		if value, exists := c.Get(responseErrorContextKey); exists {
+			diagnostic, _ = value.(responseErrorDiagnostic)
+		}
+		if statusCode >= http.StatusBadRequest && (len(response.body) > 0 || diagnostic.status == 0) {
+			diagnostic = buildResponseErrorDiagnostic(c, statusCode, response.body)
+			diagnostic.truncated = diagnostic.truncated || response.truncated
+		}
+		if diagnostic.status != 0 {
+			logLine += fmt.Sprintf(" | error_status=%d code=%q error=%q", diagnostic.status, diagnostic.code, diagnostic.message)
+			fields["code"] = diagnostic.code
+			fields["stage"] = "response"
+			fields["response_body"] = managementdiag.NewManagementOnlyValue(diagnostic.body)
+			fields["response_body_truncated"] = diagnostic.truncated
+			if diagnostic.status > levelStatus {
+				levelStatus = diagnostic.status
+			}
+		}
+		entry := log.WithFields(fields)
 
 		switch {
-		case statusCode >= http.StatusInternalServerError:
+		case levelStatus >= http.StatusInternalServerError:
 			entry.Error(logLine)
-		case statusCode >= http.StatusBadRequest:
+		case levelStatus >= http.StatusBadRequest:
 			entry.Warn(logLine)
 		default:
 			entry.Info(logLine)
