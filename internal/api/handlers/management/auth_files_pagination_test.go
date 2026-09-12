@@ -3,6 +3,7 @@ package management
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -69,6 +70,28 @@ func TestAuthFilesEffectiveZeroPriorityFiltering(t *testing.T) {
 	missing, _ := manager.GetByID("default.json")
 	if _, exists := missing.Metadata["priority"]; exists {
 		t.Fatal("reading effective priority must not write a configured value")
+	}
+}
+
+func TestAuthFilesInvalidPriorityUsesEffectiveZero(t *testing.T) {
+	for _, raw := range []string{"invalid", "999999999999999999999999999999", "-999999999999999999999999999999"} {
+		for _, attribute := range []bool{true, false} {
+			t.Run(fmt.Sprintf("%s/attribute=%t", raw, attribute), func(t *testing.T) {
+				auth := &coreauth.Auth{ID: "legacy.json", Provider: "codex", Metadata: map[string]any{"priority": raw}}
+				if attribute {
+					auth.Attributes = map[string]string{"priority": raw}
+				}
+				records := []*authFileListRecord{authFileRecordForAuth(auth, auth.ID, false)}
+				query := authFilesListQuery{provider: "all", plan: "all", priority: "0"}
+				if len(filterAuthFileRecords(records, query)) != 1 {
+					t.Fatal("invalid legacy priority disappeared from effective-zero results")
+				}
+				facets := buildAuthFilesFacets(records, "0")
+				if len(facets.Priorities) != 1 || facets.Priorities[0].Value != "0" {
+					t.Fatal("invalid legacy priority created a nonzero facet")
+				}
+			})
+		}
 	}
 }
 

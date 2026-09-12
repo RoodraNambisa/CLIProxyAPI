@@ -607,7 +607,10 @@ func authFileRecordForAuth(auth *coreauth.Auth, name string, runtimeOnly bool) *
 		plan = strings.TrimSpace(stringValue(auth.Metadata, "plan_type"))
 	}
 	plan = strings.ToLower(plan)
-	priority, _ := authFilePriority(auth)
+	priority, validPriority := authFilePriority(auth)
+	if !validPriority {
+		priority = 0
+	}
 	note := authFileNote(auth)
 	searchValues := []string{name, provider, plan, string(auth.Status), note, statusMessage, authEmail(auth)}
 	if auth.LastError != nil {
