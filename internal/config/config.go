@@ -2380,6 +2380,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	cfg.Images.ImageModels = normalizeImageModelIDs(cfg.Images.ImageModels)
 	cfg.Images.ChatGPTWeb.ImageModels = normalizeImageModelIDs(cfg.Images.ChatGPTWeb.ImageModels)
 	cfg.Images.ChatGPTWeb.UpstreamModel = cfg.Images.ChatGPTWeb.ResolvedUpstreamModel()
+	if err = cfg.Images.ValidateRequestTimeouts(); err != nil {
+		return nil, err
+	}
 	if err = cfg.Images.ChatGPTWeb.Validate(); err != nil {
 		return nil, err
 	}
@@ -3985,6 +3988,9 @@ func hashSecret(secret string) (string, error) {
 func SaveConfigPreserveComments(configFile string, cfg *Config) error {
 	if cfg == nil {
 		return fmt.Errorf("config is nil")
+	}
+	if errTimeout := cfg.Images.ValidateRequestTimeouts(); errTimeout != nil {
+		return errTimeout
 	}
 	if errWeight := cfg.ValidateCredentialWeights(); errWeight != nil {
 		return errWeight

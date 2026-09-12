@@ -13,7 +13,12 @@ import (
 // DoUpstreamHTTPRequest observes transport dispatch without replacing clients,
 // transports, TLS profiles, proxy behavior, or timeout settings. An HTTP response
 // also supplies evidence for custom transports that do not implement httptrace.
-func DoUpstreamHTTPRequest(client *http.Client, req *http.Request) (*http.Response, error) {
+func DoUpstreamHTTPRequest(client *http.Client, req *http.Request) (response *http.Response, err error) {
+	defer func() {
+		if req != nil && response != nil {
+			response.Body = executor.GuardImageResponseBody(req.Context(), response.Body)
+		}
+	}()
 	if req == nil || !executor.TracksUpstreamAttempt(req.Context()) {
 		return client.Do(req)
 	}
@@ -25,7 +30,7 @@ func DoUpstreamHTTPRequest(client *http.Client, req *http.Request) (*http.Respon
 		GotConn:      func(httptrace.GotConnInfo) { mark() },
 		WroteRequest: func(httptrace.WroteRequestInfo) { mark() },
 	}
-	response, err := client.Do(req.WithContext(httptrace.WithClientTrace(ctx, trace)))
+	response, err = client.Do(req.WithContext(httptrace.WithClientTrace(ctx, trace)))
 	if response != nil {
 		mark()
 	}

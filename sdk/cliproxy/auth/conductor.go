@@ -2431,6 +2431,15 @@ func (m *Manager) wrapStreamResult(ctx, resultCtx context.Context, auth *Auth, a
 		}
 		defer func() {
 			retiredAtFinish := finishLease()
+			if timeout := cliproxyexecutor.ImageRequestContextError(ctx, nil); timeout != nil {
+				timeout = withAuthErrorResponseSource(timeout, auth, provider)
+				m.recordExecutionResultMetrics(opts, timeout)
+				opts.UsageOutcome.FinalizeFailure()
+				select {
+				case out <- cliproxyexecutor.StreamChunk{Err: timeout}:
+				default:
+				}
+			}
 			if !terminalSent && (retiredAtFinish || runtimeAuthInstanceRetiredContext(ctx)) {
 				emitRetiredError()
 			}
@@ -2455,6 +2464,7 @@ func (m *Manager) wrapStreamResult(ctx, resultCtx context.Context, auth *Auth, a
 			}
 		}
 		emit := func(chunk cliproxyexecutor.StreamChunk) bool {
+			chunk.Err = cliproxyexecutor.ImageRequestContextError(ctx, chunk.Err)
 			if cliproxyexecutor.IsSuccessfulStreamTerminalChunk(chunk) {
 				if tail := finishForceMappedStreamChunks(rewriter); len(tail) > 0 {
 					rewriter = nil
@@ -4566,6 +4576,9 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 	ctx = cliproxyexecutor.WithRequestUsageOutcome(ctx, opts.UsageOutcome)
 	defer func() {
 		err = upstreamErrors.preferred(err)
+		if timeout := cliproxyexecutor.ImageRequestContextError(ctx, nil); timeout != nil {
+			err = withInheritedErrorResponseSource(timeout, err)
+		}
 		if err != nil {
 			err = finalizeErrorResponseSource(opts.Metadata, err)
 		}
@@ -4756,6 +4769,9 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 	ctx = cliproxyexecutor.WithRequestUsageOutcome(ctx, opts.UsageOutcome)
 	defer func() {
 		err = upstreamErrors.preferred(err)
+		if timeout := cliproxyexecutor.ImageRequestContextError(ctx, nil); timeout != nil {
+			err = withInheritedErrorResponseSource(timeout, err)
+		}
 		if err != nil {
 			err = finalizeErrorResponseSource(opts.Metadata, err)
 		}
@@ -5678,6 +5694,9 @@ func carryForwardPreparedAuthRuntimeState(current, next *Auth) {
 }
 
 func (m *Manager) prepareRequestAuthWithUnauthorizedRefresh(ctx context.Context, executor ProviderExecutor, auth *Auth) (*Auth, bool, error) {
+	if err := cliproxyexecutor.ImageRequestBudgetFromContext(ctx).Select(auth.Provider); err != nil {
+		return auth, false, err
+	}
 	prepared, errPrepare := m.prepareRequestAuth(ctx, executor, auth)
 	if errPrepare == nil {
 		return prepared, false, nil
@@ -7236,6 +7255,13 @@ func publishSelectedAuthMetadata(meta map[string]any, auth *Auth, fallbackProvid
 		return
 	}
 	meta[cliproxyexecutor.SelectedAuthMetadataKey] = authID
+	if budget, ok := meta[cliproxyexecutor.ImageRequestBudgetMetadataKey].(*cliproxyexecutor.ImageRequestBudget); ok {
+		provider := auth.Provider
+		if provider == "" {
+			provider = fallbackProvider
+		}
+		_ = budget.Select(provider)
+	}
 	if callback, ok := meta[cliproxyexecutor.SelectedAuthCallbackMetadataKey].(func(string)); ok && callback != nil {
 		callback(authID)
 	}
@@ -7601,6 +7627,10 @@ func (m *Manager) prepareProviderRequests(
 	opts cliproxyexecutor.Options,
 	operation cliproxyexecutor.RequestOperation,
 ) ([]string, cliproxyexecutor.Options, error) {
+	budget := cliproxyexecutor.ImageRequestBudgetFromOptions(opts)
+	if err := budget.Candidates(providers); err != nil {
+		return nil, opts, err
+	}
 	if selector, ok := m.selectorForContext(ctx).(*SessionAffinitySelector); ok && selector != nil {
 		if selector.subagents || selector.lcp {
 			opts = withAffinityIdentity(ctx, req, opts, selector.lcp)
@@ -7619,8 +7649,15 @@ func (m *Manager) prepareProviderRequests(
 			continue
 		}
 		providerReq, providerOpts := cliproxyexecutor.PrepareImageRequestForProvider(provider, req, opts)
-		prepared, errPrepare := preparer.PrepareProviderRequest(ctx, providerReq, providerOpts, operation)
+		prepareCtx, cancelPrepare := budget.PreflightContext(ctx, provider)
+		prepared, errPrepare := preparer.PrepareProviderRequest(prepareCtx, providerReq, providerOpts, operation)
+		errPrepare = cliproxyexecutor.ImageRequestContextError(prepareCtx, errPrepare)
+		cancelPrepare()
 		if errPrepare != nil {
+			if cliproxyexecutor.IsImageRequestTimeout(errPrepare) {
+				firstErr = errPrepare
+				continue
+			}
 			if cliproxyexecutor.ProviderRequestPreparationScopeOf(errPrepare) != cliproxyexecutor.ProviderRequestPreparationProviderIncompatible {
 				preparedOpts.ExecutionMetrics.RecordPreflightRejected()
 				if preparedOpts.ExecutionDiagnostics != nil {
@@ -7642,6 +7679,9 @@ func (m *Manager) prepareProviderRequests(
 			preparedOpts.ExecutionDiagnostics.SetFailure("preflight", requestErrorCode(firstErr))
 		}
 		return nil, opts, firstErr
+	}
+	if err := budget.Candidates(preparedProviders); err != nil {
+		return nil, opts, err
 	}
 	return preparedProviders, preparedOpts, nil
 }

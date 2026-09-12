@@ -561,6 +561,7 @@ nonstream-keepalive-interval: 0
 # images:
 #   codex-model: "gpt-5.4"          # Outer Responses model used to invoke the image tool.
 #   image-model: "gpt-image-2"      # Default when the request omits model; retained for older configurations.
+#   codex-request-timeout-seconds: 0 # Logical image request budget for Codex tool/native paths (0 disables; 1-86400 seconds). Retries and n share one start time.
 #   image-models: ["gpt-image-2", "gpt-image-2.5", "gpt-image-2.5-flare", "gpt-image-2.5-sunburst"] # Codex tool models; the requested model is forwarded, not rotated.
 #   enable-free-plan-image-model: false # Allow Codex free-plan auths to register/use the image model.
 #   enable-n-aggregation: false     # Split n > 1 into multiple Codex image calls and aggregate results.
@@ -599,6 +600,7 @@ nonstream-keepalive-interval: 0
 #     poll-concurrency: 64              # Concurrent poll HTTP requests (recommended: 1-512); sleeping tasks hold no slot.
 #     poll-stall-breaker-enabled: true  # Reject new Web image attempts when every poll slot stops completing requests.
 #     poll-stall-seconds: 120           # Full-slot no-completion interval before the breaker opens (30-3600 seconds).
+#     request-timeout-seconds: 0       # Total Web image budget including queues, requirements, upload, stream, poll, download and processing. 0 disables; 1-86400 seconds. Hot reload affects new requests only. Expiry cancels work and defaults to 504; the upstream may still finish the image.
 #     memory-finalizer-concurrency: 1   # Disk-spooled heavy finalizers (recommended: 1-64), also bounded by staging and memory.
 #   native:
 #     generations:

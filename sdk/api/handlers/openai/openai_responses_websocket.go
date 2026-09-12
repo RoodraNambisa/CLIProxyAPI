@@ -276,7 +276,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		updatedLastRequest = bytes.Clone(requestJSON)
 
 		modelName := gjson.GetBytes(requestJSON, "model").String()
-		cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
+		cliCtx, cliCancel := h.GetImageContextWithCancel(h, c, context.Background(), requestJSON)
 		cliCtx = cliproxyexecutor.WithDownstreamWebsocket(cliCtx)
 		if strings.TrimSpace(gjson.GetBytes(requestJSON, "previous_response_id").String()) != "" {
 			cliCtx = cliproxyexecutor.WithRequiredUpstreamWebsocket(cliCtx)

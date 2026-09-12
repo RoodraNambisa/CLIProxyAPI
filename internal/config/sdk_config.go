@@ -169,6 +169,8 @@ type StreamingConfig struct {
 
 // ImagesConfig holds OpenAI Images compatibility configuration.
 type ImagesConfig struct {
+	// CodexRequestTimeoutSeconds bounds the logical Codex image request, including tool/native retries.
+	CodexRequestTimeoutSeconds int `yaml:"codex-request-timeout-seconds" json:"codex-request-timeout-seconds"`
 	// CodexModel is the outer Responses model used to invoke the Codex image_generation tool.
 	CodexModel string `yaml:"codex-model,omitempty" json:"codex-model,omitempty"`
 	// ImageModel is the default when an Images API request omits its model.
@@ -205,6 +207,8 @@ type ImagesConfig struct {
 
 // ChatGPTWebImageConfig controls the ChatGPT Web image compatibility path.
 type ChatGPTWebImageConfig struct {
+	// RequestTimeoutSeconds bounds one logical Web image request; zero disables the budget.
+	RequestTimeoutSeconds int `yaml:"request-timeout-seconds" json:"request-timeout-seconds"`
 	// ImageModels lists public aliases for the shared Web image capability, not upstream engines.
 	ImageModels []string `yaml:"image-models,omitempty" json:"image-models,omitempty"`
 	// UpstreamModel is the ChatGPT Web conversation model that invokes picture_v2.
@@ -472,6 +476,9 @@ func (cfg ChatGPTWebImageConfig) Resolved() ResolvedChatGPTWebImageConfig {
 
 // Validate rejects invalid ChatGPT Web image compatibility settings.
 func (cfg ChatGPTWebImageConfig) Validate() error {
+	if cfg.RequestTimeoutSeconds < 0 || cfg.RequestTimeoutSeconds > MaxImageRequestTimeoutSeconds {
+		return fmt.Errorf("images.chatgpt-web.request-timeout-seconds must be between 0 and %d", MaxImageRequestTimeoutSeconds)
+	}
 	resolved := cfg.Resolved()
 	if math.IsNaN(resolved.AspectRatioMaxErrorPercent) || math.IsInf(resolved.AspectRatioMaxErrorPercent, 0) ||
 		resolved.AspectRatioMaxErrorPercent < 0 ||

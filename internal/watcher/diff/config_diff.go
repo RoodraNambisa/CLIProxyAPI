@@ -444,6 +444,12 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	if oldImageRuntime.PollStallBreakerEnabled != newImageRuntime.PollStallBreakerEnabled {
 		changes = append(changes, fmt.Sprintf("images.chatgpt-web.poll-stall-breaker-enabled: %t -> %t", oldImageRuntime.PollStallBreakerEnabled, newImageRuntime.PollStallBreakerEnabled))
 	}
+	if oldCfg.Images.CodexRequestTimeoutSeconds != newCfg.Images.CodexRequestTimeoutSeconds {
+		changes = append(changes, fmt.Sprintf("images.codex-request-timeout-seconds: %d -> %d", oldCfg.Images.CodexRequestTimeoutSeconds, newCfg.Images.CodexRequestTimeoutSeconds))
+	}
+	if oldCfg.Images.ChatGPTWeb.RequestTimeoutSeconds != newCfg.Images.ChatGPTWeb.RequestTimeoutSeconds {
+		changes = append(changes, fmt.Sprintf("images.chatgpt-web.request-timeout-seconds: %d -> %d", oldCfg.Images.ChatGPTWeb.RequestTimeoutSeconds, newCfg.Images.ChatGPTWeb.RequestTimeoutSeconds))
+	}
 	if oldImageRuntime.PollStallSeconds != newImageRuntime.PollStallSeconds {
 		changes = append(changes, fmt.Sprintf("images.chatgpt-web.poll-stall-seconds: %d -> %d", oldImageRuntime.PollStallSeconds, newImageRuntime.PollStallSeconds))
 	}

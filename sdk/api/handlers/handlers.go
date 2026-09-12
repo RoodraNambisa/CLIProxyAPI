@@ -651,6 +651,9 @@ func requestExecutionMetadata(ctx context.Context) map[string]any {
 	key := ""
 	requestPath := ""
 	meta := make(map[string]any)
+	if budget := coreexecutor.ImageRequestBudgetFromContext(ctx); budget != nil {
+		meta[coreexecutor.ImageRequestBudgetMetadataKey] = budget
+	}
 	if ctx != nil {
 		if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
 			key = strings.TrimSpace(ginCtx.GetHeader("Idempotency-Key"))
@@ -957,7 +960,12 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
 	newCtx = executorhelps.CaptureCodexMultiAgentPolicyContext(newCtx)
 	newCtx = context.WithValue(newCtx, "handler", handler)
 	newCtx, _ = ensureErrorResponseSourceTracker(newCtx, c)
+	releaseBudget := func() {}
+	if budget := imageRequestBudgetForGin(c); budget != nil {
+		newCtx, releaseBudget = budget.Bind(newCtx)
+	}
 	return newCtx, func(params ...interface{}) {
+		defer releaseBudget()
 		if h.Cfg.RequestLog && len(params) == 1 {
 			if existing, exists := c.Get("API_RESPONSE"); exists {
 				if existingBytes, ok := existing.([]byte); ok && len(bytes.TrimSpace(existingBytes)) > 0 {
@@ -1109,6 +1117,7 @@ func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType
 	}
 	opts.Metadata = reqMeta
 	resp, err := h.AuthManager.Execute(ctx, providers, req, opts)
+	err = coreexecutor.ImageRequestContextError(ctx, err)
 	if err != nil {
 		if strictErr := chatGPTWebStrictImageSizeUnavailableError(ctx, err); strictErr != nil {
 			return nil, nil, strictErr
@@ -1170,6 +1179,7 @@ func (h *BaseAPIHandler) ExecuteWithProvidersAndExecutionModel(ctx context.Conte
 	}
 	opts.Metadata = reqMeta
 	resp, err := h.AuthManager.Execute(ctx, providers, req, opts)
+	err = coreexecutor.ImageRequestContextError(ctx, err)
 	if err != nil {
 		if strictErr := chatGPTWebStrictImageSizeUnavailableError(ctx, err); strictErr != nil {
 			return nil, nil, strictErr
@@ -1325,6 +1335,7 @@ func (h *BaseAPIHandler) executeStreamWithResolvedProviders(ctx context.Context,
 	opts.Metadata = reqMeta
 	allowRequestErrorRetry := h.AuthManager.SnapshotRequestErrorRetryPolicy(ctx)
 	streamResult, err := h.AuthManager.ExecuteStream(ctx, providers, req, opts)
+	err = coreexecutor.ImageRequestContextError(ctx, err)
 	if err != nil {
 		errChan := make(chan *interfaces.ErrorMessage, 1)
 		if strictErr := chatGPTWebStrictImageSizeUnavailableError(ctx, err); strictErr != nil {
@@ -1360,9 +1371,21 @@ func (h *BaseAPIHandler) executeStreamWithResolvedProviders(ctx context.Context,
 		sentPayload := false
 		bootstrapRetries := 0
 		maxBootstrapRetries := StreamingBootstrapRetries(h.Cfg)
+		errorSent := false
+		defer func() {
+			if msg := h.ImageRequestTimeoutResponse(ctx); msg != nil && !errorSent {
+				publishHeaders()
+				errChan <- msg
+			}
+		}()
 
 		sendErr := func(msg *interfaces.ErrorMessage) bool {
 			publishHeaders()
+			if timeout := h.ImageRequestTimeoutResponse(ctx); timeout != nil {
+				errChan <- timeout
+				errorSent = true
+				return true
+			}
 			if ctx == nil {
 				errChan <- msg
 				return true
@@ -1371,6 +1394,7 @@ func (h *BaseAPIHandler) executeStreamWithResolvedProviders(ctx context.Context,
 			case <-ctx.Done():
 				return false
 			case errChan <- msg:
+				errorSent = true
 				return true
 			}
 		}
@@ -1390,6 +1414,9 @@ func (h *BaseAPIHandler) executeStreamWithResolvedProviders(ctx context.Context,
 		}
 
 		bootstrapEligible := func(err error) bool {
+			if coreexecutor.IsImageRequestTimeout(err) || coreexecutor.ImageRequestContextError(ctx, nil) != nil {
+				return false
+			}
 			status := statusFromError(err)
 			if status == 0 {
 				return true

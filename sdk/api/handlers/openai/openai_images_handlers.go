@@ -367,6 +367,8 @@ func (e imageUnsupportedError) Unwrap() error {
 
 // Generations handles POST /v1/images/generations.
 func (h *OpenAIImagesAPIHandler) Generations(c *gin.Context) {
+	finishBudget := h.BeginImageRequestBudget(c)
+	defer finishBudget()
 	h.BeginChatGPTWebImageErrorSanitization(c, false)
 	finishTrace := beginImageRequestTrace(c)
 	defer finishTrace()
@@ -408,6 +410,8 @@ func (h *OpenAIImagesAPIHandler) Generations(c *gin.Context) {
 
 // Edits handles POST /v1/images/edits.
 func (h *OpenAIImagesAPIHandler) Edits(c *gin.Context) {
+	finishBudget := h.BeginImageRequestBudget(c)
+	defer finishBudget()
 	h.BeginChatGPTWebImageErrorSanitization(c, false)
 	finishTrace := beginImageRequestTrace(c)
 	defer finishTrace()
@@ -828,6 +832,10 @@ func (h *OpenAIImagesAPIHandler) handleNonStreamingImagesResponse(c *gin.Context
 		count = 1
 	}
 	for i := 0; i < count && len(combined.Data) < count; i++ {
+		if timeout := h.ImageRequestTimeoutResponseForGin(c); timeout != nil {
+			h.WriteErrorResponse(c, timeout)
+			return
+		}
 		remaining := count - len(combined.Data)
 		iterationImageConfig := imageConfig
 		if responseByteLimit > 0 {
@@ -858,6 +866,11 @@ func (h *OpenAIImagesAPIHandler) handleNonStreamingImagesResponse(c *gin.Context
 			return
 		}
 		parsed, err := parseResponsesToImagesResponse(resp, time.Now().Unix())
+		if timeout := h.ImageRequestTimeoutResponse(cliCtx); timeout != nil {
+			h.WriteErrorResponse(c, timeout)
+			cliCancel(timeout.Error)
+			return
+		}
 		if err != nil {
 			h.WriteErrorResponse(c, h.RewriteExecutionErrorResponseForContext(cliCtx, imageConversionErrorMessage(markChatGPTWebImageProcessingError(err, webImageRoute))))
 			cliCancel(err)
@@ -900,6 +913,10 @@ func (h *OpenAIImagesAPIHandler) handleNonStreamingImagesResponse(c *gin.Context
 	encodeStarted := time.Now()
 	imagesPayload, err := json.Marshal(combined)
 	observeImageRequestPhase(c, coreexecutor.ImagePhaseResponseEncode, encodeStarted)
+	if timeout := h.ImageRequestTimeoutResponseForGin(c); timeout != nil {
+		h.WriteErrorResponse(c, timeout)
+		return
+	}
 	if err != nil {
 		h.writeImagesError(c, http.StatusInternalServerError, markChatGPTWebImageProcessingError(err, webImageRoute))
 		return
@@ -940,6 +957,7 @@ func (h *OpenAIImagesAPIHandler) handleStreamingImagesResponse(c *gin.Context, r
 		responseByteLimit = imageResponseByteLimit(imageConfig)
 	}
 	mapper := &imageStreamMapper{
+		requestContext:        cliCtx,
 		nativeRequest:         nativeImageRequest(c),
 		operation:             op,
 		responseFormat:        responseFormat,
@@ -1055,6 +1073,7 @@ func (h *OpenAIImagesAPIHandler) handleMultiStreamingImagesResponse(c *gin.Conte
 			handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
 		}
 		mapper := &imageStreamMapper{
+			requestContext:        cliCtx,
 			nativeRequest:         nativeImageRequest(c),
 			operation:             op,
 			omitInputUsage:        i > 0,
@@ -2116,6 +2135,7 @@ func mergeImageUsageValue(current, next any) any {
 }
 
 type imageStreamMapper struct {
+	requestContext        context.Context
 	nativeRequest         *coreexecutor.CodexNativeImageRequest
 	operation             imageOperation
 	parser                imageSSEParser
@@ -2134,6 +2154,9 @@ type imageStreamMapper struct {
 }
 
 func (m *imageStreamMapper) writeChunk(w io.Writer, chunk []byte) {
+	if m != nil && coreexecutor.ImageRequestContextError(m.requestContext, nil) != nil {
+		return
+	}
 	if m != nil && m.nativeRequest.NativeResponse() {
 		_, _ = w.Write(chunk)
 		m.forceFlush = true
@@ -2167,6 +2190,9 @@ func (m *imageStreamMapper) consumeForceFlush() bool {
 }
 
 func (m *imageStreamMapper) flush(w io.Writer) {
+	if m != nil && coreexecutor.ImageRequestContextError(m.requestContext, nil) != nil {
+		return
+	}
 	if m != nil && m.nativeRequest.NativeResponse() {
 		// The native executor already validates terminal frames and reports
 		// incomplete streams through StreamChunk.Err.
@@ -2264,6 +2290,9 @@ func (m *imageStreamMapper) writePayload(w io.Writer, payload []byte) {
 func (m *imageStreamMapper) fatalError() error {
 	if m == nil {
 		return nil
+	}
+	if timeout := coreexecutor.ImageRequestContextError(m.requestContext, nil); timeout != nil {
+		return timeout
 	}
 	return markChatGPTWebImageProcessingError(m.fatalErr, m.projectWebImageErrors)
 }
@@ -2582,6 +2611,9 @@ func (m *imageStreamMapper) writeSSE(w io.Writer, eventName string, payload imag
 	}
 	data, err := json.Marshal(payload)
 	if err != nil {
+		return
+	}
+	if coreexecutor.ImageRequestContextError(m.requestContext, nil) != nil {
 		return
 	}
 	_, _ = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", eventName, string(data))
@@ -3007,6 +3039,10 @@ func (h *OpenAIImagesAPIHandler) writeImagesRequestError(c *gin.Context, err err
 }
 
 func (h *OpenAIImagesAPIHandler) writeImagesError(c *gin.Context, status int, err error) {
+	if timeout := h.ImageRequestTimeoutResponseForGin(c); timeout != nil {
+		h.WriteErrorResponse(c, timeout)
+		return
+	}
 	h.WriteErrorResponse(c, &interfaces.ErrorMessage{StatusCode: status, Error: err})
 }
 

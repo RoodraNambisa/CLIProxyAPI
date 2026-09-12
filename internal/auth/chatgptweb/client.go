@@ -39,6 +39,7 @@ type Client struct {
 	beforeRequestMu    sync.RWMutex
 	beforeRequest      func()
 	beforeRequestOnce  sync.Once
+	requestCancelStop  func() bool
 }
 
 const defaultPollCancellationGrace = 2 * time.Second
@@ -78,6 +79,25 @@ func NewClient(persona Persona, proxyURL string, cookies []Cookie) (*Client, err
 	return newClient(persona, proxyURL, cookies, 0)
 }
 
+// NewRequestClient owns its transports for one cancellable logical request.
+// No socket deadline is installed; cancellation closes only this client's sockets.
+func NewRequestClient(ctx context.Context, persona Persona, proxyURL string, cookies []Cookie, sendSessionCookies bool) (*Client, error) {
+	client, err := newClientWithSessionCookiePolicy(persona, proxyURL, cookies, 0, sendSessionCookies, true)
+	if err != nil {
+		return nil, err
+	}
+	client.requestCancelStop = context.AfterFunc(ctx, func() {
+		client.CloseActiveAcquisitionConnections()
+		client.pollMu.Lock()
+		poll := client.pollTransport
+		client.pollMu.Unlock()
+		if poll != nil {
+			client.retirePollTransport(poll.generation)
+		}
+	})
+	return client, nil
+}
+
 func NewAcquisitionClient(persona Persona, proxyURL string, cookies []Cookie, timeout time.Duration) (*Client, error) {
 	if timeout <= 0 {
 		timeout = DefaultAcquisitionTimeout
@@ -110,6 +130,7 @@ func newClientWithSessionCookiePolicy(
 	cookies []Cookie,
 	timeout time.Duration,
 	sendSessionCookies bool,
+	trackRequest ...bool,
 ) (*Client, error) {
 	persona = canonicalPersona(persona)
 	proxyURL = strings.TrimSpace(proxyURL)
@@ -125,11 +146,11 @@ func newClientWithSessionCookiePolicy(
 		jar = &accessTokenCookieJar{delegate: baseJar}
 	}
 	var acquisitionTracker *connectionTracker
-	if timeout > 0 {
+	if timeout > 0 || (len(trackRequest) > 0 && trackRequest[0]) {
 		acquisitionTracker = newConnectionTracker()
 	}
 	newHTTPClient := func(followRedirect bool) (tls_client.HttpClient, error) {
-		return newBrowserHTTPClient(profile, jar, proxyURL, timeout, followRedirect, acquisitionTracker, acquisitionTracker != nil)
+		return newBrowserHTTPClient(profile, jar, proxyURL, timeout, followRedirect, acquisitionTracker, timeout > 0)
 	}
 
 	follow, err := newHTTPClient(true)
@@ -237,6 +258,8 @@ func (client *Client) Persona() Persona {
 	return client.persona
 }
 
+func (client *Client) RequestScoped() bool { return client != nil && client.requestCancelStop != nil }
+
 func (client *Client) ProxyURL() string {
 	if client == nil {
 		return ""
@@ -247,6 +270,9 @@ func (client *Client) ProxyURL() string {
 func (client *Client) CloseIdleConnections() {
 	if client == nil {
 		return
+	}
+	if client.requestCancelStop != nil {
+		client.requestCancelStop()
 	}
 	if client.follow != nil {
 		client.follow.CloseIdleConnections()
@@ -398,15 +424,23 @@ func (control *pollRequestControl) cancel() {
 	control.canceled = true
 	body := control.body
 	control.mu.Unlock()
+	// Arm retirement before Close: a broken HTTP/2 body may block in Close too.
+	retired := make(chan struct{})
+	timer := time.AfterFunc(control.grace, func() {
+		select {
+		case <-control.done:
+		default:
+			control.client.retirePollTransport(control.generation)
+		}
+		close(retired)
+	})
+	defer timer.Stop()
 	if body != nil {
 		_ = body.Close()
 	}
-	timer := time.NewTimer(control.grace)
-	defer timer.Stop()
 	select {
 	case <-control.done:
-	case <-timer.C:
-		control.client.retirePollTransport(control.generation)
+	case <-retired:
 	}
 }
 

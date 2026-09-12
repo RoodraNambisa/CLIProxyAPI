@@ -4,6 +4,8 @@ import (
 	"context"
 	"net/http"
 	"strings"
+
+	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 )
 
 // ResolvedProxy is the request-time proxy decision for one credential.
@@ -45,6 +47,9 @@ func (m *Manager) SetProxyResolver(resolver ProxyResolver) {
 func (m *Manager) ResolveProxyAuth(ctx context.Context, auth *Auth) (*Auth, error) {
 	if auth == nil {
 		return nil, nil
+	}
+	if err := executor.ImageRequestBudgetFromContext(ctx).Select(auth.Provider); err != nil {
+		return auth, err
 	}
 	m.mu.RLock()
 	resolver := m.proxyResolver
@@ -212,6 +217,9 @@ func (m *Manager) HoldProxyBinding(authID string) func() {
 }
 
 func (m *Manager) reportProxyFailure(ctx context.Context, auth *Auth, err error) error {
+	if timeout := executor.ImageRequestContextError(ctx, err); executor.IsImageRequestTimeout(timeout) {
+		return timeout
+	}
 	if m == nil || auth == nil || err == nil || auth.EffectiveProxyBindingID() == "" {
 		return err
 	}
