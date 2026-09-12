@@ -474,6 +474,7 @@ func (h authMaintenanceHook) handleAuthChange(ctx context.Context, auth *coreaut
 	}
 	registryAction := chatGPTWebRegistryStateNone
 	antigravityProviderChanged := false
+	antigravityInitialRegistration := false
 	if nativeChatGPTWeb {
 		if coreauth.ChatGPTWebCredentialRefreshed(ctx) {
 			h.service.migrateOpaqueChatGPTWebCatalogAfterRefreshLocked(auth)
@@ -503,11 +504,16 @@ func (h authMaintenanceHook) handleAuthChange(ctx context.Context, auth *coreaut
 		if antigravityProviderChanged {
 			GlobalModelRegistry().UnregisterClient(auth.ID)
 		}
+		if registeredProvider == "" && h.service.coreManager != nil {
+			// Base routing must not wait for the background capability queue.
+			h.service.registerModelsForAuth(auth)
+			antigravityInitialRegistration = true
+		}
 	}
 	unlockTransition()
 	if nativeChatGPTWeb {
 		h.service.applyChatGPTWebRegistryState(ctx, auth, registryAction)
-	} else if antigravityProviderChanged && h.service.coreManager != nil {
+	} else if (antigravityProviderChanged || antigravityInitialRegistration) && h.service.coreManager != nil {
 		h.service.coreManager.ReconcileRegistryModelStatesIfCurrent(ctx, auth)
 		h.service.coreManager.RefreshSchedulerEntry(auth.ID)
 	}

@@ -11,7 +11,9 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	sdkauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
@@ -175,5 +177,46 @@ func TestBootstrapRetainsCodexExecutorAndSkipsDisabledProvider(t *testing.T) {
 	}
 	if _, registered := manager.Executor("claude"); registered {
 		t.Fatal("disabled credential registered a provider executor")
+	}
+}
+
+func TestBootstrapRegistersBaseModelsBeforeBackgroundModelSync(t *testing.T) {
+	manager := coreauth.NewManager(nil, nil, nil)
+	service := &Service{cfg: &config.Config{}, coreManager: manager}
+	auth := &coreauth.Auth{ID: "bootstrap-antigravity-base", Provider: "antigravity", Status: coreauth.StatusActive}
+	if _, err := manager.Register(t.Context(), auth); err != nil {
+		t.Fatal(err)
+	}
+	loaded := make(chan struct{}, 1)
+	release := make(chan struct{})
+	service.modelSyncAuthLoadedObserved = func(*coreauth.Auth) {
+		select {
+		case loaded <- struct{}{}:
+		default:
+		}
+		<-release
+	}
+	service.startModelSyncLoop(t.Context())
+	t.Cleanup(func() {
+		close(release)
+		service.stopModelSyncLoop()
+		GlobalModelRegistry().UnregisterClient(auth.ID)
+		if err := manager.CloseExecutors(); err != nil {
+			t.Error(err)
+		}
+	})
+	service.installAuthMaintenanceHook(t.Context())
+	select {
+	case <-loaded:
+	case <-time.After(time.Second):
+		t.Fatal("background model sync did not start")
+	}
+	models := registry.GetGlobalRegistry().GetModelsForClient(auth.ID)
+	if len(models) == 0 {
+		t.Fatal("initial routes depend on completion of background model sync")
+	}
+	diagnostics := manager.RoutingDiagnostics(auth.Provider, models[0].ID, time.Now())
+	if len(diagnostics.Priorities) != 1 || diagnostics.Priorities[0].EligibleNow != 1 {
+		t.Fatal("base models were not published to the scheduler before startup completed")
 	}
 }

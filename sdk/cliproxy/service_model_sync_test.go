@@ -1501,6 +1501,9 @@ func TestAuthMaintenanceHookQueuesOverflowWhenModelSyncQueueIsFull(t *testing.T)
 	service.modelSyncQueue = make(chan string, 1)
 	service.modelSyncQueue <- "busy"
 	service.modelSyncPending = make(map[string]modelSyncTaskState)
+	service.modelSyncAuthLoadedObserved = func(*coreauth.Auth) {
+		t.Error("queue-full hook ran background capability sync inline")
+	}
 	auth := &coreauth.Auth{ID: "service-antigravity-full-sync-queue", Provider: "antigravity", Status: coreauth.StatusActive}
 	if _, errRegister := service.coreManager.Register(ctx, auth); errRegister != nil {
 		t.Fatalf("register auth: %v", errRegister)
@@ -1515,8 +1518,8 @@ func TestAuthMaintenanceHookQueuesOverflowWhenModelSyncQueueIsFull(t *testing.T)
 	if len(service.modelSyncOverflow) != 1 || service.modelSyncOverflow[0] != auth.ID {
 		t.Fatalf("model sync overflow = %v, want [%q]", service.modelSyncOverflow, auth.ID)
 	}
-	if models := registry.GetGlobalRegistry().GetModelsForClient(auth.ID); len(models) != 0 {
-		t.Fatal("queue-full hook unexpectedly ran model sync inline")
+	if models := registry.GetGlobalRegistry().GetModelsForClient(auth.ID); len(models) == 0 {
+		t.Fatal("queue-full hook did not publish base models")
 	}
 }
 
