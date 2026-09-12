@@ -19,6 +19,59 @@ import (
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 )
 
+func TestAuthFilesEffectiveZeroPriorityFiltering(t *testing.T) {
+	h, manager, authDir := newAuthFilesPaginationTestHandler(t, true)
+	registerAuthFilesPaginationTestAuth(t, manager, authDir, "default.json", "codex", false, "", 0, false, "free")
+	registerAuthFilesPaginationTestAuth(t, manager, authDir, "explicit.json", "codex", false, "", 0, true, "plus")
+	registerAuthFilesPaginationTestAuth(t, manager, authDir, "negative.json", "codex", false, "", -1, true, "pro")
+	router := gin.New()
+	router.GET("/auth-files", h.ListAuthFiles)
+	router.GET("/auth-files/selection", h.ListAuthFileSelection)
+	for _, value := range []string{"0", "__unset__", "%2B0", "-0"} {
+		var page struct {
+			Files      []map[string]any            `json:"files"`
+			Total      int                         `json:"total"`
+			Pagination authFilesPaginationResponse `json:"pagination"`
+			Facets     authFilesFacetsResponse     `json:"facets"`
+		}
+		decodeAuthFilesPaginationResponse(t, performAuthFilesPaginationRequest(router, "/auth-files?paged=true&page=1&page_size=1&sort=az&priority="+value), &page)
+		if page.Total != 2 || page.Pagination.TotalPages != 2 || strings.Join(authFilesPaginationNames(page.Files), ",") != "default.json" {
+			t.Fatalf("priority %s lost default-zero pagination", value)
+		}
+		zeroCount := 0
+		for _, facet := range page.Facets.Priorities {
+			if facet.Value == "__unset__" {
+				t.Fatal("unset priority must not form a separate facet")
+			}
+			if facet.Value == "0" {
+				zeroCount = facet.Count
+			}
+		}
+		if zeroCount != 2 || len(page.Facets.Plans) != 2 {
+			t.Fatal("effective-zero facets did not include both credentials")
+		}
+		var selection struct {
+			Files []map[string]any `json:"files"`
+			Total int              `json:"total"`
+		}
+		decodeAuthFilesPaginationResponse(t, performAuthFilesPaginationRequest(router, "/auth-files/selection?sort=az&priority="+value), &selection)
+		if selection.Total != 2 || strings.Join(authFilesPaginationNames(selection.Files), ",") != "default.json,explicit.json" {
+			t.Fatal("bulk selection disagrees with effective-zero pagination")
+		}
+	}
+	var negative struct {
+		Total int `json:"total"`
+	}
+	decodeAuthFilesPaginationResponse(t, performAuthFilesPaginationRequest(router, "/auth-files?paged=true&priority=-1"), &negative)
+	if negative.Total != 1 {
+		t.Fatal("negative priority filtering changed")
+	}
+	missing, _ := manager.GetByID("default.json")
+	if _, exists := missing.Metadata["priority"]; exists {
+		t.Fatal("reading effective priority must not write a configured value")
+	}
+}
+
 func TestAuthFilesPaginationNegotiationFilteringAndSelection(t *testing.T) {
 	h, manager, authDir := newAuthFilesPaginationTestHandler(t, false)
 	registerAuthFilesPaginationTestAuth(t, manager, authDir, "alpha.json", "codex", false, "", 2, true, "plus")
@@ -355,7 +408,6 @@ func BenchmarkAuthFilesPaginationFilterAndSort10000(b *testing.B) {
 			id:           strconv.Itoa(index),
 			provider:     []string{"codex", "chatgpt-web", "claude", "xai"}[index%4],
 			priority:     index % 10,
-			prioritySet:  true,
 			searchValues: []string{"auth", strconv.Itoa(index)},
 		}
 	}

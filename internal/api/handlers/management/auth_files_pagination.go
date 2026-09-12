@@ -68,7 +68,6 @@ type authFileListRecord struct {
 	provider     string
 	plan         string
 	priority     int
-	prioritySet  bool
 	disabled     bool
 	problem      bool
 	runtimeOnly  bool
@@ -322,10 +321,15 @@ func parseAuthFilesListQuery(c *gin.Context, pagination bool) (authFilesListQuer
 	default:
 		return query, fmt.Errorf("account_info_recovery_state is invalid")
 	}
-	if query.priority != "all" && query.priority != "__unset__" {
-		if _, errPriority := strconv.Atoi(query.priority); errPriority != nil {
+	if query.priority == "__unset__" {
+		query.priority = "0"
+	}
+	if query.priority != "all" {
+		priority, errPriority := strconv.Atoi(query.priority)
+		if errPriority != nil {
 			return query, fmt.Errorf("priority must be all, __unset__, or an integer")
 		}
+		query.priority = strconv.Itoa(priority)
 	}
 	query.sort = authFilesFilterValue(sortValue, "default")
 	switch query.sort {
@@ -603,7 +607,7 @@ func authFileRecordForAuth(auth *coreauth.Auth, name string, runtimeOnly bool) *
 		plan = strings.TrimSpace(stringValue(auth.Metadata, "plan_type"))
 	}
 	plan = strings.ToLower(plan)
-	priority, prioritySet := authFilePriority(auth)
+	priority, _ := authFilePriority(auth)
 	note := authFileNote(auth)
 	searchValues := []string{name, provider, plan, string(auth.Status), note, statusMessage, authEmail(auth)}
 	if auth.LastError != nil {
@@ -616,7 +620,6 @@ func authFileRecordForAuth(auth *coreauth.Auth, name string, runtimeOnly bool) *
 		provider:     provider,
 		plan:         plan,
 		priority:     priority,
-		prioritySet:  prioritySet,
 		disabled:     auth.Disabled,
 		problem:      strings.TrimSpace(statusMessage) != "",
 		runtimeOnly:  runtimeOnly,
@@ -715,16 +718,8 @@ func filterAuthFileRecords(records []*authFileListRecord, query authFilesListQue
 		if query.plan != "all" && record.plan != query.plan {
 			continue
 		}
-		switch query.priority {
-		case "all":
-		case "__unset__":
-			if record.prioritySet {
-				continue
-			}
-		default:
-			if !record.prioritySet || strconv.Itoa(record.priority) != query.priority {
-				continue
-			}
+		if query.priority != "all" && strconv.Itoa(record.priority) != query.priority {
+			continue
 		}
 		if !authFileRecordMatchesSearch(record, query) {
 			continue
@@ -782,10 +777,7 @@ func buildAuthFilesFacets(records []*authFileListRecord, priorityFilter string) 
 		if record.provider != "" {
 			providerCounts[record.provider]++
 		}
-		priorityKey := "__unset__"
-		if record.prioritySet {
-			priorityKey = strconv.Itoa(record.priority)
-		}
+		priorityKey := strconv.Itoa(record.priority)
 		priorityCounts[priorityKey]++
 		priorityMatches := priorityFilter == "all" || priorityFilter == priorityKey
 		if priorityMatches && record.plan != "" {
