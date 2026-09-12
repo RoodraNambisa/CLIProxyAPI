@@ -34,6 +34,7 @@ func populateUsageFailure(ctx context.Context, record *usage.Record, cause error
 		return text
 	}
 	record.RequestID = safe(logging.GetRequestID(ctx), 128)
+	record.UpstreamRequestID = safe(record.UpstreamRequestID, 128)
 	if record.FailureStage == "" {
 		record.FailureStage = "execution"
 		if executor.IsUpstreamAttemptError(executor.ErrorFromUpstreamAttempt(ctx, cause)) || record.UpstreamCommitted {
@@ -149,7 +150,8 @@ func logUsageAttemptFailure(ctx context.Context, record usage.Record) {
 	fields := log.Fields{
 		"request_id": record.RequestID, "provider": record.Provider, "auth_index": record.AuthIndex,
 		"stage": record.FailureStage, "code": record.ErrorCode, "status": record.StatusCode,
-		"error_type": record.ErrorType,
+		"error_type":      record.ErrorType,
+		"upstream_status": record.UpstreamStatusCode, "upstream_request_id": record.UpstreamRequestID,
 	}
 	if record.ErrorResponse != "" {
 		fields["response_body"] = managementdiag.NewManagementOnlyValue(record.ErrorResponse)

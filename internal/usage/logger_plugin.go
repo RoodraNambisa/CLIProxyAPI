@@ -191,6 +191,7 @@ type RequestDetail struct {
 	FailureStage            string     `json:"failure_stage,omitempty"`
 	ErrorCode               string     `json:"error_code,omitempty"`
 	StatusCode              int        `json:"status_code,omitempty"`
+	UpstreamStatusCode      int        `json:"upstream_status_code,omitempty"`
 	ErrorType               string     `json:"error_type,omitempty"`
 	ErrorMessage            string     `json:"error_message,omitempty"`
 	ErrorResponse           string     `json:"error_response,omitempty"`
@@ -325,6 +326,7 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 		FailureStage:            strings.TrimSpace(record.FailureStage),
 		ErrorCode:               strings.TrimSpace(record.ErrorCode),
 		StatusCode:              record.StatusCode,
+		UpstreamStatusCode:      record.UpstreamStatusCode,
 		ErrorType:               record.ErrorType,
 		ErrorMessage:            record.ErrorMessage,
 		ErrorResponse:           record.ErrorResponse,

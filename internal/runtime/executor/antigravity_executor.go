@@ -1444,7 +1444,7 @@ attemptLoop:
 				}
 				if errScan := scanner.Err(); errScan != nil {
 					helps.RecordAPIResponseError(ctx, e.cfg, errScan)
-					reporter.PublishFailure(ctx)
+					reporter.PublishFailure(ctx, errScan)
 					out <- cliproxyexecutor.StreamChunk{Err: errScan}
 				} else {
 					reporter.EnsurePublished(ctx)
@@ -2018,7 +2018,7 @@ attemptLoop:
 				}
 				if errScan := scanner.Err(); errScan != nil {
 					helps.RecordAPIResponseError(ctx, e.cfg, errScan)
-					reporter.PublishFailure(ctx)
+					reporter.PublishFailure(ctx, errScan)
 					send(cliproxyexecutor.StreamChunk{Err: errScan})
 				} else if terminalSeen && !protocolFailed {
 					tail := multiAgentResponse.TranslateStream(ctx, to, from, req.Model, originalRef.Bytes(), translatedRef.Bytes(), []byte("[DONE]"), &param)

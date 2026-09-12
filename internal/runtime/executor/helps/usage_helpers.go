@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"net/http"
 	"strings"
 	"sync"
 	"time"
@@ -41,6 +42,8 @@ type UsageReporter struct {
 	requestUsageOutcome  *cliproxyexecutor.RequestUsageOutcome
 	requestUsageAttempt  *cliproxyexecutor.RequestUsageAttempt
 	diagnosticSecrets    []string
+	upstreamStatusCode   int
+	upstreamRequestID    string
 }
 
 type observedModelUsage struct {
@@ -101,6 +104,26 @@ func NewUsageReporter(ctx context.Context, provider, model string, auth *cliprox
 func (r *UsageReporter) SetExecutionDiagnostics(diagnostics *cliproxyexecutor.RequestExecutionDiagnostics) {
 	if r != nil {
 		r.executionDiagnostics = diagnostics
+	}
+}
+
+// ObserveHTTPResponse records transport evidence for this attempt, not session-wide headers.
+func (r *UsageReporter) ObserveHTTPResponse(status int, headers http.Header) {
+	if r == nil {
+		return
+	}
+	requestID := ""
+	for _, name := range []string{"X-Request-Id", "Request-Id", "Openai-Request-Id"} {
+		if value := headers.Get(name); value != "" && len(value) <= 512 {
+			requestID = value
+			break
+		}
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.published {
+		r.upstreamStatusCode = status
+		r.upstreamRequestID = requestID
 	}
 }
 
@@ -397,6 +420,12 @@ func (r *UsageReporter) buildRecordForModel(model string, detail usage.Detail, f
 		record.CredentialSelected = diagnostics.CredentialSelected
 		record.UpstreamCommitted = diagnostics.UpstreamCommitted
 		record.AuthRequestSlotConsumed = diagnostics.AuthRequestSlotConsumed
+	}
+	if failed {
+		r.mu.Lock()
+		record.UpstreamStatusCode = r.upstreamStatusCode
+		record.UpstreamRequestID = r.upstreamRequestID
+		r.mu.Unlock()
 	}
 	return record
 }

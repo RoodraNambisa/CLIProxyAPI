@@ -141,6 +141,7 @@ func (e *CodexExecutor) executeOpenAIImage(ctx context.Context, auth *cliproxyau
 			log.Errorf("codex executor: close native image response body error: %v", errClose)
 		}
 	}()
+	reporter.ObserveHTTPResponse(httpResp.StatusCode, httpResp.Header)
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	maxResponseBytes := int64(codexOpenAIImageMaxResponseBytes)
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
@@ -216,6 +217,7 @@ func (e *CodexExecutor) executeOpenAIImageStream(ctx context.Context, auth *clip
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return nil, err
 	}
+	reporter.ObserveHTTPResponse(httpResp.StatusCode, httpResp.Header)
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		data, readErr := readCodexOpenAIImageResponseBody(httpResp.Body, codexOpenAIImageMaxErrorBytes)
@@ -352,7 +354,7 @@ func (e *CodexExecutor) executeOpenAIImageStream(ctx context.Context, auth *clip
 				return
 			}
 			helps.RecordAPIResponseError(ctx, e.cfg, readErr)
-			reporter.PublishFailure(ctx)
+			reporter.PublishFailure(ctx, readErr)
 			_ = emitCodexOpenAIImageStreamChunk(ctx, out, cliproxyexecutor.StreamChunk{Err: readErr})
 			return
 		}

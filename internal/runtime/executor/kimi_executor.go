@@ -357,7 +357,7 @@ func (e *KimiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 		}
 		if errScan := scanner.Err(); errScan != nil {
 			helps.RecordAPIResponseError(ctx, e.cfg, errScan)
-			reporter.PublishFailure(ctx)
+			reporter.PublishFailure(ctx, errScan)
 			out <- cliproxyexecutor.StreamChunk{Err: errScan}
 		} else if terminalSeen && !protocolFailed {
 			streamUsage.Publish(ctx, reporter)

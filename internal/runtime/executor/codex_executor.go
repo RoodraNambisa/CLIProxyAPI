@@ -991,6 +991,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		}
 	}()
 	helps.ObserveCodexHTTPQuota(ctx, auth, httpResp.Header)
+	reporter.ObserveHTTPResponse(httpResp.StatusCode, httpResp.Header)
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		b, _ := io.ReadAll(httpResp.Body)
@@ -1197,6 +1198,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 		}
 	}()
 	helps.ObserveCodexHTTPQuota(ctx, auth, httpResp.Header)
+	reporter.ObserveHTTPResponse(httpResp.StatusCode, httpResp.Header)
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		b, _ := io.ReadAll(httpResp.Body)
@@ -1359,6 +1361,7 @@ func (e *CodexExecutor) executeStream(ctx context.Context, auth *cliproxyauth.Au
 		return nil, err
 	}
 	helps.ObserveCodexHTTPQuota(ctx, auth, httpResp.Header)
+	reporter.ObserveHTTPResponse(httpResp.StatusCode, httpResp.Header)
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		defer cleanupBodies()
@@ -1666,7 +1669,7 @@ func (e *CodexExecutor) executeStream(ctx context.Context, auth *cliproxyauth.Au
 		}
 		if errScan := scanner.Err(); errScan != nil {
 			helps.RecordAPIResponseError(ctx, e.cfg, errScan)
-			reporter.PublishFailure(ctx)
+			reporter.PublishFailure(ctx, errScan)
 			_ = emit(cliproxyexecutor.StreamChunk{Err: errScan})
 		} else {
 			errIncomplete := helps.IncompleteStreamError("codex")

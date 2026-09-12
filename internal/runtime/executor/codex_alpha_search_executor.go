@@ -108,6 +108,7 @@ func (e *CodexExecutor) executeAlphaSearch(ctx context.Context, auth *cliproxyau
 		}
 	}()
 	helps.ObserveCodexHTTPQuota(ctx, auth, httpResp.Header)
+	reporter.ObserveHTTPResponse(httpResp.StatusCode, httpResp.Header)
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	data, err := io.ReadAll(io.LimitReader(httpResp.Body, helps.CodexAlphaSearchMaxResponseBytes+1))
 	if errContext := ctx.Err(); errContext != nil {
@@ -131,10 +132,10 @@ func (e *CodexExecutor) executeAlphaSearch(ctx context.Context, auth *cliproxyau
 	}
 	helps.AppendAPIResponseChunk(ctx, e.cfg, data)
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		if gjson.GetBytes(data, "usage").IsObject() {
-			reporter.PublishFailureWithUsage(ctx, helps.ParseOpenAIUsage(data))
-		}
 		upstreamErr := statusErr{code: httpResp.StatusCode, msg: string(data), skipAuthResult: isCodexContextTooLargeRequestError(httpResp.StatusCode, data)}
+		if gjson.GetBytes(data, "usage").IsObject() {
+			reporter.PublishFailureWithUsage(ctx, helps.ParseOpenAIUsage(data), upstreamErr)
+		}
 		upstreamErr.retryAfter = parseCodexRetryAfter(httpResp.StatusCode, data, time.Now())
 		if upstreamErr.retryAfter == nil {
 			upstreamErr.retryAfter = parseXAIRetryAfterHeader(httpResp.Header.Get("Retry-After"), time.Now())

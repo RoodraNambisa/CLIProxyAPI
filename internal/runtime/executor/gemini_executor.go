@@ -402,7 +402,7 @@ func (e *GeminiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		}
 		if errScan := scanner.Err(); errScan != nil {
 			helps.RecordAPIResponseError(ctx, e.cfg, errScan)
-			reporter.PublishFailure(ctx)
+			reporter.PublishFailure(ctx, errScan)
 			out <- cliproxyexecutor.StreamChunk{Err: errScan}
 		} else if terminalSeen && !protocolFailed {
 			lines := multiAgentResponse.TranslateStream(ctx, to, from, req.Model, originalRef.Bytes(), bodyRef.Bytes(), []byte("[DONE]"), &param)

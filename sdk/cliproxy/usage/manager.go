@@ -39,6 +39,7 @@ type Record struct {
 	FailureStage            string
 	ErrorCode               string
 	StatusCode              int
+	UpstreamStatusCode      int
 	ErrorType               string
 	ErrorMessage            string
 	ErrorResponse           string
