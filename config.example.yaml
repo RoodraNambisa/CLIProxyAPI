@@ -220,6 +220,7 @@ chatgpt-web:
 # Provider IDs are matched exactly after trimming and lowercasing; use "xai" for Grok credentials.
 # api-key-groups:
 #   - api-key: "your-api-key-1"
+#     name: "Work" # Optional display name; empty means unnamed, up to 100 Unicode characters, no control characters.
 #     providers: ["codex", "xai"]
 #     allowed-priorities: [1, 2]
 #     excluded-priorities: [2]

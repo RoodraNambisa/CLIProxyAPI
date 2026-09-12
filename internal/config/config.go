@@ -3909,6 +3909,10 @@ func normalizeAPIKeyGroups(groups []APIKeyGroup, apiKeys []string, pruneUnknown 
 		}
 		seenKeys[key] = struct{}{}
 
+		name, errName := NormalizeAPIKeyName(group.Name)
+		if errName != nil {
+			return nil, errName
+		}
 		providers := make([]string, 0, len(group.Providers))
 		seenProviders := make(map[string]struct{}, len(group.Providers))
 		unrestricted := false
@@ -3938,10 +3942,10 @@ func normalizeAPIKeyGroups(groups []APIKeyGroup, apiKeys []string, pruneUnknown 
 		if errExcluded != nil {
 			return nil, errExcluded
 		}
-		if len(providers) == 0 && len(allowed) == 0 && len(excluded) == 0 {
+		if name == "" && len(providers) == 0 && len(allowed) == 0 && len(excluded) == 0 {
 			continue
 		}
-		normalized = append(normalized, APIKeyGroup{APIKey: key, Providers: providers, AllowedPriorities: allowed, ExcludedPriorities: excluded})
+		normalized = append(normalized, APIKeyGroup{APIKey: key, Name: name, Providers: providers, AllowedPriorities: allowed, ExcludedPriorities: excluded})
 	}
 	if len(normalized) == 0 {
 		return nil, nil

@@ -186,7 +186,7 @@ func (h *Handler) GetAPIKeyGroups(c *gin.Context) {
 		priorities = append(priorities, group.ExcludedPriorities...)
 	}
 	slices.Sort(priorities)
-	c.JSON(http.StatusOK, gin.H{"api-key-groups": groups, "available-priorities": slices.Compact(priorities)})
+	c.JSON(http.StatusOK, gin.H{"api-key-groups": groups, "available-priorities": slices.Compact(priorities), "names-supported": true})
 }
 
 // PutAPIKeyGroups replaces all client API key access restrictions.
@@ -210,6 +210,7 @@ func (h *Handler) PutAPIKeyGroups(c *gin.Context) {
 func (h *Handler) PatchAPIKeyGroups(c *gin.Context) {
 	var patch struct {
 		APIKey    string          `json:"api-key"`
+		Name      json.RawMessage `json:"name"`
 		Providers json.RawMessage `json:"providers"`
 		Allowed   json.RawMessage `json:"allowed-priorities"`
 		Excluded  json.RawMessage `json:"excluded-priorities"`
@@ -231,6 +232,14 @@ func (h *Handler) PatchAPIKeyGroups(c *gin.Context) {
 		if strings.TrimSpace(existing.APIKey) == key {
 			group = existing
 			break
+		}
+	}
+	if patch.Name != nil {
+		group.Name = ""
+		if err := json.Unmarshal(patch.Name, &group.Name); err != nil {
+			h.mu.Unlock()
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid API key name"})
+			return
 		}
 	}
 	for _, field := range []struct {
@@ -349,7 +358,7 @@ func cloneAPIKeyGroups(groups []config.APIKeyGroup) []config.APIKeyGroup {
 	}
 	cloned := make([]config.APIKeyGroup, len(groups))
 	for index, group := range groups {
-		cloned[index] = config.APIKeyGroup{APIKey: group.APIKey, Providers: slices.Clone(group.Providers), AllowedPriorities: slices.Clone(group.AllowedPriorities), ExcludedPriorities: slices.Clone(group.ExcludedPriorities)}
+		cloned[index] = config.APIKeyGroup{APIKey: group.APIKey, Name: group.Name, Providers: slices.Clone(group.Providers), AllowedPriorities: slices.Clone(group.AllowedPriorities), ExcludedPriorities: slices.Clone(group.ExcludedPriorities)}
 	}
 	return cloned
 }
@@ -404,6 +413,7 @@ func copyAPIKeyGroup(groups []config.APIKeyGroup, oldKey, newKey string) []confi
 	}
 	return append(groups, config.APIKeyGroup{
 		APIKey:             newKey,
+		Name:               groups[oldIndex].Name,
 		Providers:          append([]string(nil), groups[oldIndex].Providers...),
 		AllowedPriorities:  slices.Clone(groups[oldIndex].AllowedPriorities),
 		ExcludedPriorities: slices.Clone(groups[oldIndex].ExcludedPriorities),

@@ -15,6 +15,7 @@ func TestAPIKeyAccessSaveFailureDoesNotLeavePendingMutations(t *testing.T) {
 		handler                 func(*Handler) gin.HandlerFunc
 	}{
 		{"patch-priority", http.MethodPatch, "/v0/management/api-key-groups", `{"api-key":"fixture","allowed-priorities":[2]}`, func(h *Handler) gin.HandlerFunc { return h.PatchAPIKeyGroups }},
+		{"patch-name", http.MethodPatch, "/v0/management/api-key-groups", `{"api-key":"fixture","name":"Work"}`, func(h *Handler) gin.HandlerFunc { return h.PatchAPIKeyGroups }},
 		{"put-groups", http.MethodPut, "/v0/management/api-key-groups", `[{"api-key":"fixture","excluded-priorities":[1]}]`, func(h *Handler) gin.HandlerFunc { return h.PutAPIKeyGroups }},
 		{"delete-group", http.MethodDelete, "/v0/management/api-key-groups?api-key=fixture", "", func(h *Handler) gin.HandlerFunc { return h.DeleteAPIKeyGroups }},
 		{"rename-key", http.MethodPatch, "/v0/management/api-keys", `{"old":"fixture","new":"renamed"}`, func(h *Handler) gin.HandlerFunc { return h.PatchAPIKeys }},

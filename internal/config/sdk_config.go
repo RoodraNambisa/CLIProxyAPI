@@ -118,7 +118,9 @@ type ProxyRuleConfig struct {
 
 // APIKeyGroup restricts one configured client key to providers and credential priorities.
 type APIKeyGroup struct {
-	APIKey    string   `yaml:"api-key" json:"api-key"`
+	APIKey string `yaml:"api-key" json:"api-key"`
+	// Name is an optional display label and never participates in authorization.
+	Name      string   `yaml:"name,omitempty" json:"name,omitempty"`
 	Providers []string `yaml:"providers" json:"providers"`
 	// Empty allow lists impose no priority restriction; exclusions always win.
 	AllowedPriorities  APIKeyPriorityList `yaml:"allowed-priorities,omitempty" json:"allowed-priorities,omitempty"`
