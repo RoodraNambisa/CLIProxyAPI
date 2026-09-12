@@ -124,6 +124,46 @@ func TestAPICallRejectsCodexRetainedForWebDependents(t *testing.T) {
 	}
 }
 
+func TestAPICallDisabledCodexQuotaPreservesDisabledState(t *testing.T) {
+	for _, status := range []int{http.StatusOK, http.StatusUnauthorized} {
+		t.Run(fmt.Sprint(status), func(t *testing.T) {
+			var calls atomic.Int32
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				if r.Method != http.MethodGet || r.Header.Get("Authorization") != "Bearer disabled-quota-token-fixture" {
+					t.Error("quota query lost its method or credential")
+				}
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(status)
+				_, _ = w.Write([]byte(`{"fixture":"quota"}`))
+			}))
+			defer upstream.Close()
+			manager := coreauth.NewManager(nil, nil, nil)
+			auth, err := manager.Register(coreauth.WithSkipPersist(t.Context()), &coreauth.Auth{
+				ID: "disabled-quota", Provider: "codex", Disabled: true, Status: coreauth.StatusDisabled,
+				Attributes: map[string]string{"source": "config:codex[disabled-quota]"},
+				Metadata:   map[string]any{"access_token": "disabled-quota-token-fixture", "disabled": true},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			h := NewHandlerWithoutConfigFilePath(&config.Config{}, manager)
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+			body := fmt.Sprintf(`{"auth_index":%q,"method":"GET","url":%q,"header":{"Authorization":"Bearer $TOKEN$"}}`, auth.EnsureIndex(), upstream.URL+"/usage")
+			ctx.Request = httptest.NewRequest(http.MethodPost, "/v0/management/api-call", strings.NewReader(body))
+			h.APICall(ctx)
+			if recorder.Code != http.StatusOK || calls.Load() != 1 || !strings.Contains(recorder.Body.String(), fmt.Sprintf(`"status_code":%d`, status)) {
+				t.Fatal("disabled credential could not perform the manual quota query")
+			}
+			current, _ := manager.GetByID(auth.ID)
+			if !current.Disabled || current.Status != coreauth.StatusDisabled || current.Metadata["disabled"] != true {
+				t.Fatal("manual quota query changed credential enablement")
+			}
+		})
+	}
+}
+
 func TestWriteManagementProxyErrorOnlyCopiesRetryAfter(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
