@@ -58,8 +58,9 @@ var conversationTurnstileUndefined = conversationTurnstileUndefinedValue{}
 var conversationTurnstileExplicitNull = conversationTurnstileExplicitNullValue{}
 
 type conversationTurnstileCallable struct {
-	identity *struct{ marker byte }
-	call     func([]any) (any, error)
+	identity  *struct{ marker byte }
+	call      func([]any) (any, error)
+	bindDepth int
 }
 
 func newConversationTurnstileCallable(call func([]any) (any, error)) conversationTurnstileCallable {
@@ -779,10 +780,12 @@ func normalizeConversationTurnstileEnvironment(environment ConversationTurnstile
 		"window.__oai_so_uk":                         0,
 		"window.__oai_so_uin":                        0,
 		"window.__oai_so_ui":                         0,
-		"window.history.length":                      1,
-		"window.localStorage.length":                 len(storageKeys),
-		"window.performance.timeOrigin":              float64(startedAt.UnixNano()) / float64(time.Millisecond),
-		"window.performance.memory.jsHeapSizeLimit":  profile.jsHeapSizeLimit,
+		// The collector tests this callback before installing its own bound function.
+		"window.__oai_so_hpm":                       conversationTurnstileUndefined,
+		"window.history.length":                     1,
+		"window.localStorage.length":                len(storageKeys),
+		"window.performance.timeOrigin":             float64(startedAt.UnixNano()) / float64(time.Millisecond),
+		"window.performance.memory.jsHeapSizeLimit": profile.jsHeapSizeLimit,
 	}
 	return values, sources, storageKeys
 }
@@ -2979,6 +2982,8 @@ func conversationTurnstileMapKey(value any) string {
 		return fmt.Sprintf("o:ordered:%p", typed)
 	case *conversationTurnstileProcessMapRef:
 		return fmt.Sprintf("o:process-map:%p", typed)
+	case *conversationTurnstileWeakSet:
+		return fmt.Sprintf("o:weak-set:%p", typed)
 	case *conversationTurnstileLocationRef:
 		return fmt.Sprintf("o:location:%p", typed)
 	case *conversationTurnstileArray:
@@ -3824,6 +3829,25 @@ func (vm *conversationTurnstileVM) call(target any, args []any) (any, error) {
 		return value, err
 	}
 	switch name {
+	case "window.Number":
+		if len(args) == 0 {
+			return float64(0), nil
+		}
+		value, numeric, err := vm.number(args[0])
+		if err != nil {
+			return nil, err
+		}
+		if !numeric {
+			return math.NaN(), nil
+		}
+		return value, nil
+	case "window.Number.isSafeInteger":
+		value, numeric := conversationTurnstileNumberPrimitive(conversationTurnstileArgument(args, 0))
+		return numeric && !math.IsNaN(value) && !math.IsInf(value, 0) && math.Trunc(value) == value && math.Abs(value) <= 9007199254740991, nil
+	case "window.WeakSet":
+		return nil, conversationTurnstileTypeError("Constructor WeakSet requires 'new'")
+	case "window.Reflect.construct":
+		return vm.reflectConstruct(args)
 	case "window.String":
 		if len(args) == 0 {
 			return "", nil
@@ -4027,6 +4051,17 @@ func (vm *conversationTurnstileVM) call(target any, args []any) (any, error) {
 		if len(args) < 3 {
 			return false, nil
 		}
+		if len(args) > 3 && !conversationTurnstileStrictEqual(args[0], args[3]) {
+			if conversationTurnstilePrimitive(args[3]) {
+				return false, nil
+			}
+			switch args[0].(type) {
+			case *conversationTurnstileOrderedMap, map[string]any:
+				return vm.call(conversationTurnstileObjectRef{path: "window.Reflect.set"}, []any{args[3], args[1], args[2]})
+			default:
+				return nil, vm.compatibilityError(SentinelCompatibilityUnsupportedValue, "Reflect.set.receiver", fmt.Errorf("host property receiver requires SDK"))
+			}
+		}
 		switch object := args[0].(type) {
 		case *conversationTurnstileOrderedMap:
 			propertyKey, mapKey, err := vm.propertyKey(args[1])
@@ -4050,6 +4085,8 @@ func (vm *conversationTurnstileVM) call(target any, args []any) (any, error) {
 			return vm.reflectSetObjectRefProperty(object, args[1], args[2])
 		}
 		return false, nil
+	case "window.Reflect.set.bind":
+		return vm.bindFunction(conversationTurnstileObjectRef{path: "window.Reflect.set"}, args)
 	default:
 		return nil, conversationTurnstileTypeError("value is not callable")
 	}
@@ -4082,7 +4119,15 @@ func (vm *conversationTurnstileVM) reflectSetObjectRefProperty(object conversati
 
 func conversationTurnstileWritableWindowState(key string) bool {
 	switch key {
-	case "__oai_so_owner", "__oai_so_uk", "__oai_so_uin", "__oai_so_ui":
+	case "__oai_so_owner", "__oai_so_uk", "__oai_so_uin", "__oai_so_ui",
+		"__oai_so_h", "__oai_so_hi", "__oai_so_hp", "__oai_so_hw", "__oai_so_hpm",
+		"__oai_so_bc", "__oai_so_bm", "__oai_so_cn", "__oai_so_cs", "__oai_so_cs2",
+		"__oai_so_fn", "__oai_so_fs", "__oai_so_fs2", "__oai_so_hc", "__oai_so_ht",
+		"__oai_so_i", "__oai_so_in", "__oai_so_ink", "__oai_so_k", "__oai_so_kp",
+		"__oai_so_lx", "__oai_so_ly", "__oai_so_m", "__oai_so_p", "__oai_so_pc", "__oai_so_pm",
+		"__oai_so_s", "__oai_so_sn", "__oai_so_sp", "__oai_so_spt", "__oai_so_ss", "__oai_so_ss2",
+		"__oai_so_st", "__oai_so_sw", "__oai_so_sx0", "__oai_so_sy0", "__oai_so_t0",
+		"__oai_so_wb", "__oai_so_wd", "__oai_so_we", "__oai_so_wl":
 		return true
 	default:
 		return false
@@ -4820,6 +4865,12 @@ func (vm *conversationTurnstileVM) propertyWithKey(object, propertyKey any) (any
 		return conversationTurnstileUndefined, err
 	}
 	switch value := object.(type) {
+	case conversationTurnstileCallable:
+		if keyText == "bind" {
+			return vm.browserCallable(func(args []any) (any, error) { return vm.bindFunction(value, args) })
+		}
+	case *conversationTurnstileWeakSet:
+		return vm.weakSetProperty(value, keyText)
 	case conversationTurnstileObjectRef:
 		path := value.path + "." + keyText
 		if err := vm.chargeRuntimeWork(len(value.path) + len(keyText)); err != nil {
@@ -4947,10 +4998,10 @@ func conversationTurnstileNativeObjectPath(path string) bool {
 		return true
 	}
 	switch path {
-	case "window", "window.Array", "window.Date", "window.Math", "window.Reflect", "window.performance",
+	case "window", "window.Array", "window.Date", "window.Math", "window.Reflect", "window.performance", "window.WeakSet", "window.Number", "window.Number.isSafeInteger",
 		"window.localStorage", "window.Object", "window.String",
 		"window.Array.isArray", "window.Array.from",
-		"window.Date.now", "window.Reflect.set", "window.performance.now", "window.Object.create",
+		"window.Date.now", "window.Reflect.set", "window.Reflect.set.bind", "window.Reflect.construct", "window.performance.now", "window.Object.create",
 		"window.Object.keys", "window.Math.random", "window.Math.abs",
 		"window.String.fromCharCode":
 		return true
@@ -5104,6 +5155,8 @@ func writeConversationTurnstileString(buffer *conversationTurnstileLimitedBuffer
 		_, _ = buffer.WriteString("[object Object]")
 	case *conversationTurnstileProcessMapRef:
 		_, _ = buffer.WriteString("[object Map]")
+	case *conversationTurnstileWeakSet:
+		_, _ = buffer.WriteString("[object WeakSet]")
 	case conversationTurnstileBrowserObject:
 		_, _ = buffer.WriteString(conversationTurnstileBrowserObjectValueString(typed))
 	case conversationTurnstileCallable:
@@ -5135,6 +5188,12 @@ func conversationTurnstileGlobalObjectString(path string) (string, bool) {
 		return "function Object() { [native code] }", true
 	case "window.String":
 		return "function String() { [native code] }", true
+	case "window.Number":
+		return "function Number() { [native code] }", true
+	case "window.Number.isSafeInteger":
+		return "function isSafeInteger() { [native code] }", true
+	case "window.WeakSet":
+		return "function WeakSet() { [native code] }", true
 	case "window.Array.isArray":
 		return "function isArray() { [native code] }", true
 	case "window.Array.from":
@@ -5145,6 +5204,10 @@ func conversationTurnstileGlobalObjectString(path string) (string, bool) {
 		return "function now() { [native code] }", true
 	case "window.Reflect.set":
 		return "function set() { [native code] }", true
+	case "window.Reflect.set.bind":
+		return "function bind() { [native code] }", true
+	case "window.Reflect.construct":
+		return "function construct() { [native code] }", true
 	case "window.performance.now":
 		return "function () { [native code] }", true
 	case "window.Object.create":
@@ -5326,6 +5389,9 @@ func conversationTurnstileStrictEqual(left, right any) bool {
 		return ok && leftValue == rightValue
 	case *conversationTurnstileProcessMapRef:
 		rightValue, ok := right.(*conversationTurnstileProcessMapRef)
+		return ok && leftValue == rightValue
+	case *conversationTurnstileWeakSet:
+		rightValue, ok := right.(*conversationTurnstileWeakSet)
 		return ok && leftValue == rightValue
 	case conversationTurnstileObjectRef:
 		rightValue, ok := right.(conversationTurnstileObjectRef)
@@ -5775,6 +5841,9 @@ func writeConversationTurnstileJSON(buffer *conversationTurnstileLimitedBuffer, 
 	case *conversationTurnstileProcessMapRef:
 		buffer.WriteString("{}")
 		return nil
+	case *conversationTurnstileWeakSet:
+		buffer.WriteString("{}")
+		return nil
 	case conversationTurnstileObjectRef:
 		buffer.WriteString("{}")
 		return nil
@@ -5980,7 +6049,7 @@ func conversationTurnstileCallableObjectPath(path string) bool {
 		return true
 	}
 	switch path {
-	case "window.Array", "window.Date", "window.Object", "window.String", "window.Reflect.set",
+	case "window.Array", "window.Date", "window.Object", "window.String", "window.Reflect.set", "window.Reflect.set.bind", "window.Reflect.construct", "window.WeakSet", "window.Number", "window.Number.isSafeInteger",
 		"window.Array.isArray", "window.Array.from",
 		"window.Date.now", "window.performance.now", "window.Object.create", "window.Object.keys",
 		"window.Math.random", "window.Math.abs", "window.String.fromCharCode":

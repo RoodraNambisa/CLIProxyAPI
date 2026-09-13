@@ -155,6 +155,43 @@ func TestConversationSentinelObserverVMReportsCollectorCompatibility(t *testing.
 	}
 }
 
+func TestConversationSentinelObserverVMPreservesOptionalCollectorCallback(t *testing.T) {
+	const requirementsToken = "requirements"
+	collector := []any{
+		[]any{2, 40, "__oai_so_hpm"},
+		[]any{6, 41, 10, 40},
+		[]any{2, 42, false},
+		// The collector may compare the optional callback before installing it.
+		[]any{20, 41, 42, 2, 43, "unexpected callback"},
+		[]any{2, 44, "Reflect"},
+		[]any{6, 45, 10, 44},
+		[]any{2, 46, "set"},
+		[]any{6, 47, 45, 46},
+		[]any{30, 48, 49, []any{[]any{2, 49, "callback-result"}}},
+		[]any{7, 47, 10, 40, 48},
+	}
+	snapshot := []any{
+		[]any{2, 50, "__oai_so_hpm"},
+		[]any{6, 51, 10, 50},
+		[]any{17, 52, 51},
+		[]any{7, 3, 52},
+	}
+	observer, err := newConversationSentinelObserverVM(t.Context(),
+		encodeConversationTurnstileProgram(t, requirementsToken, collector),
+		encodeConversationTurnstileProgram(t, requirementsToken, snapshot),
+		requirementsToken, ConversationTurnstileEnvironment{Persona: DefaultPersona()}, zeroReader{}, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer observer.Close()
+	for range 2 {
+		token, err := observer.Snapshot(t.Context())
+		if want := base64.StdEncoding.EncodeToString([]byte("callback-result")); err != nil || token != want {
+			t.Fatalf("Snapshot() = %q, %v; want %q", token, err, want)
+		}
+	}
+}
+
 func TestConversationSentinelObserverVMReportsSnapshotCompatibility(t *testing.T) {
 	const requirementsToken = "requirements"
 	collectorDX := encodeConversationTurnstileProgram(t, requirementsToken, []any{
