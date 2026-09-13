@@ -24,6 +24,7 @@ type CodexQuotaObservation struct {
 	ObservedAt time.Time         `json:"observed_at"`
 	Source     string            `json:"source"`
 	Signals    map[string]string `json:"signals"`
+	Pools      []CodexQuotaPool  `json:"pools,omitempty"`
 }
 
 // Clone detaches the signal map before a snapshot leaves its owner.
@@ -33,6 +34,11 @@ func (q *CodexQuotaObservation) Clone() *CodexQuotaObservation {
 	}
 	copy := *q
 	copy.Signals = maps.Clone(q.Signals)
+	copy.Pools = make([]CodexQuotaPool, len(q.Pools))
+	for i, pool := range q.Pools {
+		copy.Pools[i] = pool
+		copy.Pools[i].Signals = maps.Clone(pool.Signals)
+	}
 	return &copy
 }
 
@@ -70,9 +76,16 @@ func (m *Manager) recordCodexQuotaObservation(authID, instanceID, source string,
 	if auth == nil || auth.instanceID != instanceID || auth.RuntimeInstanceRetired() || !strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
 		return false
 	}
+	pools, updated := mergeCodexQuotaPools(auth.codexQuotaObservation, observation)
 	if previous := auth.codexQuotaObservation; previous != nil && observedAt.Before(previous.ObservedAt) {
-		return false
+		if !updated {
+			return false
+		}
+		// Concurrent responses can publish different pools out of order. Keep
+		// the newest raw response while accepting newer data within each pool.
+		observation = previous.Clone()
 	}
+	observation.Pools = pools
 	auth.codexQuotaObservation = observation
 	return true
 }
@@ -188,7 +201,7 @@ func isCodexQuotaSignalHeader(name string) bool {
 	if !strings.HasPrefix(lower, "x-codex-") {
 		return false
 	}
-	for _, suffix := range []string{"-allowed", "-limit-reached", "-limit-name", "-used-percent", "-window-minutes", "-reset-after-seconds", "-reset-at", "-over-secondary-limit-percent"} {
+	for _, suffix := range []string{"-allowed", "-limit-reached", "-limit-name", "-limit-id", "-used-percent", "-window-minutes", "-reset-after-seconds", "-reset-at", "-over-secondary-limit-percent"} {
 		if strings.HasSuffix(lower, suffix) {
 			return true
 		}

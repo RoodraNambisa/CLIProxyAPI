@@ -63,6 +63,10 @@ func ParseCodexQuotaEventHeaders(payload []byte) http.Header {
 			addCodexQuotaWindows(headers, prefix, rate)
 			if len(headers) > before {
 				headers.Set(prefix+"Limit-Name", strings.TrimSpace(name))
+				id := codexQuotaScalar(firstCodexQuotaValue(value, "metered_feature", "meteredFeature", "limit_id", "limitId"))
+				if identifier := codexQuotaHeaderIdentifier(id); identifier != "" && identifier == id {
+					headers.Set(prefix+"Limit-Id", id)
+				}
 				seen[strings.ToLower(identifier)] = true
 				count++
 			}
@@ -79,6 +83,9 @@ func ParseCodexQuotaEventHeaders(payload []byte) http.Header {
 	active := codexQuotaScalar(firstCodexQuotaValue(root, "metered_limit_name", "meteredLimitName", "limit_name", "limitName"))
 	if identifier := codexQuotaHeaderIdentifier(active); identifier != "" && identifier == active {
 		headers.Set("X-Codex-Active-Limit", active)
+		if name := firstCodexQuotaValue(root, "limit_name", "limitName"); name.Exists() && codexQuotaScalar(name) != active {
+			setCodexQuotaScalar(headers, "X-Codex-Limit-Name", name)
+		}
 	}
 	setCodexQuotaScalar(headers, "X-Codex-Plan-Type", firstCodexQuotaValue(root, "plan_type", "planType"))
 	return filteredCodexQuotaEventHeaders(headers)

@@ -78,3 +78,10 @@ func TestCodexQuotaEventsBoundAdditionalLimitsAndAvoidNamespaceMerging(t *testin
 		t.Fatal("malformed active name erased valid data or additional namespaces were merged")
 	}
 }
+
+func TestCodexQuotaEventsPreserveExplicitPoolIdentity(t *testing.T) {
+	headers := ParseCodexQuotaEventHeaders([]byte(`{"type":"codex.rate_limits","metered_limit_name":"codex_bengalfox","limit_name":"GPT-5.3-Codex-Spark","rate_limits":{"primary":{"used_percent":0,"window_minutes":300,"reset_at":1789331215}},"additional_rate_limits":[{"limit_name":"GPT-5.3-Codex-Spark","metered_feature":"codex_bengalfox","rate_limit":{"secondary":{"used_percent":2,"window_minutes":10080,"reset_at":1789806595}}}]}`))
+	if headers.Get("X-Codex-Active-Limit") != "codex_bengalfox" || headers.Get("X-Codex-Limit-Name") != "GPT-5.3-Codex-Spark" || headers.Get("X-Codex-Additional-GPT-5.3-Codex-Spark-Limit-Id") != "codex_bengalfox" {
+		t.Fatal("an explicit pool id or display name was discarded")
+	}
+}

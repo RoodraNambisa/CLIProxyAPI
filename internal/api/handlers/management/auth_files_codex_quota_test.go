@@ -77,6 +77,9 @@ func TestCodexQuotaManagementListsReadLatestRuntimeObservation(t *testing.T) {
 			if percent != "" && (len(file.Observation.Signals) != 1 || file.Observation.Signals["X-Codex-Primary-Used-Percent"] != percent || file.Observation.Source != "http" || file.Observation.ObservedAt.IsZero()) {
 				t.Fatal("list reused cached quota or exposed unfiltered response headers")
 			}
+			if percent != "" && (len(file.Observation.Pools) != 1 || file.Observation.Pools[0].ID != "codex" || file.Observation.Pools[0].Signals["X-Codex-Primary-Used-Percent"] != percent) {
+				t.Fatal("list omitted or cached the independently scoped quota pool")
+			}
 		}
 	}
 	check(true, "")
