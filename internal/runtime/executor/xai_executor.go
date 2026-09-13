@@ -1133,8 +1133,9 @@ func (e *XAIExecutor) applyPreparedXAIHeaders(ctx context.Context, auth *cliprox
 	}
 	attempt := plan.ApplyAttemptHeader(headers)
 	if log.IsLevelEnabled(log.InfoLevel) {
-		name := ""
+		name, authIndex := "", ""
 		if auth != nil {
+			authIndex = auth.Index
 			name = auth.FileName
 			if name == "" {
 				name = auth.Label
@@ -1144,13 +1145,16 @@ func (e *XAIExecutor) applyPreparedXAIHeaders(ctx context.Context, auth *cliprox
 			}
 		}
 		helps.LogWithRequestID(ctx).WithFields(log.Fields{
-			"provider": "xai", "auth_file": filepath.Base(name), "model": prepared.baseModel,
+			"provider": "xai", "auth_name": filepath.Base(name), "auth_index": authIndex, "model": prepared.baseModel,
+			"stage": "identity", "request_attempt": attempt + 1,
 			"client_model":            helps.PayloadRequestedModel(opts, prepared.baseModel),
 			"upstream_request_digest": helps.XAIIdentityDigest(prepared.identity.Request),
 			"identity_source":         prepared.identity.Source, "identity_slot": prepared.identity.Slot + 1,
 			"session_digest":   helps.XAIIdentityDigest(prepared.identity.Session),
 			"cache_key_digest": helps.XAIIdentityDigest(prepared.identity.CacheKey), "attempt": attempt,
-		}).Info("Grok request identity prepared")
+		}).Infof("Grok request identity prepared model=%q client_model=%q identity_source=%s identity_slot=%d retry=%d session_digest=%s cache_key_digest=%s request_digest=%s",
+			prepared.baseModel, helps.PayloadRequestedModel(opts, prepared.baseModel), prepared.identity.Source, prepared.identity.Slot+1, attempt,
+			helps.XAIIdentityDigest(prepared.identity.Session), helps.XAIIdentityDigest(prepared.identity.CacheKey), helps.XAIIdentityDigest(prepared.identity.Request))
 	}
 }
 

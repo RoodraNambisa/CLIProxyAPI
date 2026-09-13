@@ -8,18 +8,65 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
 	sdkauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	core "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
+	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 )
+
+type xaiIdentityCaptureHook struct{ entry *log.Entry }
+
+func (*xaiIdentityCaptureHook) Levels() []log.Level { return log.AllLevels }
+func (h *xaiIdentityCaptureHook) Fire(entry *log.Entry) error {
+	if entry.Data["request_id"] == "grok-log-fixture" {
+		h.entry = entry.Dup()
+		h.entry.Message = entry.Message
+	}
+	return nil
+}
+
+func TestXAIIdentityDiagnosticsSurviveConsoleFormatting(t *testing.T) {
+	logger := log.StandardLogger()
+	hook := &xaiIdentityCaptureHook{}
+	previousHooks := logger.ReplaceHooks(log.LevelHooks{})
+	previousLevel := logger.GetLevel()
+	logger.SetLevel(log.InfoLevel)
+	logger.AddHook(hook)
+	defer func() { logger.ReplaceHooks(previousHooks); logger.SetLevel(previousLevel) }()
+	cfg := &config.Config{XAI: config.XAIConfig{PassthroughClientIdentity: true}}
+	plan, _ := helps.NewXAIRequestPlan(t.Context(), cfg, core.Request{Payload: []byte(`{}`)}, core.Options{})
+	opts := core.WithProviderPreparedRequest(core.Options{}, "xai", plan)
+	prepared := &xaiPreparedRequest{baseModel: "grok-4.3", identity: helps.XAIIdentityProjection{Session: "private-session-value", CacheKey: "private-cache-value", Request: "private-request-value", Source: "grok-session", Slot: 2}}
+	NewXAIExecutor(cfg).applyPreparedXAIHeaders(logging.WithRequestID(t.Context(), "grok-log-fixture"), &coreauth.Auth{FileName: "my-grok.json", Index: "auth-index-fixture"}, make(http.Header), prepared, opts)
+	if hook.entry == nil {
+		t.Fatal("missing identity diagnostic")
+	}
+	line, err := (&logging.LogFormatter{}).Format(hook.entry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`request_id="grok-log-fixture"`, `auth_name="my-grok.json"`, `auth_index=auth-index-fixture`, `identity_source=grok-session`, `identity_slot=3`, `retry=0`, `cache_key_digest=`} {
+		if !strings.Contains(string(line), want) {
+			t.Fatalf("formatter dropped %q: %s", want, line)
+		}
+	}
+	if strings.Contains(string(line), "private-") {
+		t.Fatal("raw client identity entered a diagnostic")
+	}
+	if !strings.Contains(hook.entry.Message, "identity_slot=3") {
+		t.Fatal("live logs would lose the identity fields")
+	}
+}
 
 func TestXAIGlobalDefaultsPreserveExplicitParametersAndSearchChoice(t *testing.T) {
 	cfg := &config.Config{XAI: config.XAIConfig{RequestDefaults: map[string]any{"max_output_tokens": 99, "temperature": 1, "top_p": 0.9, "parallel_tool_calls": true, "stream_tool_calls": true}, InjectWebSearch: true, InjectXSearch: true}}
