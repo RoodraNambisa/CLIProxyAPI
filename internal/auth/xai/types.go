@@ -35,6 +35,7 @@ func RefreshLead() time.Duration {
 
 // Discovery contains OAuth endpoints resolved from xAI OIDC discovery.
 type Discovery struct {
+	AuthorizationEndpoint       string `json:"authorization_endpoint"`
 	DeviceAuthorizationEndpoint string `json:"device_authorization_endpoint"`
 	TokenEndpoint               string `json:"token_endpoint"`
 }

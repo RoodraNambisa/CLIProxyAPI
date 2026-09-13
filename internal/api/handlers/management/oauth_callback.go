@@ -91,6 +91,14 @@ func (h *Handler) PostOAuthCallback(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "provider does not match state"})
 		return
 	}
+	if canonicalProvider == "xai" {
+		if errCallback := h.submitXAIPKCECallback(state, code, errMsg, req.RedirectURL); errCallback != nil {
+			c.JSON(http.StatusConflict, gin.H{"status": "error", "error": errCallback.Error()})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"status": "ok"})
+		return
+	}
 
 	if _, errWrite := WriteOAuthCallbackFileForPendingSession(cfg.AuthDir, canonicalProvider, state, code, errMsg); errWrite != nil {
 		if errors.Is(errWrite, errOAuthSessionNotPending) {

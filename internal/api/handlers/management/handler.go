@@ -74,6 +74,8 @@ type Handler struct {
 	configSnapshot          atomic.Pointer[config.Config]
 	configFilePath          string
 	mu                      sync.Mutex
+	xaiPKCEMu               sync.Mutex
+	xaiPKCE                 map[string]*xaiPKCEPending
 	setConfigMu             sync.Mutex
 	codexPlanRefreshMu      sync.Mutex
 	codexPlanRefresh        codexPlanTypeRefreshTask

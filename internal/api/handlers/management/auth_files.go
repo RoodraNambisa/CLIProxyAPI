@@ -455,6 +455,9 @@ func (h *Handler) GetAuthFileModels(c *gin.Context) {
 		entry := gin.H{
 			"id": m.ID,
 		}
+		if m.UpstreamID != "" {
+			entry["upstream_id"] = m.UpstreamID
+		}
 		if m.DisplayName != "" {
 			entry["display_name"] = m.DisplayName
 		}
@@ -3881,6 +3884,15 @@ func (h *Handler) RequestAntigravityToken(c *gin.Context) {
 
 // RequestXAIToken starts the xAI OAuth device-code flow.
 func (h *Handler) RequestXAIToken(c *gin.Context) {
+	flow := strings.ToLower(strings.TrimSpace(c.Query("flow")))
+	if flow == "pkce" {
+		h.requestXAIPKCE(c)
+		return
+	}
+	if flow != "" && flow != "device" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "flow must be device or pkce"})
+		return
+	}
 	cfg := h.currentConfig()
 	if cfg == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
@@ -3924,68 +3936,7 @@ func (h *Handler) RequestXAIToken(c *gin.Context) {
 			return
 		}
 
-		tokenStorage := authSvc.CreateTokenStorage(bundle)
-		if tokenStorage == nil || strings.TrimSpace(tokenStorage.AccessToken) == "" {
-			log.Error("xAI token exchange returned empty access token")
-			SetOAuthSessionError(state, "Failed to exchange token")
-			return
-		}
-
-		fileName := xaiauth.CredentialFileName(tokenStorage.Email, tokenStorage.Subject)
-		label := strings.TrimSpace(tokenStorage.Email)
-		if label == "" {
-			label = "xAI"
-		}
-
-		metadata := map[string]any{
-			"type":           "xai",
-			"access_token":   tokenStorage.AccessToken,
-			"refresh_token":  tokenStorage.RefreshToken,
-			"id_token":       tokenStorage.IDToken,
-			"token_type":     tokenStorage.TokenType,
-			"expires_in":     tokenStorage.ExpiresIn,
-			"expired":        tokenStorage.Expire,
-			"last_refresh":   tokenStorage.LastRefresh,
-			"base_url":       tokenStorage.BaseURL,
-			"token_endpoint": tokenStorage.TokenEndpoint,
-			"auth_kind":      "oauth",
-			"using_api":      false,
-			"websockets":     false,
-		}
-		if tokenStorage.Email != "" {
-			metadata["email"] = tokenStorage.Email
-		}
-		if tokenStorage.Subject != "" {
-			metadata["sub"] = tokenStorage.Subject
-		}
-
-		record := &coreauth.Auth{
-			ID:       fileName,
-			Provider: "xai",
-			FileName: fileName,
-			Label:    label,
-			Storage:  tokenStorage,
-			Metadata: metadata,
-			Attributes: map[string]string{
-				"auth_kind":  "oauth",
-				"base_url":   tokenStorage.BaseURL,
-				"using_api":  "false",
-				"websockets": "false",
-			},
-		}
-		if errGuard := beginOAuthSessionSave(state, "xai"); errGuard != nil {
-			return
-		}
-		savedPath, errSave := h.saveTokenRecord(ctx, record)
-		if errSave != nil {
-			log.Errorf("Failed to save xAI token to file: %v", errSave)
-			SetOAuthSessionError(state, "Failed to save token to file")
-			return
-		}
-
-		CompleteOAuthSession(state)
-		fmt.Printf("Authentication successful! Token saved to %s\n", savedPath)
-		fmt.Println("You can now use xAI services through this CLI")
+		h.saveXAIAuthBundle(ctx, state, authSvc, bundle)
 	}()
 
 	response := gin.H{"status": "ok", "url": authURL, "state": state, "flow": "device"}

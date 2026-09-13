@@ -1,0 +1,89 @@
+package helps
+
+import (
+	"encoding/json"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
+)
+
+const XAIModelCatalogKey = "xai_model_catalog"
+
+// XAIModelCatalog belongs to one credential and survives provider outages.
+type XAIModelCatalog struct {
+	Models    []*registry.ModelInfo `json:"models"`
+	UpdatedAt time.Time             `json:"updated_at"`
+	Source    string                `json:"source"`
+}
+
+func ParseXAIModels(raw []byte, source string) (*XAIModelCatalog, error) {
+	var envelope struct {
+		Data []*registry.ModelInfo `json:"data"`
+	}
+	if len(raw) > 1024*1024 || json.Unmarshal(raw, &envelope) != nil || len(envelope.Data) == 0 || len(envelope.Data) > 256 {
+		return nil, fmt.Errorf("invalid or empty Grok model catalog")
+	}
+	known := make(map[string]*registry.ModelInfo)
+	for _, model := range registry.GetXAIModels() {
+		known[model.ID] = model
+	}
+	seen := make(map[string]bool)
+	models := make([]*registry.ModelInfo, 0, len(envelope.Data))
+	for _, model := range envelope.Data {
+		if model == nil || strings.TrimSpace(model.ID) == "" || len(model.ID) > 256 || strings.ContainsAny(model.ID, "\r\n\x00") {
+			return nil, fmt.Errorf("invalid Grok model identifier")
+		}
+		if seen[model.ID] {
+			continue
+		}
+		seen[model.ID] = true
+		// Keep known capabilities when the directory only returns an ID.
+		if baseline := known[model.ID]; baseline != nil {
+			if model.Thinking == nil {
+				model.Thinking = baseline.Thinking
+			}
+			if model.ContextLength == 0 {
+				model.ContextLength = baseline.ContextLength
+			}
+			if model.MaxCompletionTokens == 0 {
+				model.MaxCompletionTokens = baseline.MaxCompletionTokens
+			}
+			if len(model.SupportedParameters) == 0 {
+				model.SupportedParameters = baseline.SupportedParameters
+			}
+		}
+		model.Type, model.Object, model.UpstreamID = "xai", "model", model.ID
+		if model.OwnedBy == "" {
+			model.OwnedBy = "xai"
+		}
+		if model.DisplayName == "" {
+			model.DisplayName = model.ID
+		}
+		models = append(models, model)
+	}
+	return &XAIModelCatalog{Models: models, Source: source, UpdatedAt: time.Now().UTC()}, nil
+}
+
+func XAIModelsForAuth(auth *coreauth.Auth) *XAIModelCatalog {
+	if auth == nil {
+		return nil
+	}
+	raw, err := json.Marshal(auth.Metadata[XAIModelCatalogKey])
+	if err != nil || len(raw) > 1024*1024 {
+		return nil
+	}
+	var catalog XAIModelCatalog
+	if json.Unmarshal(raw, &catalog) != nil || len(catalog.Models) == 0 || len(catalog.Models) > 256 || catalog.UpdatedAt.IsZero() {
+		return nil
+	}
+	for _, model := range catalog.Models {
+		if model == nil || strings.TrimSpace(model.ID) == "" {
+			return nil
+		}
+		model.UpstreamID = model.ID
+	}
+	return &catalog
+}

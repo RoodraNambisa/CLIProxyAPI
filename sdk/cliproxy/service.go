@@ -5666,6 +5666,9 @@ func (s *Service) registerModelsForAuthWithState(a *coreauth.Auth, preserveTrans
 		models = applyExcludedModels(models, excluded)
 	case "xai":
 		models = registry.GetXAIModels()
+		if catalog := executorhelps.XAIModelsForAuth(a); catalog != nil && catalog.Source == executor.XAIModelsURL(a) {
+			models = catalog.Models
+		}
 		models = applyExcludedModels(models, excluded)
 	case "chatgpt-web":
 		if !a.LifecycleSelectable() {

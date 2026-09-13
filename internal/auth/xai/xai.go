@@ -102,6 +102,7 @@ func (a *XAIAuth) Discover(ctx context.Context) (*Discovery, error) {
 		return nil, fmt.Errorf("xai discovery failed with status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 	var payload struct {
+		AuthorizationEndpoint       string `json:"authorization_endpoint"`
 		DeviceAuthorizationEndpoint string `json:"device_authorization_endpoint"`
 		TokenEndpoint               string `json:"token_endpoint"`
 	}
@@ -117,6 +118,7 @@ func (a *XAIAuth) Discover(ctx context.Context) (*Discovery, error) {
 		return nil, err
 	}
 	return &Discovery{
+		AuthorizationEndpoint:       payload.AuthorizationEndpoint,
 		DeviceAuthorizationEndpoint: deviceAuthorizationEndpoint,
 		TokenEndpoint:               tokenEndpoint,
 	}, nil
