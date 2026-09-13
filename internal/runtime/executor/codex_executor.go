@@ -416,6 +416,11 @@ func (e *CodexExecutor) PrepareProviderRequest(ctx context.Context, req cliproxy
 		return nil, err
 	}
 	affinityKind, affinityDigest, tenantDigest, clientThreadID, spoofThreadID := codexPreparedRequestAffinity(ctx, opts, payload, turnID)
+	if shared := cliproxyauth.SessionAffinityFingerprint(opts); shared != "" {
+		// Reuse routing's pre-translation identity only for pool selection. Caller
+		// authorization, turn state and client thread projection stay independent.
+		affinityKind, affinityDigest, tenantDigest = "session_affinity", shared, "shared"
+	}
 	var incomingHeaders http.Header
 	if ctx != nil {
 		if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {

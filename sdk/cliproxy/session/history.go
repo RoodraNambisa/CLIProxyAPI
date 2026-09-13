@@ -20,6 +20,16 @@ type History struct {
 // Usable reports whether a complete bounded history includes actual user input.
 func (h History) Usable() bool { return h.minimum > 0 && h.minimum <= len(h.prefixes) }
 
+// InitialUserPrefixDigest returns the already captured prefix through the first
+// user input. Provider identity pools can keep this anchor as history grows,
+// while routing still matches the longest prefix to distinguish branches.
+func (h History) InitialUserPrefixDigest() ([sha256.Size]byte, bool) {
+	if !h.Usable() {
+		return [sha256.Size]byte{}, false
+	}
+	return h.prefixes[h.minimum-1], true
+}
+
 type historyBuilder struct {
 	history History
 	valid   bool

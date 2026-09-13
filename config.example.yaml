@@ -847,6 +847,9 @@ nonstream-keepalive-interval: 0
 # `codex_fingerprint_mode`; existing credentials and explicit upload values are unchanged.
 # `session-identity-pool-size` controls the persistent sticky Session pool used by
 # `session` and `full` modes. `1` keeps one converged identity; valid range is 1-64.
+# With routing affinity enabled, pool selection reuses its
+# captured session identity across client API keys on the same account. Inferred
+# LCP histories retain caller scope; resizing the pool recalculates assignment.
 # Turn IDs remain unique per logical request regardless of this value.
 # codex-fingerprint:
 #   ja3: false

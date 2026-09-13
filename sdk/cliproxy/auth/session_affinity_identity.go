@@ -21,6 +21,39 @@ type basicAffinityIdentity struct {
 	primary, fallback string
 }
 
+// SessionAffinityFingerprint reuses the immutable routing snapshot for provider
+// identity pools. It never parses request bodies or establishes an auth binding.
+// Explicit sessions share pool affinity across callers; inferred LCP histories
+// retain their authenticated scope. An empty result leaves provider fallback
+// behavior unchanged when routing affinity is disabled or has no usable identity.
+func SessionAffinityFingerprint(opts core.Options) string {
+	var id string
+	if captured, ok := opts.Metadata[basicAffinityIdentityMetadataKey].(basicAffinityIdentity); ok {
+		id = captured.primary
+		if captured.fallback != "" {
+			// The first-user anchor survives the addition of the first assistant.
+			id = captured.fallback
+		}
+	} else if captured, ok := opts.Metadata[affinityIdentityMetadataKey].(affinityRequestIdentity); ok && captured.scope != "" {
+		id = captured.identity.SessionID
+		if id == "" && captured.history != nil {
+			if digest, ok := captured.history.InitialUserPrefixDigest(); ok {
+				id = scopedAffinityID(captured.scope, "history:"+hex.EncodeToString(digest[:]))
+			}
+		} else if id == "" {
+			id = captured.legacyPrimary
+			if captured.legacyFallback != "" {
+				id = captured.legacyFallback
+			}
+		}
+	}
+	if id == "" {
+		return ""
+	}
+	digest := messageTextDigest(id)
+	return hex.EncodeToString(digest[:])
+}
+
 // Capture basic identities before provider translation and automatic cache keys.
 // Keep cross-client-key binding semantics and retain only detached identifiers.
 func (s *SessionAffinitySelector) withBasicAffinityIdentity(ctx context.Context, req core.Request, opts core.Options) core.Options {
