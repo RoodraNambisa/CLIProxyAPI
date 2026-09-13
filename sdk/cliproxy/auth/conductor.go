@@ -7643,7 +7643,7 @@ func (m *Manager) prepareProviderRequests(
 	}
 	if selector, ok := m.selectorForContext(ctx).(*SessionAffinitySelector); ok && selector != nil {
 		if selector.subagents || selector.lcp {
-			opts = withAffinityIdentity(ctx, req, opts, selector.lcp)
+			opts = withCapturedAffinityIdentity(opts, captureAffinityIdentityWithHistoryPolicy(ctx, req, opts, selector.lcp, !selector.disableHistory))
 		} else {
 			opts = selector.withBasicAffinityIdentity(ctx, req, opts)
 		}

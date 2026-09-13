@@ -268,6 +268,7 @@ func (b *Builder) Build() (*Service, error) {
 				Failover:         &sessionAffinityFailover,
 				AcrossPriorities: sessionAffinityAcrossPriorities,
 				Subagents:        sessionAffinitySubagents,
+				UseHistory:       b.cfg.Routing.SessionAffinityUseHistory,
 				LCP:              sessionAffinityLCP,
 			})
 		}

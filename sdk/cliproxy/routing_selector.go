@@ -14,6 +14,7 @@ type routingSelectorSettings struct {
 	fillRange                  int
 	affinity, failover, across bool
 	subagents, history         bool
+	useHistory                 bool
 	ttl                        time.Duration
 }
 
@@ -29,6 +30,7 @@ func routingSelectorSettingsForConfig(cfg *config.Config) routingSelectorSetting
 	settings.failover = routingSessionAffinityFailoverEnabled(cfg)
 	settings.across = cfg.Routing.SessionAffinityAcrossPriorities
 	settings.subagents = cfg.Routing.SessionAffinity && cfg.Routing.SessionAffinitySubagents
+	settings.useHistory = cfg.Routing.SessionAffinityHistoryEnabled()
 	settings.history = cfg.Routing.SessionAffinity && cfg.Routing.SessionAffinityLCP
 	settings.ttl = time.Hour
 	if parsed, err := time.ParseDuration(strings.TrimSpace(cfg.Routing.SessionAffinityTTL)); err == nil && parsed > 0 {

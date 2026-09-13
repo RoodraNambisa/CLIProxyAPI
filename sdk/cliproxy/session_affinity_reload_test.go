@@ -74,6 +74,7 @@ func TestSessionAffinitySurvivesUnrelatedRuntimeConfigUpdates(t *testing.T) {
 					next.Routing.FillFirstRange = 1
 					next.Routing.SessionAffinityTTL = "60m"
 					next.Routing.SessionAffinityFailover = &failover
+					next.Routing.SessionAffinityUseHistory = &failover
 				case "priority-rules":
 					next.Routing.PriorityOverrides = []config.RoutingPriorityOverride{{Priority: 0, Strategy: "random"}}
 				}

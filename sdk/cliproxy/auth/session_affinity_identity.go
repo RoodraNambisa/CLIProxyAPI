@@ -70,7 +70,7 @@ func (s *SessionAffinitySelector) withBasicAffinityIdentity(ctx context.Context,
 	if len(payload) == 0 {
 		payload = req.Payload
 	}
-	primary, fallback := extractSessionIDs(headers, payload, opts.Metadata)
+	primary, fallback := extractSessionIDsWithHistory(headers, payload, opts.Metadata, !s.disableHistory)
 	metadata := make(map[string]any, len(opts.Metadata)+1)
 	for key, value := range opts.Metadata {
 		metadata[key] = value
@@ -89,6 +89,10 @@ type affinityRequestIdentity struct {
 }
 
 func captureAffinityIdentity(ctx context.Context, req core.Request, opts core.Options, includeHistory ...bool) affinityRequestIdentity {
+	return captureAffinityIdentityWithHistoryPolicy(ctx, req, opts, len(includeHistory) > 0 && includeHistory[0], true)
+}
+
+func captureAffinityIdentityWithHistoryPolicy(ctx context.Context, req core.Request, opts core.Options, includeHistory, useHistory bool) affinityRequestIdentity {
 	if captured, ok := opts.Metadata[affinityIdentityMetadataKey].(affinityRequestIdentity); ok {
 		return captured
 	}
@@ -115,7 +119,10 @@ func captureAffinityIdentity(ctx context.Context, req core.Request, opts core.Op
 	executionID, _ := opts.Metadata[core.ExecutionSessionMetadataKey].(string)
 	identity, _ := session.ExtractExplicitIdentity(headers, payload, executionID)
 	captured := affinityRequestIdentity{scope: scope, identity: identity}
-	if len(includeHistory) > 0 && includeHistory[0] && (identity.SessionID == "" || strings.HasPrefix(identity.SessionID, "execution:")) {
+	if !useHistory {
+		return captured
+	}
+	if includeHistory && (identity.SessionID == "" || strings.HasPrefix(identity.SessionID, "execution:")) {
 		history := session.FingerprintHistory(opts.SourceFormat, payload)
 		captured.history = &history
 		if history.Usable() {
@@ -132,10 +139,13 @@ func captureAffinityIdentity(ctx context.Context, req core.Request, opts core.Op
 // withAffinityIdentity detaches optional inference inputs before provider
 // preparation, retries, and request-body release. It never mutates caller maps.
 func withAffinityIdentity(ctx context.Context, req core.Request, opts core.Options, includeHistory ...bool) core.Options {
+	return withCapturedAffinityIdentity(opts, captureAffinityIdentity(ctx, req, opts, includeHistory...))
+}
+
+func withCapturedAffinityIdentity(opts core.Options, captured affinityRequestIdentity) core.Options {
 	if _, ok := opts.Metadata[affinityIdentityMetadataKey].(affinityRequestIdentity); ok {
 		return opts
 	}
-	captured := captureAffinityIdentity(ctx, req, opts, includeHistory...)
 	metadata := make(map[string]any, len(opts.Metadata)+1)
 	for key, value := range opts.Metadata {
 		metadata[key] = value
@@ -159,7 +169,7 @@ func (s *SessionAffinitySelector) sessionIDs(ctx context.Context, opts core.Opti
 		return captured.primary, captured.fallback
 	}
 	if s != nil && (s.subagents || s.lcp) {
-		captured := captureAffinityIdentity(ctx, core.Request{}, opts, s.lcp)
+		captured := captureAffinityIdentityWithHistoryPolicy(ctx, core.Request{}, opts, s.lcp, !s.disableHistory)
 		if captured.scope != "" {
 			if captured.identity.SessionID == "" {
 				if s.lcp {
@@ -175,14 +185,14 @@ func (s *SessionAffinitySelector) sessionIDs(ctx context.Context, opts core.Opti
 			return primary, parent
 		}
 	}
-	return extractSessionIDs(opts.Headers, opts.OriginalRequest, opts.Metadata)
+	return extractSessionIDsWithHistory(opts.Headers, opts.OriginalRequest, opts.Metadata, s == nil || !s.disableHistory)
 }
 
 // An explicit parent is only a preference until the child has a binding of its
 // own. A parent's exhausted capacity must not turn that preference into a lock.
 func (s *SessionAffinitySelector) cachedStrictAuthID(ctx context.Context, provider, model string, opts core.Options) string {
 	if s != nil && (s.subagents || s.lcp) {
-		captured := captureAffinityIdentity(ctx, core.Request{}, opts, s.lcp)
+		captured := captureAffinityIdentityWithHistoryPolicy(ctx, core.Request{}, opts, s.lcp, !s.disableHistory)
 		if captured.scope != "" && s.lcp && captured.identity.SessionID == "" {
 			return ""
 		}

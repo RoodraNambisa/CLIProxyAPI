@@ -157,6 +157,9 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	if oldCfg.Routing.SessionAffinityLCP != newCfg.Routing.SessionAffinityLCP {
 		changes = append(changes, fmt.Sprintf("routing.session-affinity-lcp: %t -> %t", oldCfg.Routing.SessionAffinityLCP, newCfg.Routing.SessionAffinityLCP))
 	}
+	if oldCfg.Routing.SessionAffinityHistoryEnabled() != newCfg.Routing.SessionAffinityHistoryEnabled() {
+		changes = append(changes, fmt.Sprintf("routing.session-affinity-use-history: %t -> %t", oldCfg.Routing.SessionAffinityHistoryEnabled(), newCfg.Routing.SessionAffinityHistoryEnabled()))
+	}
 
 	// API keys (redacted) and counts
 	if len(oldCfg.APIKeys) != len(newCfg.APIKeys) {

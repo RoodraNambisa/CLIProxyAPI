@@ -979,6 +979,7 @@ type SessionAffinitySelector struct {
 	failover         bool
 	acrossPriorities bool
 	subagents        bool
+	disableHistory   bool
 	lcp              bool
 	historyMatcher   *session.HistoryMatcher
 }
@@ -992,6 +993,8 @@ type SessionAffinityConfig struct {
 	AcrossPriorities bool
 	// Subagents permits explicit child/fork inheritance. Default: false.
 	Subagents bool
+	// UseHistory permits message hashes and LCP inference. Nil defaults to true.
+	UseHistory *bool
 	// LCP enables bounded shared-prefix preferences. Default: false.
 	LCP bool
 }
@@ -1016,8 +1019,9 @@ func NewSessionAffinitySelectorWithConfig(cfg SessionAffinityConfig) *SessionAff
 	if cfg.Failover != nil {
 		failover = *cfg.Failover
 	}
+	useHistory := cfg.UseHistory == nil || *cfg.UseHistory
 	var historyMatcher *session.HistoryMatcher
-	if cfg.LCP {
+	if cfg.LCP && useHistory {
 		historyMatcher = session.NewHistoryMatcher(cfg.TTL)
 	}
 	return &SessionAffinitySelector{
@@ -1026,6 +1030,7 @@ func NewSessionAffinitySelectorWithConfig(cfg SessionAffinityConfig) *SessionAff
 		failover:         failover,
 		acrossPriorities: cfg.AcrossPriorities,
 		subagents:        cfg.Subagents,
+		disableHistory:   !useHistory,
 		lcp:              cfg.LCP,
 		historyMatcher:   historyMatcher,
 	}
@@ -1348,6 +1353,10 @@ func ExtractSessionID(headers http.Header, payload []byte, metadata map[string]a
 // primaryID: full hash including assistant response (stable after first turn)
 // fallbackID: short hash without assistant (used to inherit binding from first turn)
 func extractSessionIDs(headers http.Header, payload []byte, metadata map[string]any) (string, string) {
+	return extractSessionIDsWithHistory(headers, payload, metadata, true)
+}
+
+func extractSessionIDsWithHistory(headers http.Header, payload []byte, metadata map[string]any, useHistory bool) (string, string) {
 	// 1. metadata.user_id with Claude Code session format (highest priority)
 	userID := affinityBodyField(payload, "metadata.user_id").String()
 	if len(payload) > 0 {
@@ -1413,6 +1422,9 @@ func extractSessionIDs(headers http.Header, payload []byte, metadata map[string]
 	}
 
 	// 8. Hash-based fallback from message content
+	if !useHistory {
+		return "", ""
+	}
 	return extractMessageHashIDs(payload)
 }
 

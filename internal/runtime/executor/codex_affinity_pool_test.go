@@ -226,3 +226,23 @@ func TestCodexAffinityPoolSnapshotSurvivesRetryReleaseAndReload(t *testing.T) {
 		})
 	}
 }
+
+func TestCodexAffinityPoolDoesNotInferDisabledHistory(t *testing.T) {
+	manager, exec, model := newCodexPoolCaptureManager(t, true)
+	off := false
+	selector := coreauth.NewSessionAffinitySelectorWithConfig(coreauth.SessionAffinityConfig{Fallback: &coreauth.RoundRobinSelector{}, UseHistory: &off})
+	t.Cleanup(selector.Stop)
+	manager.SetConfigAndSelector(&config.Config{Routing: config.RoutingConfig{SessionAffinity: true, SessionAffinityUseHistory: &off}}, selector)
+	const body = `{"instructions":"shared","input":"same user input"}`
+	first := runCodexPoolCapture(t, manager, exec, model, "caller", body, core.Options{})
+	next := runCodexPoolCapture(t, manager, exec, model, "caller", body, core.Options{Stream: true})
+	if first.authID == next.authID || first.prepared.AffinityKind != "turn" || next.prepared.AffinityKind != "turn" || first.prepared.AffinityDigest == next.prepared.AffinityDigest {
+		t.Fatal("disabled history still supplied routing or fingerprint affinity")
+	}
+	cache := `{"prompt_cache_key":"explicit","input":"same user input"}`
+	a := runCodexPoolCapture(t, manager, exec, model, "caller-a", cache, core.Options{})
+	b := runCodexPoolCapture(t, manager, exec, model, "caller-b", cache, core.Options{Stream: true})
+	if a.authID != b.authID || a.fingerprint.sessionID != b.fingerprint.sessionID || a.prepared.AffinityKind != "session_affinity" {
+		t.Fatal("disabling history stopped explicit cache-key affinity")
+	}
+}

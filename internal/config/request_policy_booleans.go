@@ -6,7 +6,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// Validate new opt-in policies before optional loading can discard a decode
+// Validate request policy flags before optional loading can discard a decode
 // error. YAML 1.1 strings such as yes/on must not silently enable a policy.
 func validateRequestPolicyBooleansYAML(data []byte) error {
 	var document yaml.Node
@@ -18,7 +18,7 @@ func validateRequestPolicyBooleansYAML(data []byte) error {
 		keys []string
 	}{
 		{"codex", []string{"passthrough-prompt-cache-key", "stream-bootstrap-buffering", "optimize-multi-agent-v2", "orphan-delegation-compatibility", "estimate-claude-input-tokens", "observe-quota"}},
-		{"routing", []string{"session-affinity-lcp", "session-affinity-subagents", "session-affinity-across-priorities"}},
+		{"routing", []string{"session-affinity-lcp", "session-affinity-subagents", "session-affinity-across-priorities", "session-affinity-use-history"}},
 	} {
 		node, err := credentialYAMLField(document.Content[0], section.name, make(map[*yaml.Node]bool))
 		if err != nil {

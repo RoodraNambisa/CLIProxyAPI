@@ -531,6 +531,11 @@ routing:
   # Explicit session identifiers take precedence over the client cache key.
   # Cache-key affinity does not require codex.passthrough-prompt-cache-key.
   session-affinity: false # default: false
+  # Allow initial-message hashes and conversation-prefix inference when explicit
+  # session IDs/cache keys are absent. False uses the configured routing strategy
+  # without deriving affinity from message history, even if session-affinity-lcp
+  # remains configured. Explicit identities and WebSocket bindings are unchanged.
+  session-affinity-use-history: true # default: true; hot reload affects new requests
   # Keep an eligible existing binding when a higher-priority credential recovers.
   # Requires session affinity. Cold selection and failover still follow priority.
   # Boolean only; hot reload applies to new requests, not in-flight routing policy.

@@ -4969,6 +4969,7 @@ func (s *Service) applyRuntimeConfigState(ctx context.Context, previousCfg, next
 				Failover:         &failover,
 				AcrossPriorities: nextCfg.Routing.SessionAffinityAcrossPriorities,
 				Subagents:        nextCfg.Routing.SessionAffinity && nextCfg.Routing.SessionAffinitySubagents,
+				UseHistory:       nextCfg.Routing.SessionAffinityUseHistory,
 				LCP:              nextCfg.Routing.SessionAffinity && nextCfg.Routing.SessionAffinityLCP,
 			})
 		}

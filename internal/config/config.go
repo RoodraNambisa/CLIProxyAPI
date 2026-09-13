@@ -1782,6 +1782,11 @@ type RoutingConfig struct {
 	// conversation_id, prompt_cache_key, or message hash.
 	SessionAffinity bool `yaml:"session-affinity,omitempty" json:"session-affinity,omitempty"`
 
+	// SessionAffinityUseHistory permits message hashes and LCP inference when
+	// explicit identities are absent. Nil preserves the existing default: true.
+	// Disabling it leaves explicit identity and transport bindings unchanged.
+	SessionAffinityUseHistory *bool `yaml:"session-affinity-use-history,omitempty" json:"session-affinity-use-history,omitempty"`
+
 	// SessionAffinityAcrossPriorities keeps an eligible existing binding when a
 	// higher-priority credential recovers. Requires session affinity; default false.
 	// Hot reload affects new requests, not an in-flight routing policy.
@@ -1794,7 +1799,8 @@ type RoutingConfig struct {
 
 	// SessionAffinityLCP uses bounded conversation prefixes as credential
 	// preferences when reliable client identities are absent. Requires
-	// SessionAffinity; default false. Hot reload affects new requests only.
+	// SessionAffinity and enabled history inference; default false.
+	// Hot reload affects new requests only.
 	SessionAffinityLCP bool `yaml:"session-affinity-lcp" json:"session-affinity-lcp"`
 
 	// SessionAffinityFailover controls whether a session may move to another credential
@@ -1804,6 +1810,11 @@ type RoutingConfig struct {
 	// SessionAffinityTTL specifies how long session-to-auth bindings are retained.
 	// Default: 1h. Accepts duration strings like "30m", "1h", "2h30m".
 	SessionAffinityTTL string `yaml:"session-affinity-ttl,omitempty" json:"session-affinity-ttl,omitempty"`
+}
+
+// SessionAffinityHistoryEnabled resolves the backwards-compatible history policy.
+func (cfg RoutingConfig) SessionAffinityHistoryEnabled() bool {
+	return cfg.SessionAffinityUseHistory == nil || *cfg.SessionAffinityUseHistory
 }
 
 // OAuthModelAlias defines a model ID alias for a specific channel.
@@ -4351,12 +4362,22 @@ func isKnownDefaultValue(path []string, node *yaml.Node) bool {
 		return false
 	}
 	if fullPath == "routing" && node != nil && node.Kind == yaml.MappingNode {
+		if index := findMapKeyIndex(node, "session-affinity-use-history"); index >= 0 {
+			value := node.Content[index+1]
+			if value != nil && value.Tag == "!!bool" && value.Value == "false" {
+				return false
+			}
+		}
 		if index := findMapKeyIndex(node, "priority-overrides"); index >= 0 {
 			value := node.Content[index+1]
 			if value != nil && value.Kind == yaml.SequenceNode && len(value.Content) > 0 {
 				return false
 			}
 		}
+	}
+	if fullPath == "routing.session-affinity-use-history" && node != nil && node.Tag == "!!bool" {
+		// The omitted value enables history, so explicit false must survive saves.
+		return node.Value == "true"
 	}
 	if node != nil && node.Kind == yaml.ScalarNode && node.Tag == "!!int" {
 		switch fullPath {

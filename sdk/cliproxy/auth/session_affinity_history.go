@@ -14,7 +14,7 @@ func (s *SessionAffinitySelector) historyRequest(ctx context.Context, provider, 
 	if s == nil || !s.lcp || s.historyMatcher == nil {
 		return "", nil, false
 	}
-	captured := captureAffinityIdentity(ctx, core.Request{}, opts, true)
+	captured := captureAffinityIdentityWithHistoryPolicy(ctx, core.Request{}, opts, true, !s.disableHistory)
 	if captured.scope == "" || captured.identity.SessionID != "" || captured.history == nil || !captured.history.Usable() {
 		return "", nil, false
 	}

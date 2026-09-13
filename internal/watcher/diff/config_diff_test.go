@@ -746,3 +746,17 @@ func TestSessionAffinityLCPChangeDetails(t *testing.T) {
 		t.Fatal("missing or noisy history affinity change detail")
 	}
 }
+
+func TestSessionAffinityUseHistoryChangeDetails(t *testing.T) {
+	oldCfg, nextCfg := &config.Config{}, &config.Config{}
+	on, off := true, false
+	nextCfg.Routing.SessionAffinityUseHistory = &on
+	if len(BuildConfigChangeDetails(oldCfg, nextCfg)) != 0 {
+		t.Fatal("explicit default produced a noisy history policy change")
+	}
+	nextCfg.Routing.SessionAffinityUseHistory = &off
+	changes := BuildConfigChangeDetails(oldCfg, nextCfg)
+	if len(changes) != 1 || changes[0] != "routing.session-affinity-use-history: true -> false" {
+		t.Fatal("history disable was not reported")
+	}
+}
