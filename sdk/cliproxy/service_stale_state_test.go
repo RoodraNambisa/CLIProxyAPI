@@ -16,6 +16,12 @@ func newServiceStaleStateTestService() *Service {
 	return &Service{
 		cfg:         &config.Config{},
 		coreManager: manager,
+		// These tests verify account-state replacement, not upstream discovery.
+		// Executor rebinding replaces the mock, so retain discovery in an idle
+		// queue instead of allowing inline requests with fixture credentials.
+		modelSyncCancel:  func() {},
+		modelSyncQueue:   make(chan string, 8),
+		modelSyncPending: make(map[string]modelSyncTaskState),
 	}
 }
 
