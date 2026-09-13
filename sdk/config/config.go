@@ -14,6 +14,8 @@ type ThinkingSupport = registry.ThinkingSupport
 const MaxModelThinkingBudget = internalconfig.MaxModelThinkingBudget
 
 type SDKConfig = internalconfig.SDKConfig
+type XAIConfig = internalconfig.XAIConfig
+type XAIHeaderDefaults = internalconfig.XAIHeaderDefaults
 type APIKeyGroup = internalconfig.APIKeyGroup
 type APIKeyPriorityList = internalconfig.APIKeyPriorityList
 

@@ -310,6 +310,9 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 		}
 	}
 
+	if !reflect.DeepEqual(oldCfg.XAI, newCfg.XAI) {
+		changes = append(changes, "xai: global headers, request defaults or identity policy changed")
+	}
 	if oldCfg.Codex.IdentityConfuse != newCfg.Codex.IdentityConfuse {
 		changes = append(changes, fmt.Sprintf("codex.identity-confuse: %t -> %t", oldCfg.Codex.IdentityConfuse, newCfg.Codex.IdentityConfuse))
 	}

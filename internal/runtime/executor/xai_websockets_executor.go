@@ -19,7 +19,6 @@ import (
 	xaiauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/xai"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	log "github.com/sirupsen/logrus"
@@ -445,6 +444,16 @@ func (e *XAIWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyauth.
 }
 
 func (e *XAIWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	runner, scoped, errPrepare := e.XAIExecutor.requestExecutor(ctx, req, opts)
+	if errPrepare != nil {
+		return nil, errPrepare
+	}
+	copyExecutor := *e
+	copyExecutor.XAIExecutor = runner
+	return copyExecutor.executeStreamWithPolicy(ctx, auth, req, scoped)
+}
+
+func (e *XAIWebsocketsExecutor) executeStreamWithPolicy(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -586,7 +595,9 @@ func (e *XAIWebsocketsExecutor) executeStream(ctx context.Context, auth *cliprox
 	if err != nil {
 		return nil, err
 	}
-	wsHeaders := applyXAIWebsocketHeaders(http.Header{}, auth, token, prepared.sessionID)
+	wsHeaders := applyXAIWebsocketHeaders(http.Header{}, auth, token, prepared.sessionID, e.cfg)
+	wsHeaders.Set("x-grok-model-override", prepared.baseModel)
+	e.applyPreparedXAIHeaders(ctx, auth, wsHeaders, prepared, opts)
 
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
@@ -630,7 +641,7 @@ func (e *XAIWebsocketsExecutor) executeStream(ctx context.Context, auth *cliprox
 		AuthValue: authValue,
 	}
 	helps.RecordAPIWebsocketRequest(ctx, e.cfg, wsReqLog)
-	logXAIWebsocketRequest(executionSessionID, authID, wsURL, wsReqBody)
+	logXAIWebsocketRequest(ctx, executionSessionID, authID, wsURL, wsReqBody)
 
 	conn, respHS, errDial := e.ensureUpstreamConn(ctx, auth, sess, authID, wsURL, wsHeaders)
 	var upstreamHeaders http.Header
@@ -693,6 +704,9 @@ func (e *XAIWebsocketsExecutor) executeStream(ctx context.Context, auth *cliprox
 		if sess != nil {
 			sess.clearActiveForConn(readCh, conn)
 			e.invalidateUpstreamConn(sess, conn, "send_error", errSend)
+			if plan := helps.XAIPlanFromOptions(opts); plan != nil {
+				plan.ApplyAttemptHeader(wsHeaders)
+			}
 			connRetry, respHSRetry, errDialRetry := e.ensureUpstreamConn(ctx, auth, sess, authID, wsURL, wsHeaders)
 			if errDialRetry != nil || connRetry == nil {
 				bodyErrRetry := websocketHandshakeBody(respHSRetry)
@@ -719,7 +733,7 @@ func (e *XAIWebsocketsExecutor) executeStream(ctx context.Context, auth *cliprox
 				AuthType:  authType,
 				AuthValue: authValue,
 			})
-			logXAIWebsocketRequest(executionSessionID, authID, wsURL, wsReqBodyRetry)
+			logXAIWebsocketRequest(ctx, executionSessionID, authID, wsURL, wsReqBodyRetry)
 			recordAPIWebsocketHandshake(ctx, e.cfg, respHSRetry)
 			reporter.StartResponseTTFT()
 			if errSendRetry := writeCurrentXAIWebsocketMessage(ctx, auth, sess, connRetry, wsReqBodyRetry); errSendRetry != nil {
@@ -868,12 +882,12 @@ func (e *XAIWebsocketsExecutor) executeStream(ctx context.Context, auth *cliprox
 				case "response.created":
 					if warmupRequest {
 						warmupCompletedPayload = buildXAIWebsocketWarmupCompletedPayload(payload)
-						logXAIWebsocketWarmupCompleted(executionSessionID, authID, wsURL, payload)
+						logXAIWebsocketWarmupCompleted(ctx, executionSessionID, authID, wsURL, payload)
 					}
 				case "response.output_item.done":
 					xaiCollectOutputItemDone(payload, outputItemsByIndex, &outputItemsFallback)
 				case "response.completed":
-					logXAIWebsocketTerminalResponse(executionSessionID, authID, wsURL, eventType, payload)
+					logXAIWebsocketTerminalResponse(ctx, executionSessionID, authID, wsURL, eventType, payload)
 					if detail, ok := helps.ParseCodexUsage(payload); ok {
 						reporter.Observe(detail)
 					}
@@ -1197,12 +1211,21 @@ func (e *XAIWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *cl
 	currentProxyBindingID := sess.proxyBindingID
 	currentProxyIdentity := sess.proxyIdentity
 	currentWSURL := sess.wsURL
+	currentHeaderDigest := sess.xaiHeaderDigest
 	sess.connMu.Unlock()
 	requestedAuthID := strings.TrimSpace(authID)
 	requestedAuthInstanceID := auth.RuntimeInstanceID()
 	requestedProxyBindingID := auth.EffectiveProxyBindingID()
 	requestedProxyIdentity := websocketProxyIdentity(e.cfg, auth)
 	requestedWSURL := strings.TrimSpace(wsURL)
+	requestedHeaderDigest := helps.XAIWebsocketHeaderDigest(headers)
+	if conn != nil && currentHeaderDigest != requestedHeaderDigest {
+		e.invalidateUpstreamConnWithoutDisconnectNotify(sess, conn, "headers_changed", nil)
+		conn, readerConn = nil, nil
+		if cliproxyexecutor.RequiredUpstreamWebsocket(ctx) {
+			return nil, nil, cliproxyexecutor.NewUpstreamWebsocketReplayRequiredError()
+		}
+	}
 	if conn != nil && (strings.TrimSpace(currentAuthID) != requestedAuthID || strings.TrimSpace(currentAuthInstanceID) != requestedAuthInstanceID || strings.TrimSpace(currentProxyBindingID) != requestedProxyBindingID || strings.TrimSpace(currentProxyIdentity) != requestedProxyIdentity || strings.TrimSpace(currentWSURL) != requestedWSURL) {
 		e.invalidateUpstreamConnWithoutDisconnectNotify(sess, conn, "auth_changed", nil)
 		conn = nil
@@ -1266,6 +1289,7 @@ func (e *XAIWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *cl
 	}
 	sess.conn = conn
 	sess.wsURL = wsURL
+	sess.xaiHeaderDigest = requestedHeaderDigest
 	sess.authID = authID
 	sess.authInstanceID = requestedAuthInstanceID
 	sess.proxyBindingID = requestedProxyBindingID
@@ -1317,8 +1341,8 @@ func configureXAIWebsocketConn(sess *codexWebsocketSession, conn *websocket.Conn
 		return
 	}
 	conn.SetPingHandler(func(appData string) error {
-		sess.writeMu.Lock()
-		defer sess.writeMu.Unlock()
+		// WriteControl may run concurrently with payload writes. Holding writeMu
+		// here starves pongs while a large request is being transmitted.
 		return conn.WriteControl(websocket.PongMessage, []byte(appData), time.Time{})
 	})
 }
@@ -1573,7 +1597,7 @@ func buildXAIResponsesWebsocketURL(httpURL string) (string, error) {
 	return parsed.String(), nil
 }
 
-func applyXAIWebsocketHeaders(headers http.Header, auth *cliproxyauth.Auth, token string, sessionID string) http.Header {
+func applyXAIWebsocketHeaders(headers http.Header, auth *cliproxyauth.Auth, token string, sessionID string, configs ...*config.Config) http.Header {
 	if headers == nil {
 		headers = http.Header{}
 	}
@@ -1584,30 +1608,30 @@ func applyXAIWebsocketHeaders(headers http.Header, auth *cliproxyauth.Auth, toke
 	if sessionID != "" {
 		headers.Set("x-grok-conv-id", sessionID)
 	}
-	var attrs map[string]string
-	if auth != nil {
-		attrs = auth.Attributes
+	var cfg *config.Config
+	if len(configs) > 0 {
+		cfg = configs[0]
 	}
-	util.ApplyCustomHeadersFromAttrs(&http.Request{Header: headers}, attrs)
+	helps.ApplyXAIResourceHeaders(&http.Request{Header: headers}, auth, cfg)
 	return headers
 }
 
 func logXAIWebsocketConnected(sessionID string, authID string, wsURL string) {
-	log.Infof("xai websockets: upstream connected session=%s auth=%s url=%s", strings.TrimSpace(sessionID), strings.TrimSpace(authID), strings.TrimSpace(wsURL))
+	log.Infof("xai websockets: upstream connected session_digest=%s auth=%s url=%s", helps.XAIIdentityDigest(sessionID), strings.TrimSpace(authID), strings.TrimSpace(wsURL))
 }
 
-func logXAIWebsocketRequest(sessionID string, authID string, wsURL string, payload []byte) {
+func logXAIWebsocketRequest(ctx context.Context, sessionID string, authID string, wsURL string, payload []byte) {
 	if len(payload) == 0 {
-		log.Infof("xai websockets: upstream request sent session=%s auth=%s url=%s", strings.TrimSpace(sessionID), strings.TrimSpace(authID), strings.TrimSpace(wsURL))
+		helps.LogWithRequestID(ctx).Infof("xai websockets: upstream request sent session_digest=%s auth=%s url=%s", helps.XAIIdentityDigest(sessionID), strings.TrimSpace(authID), strings.TrimSpace(wsURL))
 		return
 	}
 	generateValue := "default"
 	if generate := gjson.GetBytes(payload, "generate"); generate.Exists() {
 		generateValue = strings.TrimSpace(generate.Raw)
 	}
-	log.Infof(
-		"xai websockets: upstream request sent session=%s auth=%s url=%s event=%s previous_response_id=%s generate=%s input_items=%d",
-		strings.TrimSpace(sessionID),
+	helps.LogWithRequestID(ctx).Infof(
+		"xai websockets: upstream request sent session_digest=%s auth=%s url=%s event=%s previous_response_id=%s generate=%s input_items=%d",
+		helps.XAIIdentityDigest(sessionID),
 		strings.TrimSpace(authID),
 		strings.TrimSpace(wsURL),
 		strings.TrimSpace(gjson.GetBytes(payload, "type").String()),
@@ -1617,20 +1641,20 @@ func logXAIWebsocketRequest(sessionID string, authID string, wsURL string, paylo
 	)
 }
 
-func logXAIWebsocketWarmupCompleted(sessionID string, authID string, wsURL string, payload []byte) {
-	log.Infof(
-		"xai websockets: upstream warmup completed session=%s auth=%s url=%s response_id=%s",
-		strings.TrimSpace(sessionID),
+func logXAIWebsocketWarmupCompleted(ctx context.Context, sessionID string, authID string, wsURL string, payload []byte) {
+	helps.LogWithRequestID(ctx).Infof(
+		"xai websockets: upstream warmup completed session_digest=%s auth=%s url=%s response_id=%s",
+		helps.XAIIdentityDigest(sessionID),
 		strings.TrimSpace(authID),
 		strings.TrimSpace(wsURL),
 		strings.TrimSpace(gjson.GetBytes(payload, "response.id").String()),
 	)
 }
 
-func logXAIWebsocketTerminalResponse(sessionID string, authID string, wsURL string, eventType string, payload []byte) {
-	log.Infof(
-		"xai websockets: upstream terminal response session=%s auth=%s url=%s event=%s response_id=%s previous_response_id=%s",
-		strings.TrimSpace(sessionID),
+func logXAIWebsocketTerminalResponse(ctx context.Context, sessionID string, authID string, wsURL string, eventType string, payload []byte) {
+	helps.LogWithRequestID(ctx).Infof(
+		"xai websockets: upstream terminal response session_digest=%s auth=%s url=%s event=%s response_id=%s previous_response_id=%s",
+		helps.XAIIdentityDigest(sessionID),
 		strings.TrimSpace(authID),
 		strings.TrimSpace(wsURL),
 		strings.TrimSpace(eventType),
@@ -1641,10 +1665,10 @@ func logXAIWebsocketTerminalResponse(sessionID string, authID string, wsURL stri
 
 func logXAIWebsocketDisconnected(sessionID string, authID string, wsURL string, reason string, err error) {
 	if err != nil {
-		log.Infof("xai websockets: upstream disconnected session=%s auth=%s url=%s reason=%s err=%v", strings.TrimSpace(sessionID), strings.TrimSpace(authID), strings.TrimSpace(wsURL), strings.TrimSpace(reason), err)
+		log.Infof("xai websockets: upstream disconnected session_digest=%s auth=%s url=%s reason=%s err=%v", helps.XAIIdentityDigest(sessionID), strings.TrimSpace(authID), strings.TrimSpace(wsURL), strings.TrimSpace(reason), err)
 		return
 	}
-	log.Infof("xai websockets: upstream disconnected session=%s auth=%s url=%s reason=%s", strings.TrimSpace(sessionID), strings.TrimSpace(authID), strings.TrimSpace(wsURL), strings.TrimSpace(reason))
+	log.Infof("xai websockets: upstream disconnected session_digest=%s auth=%s url=%s reason=%s", helps.XAIIdentityDigest(sessionID), strings.TrimSpace(authID), strings.TrimSpace(wsURL), strings.TrimSpace(reason))
 }
 
 type detachedXAIWebsocketSession struct {
@@ -1801,6 +1825,18 @@ func NewXAIAutoExecutor(cfg *config.Config) *XAIAutoExecutor {
 }
 
 func (e *XAIAutoExecutor) Identifier() string { return "xai" }
+
+func (e *XAIAutoExecutor) PrepareProviderRequest(ctx context.Context, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, operation cliproxyexecutor.RequestOperation) (any, error) {
+	return e.httpExec.PrepareProviderRequest(ctx, req, opts, operation)
+}
+
+func (e *XAIAutoExecutor) ShouldPrepareRequestAuth(auth *cliproxyauth.Auth) bool {
+	return e.httpExec.ShouldPrepareRequestAuth(auth)
+}
+
+func (e *XAIAutoExecutor) PrepareRequestAuth(ctx context.Context, auth *cliproxyauth.Auth) (*cliproxyauth.Auth, error) {
+	return e.httpExec.PrepareRequestAuth(ctx, auth)
+}
 
 func (e *XAIAutoExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Auth) error {
 	if e == nil || e.httpExec == nil {

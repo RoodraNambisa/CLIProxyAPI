@@ -4868,11 +4868,18 @@ func (e requestAuthPersistenceError) Error() string      { return e.err.Error() 
 func (e requestAuthPersistenceError) Unwrap() error      { return e.err }
 func (requestAuthPersistenceError) SkipAuthResult() bool { return true }
 
-func (m *Manager) prepareRequestAuth(ctx context.Context, executor ProviderExecutor, auth *Auth) (*Auth, error) {
+func (m *Manager) prepareRequestAuth(ctx context.Context, executor ProviderExecutor, auth *Auth, options ...cliproxyexecutor.Options) (*Auth, error) {
 	if m == nil || executor == nil || auth == nil {
 		return auth, nil
 	}
 	preparer, ok := executor.(RequestAuthPreparer)
+	if len(options) > 0 {
+		if prepared, exists := cliproxyexecutor.ProviderPreparedRequest(options[0], executor.Identifier()); exists {
+			if scoped, scopedOK := prepared.(RequestAuthPreparer); scopedOK {
+				preparer, ok = scoped, true
+			}
+		}
+	}
 	if !ok || !preparer.ShouldPrepareRequestAuth(auth) {
 		return auth, nil
 	}
@@ -5696,11 +5703,11 @@ func carryForwardPreparedAuthRuntimeState(current, next *Auth) {
 	applyLifecycleRuntimeState(next)
 }
 
-func (m *Manager) prepareRequestAuthWithUnauthorizedRefresh(ctx context.Context, executor ProviderExecutor, auth *Auth) (*Auth, bool, error) {
+func (m *Manager) prepareRequestAuthWithUnauthorizedRefresh(ctx context.Context, executor ProviderExecutor, auth *Auth, options ...cliproxyexecutor.Options) (*Auth, bool, error) {
 	if err := cliproxyexecutor.ImageRequestBudgetFromContext(ctx).Select(auth.Provider); err != nil {
 		return auth, false, err
 	}
-	prepared, errPrepare := m.prepareRequestAuth(ctx, executor, auth)
+	prepared, errPrepare := m.prepareRequestAuth(ctx, executor, auth, options...)
 	if errPrepare == nil {
 		return prepared, false, nil
 	}
@@ -5711,7 +5718,7 @@ func (m *Manager) prepareRequestAuthWithUnauthorizedRefresh(ctx context.Context,
 	if !attemptedRefresh {
 		return prepared, false, errPrepare
 	}
-	prepared, errPrepare = m.prepareRequestAuth(ctx, executor, refreshed)
+	prepared, errPrepare = m.prepareRequestAuth(ctx, executor, refreshed, options...)
 	return prepared, true, errPrepare
 }
 
@@ -5780,7 +5787,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			execCtx = context.WithValue(execCtx, roundTripperContextKey{}, rt)
 			execCtx = context.WithValue(execCtx, "cliproxy.roundtripper", rt)
 		}
-		preparedAuth, refreshedOnUnauthorized, errPrepare := m.prepareRequestAuthWithUnauthorizedRefresh(execCtx, executor, auth)
+		preparedAuth, refreshedOnUnauthorized, errPrepare := m.prepareRequestAuthWithUnauthorizedRefresh(execCtx, executor, auth, opts)
 		if errPrepare != nil {
 			if errCtx := execCtx.Err(); errCtx != nil {
 				return cliproxyexecutor.Response{}, withAuthErrorResponseSource(errCtx, auth, provider)
@@ -6064,7 +6071,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			execCtx = context.WithValue(execCtx, roundTripperContextKey{}, rt)
 			execCtx = context.WithValue(execCtx, "cliproxy.roundtripper", rt)
 		}
-		preparedAuth, refreshedOnUnauthorized, errPrepare := m.prepareRequestAuthWithUnauthorizedRefresh(execCtx, executor, auth)
+		preparedAuth, refreshedOnUnauthorized, errPrepare := m.prepareRequestAuthWithUnauthorizedRefresh(execCtx, executor, auth, opts)
 		if errPrepare != nil {
 			if errCtx := execCtx.Err(); errCtx != nil {
 				return cliproxyexecutor.Response{}, withAuthErrorResponseSource(errCtx, auth, provider)
@@ -6341,7 +6348,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			execCtx = context.WithValue(execCtx, roundTripperContextKey{}, rt)
 			execCtx = context.WithValue(execCtx, "cliproxy.roundtripper", rt)
 		}
-		preparedAuth, refreshedOnUnauthorized, errPrepare := m.prepareRequestAuthWithUnauthorizedRefresh(execCtx, executor, auth)
+		preparedAuth, refreshedOnUnauthorized, errPrepare := m.prepareRequestAuthWithUnauthorizedRefresh(execCtx, executor, auth, opts)
 		if errPrepare != nil {
 			if errCtx := execCtx.Err(); errCtx != nil {
 				return nil, withAuthErrorResponseSource(errCtx, auth, provider)
@@ -7642,6 +7649,14 @@ func (m *Manager) prepareProviderRequests(
 		return nil, opts, err
 	}
 	if selector, ok := m.selectorForContext(ctx).(*SessionAffinitySelector); ok && selector != nil {
+		if len(providers) == 1 && providers[0] == "xai" {
+			metadata := make(map[string]any, len(opts.Metadata)+1)
+			for key, value := range opts.Metadata {
+				metadata[key] = value
+			}
+			metadata[grokSessionIdentityMetadataKey] = true
+			opts.Metadata = metadata
+		}
 		if selector.subagents || selector.lcp {
 			opts = withCapturedAffinityIdentity(opts, captureAffinityIdentityWithHistoryPolicy(ctx, req, opts, selector.lcp, !selector.disableHistory))
 		} else {

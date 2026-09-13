@@ -424,6 +424,9 @@ type Config struct {
 	// Codex configures provider-wide Codex request behavior.
 	Codex CodexConfig `yaml:"codex" json:"codex"`
 
+	// XAI configures provider-wide Grok resource requests and optional identities.
+	XAI XAIConfig `yaml:"xai" json:"xai"`
+
 	// ChatGPTWeb configures provider-wide ChatGPT Web credential behavior.
 	ChatGPTWeb ChatGPTWebConfig `yaml:"chatgpt-web" json:"chatgpt-web"`
 
@@ -2270,6 +2273,7 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	cfg.Images.Native.Edits.UnsupportedModelMessage = "Native image edit is not enabled for model {model}"
 	cfg.CodexFingerprint.DefaultMode = DefaultCodexFingerprintMode
 	cfg.CodexFingerprint.SessionIdentityPoolSize = DefaultCodexSessionIdentityPoolSize
+	cfg.XAI.SessionIdentityPoolSize = DefaultXAISessionIdentityPoolSize
 	defaultImagesNAggregation := false
 	cfg.Images.EnableNAggregation = &defaultImagesNAggregation
 	cfg.Images.UnsupportedStatusCode = http.StatusBadRequest
@@ -2378,6 +2382,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	}
 	if cfg.CodexFingerprint.SessionIdentityPoolSize < 1 || cfg.CodexFingerprint.SessionIdentityPoolSize > MaxCodexSessionIdentityPoolSize {
 		return nil, fmt.Errorf("codex-fingerprint.session-identity-pool-size must be between 1 and %d", MaxCodexSessionIdentityPoolSize)
+	}
+	if err = cfg.XAI.Validate(); err != nil {
+		return nil, err
 	}
 
 	cfg.Images.CodexModel = strings.TrimSpace(cfg.Images.CodexModel)

@@ -15,6 +15,52 @@ import (
 
 const affinityIdentityMetadataKey = "session_affinity_identity_snapshot"
 const basicAffinityIdentityMetadataKey = "basic_session_affinity_identity_snapshot"
+const grokSessionIdentityMetadataKey = "grok_session_identity_policy"
+
+// ProviderSessionFingerprint reuses captured routing identity even when empty.
+// Without routing affinity, enabled provider identity policies may resolve one
+// identity themselves; inferred histories retain authenticated caller scope.
+func ProviderSessionFingerprint(ctx context.Context, req core.Request, opts core.Options, useHistory bool, explicit ...session.Identity) (string, string) {
+	if _, ok := opts.Metadata[basicAffinityIdentityMetadataKey]; ok {
+		return SessionAffinityFingerprint(opts), "routing"
+	}
+	if _, ok := opts.Metadata[affinityIdentityMetadataKey]; ok {
+		return SessionAffinityFingerprint(opts), "routing"
+	}
+	payload := opts.OriginalRequest
+	if len(payload) == 0 {
+		payload = req.Payload
+	}
+	executionID, _ := opts.Metadata[core.ExecutionSessionMetadataKey].(string)
+	var identity session.Identity
+	if len(explicit) > 0 {
+		identity = explicit[0]
+	} else {
+		identity, _ = session.ExtractExplicitIdentity(opts.Headers, payload, "")
+	}
+	if identity.SessionID != "" {
+		digest := messageTextDigest(identity.SessionID)
+		return hex.EncodeToString(digest[:]), "explicit"
+	}
+	if useHistory {
+		primary, fallback := extractMessageHashIDs(payload)
+		if fallback != "" {
+			primary = fallback
+		}
+		scope := util.AuthenticatedSessionScope(ctx)
+		if scope == "" {
+			scope, _ = opts.Metadata[core.CallerScopeMetadataKey].(string)
+		}
+		if primary != "" && scope != "" {
+			return scopedAffinityID(scope, primary), "history"
+		}
+	}
+	if executionID != "" {
+		digest := messageTextDigest("execution:" + executionID)
+		return hex.EncodeToString(digest[:]), "execution"
+	}
+	return "", "request"
+}
 
 type basicAffinityIdentity struct {
 	selector          *SessionAffinitySelector
@@ -71,6 +117,20 @@ func (s *SessionAffinitySelector) withBasicAffinityIdentity(ctx context.Context,
 		payload = req.Payload
 	}
 	primary, fallback := extractSessionIDsWithHistory(headers, payload, opts.Metadata, !s.disableHistory)
+	if grok, _ := opts.Metadata[grokSessionIdentityMetadataKey].(bool); grok && strings.HasPrefix(primary, "msg:") {
+		scope := util.AuthenticatedSessionScope(ctx)
+		if scope == "" {
+			scope, _ = opts.Metadata[core.CallerScopeMetadataKey].(string)
+		}
+		if scope == "" {
+			primary, fallback = "", ""
+		} else {
+			primary = scopedAffinityID(scope, primary)
+			if fallback != "" {
+				fallback = scopedAffinityID(scope, fallback)
+			}
+		}
+	}
 	metadata := make(map[string]any, len(opts.Metadata)+1)
 	for key, value := range opts.Metadata {
 		metadata[key] = value
@@ -117,7 +177,12 @@ func captureAffinityIdentityWithHistoryPolicy(ctx context.Context, req core.Requ
 		payload = req.Payload
 	}
 	executionID, _ := opts.Metadata[core.ExecutionSessionMetadataKey].(string)
-	identity, _ := session.ExtractExplicitIdentity(headers, payload, executionID)
+	var identity session.Identity
+	if grok, _ := opts.Metadata[grokSessionIdentityMetadataKey].(bool); grok {
+		identity, _ = session.ExtractGrokExplicitIdentity(headers, payload, executionID)
+	} else {
+		identity, _ = session.ExtractExplicitIdentity(headers, payload, executionID)
+	}
 	captured := affinityRequestIdentity{scope: scope, identity: identity}
 	if !useHistory {
 		return captured

@@ -13,7 +13,19 @@ var claudeSessionSuffix = regexp.MustCompile(`_session_([a-f0-9-]+)$`)
 // ExtractExplicitIdentity preserves native client signals ahead of generic
 // hints. Cache keys remain a distinct role and never establish parentage.
 func ExtractExplicitIdentity(headers http.Header, payload []byte, executionID string) (Identity, bool) {
+	return extractExplicitIdentity(headers, payload, executionID, false)
+}
+
+// ExtractGrokExplicitIdentity excludes per-request and account-only hints.
+func ExtractGrokExplicitIdentity(headers http.Header, payload []byte, executionID string) (Identity, bool) {
+	return extractExplicitIdentity(headers, payload, executionID, true)
+}
+
+func extractExplicitIdentity(headers http.Header, payload []byte, executionID string, grok bool) (Identity, bool) {
 	roots := protocolRoots(payload)
+	if id := explicitID(headerValue(headers, "X-Grok-Session-Id")); id != "" {
+		return Identity{SessionID: "grok:" + id}, true
+	}
 	if identity, ok := extractClaudeIdentity(headers, roots); ok {
 		return identity, true
 	}
@@ -29,6 +41,9 @@ func ExtractExplicitIdentity(headers http.Header, payload []byte, executionID st
 		{"X-Thread-Id", "X-Parent-Thread-Id", "thread"},
 		{"X-Client-Request-Id", "", "clientreq"},
 	} {
+		if grok && field[0] == "X-Client-Request-Id" {
+			continue
+		}
 		if id := explicitID(headerValue(headers, field[0])); id != "" {
 			return identityWithParent(field[2], id, explicitID(headerValue(headers, field[1])), roots), true
 		}
@@ -40,12 +55,18 @@ func ExtractExplicitIdentity(headers http.Header, payload []byte, executionID st
 		{"chat_id", "conv"}, {"chatId", "conv"}, {"metadata.conversation_id", "conv"},
 		{"extra_body.conversation_id", "conv"}, {"metadata.user_id", "user"},
 	} {
+		if grok && field[0] == "metadata.user_id" {
+			continue
+		}
 		if id := rootID(roots, field[0]); id != "" {
 			return identityWithParent(field[1], id, "", roots), true
 		}
 	}
 	if id := promptCacheIdentity(roots[0].Get("prompt_cache_key")); id != "" {
 		return Identity{SessionID: id}, true
+	}
+	if id := explicitID(headerValue(headers, "X-Grok-Conv-Id")); id != "" {
+		return Identity{SessionID: "grok:" + id}, true
 	}
 	if id := explicitID(executionID); id != "" {
 		return Identity{SessionID: "execution:" + id}, true

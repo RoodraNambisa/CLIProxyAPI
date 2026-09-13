@@ -76,6 +76,7 @@ type codexWebsocketSession struct {
 	proxyIdentity      string
 	softwareIdentity   codexauth.SoftwareIdentity
 	cacheSessionDigest [sha256.Size]byte
+	xaiHeaderDigest    string
 	// multiAgentResponse describes only the tools committed on the current conn.
 	// It is guarded by connMu and contains no request bodies or connection pointer.
 	multiAgentResponse helps.CodexMultiAgentResponsePolicy

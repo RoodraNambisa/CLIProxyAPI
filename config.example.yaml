@@ -678,6 +678,31 @@ nonstream-keepalive-interval: 0
 #     excluded-models:
 #       - "gemini-2.5-pro"
 
+# Grok global resource headers and policies. Credential custom headers win.
+# OAuth acquisition uses separate login headers. Model override and identity
+# headers are controlled by the final model and the policies below.
+xai:
+  header-defaults:
+    user-agent: "" # Built-in: xai-grok-workspace/0.2.120
+    client-version: "" # Built-in: 0.2.120
+    client-identifier: "" # Built-in: grok-shell
+  headers: {}
+  passthrough-client-identity: false
+  spoof-session-identity: false
+  session-identity-convergence: false
+  session-identity-pool-size: 4 # 1-64; resizing reassigns sessions.
+  identity-confuse: false
+  # Only fills omitted client parameters; payload override rules still apply.
+  # Supported: max_output_tokens, reasoning.effort, temperature, top_p,
+  # tool_choice, parallel_tool_calls and stream_tool_calls.
+  request-defaults: {}
+  inject-web-search: false
+  inject-x-search: false
+  # Passthrough protects explicit session, conversation and cache fields.
+  # Other identities derive from a persistent per-credential random seed.
+  # Slots never share websocket state or conversation history.
+  # History inference follows routing.session-affinity-use-history.
+
 # Codex API keys
 # All configured API key model lists accept optional catalog declarations:
 # display-name: human-readable label; blank inherits the existing catalog name.

@@ -1357,6 +1357,18 @@ func extractSessionIDs(headers http.Header, payload []byte, metadata map[string]
 }
 
 func extractSessionIDsWithHistory(headers http.Header, payload []byte, metadata map[string]any, useHistory bool) (string, string) {
+	if grok, _ := metadata[grokSessionIdentityMetadataKey].(bool); grok {
+		if identity, ok := session.ExtractGrokExplicitIdentity(headers, payload, ""); ok {
+			return identity.SessionID, ""
+		}
+		if !useHistory {
+			return "", ""
+		}
+		return extractMessageHashIDs(payload)
+	}
+	if sid := strings.TrimSpace(headers.Get("X-Grok-Session-Id")); sid != "" {
+		return "grok:" + sid, ""
+	}
 	// 1. metadata.user_id with Claude Code session format (highest priority)
 	userID := affinityBodyField(payload, "metadata.user_id").String()
 	if len(payload) > 0 {
@@ -1401,6 +1413,9 @@ func extractSessionIDsWithHistory(headers http.Header, payload []byte, metadata 
 	}
 
 	if len(payload) == 0 {
+		if sid := strings.TrimSpace(headers.Get("X-Grok-Conv-Id")); sid != "" {
+			return "grok:" + sid, ""
+		}
 		return "", ""
 	}
 
@@ -1421,6 +1436,9 @@ func extractSessionIDsWithHistory(headers http.Header, payload []byte, metadata 
 		}
 	}
 
+	if sid := strings.TrimSpace(headers.Get("X-Grok-Conv-Id")); sid != "" {
+		return "grok:" + sid, ""
+	}
 	// 8. Hash-based fallback from message content
 	if !useHistory {
 		return "", ""

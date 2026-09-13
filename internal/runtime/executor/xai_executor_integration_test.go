@@ -93,8 +93,11 @@ func TestXAIUsingAPIRoutingAndChatProxyHeaders(t *testing.T) {
 	}
 	req = httptest.NewRequest(http.MethodPost, xaiauth.DefaultAPIBaseURL+"/responses", nil)
 	applyXAIChatHeaders(req, official, "token", true, "")
-	if req.Header.Get(xaiTokenAuthHeader) != "" || req.Header.Get(xaiClientVersionHeader) != "" {
-		t.Fatalf("official API unexpectedly received CLI headers: %v", req.Header)
+	if req.Header.Get(xaiTokenAuthHeader) != "" {
+		t.Fatal("official API unexpectedly received subscription authentication headers")
+	}
+	if req.Header.Get(xaiClientVersionHeader) != xaiClientVersionValue {
+		t.Fatal("official API lost the shared Grok software identity")
 	}
 }
 
