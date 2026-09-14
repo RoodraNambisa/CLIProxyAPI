@@ -1228,6 +1228,10 @@ func (service *Service) loginFailure(credential *Credential, relogin bool, authE
 }
 
 func (service *Service) applyFailure(credential *Credential, authError *AuthError, relogin bool) {
+	var computeErr *SentinelComputeError
+	if errors.As(authError, &computeErr) {
+		return
+	}
 	if credential == nil || authError == nil {
 		return
 	}
@@ -1251,6 +1255,10 @@ func (service *Service) timestamp() string {
 }
 
 func ensureAuthError(err error, defaultState LifecycleState) *AuthError {
+	var computeErr *SentinelComputeError
+	if errors.As(err, &computeErr) {
+		return newAuthError("sentinel_compute_unavailable", defaultState, 0, false, false, "Sentinel computation is unavailable", err)
+	}
 	if authError, ok := AsAuthError(err); ok {
 		return authError
 	}

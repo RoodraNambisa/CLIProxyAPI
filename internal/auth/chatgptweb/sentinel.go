@@ -303,7 +303,23 @@ func (sentinel *Sentinel) generateHeaders(
 	beginObserver SentinelObserverStarter,
 	requireObserver bool,
 ) (SentinelHeaders, error) {
-	requirementsToken, err := sentinel.generator.GenerateRequirementsToken()
+	var remote *SentinelComputeSession
+	var requirementsToken string
+	var err error
+	pool := computePoolFromContext(ctx)
+	if pool.Enabled("login") {
+		remote, err = pool.Begin(ctx, "login", SentinelComputeInput{
+			Format: "auth", Environment: ComputeEnvironment(sentinel.environment()), GeneratorSID: sentinel.generator.sid,
+			Flow: flow, Clock: sentinel.generator.now(), SDKURL: sentinelSDKURL, SDKSHA256: sentinelSDKSHA256, SDKIntegrityRequired: true,
+		}, SentinelComputeHooks{Reader: sentinel.generator.random, Now: sentinel.generator.now, Fetcher: sentinel.sdkFetcher()})
+		if err != nil {
+			return SentinelHeaders{}, err
+		}
+		defer remote.Close()
+		requirementsToken = remote.RequirementsToken()
+	} else {
+		requirementsToken, err = sentinel.generator.GenerateRequirementsToken()
+	}
 	if err != nil {
 		return SentinelHeaders{}, newAuthError("sentinel_generation_failed", LifecycleLoginPending, 0, false, true, err.Error(), err)
 	}
@@ -351,6 +367,26 @@ func (sentinel *Sentinel) generateHeaders(
 	proofSeed := stringValue(proofOfWork["seed"])
 	if proofRequired && proofSeed == "" {
 		return SentinelHeaders{}, newAuthError("sentinel_pow_invalid", LifecycleLoginPending, response.StatusCode, true, false, "sentinel proof-of-work seed is missing", nil)
+	}
+	if remote != nil {
+		computed, errCompute := remote.Solve(ctx, ComputeChallenge(challenge, requireObserver))
+		if errCompute != nil {
+			return SentinelHeaders{}, errCompute
+		}
+		headerValue, errEncode := json.Marshal(map[string]any{"p": computed.ProofToken, "t": computed.TurnstileToken, "c": challengeToken, "id": sentinel.deviceID, "flow": flow})
+		if errEncode != nil {
+			return SentinelHeaders{}, errEncode
+		}
+		if sentinel.authURL != "" {
+			if errCookie := sentinel.client.SetCookie(sentinel.authURL, "oai-sc", "0"+challengeToken); errCookie != nil {
+				return SentinelHeaders{}, errCookie
+			}
+		}
+		result := SentinelHeaders{Token: string(headerValue)}
+		if requireObserver && sentinelObserverChallengeRequired(challenge) {
+			result.SOToken, err = remote.Snapshot(ctx)
+		}
+		return result, err
 	}
 	environment := sentinel.environment()
 	var observer SentinelObserverHandle

@@ -19,6 +19,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/buildinfo"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/proxypool"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/sentinelservice"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v6/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
@@ -70,6 +71,8 @@ const managementResponseFieldsKey = "management_response_fields"
 
 // Handler aggregates config reference, persistence path and helpers.
 type Handler struct {
+	sentinelSolver          *sentinelservice.Service
+	sentinelOnly            bool
 	cfg                     *config.Config
 	configSnapshot          atomic.Pointer[config.Config]
 	configFilePath          string

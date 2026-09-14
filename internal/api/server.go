@@ -29,6 +29,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/managementasset"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/proxypool"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/sentinelservice"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v6/sdk/access"
@@ -189,6 +190,9 @@ func WithUsageRestoreStatusProvider(provider func() usage.RestoreRuntimeSnapshot
 // Server represents the main API server.
 // It encapsulates the Gin engine, HTTP server, handlers, and configuration.
 type Server struct {
+	sentinelOnly    bool
+	sentinelSolver  *sentinelservice.Service
+	sentinelInitErr error
 	// engine is the Gin web framework engine instance.
 	engine *gin.Engine
 
@@ -391,6 +395,10 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 		managementCfg = cfg
 	}
 	s.mgmt = managementHandlers.NewHandler(managementCfg, configFilePath, authManager)
+	s.sentinelSolver, s.sentinelInitErr = sentinelservice.New(cfg.SentinelSolver)
+	if s.sentinelSolver != nil {
+		s.mgmt.SetSentinelSolver(s.sentinelSolver)
+	}
 	s.mgmt.SetProxyPoolManager(optionState.proxyPoolManager)
 	runtimeConfigApply := optionState.runtimeConfigApply
 	if runtimeConfigApply == nil {
@@ -984,6 +992,10 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/chatgpt-web/image-tasks", s.mgmt.GetChatGPTWebImageTasks)
 		mgmt.DELETE("/chatgpt-web/image-tasks/:id", s.mgmt.CancelChatGPTWebImageTask)
 		mgmt.GET("/chatgpt-web/sentinel", s.mgmt.GetChatGPTWebSentinel)
+		mgmt.GET("/runtime/capabilities", s.mgmt.GetRuntimeCapabilities)
+		mgmt.GET("/sentinel-solver", s.mgmt.GetSentinelSolver)
+		mgmt.PATCH("/sentinel-solver", s.mgmt.PatchSentinelSolver)
+		mgmt.POST("/sentinel-solver/test-node", s.mgmt.TestSentinelNode)
 		mgmt.PUT("/chatgpt-web/sentinel", s.mgmt.PutChatGPTWebSentinel)
 		mgmt.PATCH("/chatgpt-web/sentinel", s.mgmt.PatchChatGPTWebSentinel)
 		mgmt.GET("/chatgpt-web/account-info", s.mgmt.GetChatGPTWebAccountInfo)
@@ -1264,6 +1276,16 @@ func (s *Server) StartListening() (net.Addr, <-chan error, error) {
 	if errListen != nil {
 		return nil, nil, fmt.Errorf("failed to bind API server on %s: %w", s.server.Addr, errListen)
 	}
+	if s.sentinelInitErr != nil {
+		_ = listener.Close()
+		return nil, nil, s.sentinelInitErr
+	}
+	if s.sentinelSolver != nil {
+		if err := s.sentinelSolver.Start(); err != nil {
+			_ = listener.Close()
+			return nil, nil, err
+		}
+	}
 	serverErr := make(chan error, 1)
 	go func() {
 		var errServe error
@@ -1295,6 +1317,12 @@ func (s *Server) StartListening() (net.Addr, <-chan error, error) {
 //   - error: An error if the server fails to stop
 func (s *Server) Stop(ctx context.Context) error {
 	log.Debug("Stopping API server...")
+	solverDone := make(chan error, 1)
+	if s.sentinelSolver != nil {
+		go func() { solverDone <- s.sentinelSolver.Stop(ctx) }()
+	} else {
+		solverDone <- nil
+	}
 	if s.codexLive != nil {
 		s.codexLive.Close()
 	}
@@ -1317,7 +1345,11 @@ func (s *Server) Stop(ctx context.Context) error {
 	}
 	errShutdown := s.server.Shutdown(ctx)
 	errManagement := <-managementDone
+	errSolver := <-solverDone
 	var shutdownErrors []error
+	if errSolver != nil {
+		shutdownErrors = append(shutdownErrors, fmt.Errorf("failed to shutdown solver: %w", errSolver))
+	}
 	if errShutdown != nil {
 		shutdownErrors = append(shutdownErrors, fmt.Errorf("failed to shutdown HTTP server: %w", errShutdown))
 	}
@@ -1371,6 +1403,9 @@ func (s *Server) applyAccessConfig(oldCfg, newCfg *config.Config) error {
 func (s *Server) UpdateClients(cfg *config.Config) error {
 	if s == nil {
 		return errors.New("runtime configuration is unavailable")
+	}
+	if s.sentinelOnly {
+		return s.updateSentinelOnlyClients(cfg)
 	}
 	s.configUpdateMu.Lock()
 	defer s.configUpdateMu.Unlock()
@@ -1486,6 +1521,11 @@ func (s *Server) updateClients(cfg *config.Config, rollbackOnError bool) error {
 	}
 
 	s.setCurrentConfig(runtimeCfg)
+	if s.sentinelSolver != nil {
+		if err := s.sentinelSolver.UpdateConfig(runtimeCfg.SentinelSolver); err != nil {
+			return rollback(err)
+		}
+	}
 
 	if errAccess := s.applyAccessConfig(oldCfg, runtimeCfg); errAccess != nil {
 		return rollback(fmt.Errorf("update access providers: %w", errAccess))

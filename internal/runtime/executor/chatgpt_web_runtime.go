@@ -1547,7 +1547,26 @@ func (e *ChatGPTWebExecutor) chatGPTWebRequirements(ctx context.Context, client 
 		ScriptSources:      sources,
 		Location:           strings.TrimRight(baseURL, "/") + "/",
 	}
-	pToken, err := chatgptwebauth.BuildConversationRequirementsTokenWithEnvironment(sentinelEnvironment, sources, dataBuild, e.runtimeRand, e.now)
+	var remoteCompute *chatgptwebauth.SentinelComputeSession
+	var pToken string
+	computeScope := chatgptwebauth.SentinelComputeScope(ctx)
+	if e.sentinelCompute.Enabled(computeScope) {
+		computeFetcher := e.chatGPTWebSentinelSDKFetcher(client, credential)
+		if e.sentinelSDKFetcherFactory != nil {
+			computeFetcher = e.sentinelSDKFetcherFactory(client, credential)
+		}
+		remoteCompute, err = e.sentinelCompute.Begin(ctx, computeScope, chatgptwebauth.SentinelComputeInput{
+			Format: "conversation", Environment: chatgptwebauth.ComputeEnvironment(sentinelEnvironment), DataBuild: dataBuild,
+			Flow: "conversation", Clock: e.now(), SDKURL: sdkResource.URL, SDKSHA256: sdkResource.SHA256, SDKIntegrityRequired: sdkResource.IntegrityRequired,
+		}, chatgptwebauth.SentinelComputeHooks{Reader: e.runtimeRand, Now: e.now, Fetcher: computeFetcher})
+		if err != nil {
+			return chatGPTWebRequirements{}, err
+		}
+		defer remoteCompute.Close()
+		pToken = remoteCompute.RequirementsToken()
+	} else {
+		pToken, err = chatgptwebauth.BuildConversationRequirementsTokenWithEnvironment(sentinelEnvironment, sources, dataBuild, e.runtimeRand, e.now)
+	}
 	if err != nil {
 		return chatGPTWebRequirements{}, chatGPTWebLocalProtocolError(
 			http.StatusBadGateway,
@@ -1595,78 +1614,88 @@ func (e *ChatGPTWebExecutor) chatGPTWebRequirements(ctx context.Context, client 
 	var observer helps.ChatGPTWebSentinelObserver
 	var observerErr error
 	soRequired := requiredJSONFlag(prepare, "so", "required")
-	if e.sentinelRuntime != nil {
-		setPhase(cliproxyexecutor.ImagePhaseRequirementsObserver)
-		observer, err = e.sentinelRuntime.BeginObserver(ctx, sdkRequest)
-		if err != nil {
-			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || (ctx != nil && ctx.Err() != nil) {
-				return chatGPTWebRequirements{}, err
-			}
-			observerErr = err
-		}
-	}
-	if observer != nil {
-		defer func() {
-			setPhase(cliproxyexecutor.ImagePhaseRequirementsCleanup)
-			observer.Close()
-		}()
-	}
 	proofToken := ""
-	if requiredJSONFlag(prepare, "proofofwork", "required") {
-		setPhase(cliproxyexecutor.ImagePhaseRequirementsProof)
-		proof, _ := prepare["proofofwork"].(map[string]any)
-		proofToken, err = chatgptwebauth.BuildConversationProofTokenWithEnvironment(
-			ctx,
-			chatGPTWebAnyString(proof["seed"]),
-			chatGPTWebAnyString(proof["difficulty"]),
-			sentinelEnvironment, sources, dataBuild, e.runtimeRand, e.now,
-		)
-		if err != nil {
-			if ctx != nil && ctx.Err() != nil {
-				return chatGPTWebRequirements{}, ctx.Err()
-			}
-			return chatGPTWebRequirements{}, chatGPTWebLocalProtocolError(
-				http.StatusBadGateway,
-				"build chatgpt web proof token: "+err.Error(),
-			)
-		}
-	}
 	turnstileToken := ""
-	if requiredJSONFlag(prepare, "turnstile", "required") {
-		setPhase(cliproxyexecutor.ImagePhaseRequirementsTurnstile)
-		turnstile, _ := prepare["turnstile"].(map[string]any)
-		dx := chatGPTWebAnyString(turnstile["dx"])
-		if dx == "" {
-			return chatGPTWebRequirements{}, chatGPTWebTurnstileProtocolError(
-				"ChatGPT Web Turnstile challenge is missing dx",
-			)
+	if remoteCompute != nil {
+		setPhase(cliproxyexecutor.ImagePhaseRequirementsObserver)
+		computed, computeErr := remoteCompute.Solve(ctx, chatgptwebauth.ComputeChallenge(prepare, true))
+		if computeErr != nil {
+			return chatGPTWebRequirements{}, computeErr
 		}
-		goRequest := chatgptwebauth.ConversationTurnstileSolveRequest{
-			DX:                dx,
-			RequirementsToken: pToken,
-			Environment:       sentinelEnvironment,
-			Reader:            e.runtimeRand,
-			Now:               e.now,
-		}
-		if e.sentinelRuntime == nil {
-			turnstileToken, err = chatgptwebauth.BuildConversationTurnstileTokenWithEnvironment(
-				ctx, dx, pToken, sentinelEnvironment, e.runtimeRand, e.now,
-			)
-		} else {
-			turnstileToken, err = e.sentinelRuntime.SolveTurnstile(ctx, goRequest, sdkRequest, observer)
-		}
-		if err != nil {
-			if ctx != nil && ctx.Err() != nil {
-				return chatGPTWebRequirements{}, ctx.Err()
+		proofToken, turnstileToken = computed.ProofToken, computed.TurnstileToken
+		observer = remoteCompute
+	} else {
+		if e.sentinelRuntime != nil {
+			setPhase(cliproxyexecutor.ImagePhaseRequirementsObserver)
+			observer, err = e.sentinelRuntime.BeginObserver(ctx, sdkRequest)
+			if err != nil {
+				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || (ctx != nil && ctx.Err() != nil) {
+					return chatGPTWebRequirements{}, err
+				}
+				observerErr = err
 			}
-			var runtimeErr *chatgptwebauth.SentinelRuntimeError
-			if errors.As(err, &runtimeErr) {
-				return chatGPTWebRequirements{}, chatGPTWebSentinelRuntimeProtocolError(runtimeErr)
-			}
-			log.Warn("chatgpt web executor: Turnstile challenge solve failed")
-			return chatGPTWebRequirements{}, chatGPTWebTurnstileProtocolError(
-				"ChatGPT Web Turnstile challenge could not be solved",
+		}
+		if observer != nil {
+			defer func() {
+				setPhase(cliproxyexecutor.ImagePhaseRequirementsCleanup)
+				observer.Close()
+			}()
+		}
+		if requiredJSONFlag(prepare, "proofofwork", "required") {
+			setPhase(cliproxyexecutor.ImagePhaseRequirementsProof)
+			proof, _ := prepare["proofofwork"].(map[string]any)
+			proofToken, err = chatgptwebauth.BuildConversationProofTokenWithEnvironment(
+				ctx,
+				chatGPTWebAnyString(proof["seed"]),
+				chatGPTWebAnyString(proof["difficulty"]),
+				sentinelEnvironment, sources, dataBuild, e.runtimeRand, e.now,
 			)
+			if err != nil {
+				if ctx != nil && ctx.Err() != nil {
+					return chatGPTWebRequirements{}, ctx.Err()
+				}
+				return chatGPTWebRequirements{}, chatGPTWebLocalProtocolError(
+					http.StatusBadGateway,
+					"build chatgpt web proof token: "+err.Error(),
+				)
+			}
+		}
+		if requiredJSONFlag(prepare, "turnstile", "required") {
+			setPhase(cliproxyexecutor.ImagePhaseRequirementsTurnstile)
+			turnstile, _ := prepare["turnstile"].(map[string]any)
+			dx := chatGPTWebAnyString(turnstile["dx"])
+			if dx == "" {
+				return chatGPTWebRequirements{}, chatGPTWebTurnstileProtocolError(
+					"ChatGPT Web Turnstile challenge is missing dx",
+				)
+			}
+			goRequest := chatgptwebauth.ConversationTurnstileSolveRequest{
+				DX:                dx,
+				RequirementsToken: pToken,
+				Environment:       sentinelEnvironment,
+				Reader:            e.runtimeRand,
+				Now:               e.now,
+			}
+			if e.sentinelRuntime == nil {
+				turnstileToken, err = chatgptwebauth.BuildConversationTurnstileTokenWithEnvironment(
+					ctx, dx, pToken, sentinelEnvironment, e.runtimeRand, e.now,
+				)
+			} else {
+				turnstileToken, err = e.sentinelRuntime.SolveTurnstile(ctx, goRequest, sdkRequest, observer)
+			}
+			if err != nil {
+				if ctx != nil && ctx.Err() != nil {
+					return chatGPTWebRequirements{}, ctx.Err()
+				}
+				var runtimeErr *chatgptwebauth.SentinelRuntimeError
+				if errors.As(err, &runtimeErr) {
+					return chatGPTWebRequirements{}, chatGPTWebSentinelRuntimeProtocolError(runtimeErr)
+				}
+				log.Warn("chatgpt web executor: Turnstile challenge solve failed")
+				return chatGPTWebRequirements{}, chatGPTWebTurnstileProtocolError(
+					"ChatGPT Web Turnstile challenge could not be solved",
+				)
+			}
 		}
 	}
 	finalizePath := "/backend-api/sentinel/chat-requirements/finalize"

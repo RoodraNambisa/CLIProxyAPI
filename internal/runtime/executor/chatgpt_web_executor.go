@@ -100,6 +100,7 @@ type ChatGPTWebExecutor struct {
 	loginCoordinator          *ChatGPTWebLoginCoordinator
 	loginWG                   sync.WaitGroup
 	sentinelRuntime           helps.ChatGPTWebSentinelRuntime
+	sentinelCompute           *chatgptwebauth.SentinelComputePool
 	personaOutcomeMu          sync.Mutex
 	personaOutcomes           map[string]chatgptwebauth.PersonaOutcomeSnapshot
 	usageCache                *helps.ChatGPTWebUsageCache
@@ -147,6 +148,7 @@ func NewChatGPTWebExecutorWithLoginCoordinator(cfg *config.Config, manager *clip
 		reloginFlights:     make(map[string]*chatGPTWebReloginFlight),
 		loginCoordinator:   coordinator,
 		sentinelRuntime:    helps.NewChatGPTWebSentinelRuntime(chatGPTWebSentinelRuntimeConfig(cfg)),
+		sentinelCompute:    chatgptwebauth.NewSentinelComputePool(),
 		personaOutcomes:    make(map[string]chatgptwebauth.PersonaOutcomeSnapshot),
 		usageCache:         helps.NewChatGPTWebUsageCache(),
 		lifecycleCtx:       lifecycleCtx,
@@ -188,6 +190,9 @@ func (e *ChatGPTWebExecutor) Close() error {
 	e.loginWG.Wait()
 	if e.sentinelRuntime != nil {
 		e.sentinelRuntime.Close()
+	}
+	if e.sentinelCompute != nil {
+		e.sentinelCompute.Close()
 	}
 	if e.usageCache != nil {
 		e.usageCache.Close()
@@ -248,6 +253,9 @@ func (e *ChatGPTWebExecutor) UpdateConfig(cfg *config.Config) {
 		if e.sentinelRuntime != nil {
 			e.sentinelRuntime.UpdateConfig(chatgptwebauth.SentinelRuntimeConfig{})
 		}
+		if e.sentinelCompute != nil {
+			_ = e.sentinelCompute.UpdateConfig("local", config.ChatGPTWebSentinelConfig{}.Remote, chatgptwebauth.SentinelRuntimeConfig{})
+		}
 		if e.accountInfo != nil {
 			e.accountInfo.updateConfig(nil)
 		}
@@ -265,6 +273,10 @@ func (e *ChatGPTWebExecutor) UpdateConfig(cfg *config.Config) {
 	policy, errPolicy := sentinelcompat.Compile(snapshot.ChatGPTWeb.Sentinel.GoVMCompatibility)
 	if errPolicy != nil {
 		log.WithError(errPolicy).Error("chatgpt web executor: retain previous configuration after Sentinel policy validation failure")
+		return
+	}
+	if err := snapshot.ChatGPTWeb.Sentinel.Validate(); err != nil {
+		log.WithError(err).Error("chatgpt web executor: retain previous Sentinel configuration")
 		return
 	}
 	snapshot.ChatGPTWeb.Sentinel.GoVMPolicy = policy
@@ -289,6 +301,11 @@ func (e *ChatGPTWebExecutor) UpdateConfig(cfg *config.Config) {
 	}
 	if e.sentinelRuntime != nil {
 		e.sentinelRuntime.UpdateConfig(chatGPTWebSentinelRuntimeConfig(snapshot))
+	}
+	if e.sentinelCompute != nil {
+		if err := e.sentinelCompute.UpdateConfig(snapshot.ChatGPTWeb.Sentinel.Mode, snapshot.ChatGPTWeb.Sentinel.Remote, chatGPTWebSentinelRuntimeConfig(snapshot)); err != nil {
+			log.WithError(err).Error("chatgpt web executor: retain previous Sentinel compute configuration")
+		}
 	}
 	if e.accountInfo != nil {
 		e.accountInfo.updateConfig(snapshot)
@@ -331,6 +348,14 @@ func chatGPTWebSentinelRuntimeConfig(cfg *config.Config) chatgptwebauth.Sentinel
 		QueueSize:     resolved.SDKQueueSize,
 		CacheVersions: resolved.SDKCacheVersions,
 	}
+}
+
+// SentinelComputeSnapshot reports remote computation separately from local SDK counters.
+func (e *ChatGPTWebExecutor) SentinelComputeSnapshot() []chatgptwebauth.SentinelComputeNodeSnapshot {
+	if e == nil {
+		return nil
+	}
+	return e.sentinelCompute.Snapshot()
 }
 
 // SentinelSnapshot returns the currently applied SDK runtime state.
@@ -667,6 +692,9 @@ func (e *ChatGPTWebExecutor) Login(ctx context.Context, input chatgptwebauth.Log
 }
 
 func (e *ChatGPTWebExecutor) loginWithRuntimeSnapshot(ctx context.Context, input chatgptwebauth.LoginInput, cfg *config.Config) (*chatgptwebauth.Credential, error) {
+	if e.sentinelCompute != nil {
+		ctx = chatgptwebauth.WithSentinelComputePool(ctx, e.sentinelCompute)
+	}
 	if cfg != nil {
 		input.AllowAutoAPI798 = cfg.ChatGPTWeb.API798AutoLoginEnabled
 	}

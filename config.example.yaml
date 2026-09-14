@@ -186,6 +186,12 @@ chatgpt-web:
     # Number of retries after the initial failed refresh.
     max-retries: 3
   sentinel:
+    # Local remains the default. Empty scopes means no remote computation.
+    mode: local
+    remote:
+      scopes: [images] # Other supported scopes: chat, login.
+      budget-seconds: 30 # Cumulative RPC/queue/compute time per challenge round.
+      nodes: [] # Each item: {name: solver-1, url: https://solver.example.com, api-key: ...}
     # Data-only compatibility rules for new page properties. Changes apply to
     # new conversation requests; current collector/snapshot pairs keep their rules.
     go-vm-compatibility:
@@ -210,6 +216,29 @@ chatgpt-web:
     sdk-queue-size: 32
     # Number of SDK source and bytecode versions retained in memory.
     sdk-cache-versions: 3
+
+# Independent computation listener; can also run with --sentinel-solver-only.
+# This service never loads account credentials or calls authenticated official APIs.
+sentinel-solver:
+  enabled: false
+  listen: "127.0.0.1:8318"
+  api-keys: [] # Separate from management credentials; required when enabled.
+  tls: {enable: false, cert: "", key: ""}
+  sdk-fallback-enabled: false
+  go-vm-compatibility:
+    enabled: false
+    observer-state-auto-extend: true
+    writable-window-properties: []
+    environment-properties: []
+  go-workers: 0
+  queue-size: 64
+  max-sessions: 128
+  memory-budget-mib: 512 # Conservative admission reservation, not an RSS limit.
+  sdk-workers: 0
+  sdk-queue-size: 32
+  sdk-cache-versions: 3
+  session-idle-seconds: 120
+  drain-timeout-seconds: 120
 
 # Optional provider and credential-priority restrictions for client API keys.
 # Empty allow/exclude lists preserve unrestricted priority routing. Exclusions always win.

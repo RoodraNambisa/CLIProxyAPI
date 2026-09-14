@@ -23,6 +23,8 @@ type chatGPTWebSentinelConfigUpdater interface {
 }
 
 type chatGPTWebSentinelRequest struct {
+	Mode              json.RawMessage `json:"mode"`
+	Remote            json.RawMessage `json:"remote"`
 	GoVMCompatibility json.RawMessage `json:"go-vm-compatibility"`
 	SDKRuntimeEnabled json.RawMessage `json:"sdk-runtime-enabled"`
 	SDKWorkers        json.RawMessage `json:"sdk-workers"`
@@ -31,11 +33,12 @@ type chatGPTWebSentinelRequest struct {
 }
 
 type chatGPTWebSentinelResponse struct {
-	GoVMRulesHash          string    `json:"go_vm_rules_hash"`
-	GoVMRuleCount          int       `json:"go_vm_rule_count"`
-	GoVMRulesAppliedAt     time.Time `json:"go_vm_rules_applied_at"`
-	GoVMExtensionUses      uint64    `json:"go_vm_extension_uses"`
-	GoVMExtensionFallbacks uint64    `json:"go_vm_extension_fallbacks"`
+	RemoteNodes            []chatgptwebauth.SentinelComputeNodeSnapshot `json:"remote_nodes,omitempty"`
+	GoVMRulesHash          string                                       `json:"go_vm_rules_hash"`
+	GoVMRuleCount          int                                          `json:"go_vm_rule_count"`
+	GoVMRulesAppliedAt     time.Time                                    `json:"go_vm_rules_applied_at"`
+	GoVMExtensionUses      uint64                                       `json:"go_vm_extension_uses"`
+	GoVMExtensionFallbacks uint64                                       `json:"go_vm_extension_fallbacks"`
 	config.ResolvedChatGPTWebSentinelConfig
 	Initialized                    bool                                    `json:"initialized"`
 	Available                      bool                                    `json:"available"`
@@ -75,15 +78,23 @@ func (h *Handler) GetChatGPTWebSentinel(c *gin.Context) {
 		return
 	}
 	resolved := cfg.ChatGPTWeb.Sentinel.Resolved()
+	var remoteNodes []chatgptwebauth.SentinelComputeNodeSnapshot
 	snapshot := chatgptwebauth.SentinelRuntimeSnapshot{}
 	h.mu.Lock()
 	manager := h.authManager
 	h.mu.Unlock()
 	if manager != nil {
 		if registered, ok := manager.Executor(chatgptwebauth.Provider); ok {
+			if reporter, ok := registered.(interface {
+				SentinelComputeSnapshot() []chatgptwebauth.SentinelComputeNodeSnapshot
+			}); ok {
+				remoteNodes = reporter.SentinelComputeSnapshot()
+			}
 			if snapshotter, okSnapshotter := registered.(chatGPTWebSentinelSnapshotter); okSnapshotter {
 				snapshot = snapshotter.SentinelSnapshot()
 				resolved = config.ResolvedChatGPTWebSentinelConfig{
+					Mode:              resolved.Mode,
+					Remote:            resolved.Remote,
 					GoVMCompatibility: resolved.GoVMCompatibility,
 					SDKRuntimeEnabled: snapshot.SDKRuntimeEnabled,
 					SDKWorkers:        snapshot.SDKWorkers,
@@ -94,6 +105,7 @@ func (h *Handler) GetChatGPTWebSentinel(c *gin.Context) {
 		}
 	}
 	c.JSON(http.StatusOK, chatGPTWebSentinelResponse{
+		RemoteNodes:                      remoteNodes,
 		GoVMRulesHash:                    snapshot.GoVMRulesHash,
 		GoVMRuleCount:                    snapshot.GoVMRuleCount,
 		GoVMRulesAppliedAt:               snapshot.GoVMRulesAppliedAt,
@@ -162,6 +174,8 @@ func (h *Handler) updateChatGPTWebSentinel(c *gin.Context, replace bool) {
 	candidate := previous
 	if replace {
 		candidate = config.ChatGPTWebSentinelConfig{}
+		candidate.Mode = previous.Mode
+		candidate.Remote = previous.Remote
 		candidate.GoVMCompatibility = previous.GoVMCompatibility
 	}
 	if errApply := request.apply(&candidate); errApply != nil {
@@ -223,6 +237,21 @@ func (request chatGPTWebSentinelRequest) complete() bool {
 func (request chatGPTWebSentinelRequest) apply(candidate *config.ChatGPTWebSentinelConfig) error {
 	if candidate == nil {
 		return fmt.Errorf("configuration unavailable")
+	}
+	if len(request.Mode) > 0 {
+		if bytes.Equal(bytes.TrimSpace(request.Mode), []byte("null")) || json.Unmarshal(request.Mode, &candidate.Mode) != nil {
+			return fmt.Errorf("invalid mode")
+		}
+	}
+	if len(request.Remote) > 0 {
+		if bytes.Equal(bytes.TrimSpace(request.Remote), []byte("null")) {
+			return fmt.Errorf("invalid remote settings")
+		}
+		decoder := json.NewDecoder(bytes.NewReader(request.Remote))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&candidate.Remote); err != nil {
+			return fmt.Errorf("invalid remote settings")
+		}
 	}
 	if len(request.GoVMCompatibility) > 0 {
 		merged, err := sentinelcompat.Merge(candidate.GoVMCompatibility, request.GoVMCompatibility)

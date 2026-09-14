@@ -362,6 +362,12 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	if !reflect.DeepEqual(oldCfg.ChatGPTWeb.Sentinel.GoVMCompatibility.Resolved(), newCfg.ChatGPTWeb.Sentinel.GoVMCompatibility.Resolved()) {
 		changes = append(changes, "chatgpt-web.sentinel.go-vm-compatibility: updated (property values omitted)")
 	}
+	if oldCfg.ChatGPTWeb.Sentinel.Resolved().Mode != newCfg.ChatGPTWeb.Sentinel.Resolved().Mode || !reflect.DeepEqual(oldCfg.ChatGPTWeb.Sentinel.Remote, newCfg.ChatGPTWeb.Sentinel.Remote) {
+		changes = append(changes, "chatgpt-web.sentinel.remote: updated (addresses and keys omitted)")
+	}
+	if !reflect.DeepEqual(oldCfg.SentinelSolver, newCfg.SentinelSolver) {
+		changes = append(changes, "sentinel-solver: updated (keys and property values omitted)")
+	}
 	oldUsageCache := oldCfg.ChatGPTWeb.UsageCache.Resolved()
 	newUsageCache := newCfg.ChatGPTWeb.UsageCache.Resolved()
 	if oldUsageCache.Enabled != newUsageCache.Enabled {

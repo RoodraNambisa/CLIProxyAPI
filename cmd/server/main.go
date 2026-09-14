@@ -108,6 +108,7 @@ func main() {
 	var tuiMode bool
 	var standalone bool
 	var localModel bool
+	var sentinelSolverOnly bool
 	var deprecatedGeminiLogin bool
 	var deprecatedGeminiProjectID string
 
@@ -127,6 +128,7 @@ func main() {
 	flag.BoolVar(&tuiMode, "tui", false, "Start with terminal management UI")
 	flag.BoolVar(&standalone, "standalone", false, "In TUI mode, start an embedded local server")
 	flag.BoolVar(&localModel, "local-model", false, "Use embedded model catalog only, skip remote model fetching")
+	flag.BoolVar(&sentinelSolverOnly, "sentinel-solver-only", false, "Run only Sentinel computation and lightweight management")
 	flag.BoolVar(&deprecatedGeminiLogin, "login", false, "Deprecated Gemini CLI login flag")
 	flag.StringVar(&deprecatedGeminiProjectID, "project_id", "", "Deprecated Gemini CLI project flag")
 
@@ -202,6 +204,16 @@ func main() {
 		if !errors.Is(errLoad, os.ErrNotExist) {
 			log.WithError(errLoad).Warn("failed to load .env file")
 		}
+	}
+
+	if sentinelSolverOnly {
+		if configPath == "" {
+			configPath = resolveDefaultConfigPath(wd)
+		}
+		if errRun := runSentinelSolverOnly(configPath, password); errRun != nil {
+			log.WithError(errRun).Error("Sentinel solver stopped")
+		}
+		return
 	}
 
 	lookupEnv := func(keys ...string) (string, bool) {

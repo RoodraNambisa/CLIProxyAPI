@@ -2666,6 +2666,10 @@ type SentinelObserver struct {
 // both collector and snapshot programs. Compatible Go work finishes before
 // return; an SDK compatibility fallback continues asynchronously.
 func (manager *SentinelRuntimeManager) BeginObserver(ctx context.Context, request SentinelSDKRequest) (*SentinelObserver, error) {
+	return manager.beginObserver(ctx, request, false)
+}
+
+func (manager *SentinelRuntimeManager) beginObserver(ctx context.Context, request SentinelSDKRequest, sdkOnly bool) (*SentinelObserver, error) {
 	if manager == nil || !sentinelObserverRequired(request.Challenge) {
 		return nil, nil
 	}
@@ -2697,15 +2701,21 @@ func (manager *SentinelRuntimeManager) BeginObserver(ctx context.Context, reques
 	manager.observers[observer] = struct{}{}
 	manager.mu.Unlock()
 	observerConfig, _ := request.Challenge["so"].(map[string]any)
-	goVM, err := newConversationSentinelObserverVM(
-		observerCtx,
-		stringValue(observerConfig["collector_dx"]),
-		stringValue(observerConfig["snapshot_dx"]),
-		request.RequirementsToken,
-		request.Environment,
-		manager.random,
-		manager.now,
-	)
+	var goVM *conversationSentinelObserverVM
+	var err error
+	if sdkOnly {
+		err = &SentinelCompatibilityError{Kind: SentinelCompatibilityUnsupportedValue, ProgramKind: SentinelProgramObserverCollect}
+	} else {
+		goVM, err = newConversationSentinelObserverVM(
+			observerCtx,
+			stringValue(observerConfig["collector_dx"]),
+			stringValue(observerConfig["snapshot_dx"]),
+			request.RequirementsToken,
+			request.Environment,
+			manager.random,
+			manager.now,
+		)
+	}
 	if err == nil {
 		observer.installGoVM(goVM)
 		close(observer.ready)

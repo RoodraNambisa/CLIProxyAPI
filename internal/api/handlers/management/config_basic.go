@@ -32,6 +32,7 @@ type safeRemoteManagementConfig struct {
 }
 
 type configResponse struct {
+	RuntimeRole string `json:"runtime-role"`
 	*config.Config
 	RemoteManagement safeRemoteManagementConfig `json:"remote-management"`
 }
@@ -51,8 +52,13 @@ func (h *Handler) GetConfig(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to snapshot configuration"})
 		return
 	}
+	role := "proxy"
+	if h.sentinelOnly {
+		role = "sentinel-solver"
+	}
 	c.JSON(200, &configResponse{
-		Config: &snapshot,
+		RuntimeRole: role,
+		Config:      &snapshot,
 		RemoteManagement: safeRemoteManagementConfig{
 			LiveLogs: cfg.RemoteManagement.LiveLogs,
 			Diagnostics: config.ManagementDiagnosticsConfig{

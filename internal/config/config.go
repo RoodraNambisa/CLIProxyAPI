@@ -20,6 +20,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/sentinelcompat"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/sentinelconfig"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/proxyutil"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/crypto/bcrypt"
@@ -428,7 +429,8 @@ type Config struct {
 	XAI XAIConfig `yaml:"xai" json:"xai"`
 
 	// ChatGPTWeb configures provider-wide ChatGPT Web credential behavior.
-	ChatGPTWeb ChatGPTWebConfig `yaml:"chatgpt-web" json:"chatgpt-web"`
+	ChatGPTWeb     ChatGPTWebConfig      `yaml:"chatgpt-web" json:"chatgpt-web"`
+	SentinelSolver sentinelconfig.Server `yaml:"sentinel-solver,omitempty" json:"sentinel-solver"`
 
 	// CodexHeaderDefaults configures canonical software identity and fallback
 	// feature headers for Codex OAuth model requests.
@@ -1262,6 +1264,8 @@ func (cfg ChatGPTWebAccountInfoConfig) Validate() error {
 // ChatGPTWebSentinelConfig preserves whether values were explicitly configured.
 // This matters because disabled and zero-length queue are both valid overrides.
 type ChatGPTWebSentinelConfig struct {
+	Mode              string                 `yaml:"mode,omitempty" json:"mode,omitempty"`
+	Remote            sentinelconfig.Remote  `yaml:"remote,omitempty" json:"remote,omitempty"`
 	GoVMCompatibility sentinelcompat.Config  `yaml:"go-vm-compatibility,omitempty" json:"go-vm-compatibility,omitempty"`
 	GoVMPolicy        *sentinelcompat.Policy `yaml:"-" json:"-"`
 	SDKRuntimeEnabled *bool                  `yaml:"sdk-runtime-enabled,omitempty" json:"sdk-runtime-enabled,omitempty"`
@@ -1297,7 +1301,7 @@ func validateChatGPTWebSentinelMappingFields(node *yaml.Node) error {
 	}
 	for name, value := range effective {
 		switch name {
-		case "sdk-runtime-enabled", "sdk-workers", "sdk-queue-size", "sdk-cache-versions", "go-vm-compatibility":
+		case "sdk-runtime-enabled", "sdk-workers", "sdk-queue-size", "sdk-cache-versions", "go-vm-compatibility", "mode", "remote":
 			if value == nil {
 				return fmt.Errorf("chatgpt-web.sentinel.%s must not be null", name)
 			}
@@ -1310,6 +1314,8 @@ func validateChatGPTWebSentinelMappingFields(node *yaml.Node) error {
 
 // ResolvedChatGPTWebSentinelConfig contains effective runtime values.
 type ResolvedChatGPTWebSentinelConfig struct {
+	Mode              string                `json:"mode"`
+	Remote            sentinelconfig.Remote `json:"remote"`
 	GoVMCompatibility sentinelcompat.Config `json:"go-vm-compatibility"`
 	SDKRuntimeEnabled bool                  `json:"sdk-runtime-enabled"`
 	SDKWorkers        int                   `json:"sdk-workers"`
@@ -1320,6 +1326,8 @@ type ResolvedChatGPTWebSentinelConfig struct {
 // Resolved returns the effective Sentinel SDK configuration.
 func (cfg ChatGPTWebSentinelConfig) Resolved() ResolvedChatGPTWebSentinelConfig {
 	out := ResolvedChatGPTWebSentinelConfig{
+		Mode:              sentinelconfig.Mode(cfg.Mode),
+		Remote:            cfg.Remote,
 		GoVMCompatibility: cfg.GoVMCompatibility.Resolved(),
 		SDKRuntimeEnabled: true,
 		SDKQueueSize:      DefaultChatGPTWebSentinelSDKQueueSize,
@@ -1342,6 +1350,9 @@ func (cfg ChatGPTWebSentinelConfig) Resolved() ResolvedChatGPTWebSentinelConfig 
 
 // Validate rejects structurally invalid Sentinel SDK values.
 func (cfg ChatGPTWebSentinelConfig) Validate() error {
+	if err := cfg.Remote.Validate(cfg.Mode); err != nil {
+		return err
+	}
 	if _, err := sentinelcompat.Compile(cfg.GoVMCompatibility); err != nil {
 		return fmt.Errorf("chatgpt-web.sentinel.go-vm-compatibility: %w", err)
 	}
@@ -2312,6 +2323,15 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 			if sentinelErr := validateChatGPTWebSentinelYAML(data); sentinelErr != nil {
 				return nil, fmt.Errorf("failed to parse config file: %w", sentinelErr)
 			}
+			var solverEnvelope struct {
+				Solver yaml.Node `yaml:"sentinel-solver"`
+			}
+			if yaml.Unmarshal(data, &solverEnvelope) == nil && solverEnvelope.Solver.Kind != 0 {
+				var solver sentinelconfig.Server
+				if solverErr := solverEnvelope.Solver.Decode(&solver); solverErr != nil {
+					return nil, fmt.Errorf("failed to parse sentinel-solver: %w", solverErr)
+				}
+			}
 			// In cloud deploy mode, if YAML parsing fails, return empty config instead of error.
 			return &Config{}, nil
 		}
@@ -2466,6 +2486,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	cfg.ChatGPTWeb.LoginProxy.URLTemplate = strings.TrimSpace(cfg.ChatGPTWeb.LoginProxy.URLTemplate)
 	cfg.ChatGPTWeb.LoginProxy.PlaceholderCharset = strings.TrimSpace(cfg.ChatGPTWeb.LoginProxy.PlaceholderCharset)
 	if err = cfg.ChatGPTWeb.Validate(); err != nil {
+		return nil, err
+	}
+	if err = cfg.SentinelSolver.Validate(); err != nil {
 		return nil, err
 	}
 
