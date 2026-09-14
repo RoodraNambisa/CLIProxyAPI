@@ -711,6 +711,12 @@ nonstream-keepalive-interval: 0
 # OAuth acquisition uses separate login headers. Model override and identity
 # headers are controlled by the final model and the policies below.
 xai:
+  # Default endpoint for credentials with an empty base_url. Explicit credential
+  # base_url values always win, including https://api.x.ai/v1.
+  # Choices: cli, api, us-east-1, us-west-2, eu-west-1.
+  # This selects an address; it does not grant upstream account permissions.
+  # WebSocket and compact requests use the API when the chosen endpoint is CLI.
+  default-base-url-mode: "cli"
   header-defaults:
     user-agent: "" # Built-in: xai-grok-workspace/0.2.120
     client-version: "" # Built-in: 0.2.120

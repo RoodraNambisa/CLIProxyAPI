@@ -202,7 +202,7 @@ func (a *XAIAuth) WaitForAuthorization(ctx context.Context, deviceCode *DeviceCo
 	return &AuthBundle{
 		TokenData:     *tokenData,
 		LastRefresh:   time.Now().UTC().Format(time.RFC3339),
-		BaseURL:       DefaultAPIBaseURL,
+		BaseURL:       "",
 		TokenEndpoint: tokenEndpoint,
 	}, nil
 }
@@ -446,7 +446,7 @@ func (a *XAIAuth) CreateTokenStorage(bundle *AuthBundle) *TokenStorage {
 		LastRefresh:   bundle.LastRefresh,
 		Email:         strings.TrimSpace(bundle.TokenData.Email),
 		Subject:       bundle.TokenData.Subject,
-		BaseURL:       firstNonEmpty(bundle.BaseURL, DefaultAPIBaseURL),
+		BaseURL:       strings.TrimSpace(bundle.BaseURL),
 		RedirectURI:   bundle.RedirectURI,
 		TokenEndpoint: bundle.TokenEndpoint,
 		AuthKind:      "oauth",

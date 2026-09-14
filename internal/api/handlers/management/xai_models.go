@@ -34,7 +34,7 @@ func (h *Handler) RefreshXAIModels(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Grok credential not found"})
 		return
 	}
-	endpoint := runtimeexecutor.XAIModelsURL(auth)
+	endpoint := runtimeexecutor.XAIModelsURL(auth, h.currentConfig())
 	req, err := http.NewRequestWithContext(c.Request.Context(), http.MethodGet, endpoint, nil)
 	var catalog *helps.XAIModelCatalog
 	if err == nil {

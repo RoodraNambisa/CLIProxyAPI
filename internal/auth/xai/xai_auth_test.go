@@ -277,7 +277,7 @@ func TestCreateTokenStorageAndCredentialFileName(t *testing.T) {
 	storage := auth.CreateTokenStorage(&AuthBundle{
 		TokenData: TokenData{AccessToken: "access", Email: "user@example.com", Subject: "sub-1"},
 	})
-	if storage == nil || storage.BaseURL != DefaultAPIBaseURL || storage.UsingAPI || storage.Websockets {
+	if storage == nil || storage.BaseURL != "" || storage.UsingAPI || storage.Websockets {
 		t.Fatalf("unexpected token storage defaults: %#v", storage)
 	}
 	if got := CredentialFileName("user@example.com", "sub-1"); got != "xai-user@example.com.json" {

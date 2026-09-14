@@ -27,6 +27,7 @@ type patchAuthFileFieldsRequest struct {
 	Fields               json.RawMessage         `json:"fields"`
 	Prefix               *string                 `json:"prefix"`
 	ProxyURL             *string                 `json:"proxy_url"`
+	BaseURL              *string                 `json:"base_url"`
 	Headers              map[string]string       `json:"headers"`
 	Priority             *int                    `json:"priority"`
 	Weight               credentialWeightPatch   `json:"weight"`
@@ -43,6 +44,7 @@ type patchAuthFileFieldsRequest struct {
 type authFileFieldValues struct {
 	prefix               *string
 	proxyURL             *string
+	baseURL              *string
 	headers              map[string]string
 	headersSet           bool
 	priority             *int
@@ -112,6 +114,7 @@ func (h *Handler) patchAuthFileFieldsLegacy(c *gin.Context, req *patchAuthFileFi
 	values := authFileFieldValues{
 		prefix:          req.Prefix,
 		proxyURL:        req.ProxyURL,
+		baseURL:         req.BaseURL,
 		note:            req.Note,
 		usingAPI:        req.UsingAPI,
 		websockets:      req.Websockets,
@@ -296,6 +299,12 @@ func decodeAuthFileFieldValues(raw json.RawMessage) (authFileFieldValues, error)
 				return authFileFieldValues{}, fmt.Errorf("invalid using_api")
 			}
 			values.usingAPI = &decoded
+		case "base_url":
+			var decoded string
+			if err := decodeNonNullAuthField(value, &decoded); err != nil {
+				return authFileFieldValues{}, fmt.Errorf("invalid base_url")
+			}
+			values.baseURL = &decoded
 		case "websockets":
 			var decoded bool
 			if err := decodeNonNullAuthField(value, &decoded); err != nil {
@@ -359,19 +368,27 @@ func decodeNonNullAuthField(raw json.RawMessage, target any) error {
 }
 
 func (v authFileFieldValues) hasFields() bool {
-	return v.prefix != nil || v.proxyURL != nil || v.headersSet || v.prioritySet || v.weightSet || v.note != nil ||
+	return v.prefix != nil || v.proxyURL != nil || v.baseURL != nil || v.headersSet || v.prioritySet || v.weightSet || v.note != nil ||
 		v.usingAPI != nil || v.websockets != nil || v.excludedSet || v.disableCooling != nil ||
 		v.loginMethod != nil || v.api798URL != nil || v.codexFingerprintMode != nil || v.errorRules.set
 }
 
 func (v authFileFieldValues) hasNonHeaderFields() bool {
-	return v.prefix != nil || v.proxyURL != nil || v.prioritySet || v.weightSet || v.note != nil || v.usingAPI != nil ||
+	return v.prefix != nil || v.proxyURL != nil || v.baseURL != nil || v.prioritySet || v.weightSet || v.note != nil || v.usingAPI != nil ||
 		v.websockets != nil || v.excludedSet || v.disableCooling != nil || v.loginMethod != nil ||
 		v.api798URL != nil || v.codexFingerprintMode != nil || v.errorRules.set
 }
 
 func validateBatchAuthFileFields(auth *coreauth.Auth, values authFileFieldValues) error {
 	provider := strings.ToLower(strings.TrimSpace(auth.Provider))
+	if values.baseURL != nil {
+		if provider != "xai" {
+			return errors.New("base_url is only supported for xai auth files")
+		}
+		if _, err := config.NormalizeXAIBaseURL(*values.baseURL); err != nil {
+			return err
+		}
+	}
 	if values.usingAPI != nil && provider != "xai" {
 		return errors.New("using_api is only supported for xai auth files")
 	}
@@ -529,6 +546,30 @@ func (h *Handler) applyAuthFileFieldValues(auth *coreauth.Auth, values authFileF
 	if values.usingAPI != nil {
 		auth.Metadata["using_api"] = *values.usingAPI
 		auth.Attributes["using_api"] = strconv.FormatBool(*values.usingAPI)
+		// Translate older clients' endpoint toggle into the authoritative URL.
+		if values.baseURL == nil {
+			mode := "cli"
+			if *values.usingAPI {
+				mode = "api"
+			}
+			baseURL, _ := config.XAIBaseURLForMode(mode)
+			setOrDeleteAuthString(auth, "base_url", baseURL)
+		}
+	}
+	if values.baseURL != nil {
+		baseURL, _ := config.NormalizeXAIBaseURL(*values.baseURL)
+		// Keep an empty metadata value so typed token storage cannot resurrect
+		// its previous URL while merging the edited credential for persistence.
+		auth.Metadata["base_url"] = baseURL
+		if baseURL == "" {
+			delete(auth.Attributes, "base_url")
+		} else {
+			auth.Attributes["base_url"] = baseURL
+		}
+		cliURL, _ := config.XAIBaseURLForMode("cli")
+		usingAPI := baseURL != "" && baseURL != cliURL
+		auth.Metadata["using_api"] = usingAPI
+		auth.Attributes["using_api"] = strconv.FormatBool(usingAPI)
 	}
 	if values.errorRules.set {
 		delete(auth.Metadata, "request_scoped_errors")

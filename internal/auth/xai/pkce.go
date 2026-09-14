@@ -80,5 +80,5 @@ func (a *XAIAuth) ExchangePKCE(ctx context.Context, flow *PKCEFlow, code string)
 	if err != nil {
 		return nil, err
 	}
-	return &AuthBundle{TokenData: *token, LastRefresh: time.Now().UTC().Format(time.RFC3339), BaseURL: DefaultAPIBaseURL, RedirectURI: flow.RedirectURI, TokenEndpoint: endpoint}, nil
+	return &AuthBundle{TokenData: *token, LastRefresh: time.Now().UTC().Format(time.RFC3339), BaseURL: "", RedirectURI: flow.RedirectURI, TokenEndpoint: endpoint}, nil
 }

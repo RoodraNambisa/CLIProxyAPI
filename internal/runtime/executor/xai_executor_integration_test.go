@@ -66,12 +66,11 @@ func TestXAIExecuteAcceptsResponseDoneAndRestoresOutput(t *testing.T) {
 	}
 }
 
-func TestXAIUsingAPIRoutingAndChatProxyHeaders(t *testing.T) {
+func TestXAIUpstreamRoutingAndChatProxyHeaders(t *testing.T) {
 	oauth := &cliproxyauth.Auth{Attributes: map[string]string{
 		"auth_kind": "oauth",
-		"base_url":  xaiauth.DefaultAPIBaseURL,
 	}}
-	if got := xaiChatBaseURL(oauth); got != xaiauth.CLIChatProxyBaseURL {
+	if got := xaiChatBaseURL(oauth, nil); got != xaiauth.CLIChatProxyBaseURL {
 		t.Fatalf("OAuth base URL = %q, want %q", got, xaiauth.CLIChatProxyBaseURL)
 	}
 	req := httptest.NewRequest(http.MethodPost, xaiauth.CLIChatProxyBaseURL+"/responses", nil)
@@ -84,12 +83,12 @@ func TestXAIUsingAPIRoutingAndChatProxyHeaders(t *testing.T) {
 	}
 
 	official := &cliproxyauth.Auth{Attributes: map[string]string{
-		"auth_kind":     "oauth",
-		"base_url":      xaiauth.DefaultAPIBaseURL,
-		xaiUsingAPIAttr: "true",
+		"auth_kind": "oauth",
+		"base_url":  xaiauth.DefaultAPIBaseURL,
+		"using_api": "true",
 	}}
-	if got := xaiChatBaseURL(official); got != xaiauth.DefaultAPIBaseURL {
-		t.Fatalf("using_api base URL = %q, want %q", got, xaiauth.DefaultAPIBaseURL)
+	if got := xaiChatBaseURL(official, nil); got != xaiauth.DefaultAPIBaseURL {
+		t.Fatalf("explicit base URL = %q, want %q", got, xaiauth.DefaultAPIBaseURL)
 	}
 	req = httptest.NewRequest(http.MethodPost, xaiauth.DefaultAPIBaseURL+"/responses", nil)
 	applyXAIChatHeaders(req, official, "token", true, "")
@@ -98,6 +97,78 @@ func TestXAIUsingAPIRoutingAndChatProxyHeaders(t *testing.T) {
 	}
 	if req.Header.Get(xaiClientVersionHeader) != xaiClientVersionValue {
 		t.Fatal("official API lost the shared Grok software identity")
+	}
+}
+
+type xaiUpstreamRoundTripper func(*http.Request) (*http.Response, error)
+
+func (f xaiUpstreamRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+func TestXAIHTTPExecutionUsesSelectedUpstream(t *testing.T) {
+	for _, tc := range []struct{ name, mode, pin, want string }{
+		{"CLI default", "", "", xaiauth.CLIChatProxyBaseURL},
+		{"global region", "us-east-1", "", "https://us-east-1.api.x.ai/v1"},
+		{"explicit API", "cli", xaiauth.DefaultAPIBaseURL, xaiauth.DefaultAPIBaseURL},
+		{"explicit CLI", "eu-west-1", xaiauth.CLIChatProxyBaseURL, xaiauth.CLIChatProxyBaseURL},
+		{"custom prefix", "api", "https://relay.example/grok/v1", "https://relay.example/grok/v1"},
+	} {
+		for _, operation := range []string{"complete", "stream", "compact"} {
+			t.Run(tc.name+"/"+operation, func(t *testing.T) {
+				cfg := &config.Config{XAI: config.XAIConfig{DefaultBaseURLMode: tc.mode}}
+				auth := &cliproxyauth.Auth{Provider: "xai", Attributes: map[string]string{"api_key": "fixture-token", "base_url": tc.pin}}
+				if got := XAIModelsURL(auth, cfg); got != tc.want+"/models" {
+					t.Fatalf("models URL = %s", got)
+				}
+				wantURL := tc.want + "/responses"
+				if operation == "compact" {
+					base := tc.want
+					if base == xaiauth.CLIChatProxyBaseURL {
+						base = xaiauth.DefaultAPIBaseURL
+					}
+					wantURL = base + "/responses/compact"
+				}
+				calls := 0
+				ctx := context.WithValue(t.Context(), "cliproxy.roundtripper", xaiUpstreamRoundTripper(func(r *http.Request) (*http.Response, error) {
+					calls++
+					if r.URL.String() != wantURL || r.Header.Get("Authorization") != "Bearer fixture-token" {
+						t.Errorf("outgoing endpoint or auth incorrect: %s", r.URL)
+					}
+					if (r.Header.Get(xaiTokenAuthHeader) != "") != strings.HasPrefix(wantURL, xaiauth.CLIChatProxyBaseURL+"/") {
+						t.Error("CLI compatibility headers do not match the destination")
+					}
+					body := "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"fixture\",\"status\":\"completed\",\"output\":[]}}\n\n"
+					contentType := "text/event-stream"
+					if operation == "compact" {
+						body = `{"id":"fixture","object":"response.compaction","output":[]}`
+						contentType = "application/json"
+					}
+					return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": {contentType}}, Body: io.NopCloser(strings.NewReader(body))}, nil
+				}))
+				exec := NewXAIExecutor(cfg)
+				opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAIResponse}
+				if operation == "compact" {
+					opts.Alt = "responses/compact"
+				}
+				if operation == "stream" {
+					stream, err := exec.ExecuteStream(ctx, auth, xaiStreamRequest(), opts)
+					if err != nil {
+						t.Fatal(err)
+					}
+					for chunk := range stream.Chunks {
+						if chunk.Err != nil {
+							t.Fatal(chunk.Err)
+						}
+					}
+				} else if _, err := exec.Execute(ctx, auth, xaiStreamRequest(), opts); err != nil {
+					t.Fatal(err)
+				}
+				if calls != 1 {
+					t.Fatalf("upstream calls = %d", calls)
+				}
+			})
+		}
 	}
 }
 

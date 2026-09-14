@@ -92,8 +92,6 @@ const (
 	xaiClientVersionHeader      = "x-grok-client-version"
 	// Keep in sync with the current Grok CLI client version that chat-proxy expects.
 	xaiClientVersionValue = helps.XAIClientVersion
-	// xaiUsingAPIAttr enables the official API path for non-media HTTP chat.
-	xaiUsingAPIAttr = "using_api"
 )
 
 // XAIExecutor is a stateless executor for xAI Grok's Responses API.
@@ -229,7 +227,7 @@ func (e *XAIExecutor) executeWithPolicy(ctx context.Context, auth *cliproxyauth.
 	}
 
 	token, _ := xaiCreds(auth)
-	baseURL := xaiChatBaseURL(auth)
+	baseURL := xaiChatBaseURL(auth, e.cfg)
 
 	prepared, err := e.prepareResponsesRequest(ctx, auth, req, opts, true)
 	if err != nil {
@@ -337,7 +335,7 @@ func (e *XAIExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.Aut
 
 func (e *XAIExecutor) executeCompactRequest(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*xaiPreparedRequest, []byte, http.Header, error) {
 	token, _ := xaiCreds(auth)
-	baseURL := xaiChatBaseURL(auth)
+	baseURL := helps.XAIAPIOnlyBaseURL(auth, e.cfg)
 
 	prepared, err := e.prepareResponsesRequestTo(ctx, auth, req, opts, false, sdktranslator.FormatOpenAIResponse)
 	if err != nil {
@@ -600,7 +598,7 @@ func (e *XAIExecutor) executeImages(ctx context.Context, auth *cliproxyauth.Auth
 		req.Payload, _ = sjson.SetBytes(req.Payload, "model", thinking.ParseSuffix(req.Model).ModelName)
 	}
 	token, _ := xaiCreds(auth)
-	baseURL := xaiChatBaseURL(auth)
+	baseURL := xaiChatBaseURL(auth, e.cfg)
 	if endpointPath == "" {
 		endpointPath = xaiDefaultImageEndpointPath
 	}
@@ -654,7 +652,7 @@ func (e *XAIExecutor) executeVideos(ctx context.Context, auth *cliproxyauth.Auth
 		req.Payload, _ = sjson.SetBytes(req.Payload, "model", thinking.ParseSuffix(req.Model).ModelName)
 	}
 	token, _ := xaiCreds(auth)
-	baseURL := xaiChatBaseURL(auth)
+	baseURL := xaiChatBaseURL(auth, e.cfg)
 	reporter := helps.NewExecutorUsageReporter(ctx, e, thinking.ParseSuffix(req.Model).ModelName, auth)
 	defer reporter.TrackFailure(ctx, &err)
 	reporter.SetRequestServiceTierFromPayload(req.Payload)
@@ -745,7 +743,7 @@ func (e *XAIExecutor) executeStreamWithPolicy(ctx context.Context, auth *cliprox
 	}
 
 	token, _ := xaiCreds(auth)
-	baseURL := xaiChatBaseURL(auth)
+	baseURL := xaiChatBaseURL(auth, e.cfg)
 
 	prepared, err := e.prepareResponsesRequest(ctx, auth, req, opts, true)
 	if err != nil {
@@ -996,17 +994,11 @@ func (e *XAIExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*cl
 	if tokenEndpoint != "" {
 		auth.Metadata["token_endpoint"] = tokenEndpoint
 	}
-	if xaiMetadataString(auth.Metadata, "base_url") == "" {
-		auth.Metadata["base_url"] = xaiauth.DefaultAPIBaseURL
-	}
 	auth.Metadata["last_refresh"] = time.Now().UTC().Format(time.RFC3339)
 	if auth.Attributes == nil {
 		auth.Attributes = make(map[string]string)
 	}
 	auth.Attributes["auth_kind"] = "oauth"
-	if strings.TrimSpace(auth.Attributes["base_url"]) == "" {
-		auth.Attributes["base_url"] = xaiauth.DefaultAPIBaseURL
-	}
 	return auth, nil
 }
 
@@ -1213,77 +1205,16 @@ func xaiCreds(auth *cliproxyauth.Auth) (token, baseURL string) {
 	return token, baseURL
 }
 
-// xaiUsingAPI reports whether this xAI auth should use the official API path
-// for non-media HTTP chat. OAuth defaults to false to use Grok Build.
-func xaiUsingAPI(auth *cliproxyauth.Auth) bool {
-	if auth == nil {
-		return true
-	}
-	if len(auth.Attributes) > 0 {
-		if raw := strings.TrimSpace(auth.Attributes[xaiUsingAPIAttr]); raw != "" {
-			parsed, errParse := strconv.ParseBool(raw)
-			if errParse == nil {
-				return parsed
-			}
-		}
-	}
-	if len(auth.Metadata) > 0 {
-		raw, ok := auth.Metadata[xaiUsingAPIAttr]
-		if ok && raw != nil {
-			switch v := raw.(type) {
-			case bool:
-				return v
-			case string:
-				parsed, errParse := strconv.ParseBool(strings.TrimSpace(v))
-				if errParse == nil {
-					return parsed
-				}
-			default:
-			}
-		}
-	}
-	if raw := strings.TrimSpace(auth.Attributes["auth_kind"]); raw != "" {
-		return !strings.EqualFold(raw, "oauth")
-	}
-	return !strings.EqualFold(xaiMetadataString(auth.Metadata, "auth_kind"), "oauth")
+// xaiChatBaseURL resolves an explicit credential base_url before the global
+// default. Compact and websocket transports use XAIAPIOnlyBaseURL because the
+// CLI gateway does not support those endpoints.
+func xaiChatBaseURL(auth *cliproxyauth.Auth, cfg *config.Config) string {
+	return helps.ResolveXAIUpstream(auth, cfg).BaseURL
 }
 
-// xaiChatBaseURL returns the base URL for non-image/video xAI HTTP chat requests.
-// When auth using_api is true, the official API base URL logic is used. When it
-// is false (including its OAuth default), empty or official default base_url is
-// rewritten to the CLI chat-proxy endpoint; an explicit non-default base_url is
-// still honored.
-// Websocket transport intentionally does not use this helper: cli-chat-proxy only
-// accepts HTTP POST and returns 405 for websocket upgrades.
-func xaiChatBaseURL(auth *cliproxyauth.Auth) string {
-	_, baseURL := xaiCreds(auth)
-	if xaiUsingAPI(auth) {
-		if baseURL == "" {
-			return xaiauth.DefaultAPIBaseURL
-		}
-		return baseURL
-	}
-	if baseURL != "" && !xaiIsDefaultAPIBaseURL(baseURL) {
-		return baseURL
-	}
-	return xaiauth.CLIChatProxyBaseURL
-}
-
-// XAIModelsURL uses the same credential endpoint selection as HTTP inference.
-func XAIModelsURL(auth *cliproxyauth.Auth) string {
-	return strings.TrimRight(xaiChatBaseURL(auth), "/") + "/models"
-}
-
-func xaiNormalizeBaseURL(baseURL string) string {
-	return strings.TrimRight(strings.TrimSpace(baseURL), "/")
-}
-
-func xaiIsDefaultAPIBaseURL(baseURL string) bool {
-	return xaiNormalizeBaseURL(baseURL) == xaiNormalizeBaseURL(xaiauth.DefaultAPIBaseURL)
-}
-
-func xaiIsCLIChatProxyBaseURL(baseURL string) bool {
-	return xaiNormalizeBaseURL(baseURL) == xaiNormalizeBaseURL(xaiauth.CLIChatProxyBaseURL)
+// XAIModelsURL uses the same request destination as HTTP inference.
+func XAIModelsURL(auth *cliproxyauth.Auth, cfg *config.Config) string {
+	return strings.TrimRight(xaiChatBaseURL(auth, cfg), "/") + "/models"
 }
 
 func applyXAIHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, stream bool, sessionID string, configs ...*config.Config) {
@@ -1319,26 +1250,9 @@ func applyXAICustomHeaders(r *http.Request, auth *cliproxyauth.Auth) {
 	util.ApplyCustomHeadersFromAttrs(r, attrs)
 }
 
-// applyXAIChatHeaders applies standard xAI headers for non-image/video chat
-// requests. When using_api is true, this matches the standard
-// applyXAIHeaders behavior. CLI chat-proxy identity headers are only attached
-// when using_api is false and the resolved chat base URL is the official CLI
-// chat-proxy endpoint.
+// applyXAIChatHeaders selects CLI compatibility headers from the actual URL.
 func applyXAIChatHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, stream bool, sessionID string, configs ...*config.Config) {
-	if xaiUsingAPI(auth) {
-		applyXAIHeaders(r, auth, token, stream, sessionID, configs...)
-		return
-	}
-	applyXAIDefaultHeaders(r, token, stream, sessionID)
-	if xaiIsCLIChatProxyBaseURL(xaiChatBaseURL(auth)) {
-		r.Header.Set(xaiTokenAuthHeader, xaiTokenAuthValue)
-		r.Header.Set(xaiClientVersionHeader, xaiClientVersionValue)
-	}
-	var cfg *config.Config
-	if len(configs) > 0 {
-		cfg = configs[0]
-	}
-	helps.ApplyXAIResourceHeaders(r, auth, cfg)
+	applyXAIHeaders(r, auth, token, stream, sessionID, configs...)
 }
 
 func xaiResolveComposerSessionID(ctx context.Context, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, baseModel string) (string, error) {

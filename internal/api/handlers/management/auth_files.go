@@ -545,6 +545,10 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context, manager *coreauth.Manage
 			if strings.EqualFold(strings.TrimSpace(typeValue), "xai") {
 				fileData["using_api"] = effectiveXAIUsingAPIFromJSON(data)
 				fileData["websockets"] = jsonBoolField(data, "websockets")
+				var metadata map[string]any
+				if json.Unmarshal(data, &metadata) == nil {
+					h.applyXAIUpstreamInfo(fileData, &coreauth.Auth{Provider: "xai", Metadata: metadata})
+				}
 			}
 			if strings.EqualFold(strings.TrimSpace(typeValue), "chatgpt-web") {
 				if dependencyMetadata != nil {
@@ -695,6 +699,7 @@ func (h *Handler) buildAuthFileEntryAtWithRuntime(auth *coreauth.Auth, now time.
 	}
 	if strings.EqualFold(strings.TrimSpace(auth.Provider), "xai") {
 		entry["using_api"] = effectiveXAIUsingAPI(auth)
+		h.applyXAIUpstreamInfo(entry, auth)
 		entry["websockets"] = authBooleanValue(auth, "websockets")
 	}
 	if runtimeSummary.proxyBinding != nil {

@@ -5020,6 +5020,12 @@ func (s *Service) applyRuntimeConfigState(ctx context.Context, previousCfg, next
 		}
 	}
 	s.applyUsagePersistenceConfigChange(previousUsageEnabled, previousUsageSettings, nextCfg)
+	if s.coreManager != nil && !authModelExclusionsChanged &&
+		(previousCfg == nil || previousCfg.XAI.DefaultBaseURLMode != nextCfg.XAI.DefaultBaseURLMode) {
+		for _, auth := range s.coreManager.AuthsForProviders("xai") {
+			s.refreshModelRegistrationForAuth(auth)
+		}
+	}
 	s.warnAuthMaintenanceConfig(nextCfg.AuthMaintenance)
 	s.wakeAuthMaintenance()
 	return nil
@@ -5666,7 +5672,7 @@ func (s *Service) registerModelsForAuthWithState(a *coreauth.Auth, preserveTrans
 		models = applyExcludedModels(models, excluded)
 	case "xai":
 		models = registry.GetXAIModels()
-		if catalog := executorhelps.XAIModelsForAuth(a); catalog != nil && catalog.Source == executor.XAIModelsURL(a) {
+		if catalog := executorhelps.XAIModelsForAuth(a); catalog != nil && catalog.Source == executor.XAIModelsURL(a, s.cfg) {
 			models = catalog.Models
 		}
 		models = applyExcludedModels(models, excluded)

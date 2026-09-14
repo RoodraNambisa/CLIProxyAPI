@@ -85,7 +85,7 @@ func TestXAIReloginKeepsSettingsAndSeparatesChangedAccounts(t *testing.T) {
 		t.Run(subject, func(t *testing.T) {
 			manager := coreauth.NewManager(nil, nil, nil)
 			file := xaiauth.CredentialFileName("fixture@x.ai", "same-account")
-			previous, err := manager.Register(t.Context(), &coreauth.Auth{ID: file, FileName: file, Provider: "xai", ProxyURL: "http://proxy.invalid", Attributes: map[string]string{"header:X-Keep": "keep"}, Metadata: map[string]any{"type": "xai", "sub": "same-account", "headers": map[string]any{"X-Keep": "keep"}, "using_api": true, "websockets": true, helps.XAIIdentitySeedKey: "seed-fixture", helps.XAIModelCatalogKey: "catalog-fixture"}})
+			previous, err := manager.Register(t.Context(), &coreauth.Auth{ID: file, FileName: file, Provider: "xai", ProxyURL: "http://proxy.invalid", Attributes: map[string]string{"header:X-Keep": "keep", "base_url": "https://eu-west-1.api.x.ai/v1"}, Metadata: map[string]any{"type": "xai", "base_url": "https://eu-west-1.api.x.ai/v1", "sub": "same-account", "headers": map[string]any{"X-Keep": "keep"}, "using_api": true, "websockets": true, helps.XAIIdentitySeedKey: "seed-fixture", helps.XAIModelCatalogKey: "catalog-fixture"}})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -95,7 +95,7 @@ func TestXAIReloginKeepsSettingsAndSeparatesChangedAccounts(t *testing.T) {
 			h := &Handler{cfg: &config.Config{}, authManager: manager}
 			h.saveXAIAuthBundle(t.Context(), state, xaiauth.NewXAIAuth(nil), &xaiauth.AuthBundle{TokenData: xaiauth.TokenData{AccessToken: "new-fixture-token", RefreshToken: "new-refresh-fixture", Email: "fixture@x.ai", Subject: subject}})
 			current, _ := manager.GetByID(file)
-			if current.Metadata["access_token"] != "new-fixture-token" || current.Metadata["using_api"] != true || current.Metadata["websockets"] != true || current.Attributes["header:X-Keep"] != "keep" || current.ProxyURL != "http://proxy.invalid" {
+			if current.Metadata["access_token"] != "new-fixture-token" || current.Metadata["using_api"] != true || current.Metadata["websockets"] != true || current.Attributes["header:X-Keep"] != "keep" || current.ProxyURL != "http://proxy.invalid" || current.Metadata["base_url"] != "https://eu-west-1.api.x.ai/v1" || current.Attributes["base_url"] != "https://eu-west-1.api.x.ai/v1" {
 				t.Fatal("relogin discarded credential settings or tokens")
 			}
 			if subject == "same-account" {
