@@ -22,6 +22,21 @@ func TestCodexAlphaSearchConfigChangeDetails(t *testing.T) {
 	}
 }
 
+func TestImageBootstrapConfigChangeDetails(t *testing.T) {
+	oldCfg, newCfg := &config.Config{}, &config.Config{}
+	newCfg.Images.ChatGPTWeb.BootstrapTimeoutSeconds = 10
+	newCfg.Images.ChatGPTWeb.BootstrapRetries = 1
+	changes := strings.Join(BuildConfigChangeDetails(oldCfg, newCfg), "\n")
+	for _, expected := range []string{"images.chatgpt-web.bootstrap-timeout-seconds: 0 -> 10", "images.chatgpt-web.bootstrap-retries: 0 -> 1"} {
+		if !strings.Contains(changes, expected) {
+			t.Fatalf("missing %s in %s", expected, changes)
+		}
+	}
+	if changes := BuildConfigChangeDetails(newCfg, newCfg); len(changes) != 0 {
+		t.Fatal("unchanged bootstrap policy produced a diff")
+	}
+}
+
 func TestCodexLiveEnabledConfigChangeDetails(t *testing.T) {
 	oldCfg, newCfg := &config.Config{}, &config.Config{Codex: config.CodexConfig{LiveEnabled: true}}
 	if changes := BuildConfigChangeDetails(oldCfg, newCfg); len(changes) != 1 || changes[0] != "codex.live-enabled: false -> true" {

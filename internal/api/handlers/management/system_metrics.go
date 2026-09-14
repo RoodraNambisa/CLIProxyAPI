@@ -37,6 +37,7 @@ type systemMetricsResponse struct {
 	ChatGPTWebImageProtocol    runtimeexecutor.ChatGPTWebImageProtocolRuntimeSnapshot `json:"chatgpt_web_image_protocol"`
 	ImageSpool                 helps.ChatGPTWebImageSpoolRuntimeSnapshot              `json:"image_spool"`
 	ImageRequestPhases         systemMetricsImageRequestPhases                        `json:"image_request_phases"`
+	ImageBootstrap             coreexecutor.ImageBootstrapMetrics                     `json:"chatgpt_web_image_bootstrap"`
 }
 
 type systemMetricsImageRequestPhases struct {
@@ -82,6 +83,7 @@ func (h *Handler) GetSystemMetrics(c *gin.Context) {
 		ChatGPTWebPollBreaker:      coreexecutor.ChatGPTWebImagePollStallBreakerSnapshot(),
 		ChatGPTWebImageProtocol:    runtimeexecutor.ChatGPTWebImageProtocolSnapshot(),
 		ImageSpool:                 helps.ChatGPTWebImageSpoolSnapshot(),
+		ImageBootstrap:             coreexecutor.ImageBootstrapSnapshot(),
 		ImageRequestPhases: systemMetricsImageRequestPhases{
 			HandlerScope:                "all_image_routes",
 			WebScope:                    "chatgpt_web_only_after_executor_selection",

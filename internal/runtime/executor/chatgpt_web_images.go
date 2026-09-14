@@ -870,7 +870,8 @@ func (e *ChatGPTWebExecutor) beginChatGPTWebImage(ctx context.Context, client *c
 
 	requirementsStarted := time.Now()
 	setChatGPTWebImageTaskStage(ctx, "fetching_requirements")
-	requirements, err := e.chatGPTWebRequirements(chatgptwebauth.WithSentinelComputeScope(ctx, "images"), client, credential, prepared.sentinelPolicy)
+	bootstrapCtx := cliproxyexecutor.WithImageBootstrapPolicy(ctx, prepared.bootstrapPolicy)
+	requirements, err := e.chatGPTWebRequirements(chatgptwebauth.WithSentinelComputeScope(bootstrapCtx, "images"), client, credential, prepared.sentinelPolicy)
 	cliproxyexecutor.ObserveRequestPhaseContext(ctx, cliproxyexecutor.ImagePhaseRequirements, requirementsStarted)
 	if err != nil {
 		return nil, err

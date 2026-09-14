@@ -961,6 +961,13 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
 	newCtx = executorhelps.CaptureCodexMultiAgentPolicyContext(newCtx)
 	newCtx = context.WithValue(newCtx, "handler", handler)
 	newCtx, _ = ensureErrorResponseSourceTracker(newCtx, c)
+	if c != nil {
+		if value, exists := c.Get(coreexecutor.ImageBootstrapPolicyMetadataKey); exists {
+			if policy, ok := value.(coreexecutor.ImageBootstrapPolicy); ok {
+				newCtx = coreexecutor.WithImageBootstrapPolicy(newCtx, policy)
+			}
+		}
+	}
 	releaseBudget := func() {}
 	if budget := imageRequestBudgetForGin(c); budget != nil {
 		newCtx, releaseBudget = budget.Bind(newCtx)

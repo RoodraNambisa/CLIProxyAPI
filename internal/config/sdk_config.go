@@ -211,6 +211,10 @@ type ImagesConfig struct {
 type ChatGPTWebImageConfig struct {
 	// RequestTimeoutSeconds bounds one logical Web image request; zero disables the budget.
 	RequestTimeoutSeconds int `yaml:"request-timeout-seconds" json:"request-timeout-seconds"`
+	// BootstrapTimeoutSeconds bounds one image homepage attempt, including redirects and body reads.
+	BootstrapTimeoutSeconds int `yaml:"bootstrap-timeout-seconds" json:"bootstrap-timeout-seconds"`
+	// BootstrapRetries counts additional homepage attempts before normal credential failover.
+	BootstrapRetries int `yaml:"bootstrap-retries" json:"bootstrap-retries"`
 	// ImageModels lists public aliases for the shared Web image capability, not upstream engines.
 	ImageModels []string `yaml:"image-models,omitempty" json:"image-models,omitempty"`
 	// UpstreamModel is the ChatGPT Web conversation model that invokes picture_v2.
@@ -478,6 +482,9 @@ func (cfg ChatGPTWebImageConfig) Resolved() ResolvedChatGPTWebImageConfig {
 
 // Validate rejects invalid ChatGPT Web image compatibility settings.
 func (cfg ChatGPTWebImageConfig) Validate() error {
+	if err := cfg.ValidateBootstrap(); err != nil {
+		return err
+	}
 	if cfg.RequestTimeoutSeconds < 0 || cfg.RequestTimeoutSeconds > MaxImageRequestTimeoutSeconds {
 		return fmt.Errorf("images.chatgpt-web.request-timeout-seconds must be between 0 and %d", MaxImageRequestTimeoutSeconds)
 	}

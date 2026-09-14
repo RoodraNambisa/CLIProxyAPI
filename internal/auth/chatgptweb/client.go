@@ -739,6 +739,11 @@ func (client *Client) doStream(ctx context.Context, httpClient tls_client.HttpCl
 	if errContext := ctx.Err(); errContext != nil {
 		return nil, errContext
 	}
+	client.runBeforeRequest()
+	return httpClient.Do(request)
+}
+
+func (client *Client) runBeforeRequest() {
 	client.beforeRequestOnce.Do(func() {
 		client.beforeRequestMu.RLock()
 		hook := client.beforeRequest
@@ -747,7 +752,6 @@ func (client *Client) doStream(ctx context.Context, httpClient tls_client.HttpCl
 			hook()
 		}
 	})
-	return httpClient.Do(request)
 }
 
 // SetBeforeRequestHook installs a one-shot callback invoked immediately before

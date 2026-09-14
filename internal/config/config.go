@@ -4037,6 +4037,9 @@ func SaveConfigPreserveComments(configFile string, cfg *Config) error {
 	if errTimeout := cfg.Images.ValidateRequestTimeouts(); errTimeout != nil {
 		return errTimeout
 	}
+	if errBootstrap := cfg.Images.ChatGPTWeb.ValidateBootstrap(); errBootstrap != nil {
+		return errBootstrap
+	}
 	if errWeight := cfg.ValidateCredentialWeights(); errWeight != nil {
 		return errWeight
 	}

@@ -10,6 +10,16 @@ import (
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 )
 
+func (h *BaseAPIHandler) imageBootstrapPolicy() coreexecutor.ImageBootstrapPolicy {
+	if cfg := h.ConfigSnapshot(); cfg != nil {
+		return coreexecutor.ImageBootstrapPolicy{
+			Timeout: time.Duration(cfg.Images.ChatGPTWeb.BootstrapTimeoutSeconds) * time.Second,
+			Retries: cfg.Images.ChatGPTWeb.BootstrapRetries,
+		}
+	}
+	return coreexecutor.ImageBootstrapPolicy{}
+}
+
 func (h *BaseAPIHandler) newImageRequestBudget(ctx context.Context) *coreexecutor.ImageRequestBudget {
 	cfg := h.ConfigSnapshot()
 	if cfg == nil {
@@ -27,6 +37,7 @@ func (h *BaseAPIHandler) BeginImageRequestBudget(c *gin.Context) func() {
 	if c == nil || c.Request == nil {
 		return func() {}
 	}
+	c.Set(coreexecutor.ImageBootstrapPolicyMetadataKey, h.imageBootstrapPolicy())
 	budget := h.newImageRequestBudget(c.Request.Context())
 	if budget == nil {
 		return func() {}
@@ -48,7 +59,15 @@ func imageRequestBudgetForGin(c *gin.Context) *coreexecutor.ImageRequestBudget {
 // budget. In WebSocket mode this is called once per response.create, not per socket.
 func (h *BaseAPIHandler) GetImageContextWithCancel(handler interfaces.APIHandler, c *gin.Context, parent context.Context, payload []byte) (context.Context, APIHandlerCancelFunc) {
 	ctx, cancel := h.GetContextWithCancel(handler, c, parent)
-	if coreexecutor.ImageRequestBudgetFromContext(ctx) != nil || !coreauth.PayloadMaySelectImageGenerationTool(payload) {
+	// Pin preparation settings before routing: an alias or server-side payload
+	// policy can select image generation later. Only the image executor uses it.
+	if _, pinned := coreexecutor.ImageBootstrapPolicyFromContext(ctx); !pinned {
+		ctx = coreexecutor.WithImageBootstrapPolicy(ctx, h.imageBootstrapPolicy())
+	}
+	if !coreauth.PayloadMaySelectImageGenerationTool(payload) {
+		return ctx, cancel
+	}
+	if coreexecutor.ImageRequestBudgetFromContext(ctx) != nil {
 		return ctx, cancel
 	}
 	budget := h.newImageRequestBudget(ctx)

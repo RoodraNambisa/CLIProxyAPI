@@ -17,6 +17,7 @@ type connectionTracker struct {
 	mu          sync.Mutex
 	connections map[*trackedConnection]struct{}
 	closed      bool
+	lifetime    context.Context
 }
 
 type trackedConnection struct {
@@ -115,6 +116,15 @@ func (dialer *trackedConnectionDialer) Dial(network, address string) (net.Conn, 
 func (dialer *trackedConnectionDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
 	if dialer == nil || dialer.base == nil {
 		return nil, net.ErrClosed
+	}
+	if lifetime := dialer.tracker.lifetime; lifetime != nil {
+		bound, cancel := context.WithCancel(ctx)
+		stop := context.AfterFunc(lifetime, cancel)
+		defer func() { stop(); cancel() }()
+		if lifetime.Err() != nil {
+			cancel()
+		}
+		ctx = bound
 	}
 	connection, errDial := dialer.base.DialContext(ctx, network, address)
 	if errDial != nil {

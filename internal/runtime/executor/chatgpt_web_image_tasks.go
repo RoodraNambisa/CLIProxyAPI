@@ -26,6 +26,8 @@ type ChatGPTWebImageTaskSnapshot struct {
 	ID                          string     `json:"id"`
 	Status                      string     `json:"status"`
 	Stage                       string     `json:"stage"`
+	BootstrapAttempt            int        `json:"bootstrap_attempt,omitempty"`
+	BootstrapMaxAttempts        int        `json:"bootstrap_max_attempts,omitempty"`
 	StartedAt                   time.Time  `json:"started_at"`
 	DurationMilliseconds        int64      `json:"duration_milliseconds"`
 	LastProgressAt              time.Time  `json:"last_progress_at"`
@@ -57,6 +59,8 @@ type ChatGPTWebImageTaskCancelResult struct {
 type chatGPTWebImageTaskEntry struct {
 	id                    string
 	stage                 string
+	bootstrapAttempt      int
+	bootstrapMaxAttempts  int
 	startedAt             time.Time
 	lastProgressAt        time.Time
 	lastPollCompletedAt   time.Time
@@ -185,6 +189,17 @@ func setChatGPTWebImageTaskStage(ctx context.Context, stage string) {
 	}
 }
 
+func (handle *chatGPTWebImageTaskHandle) setBootstrapAttempt(attempt, maximum int) {
+	if handle == nil || handle.registry == nil {
+		return
+	}
+	handle.registry.mu.Lock()
+	defer handle.registry.mu.Unlock()
+	if entry := handle.registry.active[handle.id]; entry != nil {
+		entry.bootstrapAttempt, entry.bootstrapMaxAttempts = attempt, maximum
+	}
+}
+
 func beginChatGPTWebImageTaskPoll(ctx context.Context) func(bool) {
 	handle := chatGPTWebImageTaskHandleFromContext(ctx)
 	if handle == nil {
@@ -291,6 +306,8 @@ func (registry *chatGPTWebImageTaskRegistry) snapshot() ChatGPTWebImageTaskListS
 			ID:                          entry.id,
 			Status:                      "running",
 			Stage:                       entry.stage,
+			BootstrapAttempt:            entry.bootstrapAttempt,
+			BootstrapMaxAttempts:        entry.bootstrapMaxAttempts,
 			StartedAt:                   entry.startedAt.UTC(),
 			DurationMilliseconds:        duration.Milliseconds(),
 			LastProgressAt:              entry.lastProgressAt.UTC(),

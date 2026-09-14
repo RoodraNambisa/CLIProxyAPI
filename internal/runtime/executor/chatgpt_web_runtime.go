@@ -74,6 +74,7 @@ func (body *chatGPTWebChallengeInspectingBody) challengeError() error {
 
 type chatGPTWebPreparedRequest struct {
 	sentinelPolicy         *sentinelcompat.Policy
+	bootstrapPolicy        cliproxyexecutor.ImageBootstrapPolicy
 	baseModel              string
 	routeModel             string
 	responseFormat         sdktranslator.Format
@@ -663,7 +664,7 @@ func (e *ChatGPTWebExecutor) prepareRuntimeRequest(ctx context.Context, _ *clipr
 	return e.instantiateRuntimeRequest(template, opts)
 }
 
-func (e *ChatGPTWebExecutor) prepareRuntimeRequestTemplate(_ context.Context, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, stream bool) (*chatGPTWebPreparedRequest, error) {
+func (e *ChatGPTWebExecutor) prepareRuntimeRequestTemplate(ctx context.Context, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, stream bool) (*chatGPTWebPreparedRequest, error) {
 	baseModel := strings.TrimSpace(thinking.ParseSuffix(req.Model).ModelName)
 	routeModel := strings.TrimSpace(helps.PayloadRequestedModel(opts, req.Model))
 	if routeModel == "" {
@@ -701,9 +702,14 @@ func (e *ChatGPTWebExecutor) prepareRuntimeRequestTemplate(_ context.Context, re
 	}
 	cfg := e.configSnapshot()
 	sentinelPolicy := chatGPTWebSentinelPolicy(cfg)
+	bootstrapPolicy, bootstrapPinned := cliproxyexecutor.ImageBootstrapPolicyFromContext(ctx)
+	if !bootstrapPinned && cfg != nil {
+		bootstrapPolicy = cliproxyexecutor.ImageBootstrapPolicy{Timeout: time.Duration(cfg.Images.ChatGPTWeb.BootstrapTimeoutSeconds) * time.Second, Retries: cfg.Images.ChatGPTWeb.BootstrapRetries}
+	}
 	if opaque, ok := cliproxyexecutor.ProviderPreparedRequest(opts, e.Identifier()); ok {
 		if previous, ok := opaque.(*chatGPTWebPreparedRequest); ok {
 			sentinelPolicy = previous.sentinelPolicy
+			bootstrapPolicy = previous.bootstrapPolicy
 		}
 	}
 	resolvedImageConfig := config.ChatGPTWebImageConfig{}.Resolved()
@@ -863,6 +869,7 @@ func (e *ChatGPTWebExecutor) prepareRuntimeRequestTemplate(_ context.Context, re
 	canonicalBody = helps.SlimRequestBodyForTranslation(canonicalBody)
 	return &chatGPTWebPreparedRequest{
 		sentinelPolicy:  sentinelPolicy,
+		bootstrapPolicy: bootstrapPolicy,
 		baseModel:       baseModel,
 		routeModel:      routeModel,
 		responseFormat:  responseFormat,
@@ -1519,12 +1526,17 @@ func (e *ChatGPTWebExecutor) chatGPTWebRequirements(ctx context.Context, client 
 		"sec-fetch-mode": "navigate",
 		"sec-fetch-site": "none",
 	})
-	response, err := e.doChatGPTWebBootstrapRequest(ctx, client, credential, baseURL+bootstrapPath, bootstrapHeaders)
-	if err != nil {
-		helps.RecordAPIResponseError(ctx, e.configSnapshot(), err)
-		return chatGPTWebRequirements{}, err
+	var response *fhttp.Response
+	var bootstrap []byte
+	var err error
+	if chatgptwebauth.SentinelComputeScope(ctx) == "images" {
+		response, bootstrap, err = e.fetchChatGPTWebImageBootstrap(ctx, client, credential, baseURL+bootstrapPath, bootstrapHeaders)
+	} else {
+		response, err = e.doChatGPTWebBootstrapRequest(ctx, client, credential, baseURL+bootstrapPath, bootstrapHeaders)
+		if err == nil {
+			bootstrap, err = readChatGPTWebResponseBody(response, chatGPTWebMaxHTMLBodyBytes)
+		}
 	}
-	bootstrap, err := readChatGPTWebResponseBody(response, chatGPTWebMaxHTMLBodyBytes)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.configSnapshot(), err)
 		return chatGPTWebRequirements{}, err
@@ -1916,12 +1928,95 @@ func chatGPTWebSentinelFinalizeRejection(err error) bool {
 		strings.Contains(lower, "so_token") || strings.Contains(lower, "so-token")
 }
 
+func (e *ChatGPTWebExecutor) fetchChatGPTWebImageBootstrap(ctx context.Context, client *chatgptwebauth.Client, credential *chatgptwebauth.Credential, target string, headers map[string]string) (*fhttp.Response, []byte, error) {
+	policy, _ := cliproxyexecutor.ImageBootstrapPolicyFromContext(ctx)
+	for attempt := 0; ; attempt++ {
+		if ctx.Err() != nil {
+			return nil, nil, cliproxyexecutor.ImageRequestContextError(ctx, context.Cause(ctx))
+		}
+		if attempt > 0 {
+			setChatGPTWebImageTaskStage(ctx, cliproxyexecutor.ImagePhaseBootstrapRetryWait)
+			started := time.Now()
+			timer := time.NewTimer(helps.ChatGPTWebBootstrapRetryDelay(attempt))
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				cliproxyexecutor.ObserveRequestPhaseContext(ctx, cliproxyexecutor.ImagePhaseBootstrapRetryWait, started)
+				return nil, nil, cliproxyexecutor.ImageRequestContextError(ctx, context.Cause(ctx))
+			case <-timer.C:
+			}
+			cliproxyexecutor.ObserveRequestPhaseContext(ctx, cliproxyexecutor.ImagePhaseBootstrapRetryWait, started)
+		}
+		if ctx.Err() != nil {
+			return nil, nil, cliproxyexecutor.ImageRequestContextError(ctx, context.Cause(ctx))
+		}
+		cliproxyexecutor.ObserveImageBootstrapAttempt(attempt > 0)
+		if handle := chatGPTWebImageTaskHandleFromContext(ctx); handle != nil {
+			handle.setBootstrapAttempt(attempt+1, policy.Retries+1)
+		}
+		response, body, err, timedOut := func() (*fhttp.Response, []byte, error, bool) {
+			attemptCtx := ctx
+			cancel := func() {}
+			if policy.Timeout > 0 {
+				attemptCtx, cancel = context.WithTimeout(ctx, policy.Timeout)
+			}
+			defer cancel()
+			attemptClient := client
+			if policy.Enabled() {
+				var errClient error
+				attemptClient, errClient = client.NewBootstrapAttempt(attemptCtx)
+				if errClient != nil {
+					return nil, nil, errClient, false
+				}
+				defer func() { attemptClient.CloseActiveAcquisitionConnections(); attemptClient.CloseIdleConnections() }()
+			}
+			response, errRequest := e.doChatGPTWebBootstrapRequest(attemptCtx, attemptClient, credential, target, headers, true)
+			var body []byte
+			if errRequest == nil {
+				setChatGPTWebImageTaskStage(ctx, cliproxyexecutor.ImagePhaseBootstrapBody)
+				started := time.Now()
+				body, errRequest = readChatGPTWebResponseBody(response, chatGPTWebMaxHTMLBodyBytes)
+				cliproxyexecutor.ObserveRequestPhaseContext(ctx, cliproxyexecutor.ImagePhaseBootstrapBody, started)
+			}
+			timedOut := policy.Timeout > 0 && errors.Is(attemptCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil
+			if timedOut {
+				cliproxyexecutor.ObserveImageBootstrapTimeout()
+			}
+			// A received HTTP rejection keeps its existing classification, even if
+			// its error body could not be read before the phase deadline.
+			if response != nil && (response.StatusCode < 200 || response.StatusCode >= 300) {
+				return response, body, errRequest, false
+			}
+			if timedOut {
+				errRequest = errors.Join(context.DeadlineExceeded, errRequest)
+			}
+			return response, body, errRequest, timedOut
+		}()
+		if ctx.Err() != nil {
+			return nil, nil, cliproxyexecutor.ImageRequestContextError(ctx, context.Cause(ctx))
+		}
+		if err == nil {
+			if attempt > 0 && response.StatusCode >= 200 && response.StatusCode < 300 {
+				cliproxyexecutor.ObserveImageBootstrapRetrySuccess()
+			}
+			return response, body, nil
+		}
+		if !policy.Enabled() || !helps.ChatGPTWebBootstrapRetryable(err) {
+			return response, body, err
+		}
+		if attempt >= policy.Retries {
+			return nil, nil, &cliproxyexecutor.ImageBootstrapError{Cause: chatGPTWebTransportDiagnosticError(err, target), Timeout: timedOut}
+		}
+	}
+}
+
 func (e *ChatGPTWebExecutor) doChatGPTWebBootstrapRequest(
 	ctx context.Context,
 	client *chatgptwebauth.Client,
 	credential *chatgptwebauth.Credential,
 	targetURL string,
 	headers map[string]string,
+	observeBootstrap ...bool,
 ) (*fhttp.Response, error) {
 	if client == nil {
 		return nil, errors.New("chatgpt web bootstrap client is nil")
@@ -1931,9 +2026,17 @@ func (e *ChatGPTWebExecutor) doChatGPTWebBootstrapRequest(
 		return nil, errors.New("chatgpt web bootstrap URL is invalid")
 	}
 	currentURL := originalURL
+	observe := len(observeBootstrap) > 0 && observeBootstrap[0]
 	for redirects := 0; ; redirects++ {
+		started := time.Now()
+		if observe {
+			setChatGPTWebImageTaskStage(ctx, cliproxyexecutor.ImagePhaseBootstrapHTTP)
+		}
 		e.recordChatGPTWebRequest(ctx, credential, http.MethodGet, currentURL.String(), headers, nil)
 		response, errRequest := client.DoNoRedirectStream(ctx, http.MethodGet, currentURL.String(), headers, nil)
+		if observe {
+			cliproxyexecutor.ObserveRequestPhaseContext(ctx, cliproxyexecutor.ImagePhaseBootstrapHTTP, started)
+		}
 		if errRequest != nil {
 			return nil, chatGPTWebTransportDiagnosticError(errRequest, currentURL.String())
 		}
@@ -1953,7 +2056,14 @@ func (e *ChatGPTWebExecutor) doChatGPTWebBootstrapRequest(
 			_ = response.Body.Close()
 			return nil, fmt.Errorf("chatgpt web redirect chain exceeds %d hops", chatGPTWebMaxBootstrapRedirects)
 		}
+		started = time.Now()
+		if observe {
+			setChatGPTWebImageTaskStage(ctx, cliproxyexecutor.ImagePhaseBootstrapBody)
+		}
 		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, chatGPTWebMaxErrorBodyBytes))
+		if observe {
+			cliproxyexecutor.ObserveRequestPhaseContext(ctx, cliproxyexecutor.ImagePhaseBootstrapBody, started)
+		}
 		if errClose := response.Body.Close(); errClose != nil {
 			return nil, fmt.Errorf("close chatgpt web bootstrap redirect response: %w", errClose)
 		}

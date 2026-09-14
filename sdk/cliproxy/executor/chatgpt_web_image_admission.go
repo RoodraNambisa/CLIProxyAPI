@@ -24,6 +24,9 @@ const (
 	ImagePhaseInputUpload            = "web_input_upload"
 	ImagePhaseRequirements           = "web_requirements"
 	ImagePhaseRequirementsBootstrap  = "web_requirements_bootstrap"
+	ImagePhaseBootstrapHTTP          = "web_requirements_bootstrap_http"
+	ImagePhaseBootstrapBody          = "web_requirements_bootstrap_body"
+	ImagePhaseBootstrapRetryWait     = "web_requirements_bootstrap_retry_wait"
 	ImagePhaseRequirementsLocal      = "web_requirements_local_prepare"
 	ImagePhaseRequirementsPrepare    = "web_requirements_prepare"
 	ImagePhaseRequirementsParse      = "web_requirements_parse"
@@ -603,6 +606,7 @@ func newImageRequestPhaseObserver() *imageRequestPhaseObserver {
 		ImagePhaseExecutionAdmission, ImagePhaseCredentialSelection, ImagePhaseRequestSlot,
 		ImagePhaseInputUpload, ImagePhaseRequirements, ImagePhaseConversationPrepare,
 		ImagePhaseRequirementsBootstrap, ImagePhaseRequirementsLocal, ImagePhaseRequirementsPrepare,
+		ImagePhaseBootstrapHTTP, ImagePhaseBootstrapBody, ImagePhaseBootstrapRetryWait,
 		ImagePhaseRequirementsParse, ImagePhaseRequirementsObserver, ImagePhaseRequirementsProof,
 		ImagePhaseRequirementsTurnstile, ImagePhaseRequirementsFinalize,
 		ImagePhaseRequirementsSnapshot, ImagePhaseRequirementsCleanup,

@@ -459,6 +459,12 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	if oldCfg.Images.CodexRequestTimeoutSeconds != newCfg.Images.CodexRequestTimeoutSeconds {
 		changes = append(changes, fmt.Sprintf("images.codex-request-timeout-seconds: %d -> %d", oldCfg.Images.CodexRequestTimeoutSeconds, newCfg.Images.CodexRequestTimeoutSeconds))
 	}
+	if oldCfg.Images.ChatGPTWeb.BootstrapTimeoutSeconds != newCfg.Images.ChatGPTWeb.BootstrapTimeoutSeconds {
+		changes = append(changes, fmt.Sprintf("images.chatgpt-web.bootstrap-timeout-seconds: %d -> %d", oldCfg.Images.ChatGPTWeb.BootstrapTimeoutSeconds, newCfg.Images.ChatGPTWeb.BootstrapTimeoutSeconds))
+	}
+	if oldCfg.Images.ChatGPTWeb.BootstrapRetries != newCfg.Images.ChatGPTWeb.BootstrapRetries {
+		changes = append(changes, fmt.Sprintf("images.chatgpt-web.bootstrap-retries: %d -> %d", oldCfg.Images.ChatGPTWeb.BootstrapRetries, newCfg.Images.ChatGPTWeb.BootstrapRetries))
+	}
 	if oldCfg.Images.ChatGPTWeb.RequestTimeoutSeconds != newCfg.Images.ChatGPTWeb.RequestTimeoutSeconds {
 		changes = append(changes, fmt.Sprintf("images.chatgpt-web.request-timeout-seconds: %d -> %d", oldCfg.Images.ChatGPTWeb.RequestTimeoutSeconds, newCfg.Images.ChatGPTWeb.RequestTimeoutSeconds))
 	}
