@@ -198,7 +198,7 @@ func isCodexQuotaSignalHeader(name string) bool {
 	case "x-codex-plan-type", "x-codex-active-limit", "x-codex-credits-has-credits", "x-codex-credits-unlimited", "x-codex-credits-balance":
 		return true
 	}
-	if !strings.HasPrefix(lower, "x-codex-") {
+	if !strings.HasPrefix(lower, "x-codex-") && !strings.HasPrefix(lower, "x-base-model-inference-") {
 		return false
 	}
 	for _, suffix := range []string{"-allowed", "-limit-reached", "-limit-name", "-limit-id", "-used-percent", "-window-minutes", "-reset-after-seconds", "-reset-at", "-over-secondary-limit-percent"} {
@@ -222,7 +222,7 @@ func codexQuotaSignalRank(name string) int {
 		return 3
 	case strings.HasPrefix(lower, "x-codex-additional-"):
 		return 5
-	case strings.HasPrefix(lower, "x-codex-"):
+	case strings.HasPrefix(lower, "x-codex-"), strings.HasPrefix(lower, "x-base-model-inference-"):
 		return 4
 	default:
 		return 6

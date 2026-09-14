@@ -61,7 +61,7 @@ func extractCodexQuotaPools(observation *CodexQuotaObservation) []CodexQuotaPool
 	groups := make(map[string]map[string]string)
 	for rawKey, value := range observation.Signals {
 		key := strings.ToLower(rawKey)
-		if !strings.HasPrefix(key, "x-codex-") {
+		if !strings.HasPrefix(key, "x-codex-") && !strings.HasPrefix(key, "x-base-model-inference-") {
 			continue
 		}
 		for _, kind := range []string{"primary", "secondary"} {
@@ -87,7 +87,13 @@ func extractCodexQuotaPools(observation *CodexQuotaObservation) []CodexQuotaPool
 	for prefix := range groups {
 		prefixes = append(prefixes, prefix)
 	}
-	sort.Strings(prefixes)
+	sort.Slice(prefixes, func(i, j int) bool {
+		leftActive, rightActive := prefixes[i] == "x-codex", prefixes[j] == "x-codex"
+		if leftActive != rightActive {
+			return leftActive
+		}
+		return prefixes[i] < prefixes[j]
+	})
 	pools := make(map[string]CodexQuotaPool)
 	for _, prefix := range prefixes {
 		id := normalizeCodexQuotaPoolID(strings.TrimPrefix(prefix, "x-"))

@@ -64,6 +64,13 @@ func TestCodexQuotaErrorFramesFilterPrivateHeaders(t *testing.T) {
 	}
 }
 
+func TestCodexQuotaErrorFramesPreserveOptionalReserveHeaders(t *testing.T) {
+	headers := ParseCodexQuotaEventHeaders([]byte(`{"type":"error","status_code":429,"headers":{"x-base-model-inference-limit-name":"gpt-reserve","x-base-model-inference-primary-used-percent":"100","x-base-model-inference-primary-window-minutes":"10080","x-base-model-inference-token":"private","Authorization":"private"}}`))
+	if len(headers) != 3 || headers.Get("X-Base-Model-Inference-Limit-Name") != "gpt-reserve" || headers.Get("X-Base-Model-Inference-Primary-Used-Percent") != "100" || headers.Get("X-Base-Model-Inference-Primary-Window-Minutes") != "10080" {
+		t.Fatal("reserve quota was discarded or private headers were retained")
+	}
+}
+
 func TestCodexQuotaEventsBoundAdditionalLimitsAndAvoidNamespaceMerging(t *testing.T) {
 	var additional []string
 	for index := range 20 {
