@@ -21,7 +21,14 @@ type XAIModelCatalog struct {
 
 func ParseXAIModels(raw []byte, source string) (*XAIModelCatalog, error) {
 	var envelope struct {
-		Data []*registry.ModelInfo `json:"data"`
+		Data []*struct {
+			registry.ModelInfo
+			ContextWindow           int   `json:"context_window"`
+			SupportsReasoningEffort *bool `json:"supports_reasoning_effort"`
+			ReasoningEfforts        []struct {
+				Value string `json:"value"`
+			} `json:"reasoning_efforts"`
+		} `json:"data"`
 	}
 	if len(raw) > 1024*1024 || json.Unmarshal(raw, &envelope) != nil || envelope.Data == nil || len(envelope.Data) > 256 {
 		return nil, fmt.Errorf("invalid Grok model catalog")
@@ -32,17 +39,38 @@ func ParseXAIModels(raw []byte, source string) (*XAIModelCatalog, error) {
 	}
 	seen := make(map[string]bool)
 	models := make([]*registry.ModelInfo, 0, len(envelope.Data))
-	for _, model := range envelope.Data {
-		if model == nil || strings.TrimSpace(model.ID) == "" || len(model.ID) > 256 || strings.ContainsAny(model.ID, "\r\n\x00") {
+	for _, entry := range envelope.Data {
+		if entry == nil || strings.TrimSpace(entry.ID) == "" || len(entry.ID) > 256 || strings.ContainsAny(entry.ID, "\r\n\x00") {
 			return nil, fmt.Errorf("invalid Grok model identifier")
 		}
+		model := &entry.ModelInfo
 		if seen[model.ID] {
 			continue
 		}
 		seen[model.ID] = true
+		// The CLI catalog uses different capability fields from the API catalog.
+		// Normalize them before applying static fallbacks or persisting the cache.
+		if model.ContextLength == 0 && entry.ContextWindow > 0 {
+			model.ContextLength = entry.ContextWindow
+		}
+		reasoningDisabled := entry.SupportsReasoningEffort != nil && !*entry.SupportsReasoningEffort
+		if model.Thinking == nil && !reasoningDisabled {
+			var levels []string
+			seenLevels := make(map[string]bool)
+			for _, effort := range entry.ReasoningEfforts {
+				level := strings.ToLower(strings.TrimSpace(effort.Value))
+				if level != "" && !seenLevels[level] {
+					seenLevels[level] = true
+					levels = append(levels, level)
+				}
+			}
+			if len(levels) > 0 {
+				model.Thinking = &registry.ThinkingSupport{Levels: levels}
+			}
+		}
 		// Keep known capabilities when the directory only returns an ID.
 		if baseline := known[model.ID]; baseline != nil {
-			if model.Thinking == nil {
+			if model.Thinking == nil && !reasoningDisabled {
 				model.Thinking = baseline.Thinking
 			}
 			if model.ContextLength == 0 {
@@ -60,7 +88,10 @@ func ParseXAIModels(raw []byte, source string) (*XAIModelCatalog, error) {
 			model.OwnedBy = "xai"
 		}
 		if model.DisplayName == "" {
-			model.DisplayName = model.ID
+			model.DisplayName = strings.TrimSpace(model.Name)
+			if model.DisplayName == "" {
+				model.DisplayName = model.ID
+			}
 		}
 		models = append(models, model)
 	}
