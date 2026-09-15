@@ -22,6 +22,9 @@ func NewSentinelOnlyServer(cfg *config.Config, path, password string) (*Server, 
 	if cfg == nil || !cfg.SentinelSolver.Enabled {
 		return nil, fmt.Errorf("--sentinel-solver-only requires sentinel-solver.enabled=true")
 	}
+	if err := cfg.ValidateSentinelSolver(); err != nil {
+		return nil, err
+	}
 	snapshot, err := config.Clone(cfg)
 	if err != nil {
 		return nil, err
@@ -62,7 +65,7 @@ func NewSentinelOnlyServer(cfg *config.Config, path, password string) (*Server, 
 		err := s.updateSentinelOnlyClients(candidate)
 		return config.RuntimeApplyResult{Applied: err == nil}, err
 	})
-	s.server = &http.Server{Addr: net.JoinHostPort(snapshot.Host, strconv.Itoa(snapshot.Port)), Handler: engine}
+	s.server = &http.Server{Addr: net.JoinHostPort(snapshot.Host, strconv.Itoa(snapshot.Port)), Handler: node.Handler(engine)}
 	managementasset.SetCurrentConfig(snapshot)
 	return s, nil
 }
@@ -74,7 +77,7 @@ func (s *Server) updateSentinelOnlyClients(cfg *config.Config) error {
 	if err != nil {
 		return err
 	}
-	if err = snapshot.SentinelSolver.Validate(); err != nil {
+	if err = snapshot.ValidateSentinelSolver(); err != nil {
 		return err
 	}
 	old := s.currentConfig()

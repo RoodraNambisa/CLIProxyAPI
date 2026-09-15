@@ -395,7 +395,11 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 		managementCfg = cfg
 	}
 	s.mgmt = managementHandlers.NewHandler(managementCfg, configFilePath, authManager)
-	s.sentinelSolver, s.sentinelInitErr = sentinelservice.New(cfg.SentinelSolver)
+	if errSolverPath := cfg.ValidateSentinelSolver(); errSolverPath != nil {
+		s.sentinelInitErr = errSolverPath
+	} else {
+		s.sentinelSolver, s.sentinelInitErr = sentinelservice.New(cfg.SentinelSolver)
+	}
 	if s.sentinelSolver != nil {
 		s.mgmt.SetSentinelSolver(s.sentinelSolver)
 	}
@@ -457,6 +461,9 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	s.server = &http.Server{
 		Addr:    fmt.Sprintf("%s:%d", cfg.Host, cfg.Port),
 		Handler: engine,
+	}
+	if s.sentinelSolver != nil {
+		s.server.Handler = s.sentinelSolver.Handler(engine)
 	}
 
 	return s
@@ -1281,7 +1288,7 @@ func (s *Server) StartListening() (net.Addr, <-chan error, error) {
 		return nil, nil, s.sentinelInitErr
 	}
 	if s.sentinelSolver != nil {
-		if err := s.sentinelSolver.Start(); err != nil {
+		if err := s.sentinelSolver.Start(listener.Addr().String()); err != nil {
 			_ = listener.Close()
 			return nil, nil, err
 		}
@@ -1343,9 +1350,10 @@ func (s *Server) Stop(ctx context.Context) error {
 	} else {
 		managementDone <- nil
 	}
+	errSolver := <-solverDone
+	// Stateful solver RPCs need the shared listener until the drain completes.
 	errShutdown := s.server.Shutdown(ctx)
 	errManagement := <-managementDone
-	errSolver := <-solverDone
 	var shutdownErrors []error
 	if errSolver != nil {
 		shutdownErrors = append(shutdownErrors, fmt.Errorf("failed to shutdown solver: %w", errSolver))
@@ -1419,6 +1427,9 @@ func (s *Server) updateClients(cfg *config.Config, rollbackOnError bool) error {
 	runtimeCfg, errClone := config.Clone(cfg)
 	if errClone != nil {
 		return errClone
+	}
+	if errSolverPath := runtimeCfg.ValidateSentinelSolver(); errSolverPath != nil {
+		return errSolverPath
 	}
 	if errWeight := runtimeCfg.ValidateCredentialWeights(); errWeight != nil {
 		return errWeight

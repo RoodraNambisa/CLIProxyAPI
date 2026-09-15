@@ -313,11 +313,15 @@ func (s *SentinelComputeSession) rpc(ctx context.Context, operation string, inpu
 		if err != nil || len(body) > sentinelComputeMaxBody {
 			return s.result, computeError("invalid_input", false, err)
 		}
-		path := "/v1/sentinel/sessions"
+		baseURL, err := sentinelconfig.NodeBaseURL(s.node.config.URL)
+		if err != nil {
+			return s.result, computeError("invalid_input", false, err)
+		}
+		path := "/sessions"
 		if operation != "create" {
 			path += "/" + s.id + "/" + operation
 		}
-		request, err := http.NewRequestWithContext(opCtx, http.MethodPost, strings.TrimRight(s.node.config.URL, "/")+path, bytes.NewReader(body))
+		request, err := http.NewRequestWithContext(opCtx, http.MethodPost, baseURL+path, bytes.NewReader(body))
 		if err != nil {
 			return s.result, computeError("invalid_input", false, err)
 		}
@@ -561,7 +565,11 @@ func (s *SentinelComputeSession) Snapshot(ctx context.Context) (string, error) {
 }
 
 func (s *SentinelComputeSession) maintenance(ctx context.Context, method, path string) {
-	request, err := http.NewRequestWithContext(ctx, method, strings.TrimRight(s.node.config.URL, "/")+"/v1/sentinel/sessions/"+s.id+path, nil)
+	baseURL, err := sentinelconfig.NodeBaseURL(s.node.config.URL)
+	if err != nil {
+		return
+	}
+	request, err := http.NewRequestWithContext(ctx, method, baseURL+"/sessions/"+s.id+path, nil)
 	if err != nil {
 		return
 	}
@@ -637,7 +645,11 @@ func TestSentinelComputeNode(ctx context.Context, node sentinelconfig.Node) (Sen
 	defer p.Close()
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	target, err := url.Parse(strings.TrimRight(node.URL, "/") + "/v1/sentinel/health")
+	baseURL, err := sentinelconfig.NodeBaseURL(node.URL)
+	if err != nil {
+		return out, err
+	}
+	target, err := url.Parse(baseURL + "/health")
 	if err != nil {
 		return out, err
 	}

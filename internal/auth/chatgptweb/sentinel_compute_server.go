@@ -305,6 +305,8 @@ func (s *SentinelComputeServer) rpc(w http.ResponseWriter, r *http.Request, oper
 	startedAt := time.Now()
 	// Reading/admission is bounded independently of caller-supplied JSON.
 	_ = http.NewResponseController(w).SetReadDeadline(time.Now().Add(30 * time.Second))
+	// This connection may serve a normal proxy request after this RPC.
+	defer func() { _ = http.NewResponseController(w).SetReadDeadline(time.Time{}) }()
 	readCtx, readCancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer readCancel()
 	reservation := computeRPCReservation

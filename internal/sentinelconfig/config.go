@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"net"
 	"net/netip"
 	"net/url"
 	"strings"
@@ -146,7 +145,7 @@ func (cfg Remote) Validate(mode string) error {
 // ParseNodeURL limits cleartext credentials to explicit local/private addresses.
 func ParseNodeURL(raw string) (*url.URL, error) {
 	u, err := url.Parse(raw)
-	if err != nil || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || u.Opaque != "" {
+	if err != nil || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || u.Opaque != "" || u.RawPath != "" {
 		return nil, fmt.Errorf("invalid sentinel node URL")
 	}
 	if u.Scheme != "https" && u.Scheme != "http" {
@@ -155,7 +154,25 @@ func ParseNodeURL(raw string) (*url.URL, error) {
 	if u.Scheme == "http" && !PrivateHost(u.Hostname()) {
 		return nil, fmt.Errorf("public sentinel nodes require HTTPS; HTTP requires a private IP or localhost")
 	}
+	if u.Path != "" && u.Path != "/" {
+		if _, err := NormalizeAccessPath(strings.TrimRight(u.Path, "/")); err != nil {
+			return nil, fmt.Errorf("invalid sentinel node URL path")
+		}
+	}
 	return u, nil
+}
+
+// NodeBaseURL accepts the complete solver endpoint. Bare origins use the default path.
+func NodeBaseURL(raw string) (string, error) {
+	u, err := ParseNodeURL(raw)
+	if err != nil {
+		return "", err
+	}
+	if u.Path == "" || u.Path == "/" {
+		u.Path = DefaultAccessPath
+	}
+	u.Path = strings.TrimRight(u.Path, "/")
+	return u.String(), nil
 }
 
 func PrivateHost(host string) bool {
@@ -166,17 +183,10 @@ func PrivateHost(host string) bool {
 	return err == nil && (ip.Unmap().IsLoopback() || ip.Unmap().IsPrivate())
 }
 
-type TLS struct {
-	Enable bool   `json:"enable" yaml:"enable"`
-	Cert   string `json:"cert" yaml:"cert"`
-	Key    string `json:"key" yaml:"key"`
-}
-
 type Server struct {
 	Enabled             bool                  `json:"enabled" yaml:"enabled"`
-	Listen              string                `json:"listen,omitempty" yaml:"listen,omitempty"`
+	AccessPath          string                `json:"access-path,omitempty" yaml:"access-path,omitempty"`
 	APIKeys             []string              `json:"api-keys,omitempty" yaml:"api-keys,omitempty"`
-	TLS                 TLS                   `json:"tls" yaml:"tls,omitempty"`
 	SDKFallbackEnabled  bool                  `json:"sdk-fallback-enabled" yaml:"sdk-fallback-enabled"`
 	GoVMCompatibility   sentinelcompat.Config `json:"go-vm-compatibility" yaml:"go-vm-compatibility,omitempty"`
 	GoWorkers           *int                  `json:"go-workers,omitempty" yaml:"go-workers,omitempty"`
@@ -226,18 +236,49 @@ func value(p *int, fallback int) int {
 	}
 	return *p
 }
-func (cfg Server) Address() string {
-	if cfg.Listen == "" {
-		return "127.0.0.1:8318"
+
+const DefaultAccessPath = "/v1/sentinel"
+
+func NormalizeAccessPath(raw string) (string, error) {
+	if raw == "" {
+		return DefaultAccessPath, nil
 	}
-	return cfg.Listen
+	if len(raw) > 256 || !strings.HasPrefix(raw, "/") || strings.HasSuffix(raw, "/") {
+		return "", fmt.Errorf("sentinel-solver.access-path must be an absolute path without a trailing slash, up to 256 characters")
+	}
+	for _, segment := range strings.Split(raw[1:], "/") {
+		if segment == "" || segment == "." || segment == ".." {
+			return "", fmt.Errorf("invalid sentinel-solver.access-path segment")
+		}
+		for _, ch := range segment {
+			if !(ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z' || ch >= '0' && ch <= '9' || ch == '-' || ch == '_' || ch == '.') {
+				return "", fmt.Errorf("sentinel-solver.access-path allows letters, digits, '/', '-', '_' and '.' only")
+			}
+		}
+	}
+	return raw, nil
+}
+
+func (cfg Server) Path() string {
+	if cfg.AccessPath == "" {
+		return DefaultAccessPath
+	}
+	return cfg.AccessPath
 }
 func (cfg Server) Limits() Limits {
 	return Limits{value(cfg.GoWorkers, 0), value(cfg.QueueSize, 64), value(cfg.MaxSessions, 128), value(cfg.MemoryBudgetMiB, 512), value(cfg.SDKWorkers, 0), value(cfg.SDKQueueSize, 32), value(cfg.SDKCacheVersions, 3), value(cfg.SessionIdleSeconds, 120), value(cfg.DrainTimeoutSeconds, 120)}
 }
 func (cfg Server) Validate() error {
-	if _, _, err := net.SplitHostPort(cfg.Address()); err != nil {
-		return fmt.Errorf("invalid sentinel-solver.listen")
+	if _, err := NormalizeAccessPath(cfg.AccessPath); err != nil {
+		return err
+	}
+	// Keep the configurable mount from hiding proxy or management endpoints.
+	if cfg.Path() != DefaultAccessPath {
+		for _, reserved := range []string{"/v1", "/v1beta", "/v0", "/api", "/backend-api", "/debug", "/healthz", "/readyz", "/keep-alive", "/management.html"} {
+			if cfg.Path() == reserved || strings.HasPrefix(cfg.Path(), reserved+"/") {
+				return fmt.Errorf("sentinel-solver.access-path conflicts with a reserved API path")
+			}
+		}
 	}
 	if cfg.Enabled && len(cfg.APIKeys) == 0 {
 		return fmt.Errorf("sentinel-solver requires api-keys")
@@ -248,9 +289,6 @@ func (cfg Server) Validate() error {
 			return fmt.Errorf("invalid or duplicate sentinel-solver api-key")
 		}
 		seen[key] = true
-	}
-	if cfg.TLS.Enable && (cfg.TLS.Cert == "" || cfg.TLS.Key == "") {
-		return fmt.Errorf("sentinel-solver TLS requires cert and key")
 	}
 	if _, err := sentinelcompat.Compile(cfg.GoVMCompatibility); err != nil {
 		return fmt.Errorf("sentinel-solver.go-vm-compatibility: %w", err)

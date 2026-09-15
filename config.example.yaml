@@ -217,13 +217,12 @@ chatgpt-web:
     # Number of SDK source and bytecode versions retained in memory.
     sdk-cache-versions: 3
 
-# Independent computation listener; can also run with --sentinel-solver-only.
+# Computation shares the main host/port and TLS; can also run with --sentinel-solver-only.
 # This service never loads account credentials or calls authenticated official APIs.
 sentinel-solver:
   enabled: false
-  listen: "127.0.0.1:8318"
+  access-path: "/v1/sentinel" # Custom endpoint, e.g. /afhkajf/Sentinel. Restart to change the path. Not a replacement for authentication or HTTPS.
   api-keys: [] # Separate from management credentials; required when enabled.
-  tls: {enable: false, cert: "", key: ""}
   sdk-fallback-enabled: false
   go-vm-compatibility:
     enabled: false

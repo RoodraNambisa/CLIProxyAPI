@@ -2488,7 +2488,7 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	if err = cfg.ChatGPTWeb.Validate(); err != nil {
 		return nil, err
 	}
-	if err = cfg.SentinelSolver.Validate(); err != nil {
+	if err = cfg.ValidateSentinelSolver(); err != nil {
 		return nil, err
 	}
 
@@ -4033,6 +4033,9 @@ func hashSecret(secret string) (string, error) {
 func SaveConfigPreserveComments(configFile string, cfg *Config) error {
 	if cfg == nil {
 		return fmt.Errorf("config is nil")
+	}
+	if errSolver := cfg.ValidateSentinelSolver(); errSolver != nil {
+		return errSolver
 	}
 	if errTimeout := cfg.Images.ValidateRequestTimeouts(); errTimeout != nil {
 		return errTimeout

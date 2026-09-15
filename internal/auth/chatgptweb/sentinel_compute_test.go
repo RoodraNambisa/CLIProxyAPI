@@ -44,6 +44,31 @@ func computeTestPool(t testing.TB, nodes ...sentinelconfig.Node) *SentinelComput
 	return pool
 }
 
+type computeDeadlineRecorder struct {
+	*httptest.ResponseRecorder
+	deadlines []time.Time
+}
+
+func (w *computeDeadlineRecorder) SetReadDeadline(deadline time.Time) error {
+	w.deadlines = append(w.deadlines, deadline)
+	return nil
+}
+
+func TestSentinelComputeClearsRPCReadDeadline(t *testing.T) {
+	node, err := NewSentinelComputeServer(sentinelconfig.Server{Enabled: true, APIKeys: []string{"key"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer node.Close()
+	w := &computeDeadlineRecorder{ResponseRecorder: httptest.NewRecorder()}
+	r := httptest.NewRequest("POST", "/v1/sentinel/sessions", bytes.NewBufferString(`{}`))
+	r.Header.Set("Authorization", "Bearer key")
+	node.ServeHTTP(w, r)
+	if len(w.deadlines) != 2 || w.deadlines[0].IsZero() || !w.deadlines[1].IsZero() {
+		t.Fatalf("RPC leaked read deadline: %v", w.deadlines)
+	}
+}
+
 func TestSentinelComputeRemoteRoundAndScope(t *testing.T) {
 	server, endpoint := computeTestServer(t)
 	pool := computeTestPool(t, sentinelconfig.Node{Name: "one", URL: endpoint.URL, APIKey: "key-a"})

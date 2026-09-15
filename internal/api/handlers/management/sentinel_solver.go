@@ -97,7 +97,9 @@ func (h *Handler) PatchSentinelSolver(c *gin.Context) {
 		c.JSON(400, gin.H{"error": "invalid solver settings"})
 		return
 	}
-	if err = candidate.Validate(); err != nil {
+	validationConfig := *h.cfg
+	validationConfig.SentinelSolver = candidate
+	if err = validationConfig.ValidateSentinelSolver(); err != nil {
 		h.mu.Unlock()
 		c.JSON(400, gin.H{"error": err.Error()})
 		return

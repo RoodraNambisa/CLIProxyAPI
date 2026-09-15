@@ -2,7 +2,7 @@
 
 The default is local computation. Remote computation is opt-in and independent
 of image generation, polling, downloads, credentials and official HTTP requests.
-Never expose the computation listener without authentication. Use HTTPS across
+Never expose the computation endpoint without authentication. Use HTTPS across
 public networks; cleartext HTTP is accepted only for explicit private IPs and
 localhost. Keep management keys separate from solver keys.
 
@@ -17,7 +17,7 @@ remote-management:
   secret-key: "replace-with-management-secret"
 sentinel-solver:
   enabled: true
-  listen: "127.0.0.1:8318"
+  access-path: "/afhkajf/Sentinel"
   api-keys: ["replace-with-solver-secret"]
   sdk-fallback-enabled: false
   memory-budget-mib: 512
@@ -27,10 +27,15 @@ sentinel-solver:
 ./cli-proxy-api --sentinel-solver-only --config /path/to/solver.yaml
 ```
 
-The management page is `/management.html` on the management listener. Dedicated
+Management and computation share the main `host`, `port` and TLS settings. There
+is no additional solver listener or certificate configuration. An existing HTTPS
+reverse proxy can terminate TLS for both surfaces. The management page is
+`/management.html`; the example solver health endpoint is
+`/afhkajf/Sentinel/health` and requires its own Bearer solver key. A private-looking
+path is not encryption and does not replace authentication or HTTPS. Dedicated
 mode skips PG/git/object token stores, auth scanning, login/refresh workers,
 model updates and proxy routes, even if storage environment variables exist.
-Normal proxy instances may enable the same independent computation listener.
+Normal proxy instances may enable the computation endpoint on their main listener.
 Avoid reusing the same configuration/ports for two local instances.
 
 ## Caller
@@ -45,13 +50,16 @@ chatgpt-web:
       budget-seconds: 30
       nodes:
         - name: primary
-          url: "https://solver.example.com"
+          url: "https://solver.example.com/afhkajf/Sentinel"
           api-key: "replace-with-solver-secret"
         - name: secondary
-          url: "https://solver-2.example.com"
+          url: "https://solver-2.example.com/afhkajf/Sentinel"
           api-key: "replace-with-other-solver-secret"
 ```
 
+Node URLs contain the complete solver endpoint, with case preserved. A URL with
+no path uses `/v1/sentinel`; do not append that default path to a custom endpoint.
+The server's `access-path` is independent of `remote-management.access-path`.
 Supported scopes are `images`, `chat`, and `login`. Omitting scopes selects only
 images; an explicit empty list selects none. Ordinary chat with an input image
 is not image generation. The RPC budget is cumulative per challenge round,
@@ -69,7 +77,11 @@ remain the fallback for requirements/proof; the SDK handles Turnstile/Observer.
 
 The node owns immutable compatibility rule generations. New sessions see new
 rules, while existing sessions and local SDK reconstruction retain their pinned
-rules. Listener/TLS changes require restarting that instance. Revoke API keys
+rules. Changing `access-path` requires restarting that instance; the old path
+remains active until restart so in-flight sessions retain their endpoint. The
+status view reports the currently active path and pending restart. Enabling or
+disabling the service and updating keys or capacity applies without restart.
+Main listener/TLS changes also require restarting the instance. Revoke API keys
 only after callers have received the replacement key.
 
 For rolling updates, run at least two separate solver processes, stop routing
