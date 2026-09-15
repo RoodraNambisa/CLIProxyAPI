@@ -26,10 +26,24 @@ type Remote struct {
 	BudgetSeconds *int      `json:"budget-seconds,omitempty" yaml:"budget-seconds,omitempty"`
 }
 
-func decodeSettings(data []byte, target any) error {
+func decodeSettings(data []byte, target any, ignoredFields ...string) error {
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal(data, &fields); err != nil || fields == nil {
 		return fmt.Errorf("Sentinel settings must be an object")
+	}
+	filtered := false
+	for _, name := range ignoredFields {
+		if _, exists := fields[name]; exists {
+			delete(fields, name)
+			filtered = true
+		}
+	}
+	if filtered {
+		var err error
+		data, err = json.Marshal(fields)
+		if err != nil {
+			return err
+		}
 	}
 	for name, value := range fields {
 		if bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
@@ -210,7 +224,8 @@ func (cfg *Server) UnmarshalJSON(data []byte) error {
 	if err = json.Unmarshal(seed, &next); err != nil {
 		return err
 	}
-	if err := decodeSettings(data, &next); err != nil {
+	// Retired listener settings are accepted but never stored or used at runtime.
+	if err := decodeSettings(data, &next, "listen", "tls"); err != nil {
 		return err
 	}
 	*cfg = Server(next)

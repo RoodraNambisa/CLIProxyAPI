@@ -2,8 +2,10 @@ package sentinelconfig
 
 import (
 	"encoding/json"
-	"gopkg.in/yaml.v3"
+	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 func TestRejectedPartialJSONDoesNotMutatePreviousSnapshot(t *testing.T) {
@@ -61,10 +63,51 @@ func TestSolverAccessPathAndNodeURL(t *testing.T) {
 			t.Errorf("accepted node URL %s", raw)
 		}
 	}
-	for _, legacy := range []string{`{"listen":"127.0.0.1:8318"}`, `{"tls":{"enable":false}}`} {
-		var cfg Server
-		if err := json.Unmarshal([]byte(legacy), &cfg); err == nil {
-			t.Fatal("removed listener setting accepted")
+}
+
+func TestSolverIgnoresRetiredListenerSettings(t *testing.T) {
+	for _, data := range []string{
+		`{"listen":"invalid-address","tls":{"enable":true,"cert":"/missing/cert","key":"/missing/key"}}`,
+		`{"listen":null,"tls":null}`,
+		`{"listen":{"unused":true},"tls":"unused"}`,
+	} {
+		for _, format := range []string{"json", "yaml"} {
+			t.Run(format+"/"+data, func(t *testing.T) {
+				cfg := Server{Enabled: true, AccessPath: "/custom/Sentinel", APIKeys: []string{"fixture"}}
+				var err error
+				if format == "json" {
+					err = json.Unmarshal([]byte(data), &cfg)
+				} else {
+					err = yaml.Unmarshal([]byte(data), &cfg)
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !cfg.Enabled || cfg.Path() != "/custom/Sentinel" || len(cfg.APIKeys) != 1 || cfg.APIKeys[0] != "fixture" {
+					t.Fatal("retired settings changed active configuration")
+				}
+				if err := cfg.Validate(); err != nil {
+					t.Fatal(err)
+				}
+				encoded, err := json.Marshal(cfg)
+				if err != nil || strings.Contains(string(encoded), `"listen"`) || strings.Contains(string(encoded), `"tls"`) {
+					t.Fatalf("retired settings serialized: %s (%v)", encoded, err)
+				}
+			})
 		}
+	}
+	for _, data := range []string{
+		`{"listen":"ignored","queue-size":null}`,
+		`{"tls":null,"access-path":123}`,
+		`{"listen":"ignored","unknown":true}`,
+	} {
+		cfg := Server{AccessPath: "/unchanged"}
+		if err := json.Unmarshal([]byte(data), &cfg); err == nil || cfg.Path() != "/unchanged" {
+			t.Fatalf("invalid active settings accepted or changed snapshot: %s", data)
+		}
+	}
+	var remote Remote
+	if err := json.Unmarshal([]byte(`{"listen":"not-a-remote-field"}`), &remote); err == nil {
+		t.Fatal("retired server fields accepted outside the solver configuration")
 	}
 }

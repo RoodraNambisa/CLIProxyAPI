@@ -38,6 +38,11 @@ model updates and proxy routes, even if storage environment variables exist.
 Normal proxy instances may enable the computation endpoint on their main listener.
 Avoid reusing the same configuration/ports for two local instances.
 
+Legacy `sentinel-solver.listen` and `sentinel-solver.tls` settings are ignored in
+YAML and JSON, including old management-client updates. They can remain in an
+existing file, but never open a separate listener or load certificates. New
+serialized settings omit them; all other settings remain strictly validated.
+
 ## Caller
 
 ```yaml

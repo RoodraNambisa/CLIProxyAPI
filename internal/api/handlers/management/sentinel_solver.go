@@ -70,6 +70,9 @@ func (h *Handler) PatchSentinelSolver(c *gin.Context) {
 		c.JSON(400, gin.H{"error": "object required"})
 		return
 	}
+	// Old clients may still submit the retired listener settings, including null.
+	delete(fields, "listen")
+	delete(fields, "tls")
 	h.mu.Lock()
 	if h.cfg == nil {
 		h.mu.Unlock()

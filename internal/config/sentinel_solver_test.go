@@ -28,7 +28,7 @@ func TestSentinelSolverPathDoesNotHideManagement(t *testing.T) {
 
 func TestSentinelSolverSharedPathSaveReload(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yaml")
-	if err := os.WriteFile(path, []byte("port: 8317\nsentinel-solver:\n  enabled: false # preserve\n  access-path: /original\n"), 0600); err != nil {
+	if err := os.WriteFile(path, []byte("port: 8317\nsentinel-solver:\n  enabled: false # preserve\n  access-path: /original\n  listen: invalid-address\n  tls: {enable: true, cert: /missing/cert, key: /missing/key}\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
 	cfg, err := LoadConfig(path)
@@ -40,7 +40,7 @@ func TestSentinelSolverSharedPathSaveReload(t *testing.T) {
 		t.Fatal(err)
 	}
 	loaded, err := LoadConfig(path)
-	if err != nil || loaded.SentinelSolver.Path() != "/afhkajf/Sentinel" || loaded.Port != 8317 {
+	if err != nil || loaded.SentinelSolver.Path() != "/afhkajf/Sentinel" || loaded.Port != 8317 || loaded.TLS.Enable {
 		t.Fatalf("reload: %v", err)
 	}
 }
