@@ -1104,6 +1104,11 @@ func TestServiceSyncChatGPTWebCatalogRejectsStaleAuthGeneration(t *testing.T) {
 	GlobalModelRegistry().RegisterClient(auth.ID, chatgptwebauth.Provider, []*registry.ModelInfo{
 		chatGPTWebTextModelInfo("old-account-model", "", 0, ""),
 	})
+	// A queued model sync is active only while its cancellation handle exists.
+	// Keep the replacement queued so this test cannot fetch a real remote catalog.
+	_, cancelModelSync := context.WithCancel(t.Context())
+	defer cancelModelSync()
+	service.modelSyncCancel = cancelModelSync
 	service.modelSyncQueue = make(chan string, 1)
 	service.modelSyncPending = make(map[string]modelSyncTaskState)
 
