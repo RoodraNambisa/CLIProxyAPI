@@ -23,8 +23,8 @@ func ParseXAIModels(raw []byte, source string) (*XAIModelCatalog, error) {
 	var envelope struct {
 		Data []*registry.ModelInfo `json:"data"`
 	}
-	if len(raw) > 1024*1024 || json.Unmarshal(raw, &envelope) != nil || len(envelope.Data) == 0 || len(envelope.Data) > 256 {
-		return nil, fmt.Errorf("invalid or empty Grok model catalog")
+	if len(raw) > 1024*1024 || json.Unmarshal(raw, &envelope) != nil || envelope.Data == nil || len(envelope.Data) > 256 {
+		return nil, fmt.Errorf("invalid Grok model catalog")
 	}
 	known := make(map[string]*registry.ModelInfo)
 	for _, model := range registry.GetXAIModels() {
@@ -64,7 +64,11 @@ func ParseXAIModels(raw []byte, source string) (*XAIModelCatalog, error) {
 		}
 		models = append(models, model)
 	}
-	return &XAIModelCatalog{Models: models, Source: source, UpdatedAt: time.Now().UTC()}, nil
+	catalog := &XAIModelCatalog{Models: models, Source: source, UpdatedAt: time.Now().UTC()}
+	if serialized, err := json.Marshal(catalog); err != nil || len(serialized) > 1024*1024 {
+		return nil, fmt.Errorf("Grok model catalog exceeds the storage limit")
+	}
+	return catalog, nil
 }
 
 func XAIModelsForAuth(auth *coreauth.Auth) *XAIModelCatalog {
@@ -76,7 +80,7 @@ func XAIModelsForAuth(auth *coreauth.Auth) *XAIModelCatalog {
 		return nil
 	}
 	var catalog XAIModelCatalog
-	if json.Unmarshal(raw, &catalog) != nil || len(catalog.Models) == 0 || len(catalog.Models) > 256 || catalog.UpdatedAt.IsZero() {
+	if json.Unmarshal(raw, &catalog) != nil || catalog.Models == nil || len(catalog.Models) > 256 || catalog.UpdatedAt.IsZero() {
 		return nil
 	}
 	for _, model := range catalog.Models {

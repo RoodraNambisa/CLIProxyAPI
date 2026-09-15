@@ -712,12 +712,30 @@ nonstream-keepalive-interval: 0
 # OAuth acquisition uses separate login headers. Model override and identity
 # headers are controlled by the final model and the policies below.
 xai:
-  # Default endpoint for credentials with an empty base_url. Explicit credential
-  # base_url values always win, including https://api.x.ai/v1.
+  # Default endpoint when no model route matches. An explicit credential
+  # base_url overrides this default, including https://api.x.ai/v1.
   # Choices: cli, api, us-east-1, us-west-2, eu-west-1.
   # This selects an address; it does not grant upstream account permissions.
   # WebSocket and compact requests use the API when the chosen endpoint is CLI.
   default-base-url-mode: "cli"
+  # Empty: query the credential's default node. Up to 8 sources, each cached
+  # independently; use [cli, api] to merge both directories without duplicates.
+  # Sources accept cli, api, us-east-1, us-west-2, eu-west-1, default, or an
+  # HTTP(S) base URL. Directory membership does not choose the request route.
+  model-catalog-sources: []
+  # Credential xai_model_routes > global model-routes > credential base_url >
+  # global default. Exact matches win over wildcard matches within each scope;
+  # ties use list order. Rules match upstream model IDs after alias resolution.
+  # Exact IDs can register models omitted by a catalog; wildcards cannot.
+  # Credentials may override sources with xai_model_catalog_sources; empty
+  # arrays inherit globals. A route to default bypasses global model rules.
+  model-routes: []
+  # Example: grok-4.5/4.6 use the CLI; other registered models use the API.
+  # model-routes:
+  #   - models: [grok-4.5, grok-4.6]
+  #     upstream: cli
+  #   - models: ["*"]
+  #     upstream: api
   header-defaults:
     user-agent: "" # Built-in: xai-grok-workspace/0.2.120
     client-version: "" # Built-in: 0.2.120

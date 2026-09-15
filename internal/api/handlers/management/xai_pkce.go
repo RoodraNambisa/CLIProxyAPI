@@ -222,6 +222,7 @@ func (h *Handler) saveXAIAuthBundle(ctx context.Context, state string, authSvc *
 			replacesAccount = true
 			delete(merged.Metadata, helps.XAIIdentitySeedKey)
 			delete(merged.Metadata, helps.XAIModelCatalogKey)
+			delete(merged.Metadata, helps.XAIModelCatalogsKey)
 		}
 		merged.Storage = tokenStorage
 		if merged.Attributes == nil {

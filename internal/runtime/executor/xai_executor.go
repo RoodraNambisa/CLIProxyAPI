@@ -227,7 +227,10 @@ func (e *XAIExecutor) executeWithPolicy(ctx context.Context, auth *cliproxyauth.
 	}
 
 	token, _ := xaiCreds(auth)
-	baseURL := xaiChatBaseURL(auth, e.cfg)
+	baseURL, err := xaiModelBaseURL(auth, e.cfg, req.Model)
+	if err != nil {
+		return resp, err
+	}
 
 	prepared, err := e.prepareResponsesRequest(ctx, auth, req, opts, true)
 	if err != nil {
@@ -335,7 +338,10 @@ func (e *XAIExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.Aut
 
 func (e *XAIExecutor) executeCompactRequest(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*xaiPreparedRequest, []byte, http.Header, error) {
 	token, _ := xaiCreds(auth)
-	baseURL := helps.XAIAPIOnlyBaseURL(auth, e.cfg)
+	baseURL, err := helps.XAIModelAPIOnlyBaseURL(auth, e.cfg, req.Model)
+	if err != nil {
+		return nil, nil, nil, statusErr{code: http.StatusBadRequest, msg: err.Error()}
+	}
 
 	prepared, err := e.prepareResponsesRequestTo(ctx, auth, req, opts, false, sdktranslator.FormatOpenAIResponse)
 	if err != nil {
@@ -598,7 +604,10 @@ func (e *XAIExecutor) executeImages(ctx context.Context, auth *cliproxyauth.Auth
 		req.Payload, _ = sjson.SetBytes(req.Payload, "model", thinking.ParseSuffix(req.Model).ModelName)
 	}
 	token, _ := xaiCreds(auth)
-	baseURL := xaiChatBaseURL(auth, e.cfg)
+	baseURL, err := xaiModelBaseURL(auth, e.cfg, req.Model)
+	if err != nil {
+		return resp, err
+	}
 	if endpointPath == "" {
 		endpointPath = xaiDefaultImageEndpointPath
 	}
@@ -652,7 +661,10 @@ func (e *XAIExecutor) executeVideos(ctx context.Context, auth *cliproxyauth.Auth
 		req.Payload, _ = sjson.SetBytes(req.Payload, "model", thinking.ParseSuffix(req.Model).ModelName)
 	}
 	token, _ := xaiCreds(auth)
-	baseURL := xaiChatBaseURL(auth, e.cfg)
+	baseURL, err := xaiModelBaseURL(auth, e.cfg, req.Model)
+	if err != nil {
+		return resp, err
+	}
 	reporter := helps.NewExecutorUsageReporter(ctx, e, thinking.ParseSuffix(req.Model).ModelName, auth)
 	defer reporter.TrackFailure(ctx, &err)
 	reporter.SetRequestServiceTierFromPayload(req.Payload)
@@ -743,7 +755,10 @@ func (e *XAIExecutor) executeStreamWithPolicy(ctx context.Context, auth *cliprox
 	}
 
 	token, _ := xaiCreds(auth)
-	baseURL := xaiChatBaseURL(auth, e.cfg)
+	baseURL, err := xaiModelBaseURL(auth, e.cfg, req.Model)
+	if err != nil {
+		return nil, err
+	}
 
 	prepared, err := e.prepareResponsesRequest(ctx, auth, req, opts, true)
 	if err != nil {
@@ -1212,7 +1227,16 @@ func xaiChatBaseURL(auth *cliproxyauth.Auth, cfg *config.Config) string {
 	return helps.ResolveXAIUpstream(auth, cfg).BaseURL
 }
 
-// XAIModelsURL uses the same request destination as HTTP inference.
+func xaiModelBaseURL(auth *cliproxyauth.Auth, cfg *config.Config, model string) (string, error) {
+	upstream, err := helps.ResolveXAIModelUpstream(auth, cfg, model)
+	if err != nil {
+		return "", statusErr{code: http.StatusBadRequest, msg: err.Error()}
+	}
+	return upstream.BaseURL, nil
+}
+
+// XAIModelsURL preserves the legacy single-source default. Multi-source
+// directory refresh uses helps.XAICatalogEndpoints.
 func XAIModelsURL(auth *cliproxyauth.Auth, cfg *config.Config) string {
 	return strings.TrimRight(xaiChatBaseURL(auth, cfg), "/") + "/models"
 }

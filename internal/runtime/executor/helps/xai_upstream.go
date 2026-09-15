@@ -60,6 +60,10 @@ func xaiBaseURLMode(baseURL string) string {
 // while preserving explicitly selected API regions and custom relays.
 func XAIAPIOnlyBaseURL(auth *coreauth.Auth, cfg *config.Config) string {
 	baseURL := ResolveXAIUpstream(auth, cfg).BaseURL
+	return xaiAPIOnlyURL(baseURL)
+}
+
+func xaiAPIOnlyURL(baseURL string) string {
 	if parsed, err := url.Parse(baseURL); err == nil && strings.EqualFold(parsed.Hostname(), "cli-chat-proxy.grok.com") {
 		baseURL, _ = config.XAIBaseURLForMode("api")
 	}

@@ -575,7 +575,10 @@ func (e *XAIWebsocketsExecutor) executeStream(ctx context.Context, auth *cliprox
 	// Keep websocket on the selected API region or relay. The CLI gateway
 	// returns 405 for upgrades, so CLI selections use the official API here.
 	token, _ := xaiCreds(auth)
-	baseURL := helps.XAIAPIOnlyBaseURL(auth, e.cfg)
+	baseURL, err := helps.XAIModelAPIOnlyBaseURL(auth, e.cfg, req.Model)
+	if err != nil {
+		return nil, statusErr{code: http.StatusBadRequest, msg: err.Error()}
+	}
 
 	prepared, err := e.prepareResponsesWebsocketRequest(ctx, auth, req, opts)
 	if err != nil {

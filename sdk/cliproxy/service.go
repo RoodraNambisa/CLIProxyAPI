@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"sort"
 	"strconv"
@@ -5021,7 +5022,9 @@ func (s *Service) applyRuntimeConfigState(ctx context.Context, previousCfg, next
 	}
 	s.applyUsagePersistenceConfigChange(previousUsageEnabled, previousUsageSettings, nextCfg)
 	if s.coreManager != nil && !authModelExclusionsChanged &&
-		(previousCfg == nil || previousCfg.XAI.DefaultBaseURLMode != nextCfg.XAI.DefaultBaseURLMode) {
+		(previousCfg == nil || previousCfg.XAI.DefaultBaseURLMode != nextCfg.XAI.DefaultBaseURLMode ||
+			!reflect.DeepEqual(previousCfg.XAI.ModelCatalogSources, nextCfg.XAI.ModelCatalogSources) ||
+			!reflect.DeepEqual(previousCfg.XAI.ModelRoutes, nextCfg.XAI.ModelRoutes)) {
 		for _, auth := range s.coreManager.AuthsForProviders("xai") {
 			s.refreshModelRegistrationForAuth(auth)
 		}
@@ -5671,10 +5674,7 @@ func (s *Service) registerModelsForAuthWithState(a *coreauth.Auth, preserveTrans
 		models = registry.GetKimiModels()
 		models = applyExcludedModels(models, excluded)
 	case "xai":
-		models = registry.GetXAIModels()
-		if catalog := executorhelps.XAIModelsForAuth(a); catalog != nil && catalog.Source == executor.XAIModelsURL(a, s.cfg) {
-			models = catalog.Models
-		}
+		models = executorhelps.XAIMergedModelsForAuth(a, s.cfg)
 		models = applyExcludedModels(models, excluded)
 	case "chatgpt-web":
 		if !a.LifecycleSelectable() {

@@ -103,3 +103,57 @@ func TestXAICredentialBaseURLValidationIsAtomic(t *testing.T) {
 		}
 	}
 }
+
+func TestXAICredentialModelRoutingPatchPreservesSecretsAndRestoresInheritance(t *testing.T) {
+	dir := t.TempDir()
+	store := sdkAuth.NewFileTokenStore()
+	store.SetBaseDir(dir)
+	manager := coreauth.NewManager(store, nil, nil)
+	_, err := manager.Register(t.Context(), &coreauth.Auth{ID: "routes.json", FileName: "routes.json", Provider: "xai", Storage: &xaiauth.TokenStorage{AccessToken: "fixture-access", RefreshToken: "fixture-refresh"}, Metadata: map[string]any{"type": "xai", helps.XAIIdentitySeedKey: "keep-seed", "headers": map[string]any{"X-Keep": "keep"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{AuthDir: dir, XAI: config.XAIConfig{ModelCatalogSources: []string{"api"}, ModelRoutes: []config.XAIModelRoute{{Models: []string{"grok-4.3"}, Upstream: "us-west-2"}}}}
+	h := NewHandlerWithoutConfigFilePath(cfg, manager)
+	for _, tc := range []struct {
+		body, mode  string
+		sourceCount int
+	}{
+		{`{"xai_model_catalog_sources":["cli","api"],"xai_model_routes":[{"models":["grok-4.3"],"upstream":"eu-west-1"}]}`, "eu-west-1", 2},
+		{`{"xai_model_catalog_sources":[],"xai_model_routes":[]}`, "us-west-2", 1},
+	} {
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest("PATCH", "/auth-files/fields", strings.NewReader(`{"names":["routes.json"],"fields":`+tc.body+`}`))
+		c.Request.Header.Set("Content-Type", "application/json")
+		h.PatchAuthFileFields(c)
+		if w.Code != 200 {
+			t.Fatalf("patch: %d %s", w.Code, w.Body.String())
+		}
+		raw, err := os.ReadFile(filepath.Join(dir, "routes.json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var metadata map[string]any
+		if err = json.Unmarshal(raw, &metadata); err != nil {
+			t.Fatal(err)
+		}
+		if metadata["access_token"] != "fixture-access" || metadata["refresh_token"] != "fixture-refresh" || metadata[helps.XAIIdentitySeedKey] != "keep-seed" {
+			t.Fatal("route edit lost authentication or identity")
+		}
+		loaded := &coreauth.Auth{Provider: "xai", Metadata: metadata}
+		route, err := helps.ResolveXAIModelUpstream(loaded, cfg, "grok-4.3")
+		if err != nil || route.Mode != tc.mode {
+			t.Fatalf("persisted route: %+v %v", route, err)
+		}
+		sources, err := helps.XAICatalogEndpoints(loaded, cfg)
+		if err != nil || len(sources) != tc.sourceCount {
+			t.Fatalf("persisted sources: %v %v", sources, err)
+		}
+	}
+	for _, fields := range []string{`{"xai_model_routes":[{"models":["*"],"upstream":"file:///bad"}]}`, `{"xai_model_catalog_sources":null}`} {
+		if _, err := decodeAuthFileFieldValues(json.RawMessage(fields)); err == nil {
+			t.Fatalf("invalid route fields accepted: %s", fields)
+		}
+	}
+}

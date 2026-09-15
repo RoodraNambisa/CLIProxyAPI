@@ -36,6 +36,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/credentialweight"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
 	internalstore "github.com/router-for-me/CLIProxyAPI/v6/internal/store"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/watcher"
@@ -451,6 +452,11 @@ func (h *Handler) GetAuthFileModels(c *gin.Context) {
 			chatGPTWebAccountInfo = &state
 		}
 	}
+	var xaiProvenance map[string][]string
+	cfg := h.currentConfig()
+	if auth != nil && strings.EqualFold(auth.Provider, "xai") {
+		xaiProvenance = helps.XAIModelCatalogProvenance(auth, cfg)
+	}
 	for _, m := range models {
 		entry := gin.H{
 			"id": m.ID,
@@ -466,6 +472,19 @@ func (h *Handler) GetAuthFileModels(c *gin.Context) {
 		}
 		if m.OwnedBy != "" {
 			entry["owned_by"] = m.OwnedBy
+		}
+		if xaiProvenance != nil {
+			modelID := m.UpstreamID
+			if modelID == "" {
+				modelID = m.ID
+			}
+			entry["catalog_sources"] = xaiProvenance[modelID]
+			if route, err := helps.ResolveXAIModelUpstream(auth, cfg, modelID); err == nil {
+				entry["upstream_url"], entry["upstream_source"] = route.BaseURL, route.Source
+				entry["websocket_upstream_url"], _ = helps.XAIModelAPIOnlyBaseURL(auth, cfg, modelID)
+			} else {
+				entry["routing_error"] = err.Error()
+			}
 		}
 		modelIDs := []string{m.ID, m.UpstreamID, trimModelsPrefix(m.Name)}
 		status := modelCooldownForAuth(auth, now, modelIDs...)

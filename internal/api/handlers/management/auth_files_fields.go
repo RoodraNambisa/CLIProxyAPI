@@ -45,6 +45,8 @@ type authFileFieldValues struct {
 	prefix               *string
 	proxyURL             *string
 	baseURL              *string
+	xaiCatalogSources    *[]string
+	xaiModelRoutes       *[]config.XAIModelRoute
 	headers              map[string]string
 	headersSet           bool
 	priority             *int
@@ -305,6 +307,26 @@ func decodeAuthFileFieldValues(raw json.RawMessage) (authFileFieldValues, error)
 				return authFileFieldValues{}, fmt.Errorf("invalid base_url")
 			}
 			values.baseURL = &decoded
+		case "xai_model_catalog_sources":
+			var decoded []string
+			if err := decodeNonNullAuthField(value, &decoded); err != nil || decoded == nil {
+				return authFileFieldValues{}, fmt.Errorf("invalid xai_model_catalog_sources")
+			}
+			normalized, err := config.NormalizeXAICatalogSources(decoded)
+			if err != nil {
+				return authFileFieldValues{}, err
+			}
+			values.xaiCatalogSources = &normalized
+		case "xai_model_routes":
+			var decoded []config.XAIModelRoute
+			if err := decodeNonNullAuthField(value, &decoded); err != nil || decoded == nil {
+				return authFileFieldValues{}, fmt.Errorf("invalid xai_model_routes")
+			}
+			normalized, err := config.NormalizeXAIModelRoutes(decoded)
+			if err != nil {
+				return authFileFieldValues{}, err
+			}
+			values.xaiModelRoutes = &normalized
 		case "websockets":
 			var decoded bool
 			if err := decodeNonNullAuthField(value, &decoded); err != nil {
@@ -368,19 +390,22 @@ func decodeNonNullAuthField(raw json.RawMessage, target any) error {
 }
 
 func (v authFileFieldValues) hasFields() bool {
-	return v.prefix != nil || v.proxyURL != nil || v.baseURL != nil || v.headersSet || v.prioritySet || v.weightSet || v.note != nil ||
+	return v.prefix != nil || v.proxyURL != nil || v.baseURL != nil || v.xaiCatalogSources != nil || v.xaiModelRoutes != nil || v.headersSet || v.prioritySet || v.weightSet || v.note != nil ||
 		v.usingAPI != nil || v.websockets != nil || v.excludedSet || v.disableCooling != nil ||
 		v.loginMethod != nil || v.api798URL != nil || v.codexFingerprintMode != nil || v.errorRules.set
 }
 
 func (v authFileFieldValues) hasNonHeaderFields() bool {
-	return v.prefix != nil || v.proxyURL != nil || v.baseURL != nil || v.prioritySet || v.weightSet || v.note != nil || v.usingAPI != nil ||
+	return v.prefix != nil || v.proxyURL != nil || v.baseURL != nil || v.xaiCatalogSources != nil || v.xaiModelRoutes != nil || v.prioritySet || v.weightSet || v.note != nil || v.usingAPI != nil ||
 		v.websockets != nil || v.excludedSet || v.disableCooling != nil || v.loginMethod != nil ||
 		v.api798URL != nil || v.codexFingerprintMode != nil || v.errorRules.set
 }
 
 func validateBatchAuthFileFields(auth *coreauth.Auth, values authFileFieldValues) error {
 	provider := strings.ToLower(strings.TrimSpace(auth.Provider))
+	if (values.xaiCatalogSources != nil || values.xaiModelRoutes != nil) && provider != "xai" {
+		return errors.New("Grok model sources and routes are only supported for xai auth files")
+	}
 	if values.baseURL != nil {
 		if provider != "xai" {
 			return errors.New("base_url is only supported for xai auth files")
@@ -570,6 +595,12 @@ func (h *Handler) applyAuthFileFieldValues(auth *coreauth.Auth, values authFileF
 		usingAPI := baseURL != "" && baseURL != cliURL
 		auth.Metadata["using_api"] = usingAPI
 		auth.Attributes["using_api"] = strconv.FormatBool(usingAPI)
+	}
+	if values.xaiCatalogSources != nil {
+		auth.Metadata["xai_model_catalog_sources"] = *values.xaiCatalogSources
+	}
+	if values.xaiModelRoutes != nil {
+		auth.Metadata["xai_model_routes"] = *values.xaiModelRoutes
 	}
 	if values.errorRules.set {
 		delete(auth.Metadata, "request_scoped_errors")

@@ -110,3 +110,64 @@ func TestXAIReloginKeepsSettingsAndSeparatesChangedAccounts(t *testing.T) {
 		})
 	}
 }
+
+func TestXAIMultipleCatalogsRefreshPartialFailure(t *testing.T) {
+	var failAPI atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer fixture" {
+			t.Error("missing credential")
+		}
+		switch r.URL.Path {
+		case "/cli/models":
+			_, _ = w.Write([]byte(`{"data":[{"id":"grok-4.6"},{"id":"grok-4.5"}]}`))
+		case "/api/models":
+			if failAPI.Load() {
+				w.WriteHeader(503)
+				return
+			}
+			_, _ = w.Write([]byte(`{"data":[{"id":"grok-4.6"},{"id":"grok-4.3"}]}`))
+		default:
+			t.Errorf("unexpected endpoint %s", r.URL.Path)
+			w.WriteHeader(404)
+		}
+	}))
+	defer server.Close()
+	cfg := &config.Config{XAI: config.XAIConfig{ModelCatalogSources: []string{server.URL + "/cli", server.URL + "/api"}}}
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.RegisterExecutor(runtimeexecutor.NewXAIExecutor(cfg))
+	auth, err := manager.Register(t.Context(), &coreauth.Auth{ID: "multi-model.json", FileName: "multi-model.json", Provider: "xai", Attributes: map[string]string{"api_key": "fixture"}, Metadata: map[string]any{helps.XAIIdentitySeedKey: "keep"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := &Handler{cfg: cfg, authManager: manager}
+	var apiTime string
+	for _, fail := range []bool{false, true} {
+		failAPI.Store(fail)
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest("POST", "/auth-files/xai/models/refresh", strings.NewReader(`{"name":"multi-model.json"}`))
+		h.RefreshXAIModels(c)
+		var response struct {
+			Models  []any `json:"models"`
+			Sources []struct {
+				Source, UpdatedAt string
+				UsingCached       bool `json:"using_cached"`
+				Count             int  `json:"model_count"`
+				Error             string
+			} `json:"sources"`
+		}
+		if w.Code != 200 || json.Unmarshal(w.Body.Bytes(), &response) != nil || len(response.Models) != 3 || len(response.Sources) != 2 {
+			t.Fatalf("%d %s", w.Code, w.Body.String())
+		}
+		catalogs := helps.XAIModelCatalogsForAuth(func() *coreauth.Auth { a, _ := manager.GetByID(auth.ID); return a }())
+		currentTime := catalogs[server.URL+"/api/models"].UpdatedAt.String()
+		if fail && (response.Sources[0].UsingCached || !response.Sources[1].UsingCached || response.Sources[1].Count != 2 || response.Sources[1].Error == "" || currentTime != apiTime) {
+			t.Fatalf("partial refresh erased or retimestamped old API catalog: %s", w.Body.String())
+		}
+		apiTime = currentTime
+	}
+	current, _ := manager.GetByID(auth.ID)
+	if current.Metadata[helps.XAIIdentitySeedKey] != "keep" || current.RuntimeInstanceID() != auth.RuntimeInstanceID() {
+		t.Fatal("directory refresh replaced credential identity")
+	}
+}

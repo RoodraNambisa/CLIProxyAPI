@@ -60,6 +60,8 @@ type XAIHeaderDefaults struct {
 
 type XAIConfig struct {
 	DefaultBaseURLMode         string            `yaml:"default-base-url-mode,omitempty" json:"default-base-url-mode,omitempty"`
+	ModelCatalogSources        []string          `yaml:"model-catalog-sources,omitempty" json:"model-catalog-sources,omitempty"`
+	ModelRoutes                []XAIModelRoute   `yaml:"model-routes,omitempty" json:"model-routes,omitempty"`
 	HeaderDefaults             XAIHeaderDefaults `yaml:"header-defaults" json:"header-defaults"`
 	Headers                    map[string]string `yaml:"headers,omitempty" json:"headers,omitempty"`
 	PassthroughClientIdentity  bool              `yaml:"passthrough-client-identity" json:"passthrough-client-identity"`
@@ -101,6 +103,15 @@ func (c XAIConfig) Clone() XAIConfig {
 }
 
 func (c *XAIConfig) Validate() error {
+	var errRouting error
+	c.ModelCatalogSources, errRouting = NormalizeXAICatalogSources(c.ModelCatalogSources)
+	if errRouting != nil {
+		return fmt.Errorf("xai.model-catalog-sources: %w", errRouting)
+	}
+	c.ModelRoutes, errRouting = NormalizeXAIModelRoutes(c.ModelRoutes)
+	if errRouting != nil {
+		return fmt.Errorf("xai.model-routes: %w", errRouting)
+	}
 	c.DefaultBaseURLMode = strings.ToLower(strings.TrimSpace(c.DefaultBaseURLMode))
 	if c.DefaultBaseURLMode == "" {
 		c.DefaultBaseURLMode = DefaultXAIBaseURLMode
