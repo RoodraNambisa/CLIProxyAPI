@@ -125,7 +125,7 @@ func (h *Handler) ProbeAuthFileModel(c *gin.Context) {
 		executor = runtimeexecutor.NewXAIExecutor(cfg)
 	}
 	probeID := uuid.NewString()
-	body := map[string]any{"model": input.Model, "stream": input.Stream, "tool_choice": "none"}
+	body := map[string]any{"model": input.Model, "stream": input.Stream}
 	if format == sdktranslator.FormatOpenAI {
 		body["messages"] = []any{map[string]any{"role": "user", "content": "Reply with exactly OK."}}
 		body["max_tokens"] = 1024
