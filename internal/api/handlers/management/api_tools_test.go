@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -63,6 +64,90 @@ func TestAPICallTransportDirectBypassesGlobalProxy(t *testing.T) {
 	}
 	if httpTransport.Proxy != nil {
 		t.Fatal("expected direct transport to disable proxy function")
+	}
+}
+
+func TestAPICallGrokProviderHeadersQuotaEndpoints(t *testing.T) {
+	var calls atomic.Int32
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		if r.Method != http.MethodGet || r.Header.Get("Authorization") != "Bearer quota-fixture" {
+			t.Error("quota request lost its method or credential")
+		}
+		if r.Header.Get("X-Global") != "inherited" || r.Header.Get("X-Override") != "credential" || r.Header.Get("x-grok-client-version") != "fixture-version" {
+			t.Error("quota request lost global headers or credential precedence")
+		}
+		if r.Host == "cli-chat-proxy.grok.com" && r.Header.Get("X-XAI-Token-Auth") != "xai-grok-cli" {
+			t.Error("subscription request lost Grok CLI authentication header")
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"fixture":"quota"}`))
+	}))
+	defer upstream.Close()
+
+	// Keep the real management request path, URL and TLS transport, but route
+	// every connection to this test server instead of contacting real accounts.
+	transport := upstream.Client().Transport.(*http.Transport).Clone()
+	transport.DisableKeepAlives = true
+	transport.TLSClientConfig.ServerName = upstream.Listener.Addr().(*net.TCPAddr).IP.String()
+	transport.DialContext = func(ctx context.Context, network, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, network, upstream.Listener.Addr().String())
+	}
+	previousTransport := http.DefaultTransport
+	http.DefaultTransport = transport
+	defer func() {
+		http.DefaultTransport = previousTransport
+		transport.CloseIdleConnections()
+	}()
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	registered, err := manager.Register(coreauth.WithSkipPersist(t.Context()), &coreauth.Auth{
+		ID: "grok-quota-provider-headers", Provider: "xai",
+		Attributes: map[string]string{"source": "config:xai[quota-fixture]", "api_key": "quota-fixture", "header:X-Override": "credential"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{XAI: config.XAIConfig{
+		HeaderDefaults: config.XAIHeaderDefaults{ClientVersion: "fixture-version"},
+		Headers:        map[string]string{"X-Global": "inherited", "X-Override": "global"},
+	}}
+	h := NewHandlerWithoutConfigFilePath(cfg, manager)
+	for _, endpoint := range []string{
+		"https://cli-chat-proxy.grok.com/v1/billing?format=credits",
+		"https://cli-chat-proxy.grok.com/v1/billing",
+		"https://cli-chat-proxy.grok.com/v1/settings",
+		"https://api.x.ai/v1/models",
+		"https://us-east-1.api.x.ai/v1/models",
+	} {
+		t.Run(endpoint, func(t *testing.T) {
+			before := calls.Load()
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+			body := fmt.Sprintf(`{"authIndex":%q,"provider_headers":true,"method":"GET","url":%q,"header":{"Authorization":"Bearer $TOKEN$"}}`, registered.EnsureIndex(), endpoint)
+			ctx.Request = httptest.NewRequest(http.MethodPost, "/kimoji/v0/management/api-call", strings.NewReader(body))
+			h.APICall(ctx)
+			if recorder.Code != http.StatusOK || calls.Load() != before+1 || !strings.Contains(recorder.Body.String(), `"status_code":200`) {
+				t.Fatalf("quota request rejected: status=%d calls=%d body=%s", recorder.Code, calls.Load()-before, recorder.Body.String())
+			}
+		})
+	}
+	for _, endpoint := range []string{
+		"http://cli-chat-proxy.grok.com/v1/billing",
+		"https://cli-chat-proxy.grok.com.example.org/v1/billing",
+		"https://api.x.ai.example.org/v1/models",
+	} {
+		t.Run(endpoint, func(t *testing.T) {
+			before := calls.Load()
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+			body := fmt.Sprintf(`{"authIndex":%q,"provider_headers":true,"method":"GET","url":%q}`, registered.EnsureIndex(), endpoint)
+			ctx.Request = httptest.NewRequest(http.MethodPost, "/kimoji/v0/management/api-call", strings.NewReader(body))
+			h.APICall(ctx)
+			if recorder.Code != http.StatusBadRequest || calls.Load() != before {
+				t.Fatal("provider headers were allowed for an unrelated endpoint")
+			}
+		})
 	}
 }
 

@@ -212,7 +212,7 @@ func (h *Handler) APICall(c *gin.Context) {
 	if body.ProviderHeaders {
 		host := strings.ToLower(parsedURL.Hostname())
 		if auth == nil || auth.Provider != "xai" || parsedURL.Scheme != "https" ||
-			(host != "api.x.ai" && !strings.HasSuffix(host, ".api.x.ai")) {
+			(host != "cli-chat-proxy.grok.com" && host != "api.x.ai" && !strings.HasSuffix(host, ".api.x.ai")) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "provider headers require a Grok credential and an official xAI API address"})
 			return
 		}
