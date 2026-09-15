@@ -59,6 +59,7 @@ type XAIHeaderDefaults struct {
 }
 
 type XAIConfig struct {
+	ChatCompletionsMode        string            `yaml:"chat-completions-mode,omitempty" json:"chat-completions-mode,omitempty"`
 	DefaultBaseURLMode         string            `yaml:"default-base-url-mode,omitempty" json:"default-base-url-mode,omitempty"`
 	ModelCatalogSources        []string          `yaml:"model-catalog-sources,omitempty" json:"model-catalog-sources,omitempty"`
 	ModelRoutes                []XAIModelRoute   `yaml:"model-routes,omitempty" json:"model-routes,omitempty"`
@@ -103,6 +104,10 @@ func (c XAIConfig) Clone() XAIConfig {
 }
 
 func (c *XAIConfig) Validate() error {
+	c.ChatCompletionsMode = strings.ToLower(strings.TrimSpace(c.ChatCompletionsMode))
+	if c.ChatCompletionsMode != "" && c.ChatCompletionsMode != "responses" && c.ChatCompletionsMode != "direct" {
+		return fmt.Errorf("xai.chat-completions-mode must be responses or direct")
+	}
 	var errRouting error
 	c.ModelCatalogSources, errRouting = NormalizeXAICatalogSources(c.ModelCatalogSources)
 	if errRouting != nil {

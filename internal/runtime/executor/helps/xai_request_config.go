@@ -17,7 +17,7 @@ const XAIClientVersion = "0.2.120"
 
 // ApplyXAIRequestParameters restores Grok-supported client parameters which a
 // shared Codex translator may discard. Defaults never override explicit values.
-func ApplyXAIRequestParameters(body, original []byte, defaults map[string]any) []byte {
+func ApplyXAIRequestParameters(body, original []byte, defaults map[string]any, sourceFormat string) []byte {
 	paths := map[string][]string{
 		"max_output_tokens": {"max_output_tokens", "max_completion_tokens", "max_tokens"},
 		"temperature":       {"temperature"}, "top_p": {"top_p"},
@@ -36,7 +36,16 @@ func ApplyXAIRequestParameters(body, original []byte, defaults map[string]any) [
 			body, _ = sjson.SetRawBytes(body, destination, []byte(explicit.Raw))
 			continue
 		}
+		if xaiHasTranslatedParameter(original, destination, sourceFormat) {
+			continue
+		}
 		key := strings.Split(destination, ".")[0]
+		// Codex translators supply these defaults even when a client
+		// omitted them. Grok accepts omission and owns its model defaults.
+		if (sourceFormat == "openai" || sourceFormat == "openai-response" || sourceFormat == "codex" || sourceFormat == "claude" || sourceFormat == "gemini" || sourceFormat == "antigravity") &&
+			(destination == "reasoning.effort" || destination == "parallel_tool_calls") {
+			body, _ = sjson.DeleteBytes(body, destination)
+		}
 		if _, configured := defaults[key]; configured {
 			body, _ = sjson.DeleteBytes(body, destination)
 		}
@@ -46,7 +55,59 @@ func ApplyXAIRequestParameters(body, original []byte, defaults map[string]any) [
 			body, _ = sjson.DeleteBytes(body, "tool_choice")
 		}
 	}
-	return ApplyXAIDefaults(body, defaults)
+	body = ApplyXAIDefaults(body, defaults)
+	if reasoning := gjson.GetBytes(body, "reasoning"); reasoning.IsObject() && len(reasoning.Map()) == 0 {
+		body, _ = sjson.DeleteBytes(body, "reasoning")
+	}
+	return body
+}
+
+func xaiHasTranslatedParameter(original []byte, destination, source string) bool {
+	if source == "claude" {
+		if destination == "parallel_tool_calls" {
+			return gjson.GetBytes(original, "tool_choice.disable_parallel_tool_use").Exists()
+		}
+		return destination == "reasoning.effort" && gjson.GetBytes(original, "thinking.type").Exists()
+	}
+	if destination == "reasoning.effort" && (source == "gemini" || source == "antigravity") {
+		if source == "antigravity" && gjson.GetBytes(original, "request").IsObject() {
+			original = []byte(gjson.GetBytes(original, "request").Raw)
+		}
+		for _, path := range []string{"generationConfig.thinkingLevel", "generationConfig.thinking_level", "generationConfig.thinkingConfig.thinkingLevel", "generationConfig.thinkingConfig.thinking_level", "generationConfig.thinkingConfig.thinkingBudget", "generationConfig.thinkingConfig.thinking_budget"} {
+			if gjson.GetBytes(original, path).Exists() {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// ApplyXAIChatDefaults uses Chat field names without translating messages or tools.
+// Existing max_tokens and max_completion_tokens both suppress the output default.
+func ApplyXAIChatDefaults(body []byte, defaults map[string]any) []byte {
+	for key, value := range defaults {
+		path := key
+		switch key {
+		case "tool_choice":
+			value = xaiChatToolChoiceDefault(value)
+		case "max_output_tokens":
+			if gjson.GetBytes(body, "max_tokens").Exists() || gjson.GetBytes(body, "max_completion_tokens").Exists() {
+				continue
+			}
+			path = "max_completion_tokens"
+		case "reasoning":
+			path = "reasoning_effort"
+			raw, err := json.Marshal(value)
+			if err != nil || !gjson.GetBytes(raw, "effort").Exists() {
+				continue
+			}
+			value = gjson.GetBytes(raw, "effort").Value()
+		}
+		if !gjson.GetBytes(body, path).Exists() {
+			body, _ = sjson.SetBytes(body, path, value)
+		}
+	}
+	return body
 }
 
 // XAIWebsocketHeaderDigest freezes connection-scoped headers. Per-turn tracing

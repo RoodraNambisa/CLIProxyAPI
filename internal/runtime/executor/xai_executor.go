@@ -225,6 +225,9 @@ func (e *XAIExecutor) executeWithPolicy(ctx context.Context, auth *cliproxyauth.
 	if xaiIsVideoRequest(opts) {
 		return e.executeVideos(ctx, auth, req, opts)
 	}
+	if e.usesDirectChat(opts) {
+		return e.executeChat(ctx, auth, req, opts)
+	}
 
 	token, _ := xaiCreds(auth)
 	baseURL, err := xaiModelBaseURL(auth, e.cfg, req.Model)
@@ -750,6 +753,9 @@ func (e *XAIExecutor) executeStreamWithPolicy(ctx context.Context, auth *cliprox
 	if opts.Alt == "responses/compact" {
 		return nil, statusErr{code: http.StatusBadRequest, msg: "streaming not supported for /responses/compact"}
 	}
+	if e.usesDirectChat(opts) {
+		return e.executeChatStream(ctx, auth, req, opts)
+	}
 	if xaiInputHasItemType(req.Payload, "compaction_trigger") {
 		return e.executeCompactionTriggerStream(ctx, auth, req, opts)
 	}
@@ -1064,7 +1070,7 @@ func (e *XAIExecutor) prepareResponsesRequestTo(ctx context.Context, auth *clipr
 	if e.cfg != nil {
 		requestDefaults = e.cfg.XAI.RequestDefaults
 	}
-	body = helps.ApplyXAIRequestParameters(body, originalPayload, requestDefaults)
+	body = helps.ApplyXAIRequestParameters(body, originalPayload, requestDefaults, from.String())
 
 	var err error
 	body, err = thinking.ApplyThinking(body, req.Model, from.String(), e.Identifier(), e.Identifier())
@@ -1084,7 +1090,12 @@ func (e *XAIExecutor) prepareResponsesRequestTo(ctx context.Context, auth *clipr
 	body, _ = sjson.DeleteBytes(body, "prompt_cache_retention")
 	body, _ = sjson.DeleteBytes(body, "safety_identifier")
 	body, _ = sjson.DeleteBytes(body, "stream_options")
+	beforeToolNormalization := body
 	body = normalizeXAITools(body)
+	body, err = helps.NormalizeXAIAllowedTools(body, beforeToolNormalization)
+	if err != nil {
+		return nil, statusErr{code: http.StatusBadRequest, msg: err.Error()}
+	}
 	body = normalizeXAIToolChoiceForTools(body)
 	var replayScope xaiReasoningReplayScope
 	replayAuthID := ""
@@ -1466,6 +1477,9 @@ func normalizeXAIToolChoiceForTools(body []byte) []byte {
 			return body
 		}
 		choiceType := strings.TrimSpace(choice.Get("type").String())
+		if choiceType == "allowed_tools" {
+			return body
+		}
 		choiceName := strings.TrimSpace(choice.Get("name").String())
 		if choiceName == "" {
 			choiceName = strings.TrimSpace(choice.Get("function.name").String())
@@ -1483,6 +1497,12 @@ func normalizeXAIToolChoiceForTools(body []byte) []byte {
 			if choiceName == "" || choiceName == toolName {
 				return body
 			}
+		}
+		// Only remove choices for tools deliberately removed by compatibility
+		// filtering. Unknown or invalid constraints must not become unrestricted.
+		if choiceType != xaiToolSearchType && choiceType != xaiImageGenerationToolType &&
+			!(choiceType == xaiCustomToolType && choiceName == "apply_patch") {
+			return body
 		}
 		body, _ = sjson.DeleteBytes(body, "tool_choice")
 		return body

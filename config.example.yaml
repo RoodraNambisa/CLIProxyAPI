@@ -712,6 +712,10 @@ nonstream-keepalive-interval: 0
 # OAuth acquisition uses separate login headers. Model override and identity
 # headers are controlled by the final model and the policies below.
 xai:
+  # Incoming Chat Completions: responses converts to /responses (default);
+  # direct preserves Chat format and uses the selected model node's /chat/completions.
+  # The selected node/model must support Chat. Responses requests are unaffected.
+  chat-completions-mode: responses
   # Default endpoint when no model route matches. An explicit credential
   # base_url overrides this default, including https://api.x.ai/v1.
   # Choices: cli, api, us-east-1, us-west-2, eu-west-1.
@@ -747,9 +751,11 @@ xai:
   session-identity-pool-size: 4 # 1-64; resizing reassigns sessions.
   identity-confuse: false
   # Only fills omitted client parameters; payload override rules still apply.
+  # Empty defaults do not add reasoning effort or parallel tool calls.
   # Supported: max_output_tokens, reasoning.effort, temperature, top_p,
   # tool_choice, parallel_tool_calls and stream_tool_calls.
   request-defaults: {}
+  # Hosted search injection applies to Responses, not direct Chat Completions.
   inject-web-search: false
   inject-x-search: false
   # Passthrough protects explicit session, conversation and cache fields.

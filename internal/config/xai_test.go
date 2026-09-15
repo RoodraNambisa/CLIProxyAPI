@@ -13,6 +13,9 @@ func TestXAIConfigDefaultsValidationAndClone(t *testing.T) {
 		valid bool
 	}{
 		{"xai: {}", true},
+		{"xai:\n  chat-completions-mode: direct", true},
+		{"xai:\n  chat-completions-mode: responses", true},
+		{"xai:\n  chat-completions-mode: unknown", false},
 		{"xai:\n  default-base-url-mode: us-west-2", true},
 		{"xai:\n  default-base-url-mode: unknown", false},
 		{"xai:\n  session-identity-pool-size: 0", false},
