@@ -33,6 +33,12 @@ func TestXAIKeyManagementPersistenceAndValidation(t *testing.T) {
 	if h.cfg.XAIKey[0].APIKey != "fixture-key" || h.cfg.XAIKey[0].Weight == nil || *h.cfg.XAIKey[0].Weight != 0 {
 		t.Fatal("patch lost unchanged key or zero weight")
 	}
+	if code := call("PATCH", "/xai-api-key", `{"index":0,"value":{"priority":7,"websockets":true}}`, h.PatchXAIKey); code != 200 || h.cfg.XAIKey[0].Priority != 7 || !h.cfg.XAIKey[0].Websockets {
+		t.Fatal("patch silently ignored priority or WebSocket transport")
+	}
+	if code := call("PATCH", "/xai-api-key", `{"index":0,"value":{"priority":0,"websockets":false}}`, h.PatchXAIKey); code != 200 || h.cfg.XAIKey[0].Priority != 0 || h.cfg.XAIKey[0].Websockets {
+		t.Fatal("patch could not reset priority or disable WebSocket transport")
+	}
 	if code := call("PATCH", "/xai-api-key", `{"index":0,"value":{"weight":1.5}}`, h.PatchXAIKey); code != http.StatusBadRequest {
 		t.Fatal("fractional weight accepted")
 	}

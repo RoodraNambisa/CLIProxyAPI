@@ -43,7 +43,7 @@ func (e *XAIExecutor) prepareChatRequest(ctx context.Context, auth *coreauth.Aut
 		body = helps.ApplyXAIChatDefaults(body, e.cfg.XAI.RequestDefaults)
 	}
 	var err error
-	body, err = thinking.ApplyThinking(body, req.Model, "openai", "openai", "xai")
+	body, err = helps.ApplyRequestThinking(body, req, opts, "openai", "openai", "xai")
 	if err != nil {
 		return nil, err
 	}

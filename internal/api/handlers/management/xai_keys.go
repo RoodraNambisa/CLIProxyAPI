@@ -65,6 +65,8 @@ func (h *Handler) PutXAIKeys(c *gin.Context) {
 }
 func (h *Handler) PatchXAIKey(c *gin.Context) {
 	type xaiKeyPatch struct {
+		Priority            *int                        `json:"priority"`
+		Websockets          *bool                       `json:"websockets"`
 		Weight              credentialWeightPatch       `json:"weight"`
 		RequestRetry        credentialRequestRetryPatch `json:"request-retry"`
 		RequestScopedErrors requestScopedErrorsPatch    `json:"request-scoped-errors"`
@@ -113,6 +115,12 @@ func (h *Handler) PatchXAIKey(c *gin.Context) {
 
 	previous := append([]config.XAIKey(nil), h.cfg.XAIKey...)
 	entry := h.cfg.XAIKey[targetIndex]
+	if body.Value.Priority != nil {
+		entry.Priority = *body.Value.Priority
+	}
+	if body.Value.Websockets != nil {
+		entry.Websockets = *body.Value.Websockets
+	}
 	if body.Value.Weight.set {
 		entry.Weight = body.Value.Weight.value
 	}

@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -8,11 +9,57 @@ import (
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	core "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
 	"github.com/tidwall/gjson"
 )
+
+func TestXAIDirectChatUsesCredentialModelThinkingDeclaration(t *testing.T) {
+	cfg := &config.Config{
+		XAI: config.XAIConfig{ChatCompletionsMode: "direct"},
+		XAIKey: []config.XAIKey{{APIKey: "fixture", BaseURL: "https://api.x.ai/v1", Models: []config.CodexModel{{
+			Name: "grok-4.6", Alias: "account-model", Thinking: &registry.ThinkingSupport{Levels: []string{"low"}},
+		}}}},
+	}
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.SetConfig(cfg)
+	auth, err := manager.Register(coreauth.WithSkipPersist(t.Context()), &coreauth.Auth{
+		ID: "native-chat-capability", Provider: "xai",
+		Attributes: map[string]string{"api_key": "fixture", "base_url": "https://api.x.ai/v1", "runtime_only": "true"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	exec := NewXAIExecutor(cfg)
+	for _, effort := range []string{"high", "low"} {
+		body := []byte(`{"messages":[{"role":"user","content":"hello"}],"reasoning_effort":"` + effort + `","top_k":7}`)
+		err = manager.ProbeCredential(t.Context(), auth, exec, core.Request{Model: "account-model", Payload: body}, core.Options{SourceFormat: sdktranslator.FormatOpenAI},
+			func(ctx context.Context, selected *coreauth.Auth, req core.Request, opts core.Options) error {
+				prepared, errPrepare := exec.prepareChatRequest(ctx, selected, req, opts, false)
+				if effort == "high" {
+					if errPrepare == nil || !strings.Contains(errPrepare.Error(), "not supported") {
+						t.Error("direct Chat ignored this credential's allowed reasoning levels")
+					}
+					return nil
+				}
+				if errPrepare != nil {
+					return errPrepare
+				}
+				if gjson.GetBytes(prepared.body, "reasoning_effort").String() != "low" {
+					t.Error("direct Chat lost the supported client reasoning level")
+				}
+				if gjson.GetBytes(prepared.body, "model").String() != "grok-4.6" || gjson.GetBytes(prepared.body, "top_k").Int() != 7 {
+					t.Error("direct Chat lost the resolved model or client parameters")
+				}
+				return nil
+			})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+}
 
 func TestXAIImageToolPolicyAndForcedChoice(t *testing.T) {
 	for _, policy := range []string{"", "remove", "error", "allow"} {
