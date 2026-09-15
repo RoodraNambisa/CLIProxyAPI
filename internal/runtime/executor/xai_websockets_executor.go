@@ -908,20 +908,22 @@ func (e *XAIWebsocketsExecutor) executeStream(ctx context.Context, auth *cliprox
 							downstreamWarmupCompletedPayload = idMapper.downstreamResponsePayload(warmupCompletedPayload)
 						}
 					}
-					downstreamPayload = helps.EnsureResponsesUsageDetails(prepared.outputPolicy.Rewrite(downstreamPayload))
-					downstreamWarmupCompletedPayload = helps.EnsureResponsesUsageDetails(prepared.outputPolicy.Rewrite(downstreamWarmupCompletedPayload))
-					if !send(cliproxyexecutor.StreamChunk{Payload: downstreamPayload}) {
-						terminateReason = "context_done"
-						terminateErr = ctx.Err()
-						reporter.PublishFailure(ctx, terminateErr)
-						return
-					}
-					if len(downstreamWarmupCompletedPayload) > 0 {
-						if !send(cliproxyexecutor.StreamChunk{Payload: downstreamWarmupCompletedPayload}) {
+					for _, chunk := range prepared.outputPolicy.RewriteWebsocket(downstreamPayload) {
+						if !send(cliproxyexecutor.StreamChunk{Payload: chunk}) {
 							terminateReason = "context_done"
 							terminateErr = ctx.Err()
 							reporter.PublishFailure(ctx, terminateErr)
 							return
+						}
+					}
+					if len(downstreamWarmupCompletedPayload) > 0 {
+						for _, chunk := range prepared.outputPolicy.RewriteWebsocket(downstreamWarmupCompletedPayload) {
+							if !send(cliproxyexecutor.StreamChunk{Payload: chunk}) {
+								terminateReason = "context_done"
+								terminateErr = ctx.Err()
+								reporter.PublishFailure(ctx, terminateErr)
+								return
+							}
 						}
 						emitSuccessfulTerminal()
 						return

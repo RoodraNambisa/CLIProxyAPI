@@ -29,6 +29,22 @@ func (policy XAIResponsesOutputPolicy) Rewrite(payload []byte) []byte {
 	return policy.codex.Rewrite(policy.namespaces.Restore(policy.fold.Restore(payload)))
 }
 
+// RewriteWebsocket uses the same request-local tool envelope buffering as SSE.
+// Raw websocket deltas must not expose dispatcher arguments before restoration.
+func (policy XAIResponsesOutputPolicy) RewriteWebsocket(payload []byte) [][]byte {
+	if len(payload) == 0 {
+		return nil
+	}
+	if policy.fold == nil {
+		return [][]byte{EnsureResponsesUsageDetails(policy.Rewrite(payload))}
+	}
+	var output [][]byte
+	for _, frame := range policy.fold.StreamFrames(xaiFoldFrame(payload)) {
+		output = append(output, EnsureResponsesUsageDetails(policy.Rewrite(JSONPayload(frame))))
+	}
+	return output
+}
+
 func (policy XAIResponsesOutputPolicy) TranslateNonStream(ctx context.Context, from, to sdktranslator.Format, model string, original, request, response []byte, param *any) []byte {
 	output := policy.Rewrite(sdktranslator.TranslateNonStream(ctx, from, to, model, original, request, policy.fold.Restore(response), param))
 	if to == sdktranslator.FormatOpenAIResponse || to == sdktranslator.FormatCodex {
