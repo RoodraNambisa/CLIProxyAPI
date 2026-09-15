@@ -163,9 +163,15 @@ func (h *Handler) APICall(c *gin.Context) {
 	var token string
 	var tokenResolved bool
 	var tokenErr error
+	tokenHeaders := make(map[string]string)
+	var credentialAuthorization bool
 	for key, value := range reqHeaders {
 		if !strings.Contains(value, "$TOKEN$") {
 			continue
+		}
+		tokenHeaders[key] = value
+		if strings.EqualFold(key, "Authorization") {
+			credentialAuthorization = true
 		}
 		if !tokenResolved {
 			token, tokenErr = h.resolveTokenForAuth(c.Request.Context(), auth)
@@ -209,6 +215,7 @@ func (h *Handler) APICall(c *gin.Context) {
 	if hostOverride != "" {
 		req.Host = hostOverride
 	}
+	requestConfig := h.currentConfig()
 	if body.ProviderHeaders {
 		host := strings.ToLower(parsedURL.Hostname())
 		if auth == nil || auth.Provider != "xai" || parsedURL.Scheme != "https" ||
@@ -216,13 +223,46 @@ func (h *Handler) APICall(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "provider headers require a Grok credential and an official xAI API address"})
 			return
 		}
-		helps.ApplyXAIResourceHeaders(req, auth, h.currentConfig())
+		helps.ApplyXAIResourceHeaders(req, auth, requestConfig)
 	}
 
 	httpClient := &http.Client{
 		Timeout: defaultAPICallTimeout,
 	}
 	httpClient.Transport = h.apiCallTransport(auth)
+
+	// Only retry credential-owned, read-only Grok queries. Arbitrary API calls
+	// and explicitly overridden Authorization headers keep their existing behavior.
+	if body.ProviderHeaders && method == http.MethodGet && body.Data == "" && credentialAuthorization && token != "" && req.Header.Get("Authorization") == "Bearer "+token {
+		ctx := c.Request.Context()
+		h.mu.Lock()
+		manager := h.authManager
+		h.mu.Unlock()
+		resp, data, current, errQuery := readXAIResourceQuery(ctx, manager, auth, 0, func(current *coreauth.Auth) (*http.Response, error) {
+			query := req.Clone(ctx)
+			for key, template := range tokenHeaders {
+				query.Header.Set(key, strings.ReplaceAll(template, "$TOKEN$", tokenValueForAuth(current)))
+			}
+			helps.ApplyXAIResourceHeaders(query, current, requestConfig)
+			client := *httpClient
+			client.Transport = h.apiCallTransport(current)
+			return client.Do(query)
+		})
+		if errQuery != nil {
+			errQuery = h.reportManagementProxyFailure(ctx, current, errQuery)
+			if writeManagementProxyError(c, errQuery) {
+				return
+			}
+			if resp != nil && ctx.Err() == nil && (resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden) {
+				c.JSON(http.StatusOK, apiCallResponse{StatusCode: resp.StatusCode, Header: resp.Header, Body: string(data)})
+				return
+			}
+			c.JSON(http.StatusBadGateway, gin.H{"error": "Grok query failed; check the credential or sign in again"})
+			return
+		}
+		c.JSON(http.StatusOK, apiCallResponse{StatusCode: resp.StatusCode, Header: resp.Header, Body: string(data)})
+		return
+	}
 
 	resp, errDo := httpClient.Do(req)
 	if errDo != nil {

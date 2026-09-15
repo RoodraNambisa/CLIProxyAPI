@@ -12517,6 +12517,24 @@ func (m *Manager) RefreshAntigravityAfterUnauthorized(ctx context.Context, id, f
 	return m.refreshAntigravityForRequest(ctx, id, failedAccessToken)
 }
 
+// RefreshXAIAfterUnauthorized reuses synchronized OAuth rotation for management
+// queries. A replacement account must never inherit a stale query's refresh.
+func (m *Manager) RefreshXAIAfterUnauthorized(ctx context.Context, expected *Auth) (*Auth, error) {
+	if expected == nil || !strings.EqualFold(expected.Provider, "xai") {
+		return nil, errors.New("Grok credential required")
+	}
+	return m.refreshProviderForRequestSynchronized(ctx, expected.ID, authAccessToken(expected), "xai", expected, func(current *Auth) error {
+		if !runtimeMetadataMutationMatchesCurrent(current, expected) &&
+			(expected.requestRefreshFamilyID == "" || current.requestRefreshFamilyID != expected.requestRefreshFamilyID) {
+			return runtimeAuthInstanceRetiredError()
+		}
+		if strings.TrimSpace(current.Attributes["api_key"]) != "" || !authHasRefreshCredential(current) {
+			return errors.New("Grok OAuth refresh credential required")
+		}
+		return nil
+	})
+}
+
 // RefreshChatGPTWebForRequest refreshes and installs one ChatGPT Web
 // credential through the request-time synchronization path.
 func (m *Manager) RefreshChatGPTWebForRequest(ctx context.Context, expected *Auth) (*Auth, error) {

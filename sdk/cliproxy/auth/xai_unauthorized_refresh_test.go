@@ -2,15 +2,48 @@ package auth
 
 import (
 	"context"
-	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"sync"
 	"testing"
 
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	core "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 )
 
 type xaiRefreshProbeExecutor struct {
 	ProviderExecutor
 	calls, refreshes int
+}
+
+func TestXAIManagementRefreshDeduplicatesAndRejectsReplacement(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	exec := &xaiRefreshProbeExecutor{}
+	manager.RegisterExecutor(exec)
+	auth, err := manager.Register(t.Context(), &Auth{ID: "management-refresh", Provider: "xai", Metadata: map[string]any{"access_token": "old-token", "refresh_token": "refresh-token"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var workers sync.WaitGroup
+	for range 8 {
+		workers.Go(func() {
+			refreshed, errRefresh := manager.RefreshXAIAfterUnauthorized(t.Context(), auth)
+			if errRefresh != nil || refreshed == nil || refreshed.Metadata["access_token"] != "new-token" {
+				t.Errorf("shared refresh failed: %v", errRefresh)
+			}
+		})
+	}
+	workers.Wait()
+	if exec.refreshes != 1 {
+		t.Fatalf("concurrent queries rotated the token %d times", exec.refreshes)
+	}
+	if err = manager.Delete(t.Context(), auth.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = manager.Register(t.Context(), &Auth{ID: auth.ID, Provider: "xai", Metadata: map[string]any{"access_token": "replacement", "refresh_token": "replacement-refresh"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = manager.RefreshXAIAfterUnauthorized(t.Context(), auth); err == nil || exec.refreshes != 1 {
+		t.Fatal("stale query refreshed a replacement credential")
+	}
 }
 
 func (e *xaiRefreshProbeExecutor) Identifier() string { return "xai" }

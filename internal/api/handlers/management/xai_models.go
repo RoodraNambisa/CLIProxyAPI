@@ -2,7 +2,6 @@ package management
 
 import (
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -10,7 +9,6 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
-	log "github.com/sirupsen/logrus"
 )
 
 type xaiCatalogRefreshSource struct {
@@ -52,7 +50,8 @@ func (h *Handler) RefreshXAIModels(c *gin.Context) {
 	fresh := make(map[string]*helps.XAIModelCatalog)
 	sources := make([]xaiCatalogRefreshSource, 0, len(endpoints))
 	for _, endpoint := range endpoints {
-		catalog, errRefresh := fetchXAIModelCatalog(c, manager, auth, endpoint)
+		catalog, refreshedAuth, errRefresh := fetchXAIModelCatalog(c, manager, auth, endpoint)
+		auth = refreshedAuth
 		if c.Request.Context().Err() != nil {
 			return
 		}
@@ -108,32 +107,21 @@ func (h *Handler) RefreshXAIModels(c *gin.Context) {
 	})
 }
 
-func fetchXAIModelCatalog(c *gin.Context, manager *coreauth.Manager, auth *coreauth.Auth, endpoint string) (*helps.XAIModelCatalog, error) {
+func fetchXAIModelCatalog(c *gin.Context, manager *coreauth.Manager, auth *coreauth.Auth, endpoint string) (*helps.XAIModelCatalog, *coreauth.Auth, error) {
 	req, err := http.NewRequestWithContext(c.Request.Context(), http.MethodGet, endpoint, nil)
 	if err != nil {
-		return nil, err
+		return nil, auth, err
 	}
 	req.Header.Set("Accept", "application/json")
-	resp, err := manager.HttpRequest(c.Request.Context(), auth, req)
-	if resp != nil && resp.Body != nil {
-		defer func() {
-			if errClose := resp.Body.Close(); errClose != nil {
-				log.WithError(errClose).Warn("close Grok models response")
-			}
-		}()
-	}
+	resp, body, auth, err := readXAIResourceQuery(c.Request.Context(), manager, auth, 1024*1024+1, func(current *coreauth.Auth) (*http.Response, error) {
+		return manager.HttpRequest(c.Request.Context(), current, req.Clone(c.Request.Context()))
+	})
 	if err != nil {
-		return nil, err
-	}
-	if resp == nil || resp.Body == nil {
-		return nil, fmt.Errorf("Grok model refresh returned an empty response")
+		return nil, auth, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("Grok model refresh returned HTTP %d", resp.StatusCode)
+		return nil, auth, fmt.Errorf("Grok model refresh returned HTTP %d", resp.StatusCode)
 	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1024*1024+1))
-	if err != nil {
-		return nil, err
-	}
-	return helps.ParseXAIModels(body, endpoint)
+	catalog, err := helps.ParseXAIModels(body, endpoint)
+	return catalog, auth, err
 }
