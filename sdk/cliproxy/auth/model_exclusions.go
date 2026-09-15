@@ -31,7 +31,12 @@ func AuthModelExclusionRuleMatches(rule internalconfig.AuthModelExclusionRule, a
 	if len(rule.Priorities) > 0 {
 		priority, ok := authPriorityForModelExclusion(auth)
 		if !ok {
-			return false
+			if strings.TrimSpace(auth.Attributes["priority"]) != "" || auth.Metadata["priority"] != nil {
+				return false
+			}
+			// Omitted priorities use the same zero default as account selection
+			// and the management UI. Invalid explicit values remain unmatched.
+			priority = 0
 		}
 		matched := false
 		for _, item := range rule.Priorities {

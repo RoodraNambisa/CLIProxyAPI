@@ -6,11 +6,55 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/watcher/synthesizer"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
 )
+
+func TestRegisterModelsForAuth_GrokDefaultPriorityExclusions(t *testing.T) {
+	for _, nativeKey := range []bool{false, true} {
+		name := "oauth"
+		if nativeKey {
+			name = "api-key"
+		}
+		t.Run(name, func(t *testing.T) {
+			cfg := &config.Config{}
+			auth := &coreauth.Auth{ID: "grok-default-priority-" + name, Provider: "xai", Status: coreauth.StatusActive, Metadata: map[string]any{"type": "xai", "auth_kind": "oauth"}}
+			if nativeKey {
+				cfg.XAIKey = []config.XAIKey{{APIKey: "fixture", BaseURL: "https://api.x.ai/v1", Models: []config.CodexModel{{Name: "grok-4.6"}, {Name: "grok-4.5"}}}}
+				auths, err := synthesizer.NewConfigSynthesizer().Synthesize(&synthesizer.SynthesisContext{Config: cfg, Now: time.Now(), IDGenerator: synthesizer.NewStableIDGenerator()})
+				if err != nil || len(auths) != 1 {
+					t.Fatalf("native auth synthesis: %v", err)
+				}
+				auth = auths[0]
+			}
+			service := &Service{cfg: cfg}
+			reg := registry.GetGlobalRegistry()
+			t.Cleanup(func() { reg.UnregisterClient(auth.ID) })
+			service.registerModelsForAuth(auth)
+			if len(reg.GetModelsForClient(auth.ID)) == 0 {
+				t.Fatal("fixture has no initial models")
+			}
+			cfg.AuthModelExclusions = []config.AuthModelExclusionRule{{Priorities: []int{0, 3}, Models: []string{"-all", "+gpt-5.6-sol", "+gpt-6-astra"}}}
+			service.registerModelsForAuth(auth)
+			if models := reg.GetModelsForClient(auth.ID); len(models) != 0 {
+				t.Fatalf("default priority escaped -all: %v", registeredModelIDs(models))
+			}
+			cfg.AuthModelExclusions[0].Providers = []string{"codex"}
+			service.registerModelsForAuth(auth)
+			if len(reg.GetModelsForClient(auth.ID)) == 0 {
+				t.Fatal("Codex-only rule excluded Grok")
+			}
+			cfg.AuthModelExclusions[0].Providers = nil
+			cfg.AuthModelExclusions[0].Models = []string{"-all", "+grok-4.5"}
+			service.registerModelsForAuth(auth)
+			assertOnlyRegisteredModels(t, reg.GetModelsForClient(auth.ID), "grok-4.5")
+		})
+	}
+}
 
 func TestRegisterModelsForAuth_UsesPreMergedExcludedModelsAttribute(t *testing.T) {
 	service := &Service{
