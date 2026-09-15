@@ -743,6 +743,10 @@ func (h *Handler) persist(c *gin.Context) bool {
 // persistLocked saves the current in-memory config to disk.
 // It expects the caller to hold h.mu.
 func (h *Handler) persistLocked(c *gin.Context) bool {
+	if errKeys := h.cfg.ValidateXAIKeys(); errKeys != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errKeys.Error()})
+		return false
+	}
 	if errWeight := h.cfg.ValidateCredentialWeights(); errWeight != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": errWeight.Error()})
 		return false

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	codexauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/client/grokbuild"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
@@ -1240,6 +1241,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 }
 
 func (e *CodexExecutor) executeStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, translated bool) (_ *cliproxyexecutor.StreamResult, err error) {
+	isGrokClient := grokbuild.IsGrokClientContext(ctx, opts.Headers)
 	if opts.SourceFormat == sdktranslator.FormatCodexLive {
 		return nil, helps.CodexLiveNativeRouteError{}
 	}
@@ -1459,6 +1461,9 @@ func (e *CodexExecutor) executeStream(ctx context.Context, auth *cliproxyauth.Au
 			}
 			frame := trustedFrame
 			trustedFrame = nil
+			if transformed, ok := grokbuild.TransformKeepaliveSSEFrame(frame, isGrokClient); ok {
+				return emit(cliproxyexecutor.StreamChunk{Payload: transformed}), false
+			}
 			frame = multiAgentResponse.RewriteSSEFrame(frame)
 			hasData := false
 			terminal := false
@@ -1512,6 +1517,14 @@ func (e *CodexExecutor) executeStream(ctx context.Context, auth *cliproxyauth.Au
 				}
 			}
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
+			if !trustUpstreamSSE {
+				if transformed, ok := grokbuild.TransformKeepaliveSSELine(clientLine, isGrokClient); ok {
+					if !emit(cliproxyexecutor.StreamChunk{Payload: transformed}) {
+						return
+					}
+					continue
+				}
+			}
 			if trustUpstreamSSE {
 				nextTrustedFrame, errFrame := appendBoundedCodexTrustedSSEFrame(
 					trustedFrame,

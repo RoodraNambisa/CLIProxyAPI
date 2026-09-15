@@ -59,6 +59,8 @@ type XAIHeaderDefaults struct {
 }
 
 type XAIConfig struct {
+	ImageGenerationToolPolicy  string            `yaml:"image-generation-tool-policy,omitempty" json:"image-generation-tool-policy,omitempty"`
+	DynamicHeaders             bool              `yaml:"dynamic-headers,omitempty" json:"dynamic-headers,omitempty"`
 	ChatCompletionsMode        string            `yaml:"chat-completions-mode,omitempty" json:"chat-completions-mode,omitempty"`
 	DefaultBaseURLMode         string            `yaml:"default-base-url-mode,omitempty" json:"default-base-url-mode,omitempty"`
 	ModelCatalogSources        []string          `yaml:"model-catalog-sources,omitempty" json:"model-catalog-sources,omitempty"`
@@ -104,6 +106,13 @@ func (c XAIConfig) Clone() XAIConfig {
 }
 
 func (c *XAIConfig) Validate() error {
+	if c != nil {
+		switch c.ImageGenerationToolPolicy {
+		case "", "remove", "error", "allow":
+		default:
+			return fmt.Errorf("xai.image-generation-tool-policy must be remove, error or allow")
+		}
+	}
 	c.ChatCompletionsMode = strings.ToLower(strings.TrimSpace(c.ChatCompletionsMode))
 	if c.ChatCompletionsMode != "" && c.ChatCompletionsMode != "responses" && c.ChatCompletionsMode != "direct" {
 		return fmt.Errorf("xai.chat-completions-mode must be responses or direct")

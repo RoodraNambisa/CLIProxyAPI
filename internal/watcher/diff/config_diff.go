@@ -472,6 +472,9 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 		changes = append(changes, fmt.Sprintf("images.chatgpt-web.poll-stall-seconds: %d -> %d", oldImageRuntime.PollStallSeconds, newImageRuntime.PollStallSeconds))
 	}
 
+	if !reflect.DeepEqual(oldCfg.XAIKey, newCfg.XAIKey) {
+		changes = append(changes, "xai-api-key: updated")
+	}
 	// Codex keys (do not print key material)
 	if len(oldCfg.CodexKey) != len(newCfg.CodexKey) {
 		changes = append(changes, fmt.Sprintf("codex-api-key count: %d -> %d", len(oldCfg.CodexKey), len(newCfg.CodexKey)))

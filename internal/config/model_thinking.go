@@ -102,6 +102,11 @@ func (cfg *Config) ValidateModelThinking() error {
 			return err
 		}
 	}
+	for i, entry := range cfg.XAIKey {
+		if err := validateModelThinkingEntries(fmt.Sprintf("xai-api-key[%d]", i), entry.Models); err != nil {
+			return err
+		}
+	}
 	for i, entry := range cfg.VertexCompatAPIKey {
 		if err := validateModelThinkingEntries(fmt.Sprintf("vertex-api-key[%d]", i), entry.Models); err != nil {
 			return err

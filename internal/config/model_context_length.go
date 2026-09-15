@@ -48,6 +48,11 @@ func (cfg *Config) ValidateModelContextLengths() error {
 			return err
 		}
 	}
+	for index, entry := range cfg.XAIKey {
+		if err := validateModelContextEntries(fmt.Sprintf("xai-api-key[%d]", index), entry.Models); err != nil {
+			return err
+		}
+	}
 	for index, entry := range cfg.VertexCompatAPIKey {
 		if err := validateModelContextEntries(fmt.Sprintf("vertex-api-key[%d]", index), entry.Models); err != nil {
 			return err

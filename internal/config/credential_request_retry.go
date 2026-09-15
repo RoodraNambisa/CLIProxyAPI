@@ -47,6 +47,11 @@ func (cfg *Config) ValidateCredentialRequestRetries() error {
 			return err
 		}
 	}
+	for index, entry := range cfg.XAIKey {
+		if err := check("xai-api-key", index, entry.RequestRetry); err != nil {
+			return err
+		}
+	}
 	for index, entry := range cfg.VertexCompatAPIKey {
 		if err := check("vertex-api-key", index, entry.RequestRetry); err != nil {
 			return err
@@ -66,7 +71,7 @@ func validateCredentialRequestRetryYAML(data []byte) error {
 	if err := yaml.Unmarshal(data, &document); err != nil || len(document.Content) == 0 {
 		return nil
 	}
-	for _, family := range []string{"gemini-api-key", "interactions-api-key", "claude-api-key", "codex-api-key", "vertex-api-key", "openai-compatibility"} {
+	for _, family := range []string{"gemini-api-key", "interactions-api-key", "claude-api-key", "codex-api-key", "xai-api-key", "vertex-api-key", "openai-compatibility"} {
 		sequence, err := credentialYAMLField(document.Content[0], family, make(map[*yaml.Node]bool))
 		if err != nil {
 			return err

@@ -51,6 +51,16 @@ func (e *XAIExecutor) prepareChatRequest(ctx context.Context, auth *coreauth.Aut
 		helps.PayloadRequestedModel(opts, req.Model), helps.PayloadRequestPath(opts), opts.Headers)
 	body, _ = sjson.SetBytes(body, "model", baseModel)
 	body, _ = sjson.SetBytes(body, "stream", stream)
+	tools := gjson.GetBytes(body, "tools")
+	if !tools.Exists() || tools.Type == gjson.Null || (tools.IsArray() && len(tools.Array()) == 0) {
+		choice := gjson.GetBytes(body, "tool_choice")
+		if choice.Exists() && choice.Type != gjson.Null {
+			if choice.Type != gjson.String || (choice.Str != "none" && choice.Str != "auto") {
+				return nil, statusErr{code: http.StatusBadRequest, skipAuthResult: true, msg: "xai tool_choice requires tool declarations"}
+			}
+			body, _ = sjson.DeleteBytes(body, "tool_choice")
+		}
+	}
 	if stream && !gjson.GetBytes(body, "stream_options.include_usage").Exists() {
 		body, _ = sjson.SetBytes(body, "stream_options.include_usage", true)
 	}

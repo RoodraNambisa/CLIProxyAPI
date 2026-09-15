@@ -16,6 +16,7 @@ var credentialYAMLTypes = map[string]reflect.Type{
 	"gemini-api-key":              reflect.TypeFor[GeminiKey](),
 	"interactions-api-key":        reflect.TypeFor[GeminiKey](),
 	"claude-api-key":              reflect.TypeFor[ClaudeKey](),
+	"xai-api-key":                 reflect.TypeFor[XAIKey](),
 	"codex-api-key":               reflect.TypeFor[CodexKey](),
 	"vertex-api-key":              reflect.TypeFor[VertexCompatKey](),
 	"openai-compatibility":        reflect.TypeFor[OpenAICompatibility](),

@@ -45,6 +45,9 @@ func configuredModelCatalogOverrides(cfg *config.Config) [][]string {
 	for i, entry := range cfg.CodexKey {
 		out = appendModelCatalogOverrides(out, "codex", i, entry.Models)
 	}
+	for i, entry := range cfg.XAIKey {
+		out = appendModelCatalogOverrides(out, "xai", i, entry.Models)
+	}
 	for i, entry := range cfg.VertexCompatAPIKey {
 		out = appendModelCatalogOverrides(out, "vertex", i, entry.Models)
 	}

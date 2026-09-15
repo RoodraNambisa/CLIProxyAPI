@@ -47,6 +47,11 @@ func (cfg *Config) ValidateCredentialWeights() error {
 			return err
 		}
 	}
+	for index, key := range cfg.XAIKey {
+		if err := check(fmt.Sprintf("xai-api-key[%d]", index), key.Weight); err != nil {
+			return err
+		}
+	}
 	for index, key := range cfg.VertexCompatAPIKey {
 		if err := check(fmt.Sprintf("vertex-api-key[%d]", index), key.Weight); err != nil {
 			return err
@@ -101,7 +106,7 @@ func validateCredentialWeightYAML(data []byte) error {
 		}
 		return nil
 	}
-	for _, name := range []string{"gemini-api-key", "interactions-api-key", "claude-api-key", "codex-api-key", "vertex-api-key"} {
+	for _, name := range []string{"gemini-api-key", "interactions-api-key", "claude-api-key", "codex-api-key", "xai-api-key", "vertex-api-key"} {
 		sequence, err := credentialYAMLField(root, name, make(map[*yaml.Node]bool))
 		if err != nil {
 			return err

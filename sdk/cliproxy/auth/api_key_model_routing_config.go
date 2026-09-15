@@ -25,6 +25,13 @@ func copyAPIKeyModelRoutingConfig(source *config.Config) *config.Config {
 		}
 		next.CodexKey = append(next.CodexKey, entry)
 	}
+	for _, key := range source.XAIKey {
+		entry := config.XAIKey{APIKey: key.APIKey, BaseURL: key.BaseURL, Models: append([]config.CodexModel(nil), key.Models...)}
+		for i := range entry.Models {
+			entry.Models[i].Thinking = config.NormalizeModelThinkingSupport(entry.Models[i].Thinking)
+		}
+		next.XAIKey = append(next.XAIKey, entry)
+	}
 	for _, key := range source.VertexCompatAPIKey {
 		entry := config.VertexCompatKey{APIKey: key.APIKey, BaseURL: key.BaseURL, Models: append([]config.VertexCompatModel(nil), key.Models...)}
 		for i := range entry.Models {

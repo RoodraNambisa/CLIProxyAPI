@@ -186,6 +186,9 @@ func executeXAIHTTPRequest(httpClient *http.Client, req *http.Request, auth *cli
 	if req == nil {
 		return nil, fmt.Errorf("xai executor: request is nil")
 	}
+	if host := req.Header.Get("Host"); host != "" {
+		req.Host = host
+	}
 	if selectedAuthInstanceRetired(opts) {
 		return nil, errXAIWebsocketSessionTerminated
 	}
@@ -353,7 +356,13 @@ func (e *XAIExecutor) executeCompactRequest(ctx context.Context, auth *cliproxya
 	prepared.body, _ = sjson.DeleteBytes(prepared.body, "stream")
 	prepared.body, _ = sjson.DeleteBytes(prepared.body, "tools")
 	prepared.body = normalizeXAIToolChoiceForTools(prepared.body)
+	for _, field := range []string{"max_output_tokens", "temperature", "top_p", "top_k", "stop"} {
+		prepared.body, _ = sjson.DeleteBytes(prepared.body, field)
+	}
 	prepared.body = xaiRemoveInputItemsByType(prepared.body, "compaction_trigger")
+	if previous := strings.TrimSpace(gjson.GetBytes(req.Payload, "previous_response_id").String()); previous != "" {
+		prepared.body, _ = sjson.SetBytes(prepared.body, "previous_response_id", previous)
+	}
 
 	reporter := helps.NewExecutorUsageReporter(ctx, e, prepared.baseModel, auth)
 	defer reporter.TrackFailure(ctx, &err)
@@ -1064,8 +1073,8 @@ func (e *XAIExecutor) prepareResponsesRequestTo(ctx context.Context, auth *clipr
 	if errNormalize != nil {
 		return nil, errNormalize
 	}
-	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, stream)
-	body := sdktranslator.TranslateRequest(from, to, baseModel, bytes.Clone(requestPayload), stream)
+	originalTranslated := helps.TranslateRequestWithAPIKeyModelCompatibility(from, to, baseModel, originalPayload, stream, helps.APIKeyModelIsCompat(req))
+	body := helps.TranslateRequestWithAPIKeyModelCompatibility(from, to, baseModel, bytes.Clone(requestPayload), stream, helps.APIKeyModelIsCompat(req))
 	var requestDefaults map[string]any
 	if e.cfg != nil {
 		requestDefaults = e.cfg.XAI.RequestDefaults
@@ -1073,7 +1082,7 @@ func (e *XAIExecutor) prepareResponsesRequestTo(ctx context.Context, auth *clipr
 	body = helps.ApplyXAIRequestParameters(body, originalPayload, requestDefaults, from.String())
 
 	var err error
-	body, err = thinking.ApplyThinking(body, req.Model, from.String(), e.Identifier(), e.Identifier())
+	body, err = helps.ApplyRequestThinking(body, req, opts, from.String(), e.Identifier(), e.Identifier())
 	if err != nil {
 		return nil, err
 	}
@@ -1090,13 +1099,30 @@ func (e *XAIExecutor) prepareResponsesRequestTo(ctx context.Context, auth *clipr
 	body, _ = sjson.DeleteBytes(body, "prompt_cache_retention")
 	body, _ = sjson.DeleteBytes(body, "safety_identifier")
 	body, _ = sjson.DeleteBytes(body, "stream_options")
-	beforeToolNormalization := body
-	body = normalizeXAITools(body)
+	beforeToolNormalization := helps.PromoteXAIAdditionalTools(body)
+	imagePolicy := "remove"
+	if e.cfg != nil && e.cfg.XAI.ImageGenerationToolPolicy != "" {
+		imagePolicy = e.cfg.XAI.ImageGenerationToolPolicy
+	}
+	if helps.XAIHasImageGenerationTool(beforeToolNormalization) {
+		if imagePolicy == "error" {
+			return nil, statusErr{code: http.StatusBadRequest, skipAuthResult: true, msg: "xai image_generation tool is disabled by policy"}
+		}
+		if imagePolicy == "allow" && !helps.XAISupportsNativeImageGeneration(baseModel) {
+			return nil, statusErr{code: http.StatusBadRequest, skipAuthResult: true, msg: "xai image_generation tool requires a supported Grok 4.6+ model"}
+		}
+	}
+	body = normalizeXAITools(beforeToolNormalization, imagePolicy == "allow")
 	body, err = helps.NormalizeXAIAllowedTools(body, beforeToolNormalization)
 	if err != nil {
-		return nil, statusErr{code: http.StatusBadRequest, msg: err.Error()}
+		return nil, statusErr{code: http.StatusBadRequest, skipAuthResult: true, msg: err.Error()}
 	}
+	body = helps.NormalizeXAIImageToolChoice(body)
 	body = normalizeXAIToolChoiceForTools(body)
+	body, toolFold, err := helps.FoldXAITools(body, beforeToolNormalization)
+	if err != nil {
+		return nil, statusErr{code: http.StatusBadRequest, skipAuthResult: true, msg: err.Error()}
+	}
 	var replayScope xaiReasoningReplayScope
 	replayAuthID := ""
 	if auth != nil {
@@ -1130,7 +1156,7 @@ func (e *XAIExecutor) prepareResponsesRequestTo(ctx context.Context, auth *clipr
 	}
 
 	return &xaiPreparedRequest{
-		outputPolicy:    helps.NewXAIResponsesOutputPolicy(originalPayload, body, responseFormat, multiAgentResponse),
+		outputPolicy:    helps.NewXAIResponsesOutputPolicy(originalPayload, body, responseFormat, multiAgentResponse, toolFold),
 		baseModel:       baseModel,
 		from:            from,
 		responseFormat:  responseFormat,
@@ -1144,8 +1170,14 @@ func (e *XAIExecutor) prepareResponsesRequestTo(ctx context.Context, auth *clipr
 }
 
 func (e *XAIExecutor) applyPreparedXAIHeaders(ctx context.Context, auth *cliproxyauth.Auth, headers http.Header, prepared *xaiPreparedRequest, opts cliproxyexecutor.Options) {
-	prepared.identity.ApplyHeaders(headers)
 	plan := helps.XAIPlanFromOptions(opts)
+	if plan != nil {
+		helps.ApplyXAIDynamicHeaders(headers, auth, plan.Config, plan.ClientHeaders, plan.Basis)
+	}
+	if prepared.baseModel != "" {
+		headers.Set("x-grok-model-override", prepared.baseModel)
+	}
+	prepared.identity.ApplyHeaders(headers)
 	if plan == nil || !plan.Config.XAI.IdentityEnabled() {
 		return
 	}
@@ -1181,7 +1213,7 @@ func (e *XAIExecutor) applyXAIMediaIdentity(ctx context.Context, auth *cliproxya
 	if baseModel != "" {
 		headers.Set("x-grok-model-override", baseModel)
 	}
-	if plan := helps.XAIPlanFromOptions(opts); plan != nil && plan.Config.XAI.IdentityEnabled() {
+	if plan := helps.XAIPlanFromOptions(opts); plan != nil && (plan.Config.XAI.IdentityEnabled() || plan.Config.XAI.DynamicHeaders) {
 		// Media endpoints accept identity headers but not Responses cache fields.
 		_, identity, err := plan.Project(auth, []byte(`{}`), headers, "")
 		if err != nil {
@@ -1407,7 +1439,8 @@ func sanitizeXAIResponsesBody(body []byte, model string) []byte {
 	return body
 }
 
-func normalizeXAITools(body []byte) []byte {
+func normalizeXAITools(body []byte, keepImageOptions ...bool) []byte {
+	keepImage := len(keepImageOptions) > 0 && keepImageOptions[0]
 	body = helps.PromoteXAIAdditionalTools(body)
 	tools := gjson.GetBytes(body, "tools")
 	if !tools.Exists() || !tools.IsArray() {
@@ -1423,7 +1456,7 @@ func normalizeXAITools(body []byte) []byte {
 			namespaceName := tool.Get("name").String()
 			if namespaceTools := tool.Get("tools"); namespaceTools.IsArray() {
 				for _, nestedTool := range namespaceTools.Array() {
-					nestedRaw, nestedChanged, ok := normalizeXAITool(nestedTool, namespaceName)
+					nestedRaw, nestedChanged, ok := normalizeXAITool(nestedTool, namespaceName, keepImage)
 					if !ok {
 						return body
 					}
@@ -1440,7 +1473,7 @@ func normalizeXAITools(body []byte) []byte {
 			}
 			continue
 		}
-		raw, toolChanged, ok := normalizeXAITool(tool, "")
+		raw, toolChanged, ok := normalizeXAITool(tool, "", keepImage)
 		if !ok {
 			return body
 		}
@@ -1519,17 +1552,51 @@ func normalizeXAIToolChoiceForTools(body []byte) []byte {
 	return body
 }
 
-func normalizeXAITool(tool gjson.Result, namespaceName string) ([]byte, bool, bool) {
+func normalizeXAITool(tool gjson.Result, namespaceName string, keepImageOptions ...bool) ([]byte, bool, bool) {
+	keepImageGeneration := len(keepImageOptions) > 0 && keepImageOptions[0]
 	toolType := tool.Get("type").String()
 	changed := false
-	if toolType == xaiToolSearchType || toolType == xaiImageGenerationToolType {
+	if toolType == xaiToolSearchType {
 		return nil, true, true
 	}
+	if toolType == xaiImageGenerationToolType && !keepImageGeneration {
+		return nil, true, true
+	}
+	if toolType == xaiCustomToolType && tool.Get("name").String() == "apply_patch" {
+		return nil, true, true
+	}
+
 	raw := []byte(tool.Raw)
-	if toolType == xaiCustomToolType {
-		if tool.Get("name").String() == "apply_patch" {
-			return nil, true, true
+	schemaTool := tool
+	if toolType == xaiFunctionToolType || toolType == xaiCustomToolType {
+		if rawParams := schemaTool.Get("parameters"); rawParams.Exists() {
+			inlinedParams := util.InlineLocalRefs(rawParams.Raw)
+			if inlinedParams != rawParams.Raw {
+				if updated, errSet := sjson.SetRawBytes(raw, "parameters", []byte(inlinedParams)); errSet == nil {
+					if inlinedDefs := gjson.GetBytes(updated, "parameters.$defs"); inlinedDefs.Exists() {
+						updated, _ = sjson.DeleteBytes(updated, "parameters.$defs")
+					}
+					if inlinedDefinitions := gjson.GetBytes(updated, "parameters.definitions"); inlinedDefinitions.Exists() {
+						updated, _ = sjson.DeleteBytes(updated, "parameters.definitions")
+					}
+					raw = updated
+					schemaTool = gjson.ParseBytes(raw)
+					changed = true
+				}
+			}
 		}
+		updatedTool, schemaChanged, ok := helps.NormalizeXAIObjectRootUnionBranchTypes(raw)
+		if !ok {
+			return nil, false, false
+		}
+		raw = updatedTool
+		if schemaChanged {
+			schemaTool = gjson.ParseBytes(raw)
+			changed = true
+			log.Debugf("xai: added object types to root union branches for tool %s.%s", namespaceName, tool.Get("name").String())
+		}
+	}
+	if toolType == xaiCustomToolType {
 		updatedTool, errSet := sjson.SetBytes(raw, "type", xaiFunctionToolType)
 		if errSet != nil {
 			return nil, false, false
@@ -1546,7 +1613,7 @@ func normalizeXAITool(tool gjson.Result, namespaceName string) ([]byte, bool, bo
 		raw = updatedTool
 		changed = true
 	}
-	if toolType == xaiFunctionToolType && !tool.Get("parameters").Exists() {
+	if toolType == xaiFunctionToolType && !schemaTool.Get("parameters").Exists() {
 		updatedTool, errSet := sjson.SetRawBytes(raw, "parameters", []byte(`{"type":"object","properties":{}}`))
 		if errSet != nil {
 			return nil, false, false
@@ -1554,10 +1621,9 @@ func normalizeXAITool(tool gjson.Result, namespaceName string) ([]byte, bool, bo
 		raw = updatedTool
 		changed = true
 	}
-	// Codex Desktop's codex_app.automation_update schema hangs xAI free/build
-	// streaming. Limit the workaround to that exact namespaced tool so unrelated
-	// tools keep their parameter contracts.
-	if toolType == xaiFunctionToolType && xaiFunctionParametersNeedSimplification(tool, namespaceName) {
+	// Simplify the Codex Desktop automation schema and root unions that xAI
+	// rejects because function parameters must resolve exclusively to objects.
+	if toolType == xaiFunctionToolType && helps.XAIFunctionParametersNeedSimplification(schemaTool, namespaceName) {
 		updatedTool, errSet := sjson.SetRawBytes(raw, "parameters", []byte(xaiSafeFunctionParameters))
 		if errSet != nil {
 			return nil, false, false
@@ -1571,7 +1637,7 @@ func normalizeXAITool(tool gjson.Result, namespaceName string) ([]byte, bool, bo
 			raw = updatedTool
 		}
 		changed = true
-		log.Debugf("xai: simplified parameters for tool %s.%s to avoid upstream hang", namespaceName, tool.Get("name").String())
+		log.Debugf("xai: simplified parameters for tool %s.%s to avoid upstream schema rejection or hang", namespaceName, tool.Get("name").String())
 	}
 	return raw, changed, true
 }
@@ -1579,9 +1645,7 @@ func normalizeXAITool(tool gjson.Result, namespaceName string) ([]byte, bool, bo
 // xaiFunctionParametersNeedSimplification reports whether a function tool is
 // the Codex Desktop automation tool known to hang xAI Responses streaming.
 func xaiFunctionParametersNeedSimplification(tool gjson.Result, namespaceName string) bool {
-	return strings.EqualFold(strings.TrimSpace(tool.Get("type").String()), xaiFunctionToolType) &&
-		strings.EqualFold(strings.TrimSpace(namespaceName), xaiCodexAppNamespaceName) &&
-		strings.EqualFold(strings.TrimSpace(tool.Get("name").String()), xaiAutomationUpdateToolName)
+	return helps.XAIFunctionParametersNeedSimplification(tool, namespaceName)
 }
 
 func sanitizeXAIInputEncryptedContent(body []byte) []byte {
@@ -2033,6 +2097,10 @@ const xaiFreeUsageExhaustedCooldown = 24 * time.Hour
 // auth cooldown / account rotation.
 func xaiStatusErr(code int, body []byte) statusErr {
 	err := statusErr{code: code, msg: string(body)}
+	if code == http.StatusForbidden && helps.IsXAIBadCredentialsBody(body) {
+		err.code = http.StatusUnauthorized
+		return err
+	}
 	if code != http.StatusTooManyRequests || !xaiFreeUsageExhausted(body) {
 		return err
 	}

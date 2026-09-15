@@ -44,6 +44,7 @@ func (s *ConfigSynthesizer) Synthesize(ctx *SynthesisContext) ([]*coreauth.Auth,
 	out = append(out, s.synthesizeClaudeKeys(ctx)...)
 	// Codex API Keys
 	out = append(out, s.synthesizeCodexKeys(ctx)...)
+	out = append(out, s.synthesizeXAIKeys(ctx)...)
 	// OpenAI-compat
 	out = append(out, s.synthesizeOpenAICompat(ctx)...)
 	// Vertex-compat
@@ -377,6 +378,59 @@ func (s *ConfigSynthesizer) synthesizeVertexCompat(ctx *SynthesisContext) []*cor
 		ApplyAuthExcludedModelsMeta(a, cfg, compat.ExcludedModels, "apikey")
 		applyConfigCredentialRequestRetry(a, compat.RequestRetry)
 		applyConfigRequestScopedErrors(a, compat.RequestScopedErrors)
+		out = append(out, a)
+	}
+	return out
+}
+
+func (s *ConfigSynthesizer) synthesizeXAIKeys(ctx *SynthesisContext) []*coreauth.Auth {
+	cfg := ctx.Config
+	now := ctx.Now
+	idGen := ctx.IDGenerator
+
+	out := make([]*coreauth.Auth, 0, len(cfg.XAIKey))
+	for i := range cfg.XAIKey {
+		ck := cfg.XAIKey[i]
+		key := strings.TrimSpace(ck.APIKey)
+		if key == "" {
+			continue
+		}
+		prefix := strings.TrimSpace(ck.Prefix)
+		id, token := idGen.Next("xai:apikey", key, ck.BaseURL)
+		attrs := map[string]string{
+			"source":       fmt.Sprintf("config:xai[%s]", token),
+			"runtime_only": "true",
+			"api_key":      key,
+		}
+		if ck.Priority != 0 {
+			attrs["priority"] = strconv.Itoa(ck.Priority)
+		}
+		applyConfigCredentialWeight(attrs, ck.Weight)
+		if ck.BaseURL != "" {
+			attrs["base_url"] = ck.BaseURL
+		}
+		if ck.Websockets {
+			attrs["websockets"] = "true"
+		}
+		if hash := diff.ComputeCodexModelsHash(ck.Models); hash != "" {
+			attrs["models_hash"] = hash
+		}
+		addConfigHeadersToAttrs(ck.Headers, attrs)
+		proxyURL := strings.TrimSpace(ck.ProxyURL)
+		a := &coreauth.Auth{
+			ID:         id,
+			Provider:   "xai",
+			Label:      "xai-apikey",
+			Prefix:     prefix,
+			Status:     coreauth.StatusActive,
+			ProxyURL:   proxyURL,
+			Attributes: attrs,
+			CreatedAt:  now,
+			UpdatedAt:  now,
+		}
+		ApplyAuthExcludedModelsMeta(a, cfg, ck.ExcludedModels, "apikey")
+		applyConfigCredentialRequestRetry(a, ck.RequestRetry)
+		applyConfigRequestScopedErrors(a, ck.RequestScopedErrors)
 		out = append(out, a)
 	}
 	return out

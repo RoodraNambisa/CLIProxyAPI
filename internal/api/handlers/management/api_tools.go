@@ -13,6 +13,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/proxyutil"
 	log "github.com/sirupsen/logrus"
@@ -28,6 +29,7 @@ const (
 var antigravityOAuthTokenURL = "https://oauth2.googleapis.com/token"
 
 type apiCallRequest struct {
+	ProviderHeaders bool              `json:"provider_headers"`
 	AuthIndexSnake  *string           `json:"auth_index"`
 	AuthIndexCamel  *string           `json:"authIndex"`
 	AuthIndexPascal *string           `json:"AuthIndex"`
@@ -206,6 +208,15 @@ func (h *Handler) APICall(c *gin.Context) {
 	}
 	if hostOverride != "" {
 		req.Host = hostOverride
+	}
+	if body.ProviderHeaders {
+		host := strings.ToLower(parsedURL.Hostname())
+		if auth == nil || auth.Provider != "xai" || parsedURL.Scheme != "https" ||
+			(host != "api.x.ai" && !strings.HasSuffix(host, ".api.x.ai")) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "provider headers require a Grok credential and an official xAI API address"})
+			return
+		}
+		helps.ApplyXAIResourceHeaders(req, auth, h.currentConfig())
 	}
 
 	httpClient := &http.Client{
@@ -672,6 +683,10 @@ func proxyURLFromAPIKeyConfig(cfg *config.Config, auth *coreauth.Auth) string {
 		}
 	case "claude":
 		if entry := resolveAPIKeyConfig(cfg.ClaudeKey, auth); entry != nil {
+			return strings.TrimSpace(entry.ProxyURL)
+		}
+	case "xai":
+		if entry := resolveAPIKeyConfigExact(cfg.XAIKey, auth); entry != nil {
 			return strings.TrimSpace(entry.ProxyURL)
 		}
 	case "codex":

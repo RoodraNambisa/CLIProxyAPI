@@ -421,6 +421,7 @@ type Config struct {
 
 	// Codex defines a list of Codex API key configurations as specified in the YAML configuration file.
 	CodexKey []CodexKey `yaml:"codex-api-key" json:"codex-api-key"`
+	XAIKey   []XAIKey   `yaml:"xai-api-key" json:"xai-api-key"`
 
 	// Codex configures provider-wide Codex request behavior.
 	Codex CodexConfig `yaml:"codex" json:"codex"`
@@ -2406,6 +2407,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	if err = cfg.XAI.Validate(); err != nil {
 		return nil, err
 	}
+	if err = cfg.ValidateXAIKeys(); err != nil {
+		return nil, err
+	}
 
 	cfg.Images.CodexModel = strings.TrimSpace(cfg.Images.CodexModel)
 	if cfg.Images.CodexModel == "" {
@@ -2541,6 +2545,7 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 
 	// Sanitize Codex keys: drop entries without base-url
 	cfg.SanitizeCodexKeys()
+	cfg.SanitizeXAIKeys()
 
 	// Sanitize Codex header defaults.
 	cfg.SanitizeCodexHeaderDefaults()
@@ -4034,6 +4039,9 @@ func SaveConfigPreserveComments(configFile string, cfg *Config) error {
 	if cfg == nil {
 		return fmt.Errorf("config is nil")
 	}
+	if errKeys := cfg.ValidateXAIKeys(); errKeys != nil {
+		return errKeys
+	}
 	if errSolver := cfg.ValidateSentinelSolver(); errSolver != nil {
 		return errSolver
 	}
@@ -4421,11 +4429,11 @@ func isKnownDefaultValue(path []string, node *yaml.Node) bool {
 			// Priority zero is an identity, not an omitted default.
 			return false
 		case "gemini-api-key.weight", "interactions-api-key.weight", "claude-api-key.weight",
-			"codex-api-key.weight", "vertex-api-key.weight", "openai-compatibility.api-key-entries.weight":
+			"codex-api-key.weight", "xai-api-key.weight", "vertex-api-key.weight", "openai-compatibility.api-key-entries.weight":
 			// An explicit zero excludes this credential only in weighted routing.
 			return false
 		case "gemini-api-key.request-retry", "interactions-api-key.request-retry", "claude-api-key.request-retry",
-			"codex-api-key.request-retry", "vertex-api-key.request-retry", "openai-compatibility.request-retry":
+			"codex-api-key.request-retry", "xai-api-key.request-retry", "vertex-api-key.request-retry", "openai-compatibility.request-retry":
 			// An explicit zero disables extra rounds instead of inheriting the global limit.
 			return false
 		case "routing.priority-overrides.per-auth-request-limit":

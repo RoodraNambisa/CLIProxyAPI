@@ -88,7 +88,7 @@ func validateModelCatalogFieldsYAML(data []byte) error {
 		}
 		return nil
 	}
-	for _, family := range []string{"gemini-api-key", "interactions-api-key", "claude-api-key", "codex-api-key", "vertex-api-key", "openai-compatibility"} {
+	for _, family := range []string{"gemini-api-key", "interactions-api-key", "claude-api-key", "codex-api-key", "xai-api-key", "vertex-api-key", "openai-compatibility"} {
 		entries, err := credentialYAMLField(document.Content[0], family, make(map[*yaml.Node]bool))
 		if err != nil {
 			return err

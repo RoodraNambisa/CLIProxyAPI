@@ -708,10 +708,34 @@ nonstream-keepalive-interval: 0
 #     excluded-models:
 #       - "gemini-2.5-pro"
 
+# Native Grok API keys use the public API by default, independently of OAuth.
+# Existing OAuth credential files and their per-model routes stay separate.
+# xai-api-key:
+#   - api-key: "YOUR_XAI_API_KEY"
+#     base-url: "https://api.x.ai/v1"
+#     prefix: ""
+#     priority: 0
+#     proxy-url: ""
+#     headers: {}
+#     models:
+#       - name: "grok-4.6"
+#         alias: "grok"
+#     excluded-models: []
+# With identity policies enabled, config keys keep random identity seeds under
+# auth-dir/.xai-identities. Preserve this directory across server restarts.
+
 # Grok global resource headers and policies. Credential custom headers win.
 # OAuth acquisition uses separate login headers. Model override and identity
 # headers are controlled by the final model and the policies below.
 xai:
+  # Preserve literal custom header values by default. When enabled, $HeaderName
+  # reads a captured client header and $CPA-SESSION-ID uses the shared session
+  # fingerprint. Missing sources are omitted; identity policies still take priority.
+  dynamic-headers: false
+  # Responses image_generation tool policy: remove (default), error, or allow.
+  # allow requires Grok 4.6+ (excluding the older grok-4.20-* product line).
+  # This policy does not affect the independent image generation endpoints.
+  image-generation-tool-policy: remove
   # Incoming Chat Completions: responses converts to /responses (default);
   # direct preserves Chat format and uses the selected model node's /chat/completions.
   # The selected node/model must support Chat. Responses requests are unaffected.

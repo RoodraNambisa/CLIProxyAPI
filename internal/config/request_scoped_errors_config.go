@@ -67,7 +67,7 @@ func validateRequestScopedErrorsYAML(data []byte) error {
 			return fmt.Errorf("oauth-request-scoped-errors contains invalid rule types")
 		}
 	}
-	for _, family := range []string{"gemini-api-key", "interactions-api-key", "claude-api-key", "codex-api-key", "vertex-api-key", "openai-compatibility"} {
+	for _, family := range []string{"gemini-api-key", "interactions-api-key", "claude-api-key", "codex-api-key", "xai-api-key", "vertex-api-key", "openai-compatibility"} {
 		entries, err := credentialYAMLField(root, family, make(map[*yaml.Node]bool))
 		if err != nil {
 			return err
@@ -134,7 +134,7 @@ func (cfg *Config) ValidateRequestScopedErrorRules() error {
 		rules [][]RequestScopedErrorRule
 	}{
 		{name: "gemini-api-key"}, {name: "interactions-api-key"}, {name: "claude-api-key"},
-		{name: "codex-api-key"}, {name: "vertex-api-key"}, {name: "openai-compatibility"},
+		{name: "codex-api-key"}, {name: "vertex-api-key"}, {name: "openai-compatibility"}, {name: "xai-api-key"},
 	}
 	for _, entry := range cfg.GeminiKey {
 		families[0].rules = append(families[0].rules, entry.RequestScopedErrors)
@@ -153,6 +153,9 @@ func (cfg *Config) ValidateRequestScopedErrorRules() error {
 	}
 	for _, entry := range cfg.OpenAICompatibility {
 		families[5].rules = append(families[5].rules, entry.RequestScopedErrors)
+	}
+	for _, entry := range cfg.XAIKey {
+		families[6].rules = append(families[6].rules, entry.RequestScopedErrors)
 	}
 	for _, family := range families {
 		for index, rules := range family.rules {

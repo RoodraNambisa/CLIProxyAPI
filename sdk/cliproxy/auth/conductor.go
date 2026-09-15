@@ -3849,6 +3849,7 @@ func prepareAuthReplacement(existing *Auth, next *Auth, skipStateCarryForward bo
 	if next == nil {
 		return
 	}
+	carryForwardXAIConfigIdentity(existing, next)
 	normalizeChatGPTWebDependencyState(next)
 	if existing != nil && !next.indexAssigned && next.Index == "" {
 		next.Index = existing.Index
@@ -7337,6 +7338,10 @@ func (m *Manager) applyAPIKeyModelAlias(auth *Auth, requestedModel string, snaps
 		upstreamModel = resolveUpstreamModelForInteractionsAPIKey(cfg, auth, requestedModel)
 	case "claude":
 		upstreamModel = resolveUpstreamModelForClaudeAPIKey(cfg, auth, requestedModel)
+	case "xai":
+		if entry := resolveXAIAPIKeyConfig(cfg, auth); entry != nil {
+			upstreamModel = resolveModelAliasFromConfigModels(requestedModel, asModelAliasEntries(entry.Models))
+		}
 	case "codex":
 		upstreamModel = resolveUpstreamModelForCodexAPIKey(cfg, auth, requestedModel)
 	case "vertex":
@@ -7377,6 +7382,10 @@ func (m *Manager) resolveAPIKeyModelAliasWithResult(auth *Auth, requestedModel s
 		}
 	case "claude":
 		if entry := resolveClaudeAPIKeyConfig(cfg, auth); entry != nil {
+			models = asModelAliasEntries(entry.Models)
+		}
+	case "xai":
+		if entry := resolveXAIAPIKeyConfig(cfg, auth); entry != nil {
 			models = asModelAliasEntries(entry.Models)
 		}
 	case "codex":
@@ -11386,7 +11395,10 @@ func (m *Manager) tryRefreshAfterUnauthorized(ctx context.Context, executor Prov
 		return auth, false, nil
 	}
 	switch provider {
-	case "antigravity":
+	case "antigravity", "xai":
+		if provider == "xai" && isAPIKeyAuth(auth) {
+			return auth, false, nil
+		}
 		if !authHasRefreshCredential(auth) {
 			return auth, false, nil
 		}
@@ -13857,4 +13869,11 @@ func (m *Manager) HttpRequest(ctx context.Context, auth *Auth, req *http.Request
 	}
 	resp.Body = &runtimeExecutionResponseBody{ReadCloser: resp.Body, release: releaseExecution}
 	return resp, nil
+}
+
+func resolveXAIAPIKeyConfig(cfg *internalconfig.Config, auth *Auth) *internalconfig.XAIKey {
+	if cfg == nil {
+		return nil
+	}
+	return resolveAPIKeyConfigExact(cfg.XAIKey, auth)
 }

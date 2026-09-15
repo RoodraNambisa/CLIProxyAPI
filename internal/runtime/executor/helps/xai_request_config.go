@@ -20,7 +20,7 @@ const XAIClientVersion = "0.2.120"
 func ApplyXAIRequestParameters(body, original []byte, defaults map[string]any, sourceFormat string) []byte {
 	paths := map[string][]string{
 		"max_output_tokens": {"max_output_tokens", "max_completion_tokens", "max_tokens"},
-		"temperature":       {"temperature"}, "top_p": {"top_p"},
+		"temperature":       {"temperature"}, "top_p": {"top_p"}, "top_k": {"top_k"},
 		"parallel_tool_calls": {"parallel_tool_calls"}, "stream_tool_calls": {"stream_tool_calls"},
 		"reasoning.effort": {"reasoning.effort", "reasoning_effort"},
 	}
@@ -160,6 +160,10 @@ func ApplyXAIResourceHeaders(req *http.Request, auth *coreauth.Auth, cfg *config
 	util.ApplyCustomHeadersFromAttrs(req, attrs)
 	if auth != nil {
 		util.ApplyCustomHeadersFromAttrs(req, auth.Attributes)
+	}
+	ApplyXAIDynamicHeaders(req.Header, auth, cfg, nil, "")
+	if settings.DynamicHeaders {
+		req.Host = req.Header.Get("Host")
 	}
 }
 

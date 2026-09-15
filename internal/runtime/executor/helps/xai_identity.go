@@ -30,6 +30,7 @@ const XAIIdentitySeedKey = "xai_identity_seed"
 // XAIRequestPlan owns configuration and client identity before translation.
 // Only the attempt counter changes; no message history or credential is retained.
 type XAIRequestPlan struct {
+	ClientHeaders                                         http.Header
 	Config                                                *config.Config
 	Session, Conversation, CacheKey, Agent, Request, Turn string
 	Basis, Source, Nonce                                  string
@@ -44,13 +45,26 @@ func NewXAIRequestPlan(ctx context.Context, cfg *config.Config, req core.Request
 		owned.XAI = cfg.XAI.Clone()
 	}
 	p := &XAIRequestPlan{Config: owned}
-	if !owned.XAI.IdentityEnabled() {
+	if !owned.XAI.IdentityEnabled() && !owned.XAI.DynamicHeaders {
 		return p, nil
 	}
 	if opts.Headers == nil && ctx != nil {
 		if c, ok := ctx.Value("gin").(*gin.Context); ok && c != nil && c.Request != nil {
 			opts.Headers = c.Request.Header
 		}
+	}
+	if owned.XAI.DynamicHeaders {
+		p.ClientHeaders = opts.Headers.Clone()
+	}
+	if !owned.XAI.IdentityEnabled() {
+		payload := opts.OriginalRequest
+		if len(payload) == 0 {
+			payload = req.Payload
+		}
+		explicit, _ := session.ExtractGrokExplicitIdentity(opts.Headers, payload, "")
+		useHistory := owned.Routing.SessionAffinityUseHistory == nil || *owned.Routing.SessionAffinityUseHistory
+		p.Basis, p.Source = coreauth.ProviderSessionFingerprint(ctx, req, opts, useHistory, explicit)
+		return p, nil
 	}
 	if owned.XAI.PoolSize() < 1 || owned.XAI.PoolSize() > 64 {
 		return nil, fmt.Errorf("xai.session-identity-pool-size must be between 1 and 64")
@@ -87,7 +101,7 @@ func NewXAIRequestPlan(ctx context.Context, cfg *config.Config, req core.Request
 			return nil, fmt.Errorf("invalid Grok identity field")
 		}
 	}
-	useHistory := (owned.XAI.SpoofSessionIdentity || owned.XAI.SessionIdentityConvergence) && (owned.Routing.SessionAffinityUseHistory == nil || *owned.Routing.SessionAffinityUseHistory)
+	useHistory := (owned.XAI.SpoofSessionIdentity || owned.XAI.SessionIdentityConvergence || owned.XAI.DynamicHeaders) && (owned.Routing.SessionAffinityUseHistory == nil || *owned.Routing.SessionAffinityUseHistory)
 	p.Basis, p.Source = coreauth.ProviderSessionFingerprint(ctx, req, opts, useHistory, explicit)
 	if p.Basis != "" {
 		switch {
@@ -143,8 +157,16 @@ func (p *XAIRequestPlan) PrepareRequestAuth(_ context.Context, auth *coreauth.Au
 		return auth, nil
 	}
 	seed := make([]byte, 32)
-	if _, err := rand.Read(seed); err != nil {
-		return nil, err
+	if auth.Attributes["runtime_only"] == "true" && strings.HasPrefix(auth.Attributes["source"], "config:xai[") {
+		var err error
+		seed, err = persistentXAIKeySeed(p.Config.AuthDir, auth.ID)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		if _, err := rand.Read(seed); err != nil {
+			return nil, err
+		}
 	}
 	updated := auth.Clone()
 	if updated.Metadata == nil {

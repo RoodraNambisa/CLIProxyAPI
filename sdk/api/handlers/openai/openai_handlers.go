@@ -14,6 +14,7 @@ import (
 	"sync"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/client/grokbuild"
 	. "github.com/router-for-me/CLIProxyAPI/v6/internal/constant"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
@@ -73,6 +74,10 @@ func (h *OpenAIAPIHandler) Models() []map[string]any {
 // It returns a list of available AI models with their capabilities
 // and specifications in OpenAI-compatible format.
 func (h *OpenAIAPIHandler) OpenAIModels(c *gin.Context) {
+	if grokbuild.IsGrokShellUserAgent(c.GetHeader("User-Agent")) {
+		h.grokBuildModels(c)
+		return
+	}
 	cfg := h.ConfigSnapshot()
 	optimizeMultiAgentV2 := cfg != nil && cfg.CodexOptimizeMultiAgentV2
 	if _, ok := c.Request.URL.Query()["client_version"]; ok {
