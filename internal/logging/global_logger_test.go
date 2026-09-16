@@ -43,3 +43,17 @@ func TestLogFormatterKeepsFailureIdentityWithoutPrivateBody(t *testing.T) {
 		t.Fatal("private diagnostic data entered console log")
 	}
 }
+
+func TestLogFormatterKeepsLocalPolicyOrigin(t *testing.T) {
+	entry := log.NewEntry(log.New())
+	entry.Data = log.Fields{"stage": "local_policy", "error_origin": "local", "policy": "disabled_image_generation_tool"}
+	formatted, err := (&LogFormatter{}).Format(entry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"stage=local_policy", "error_origin=local", "policy=disabled_image_generation_tool"} {
+		if !strings.Contains(string(formatted), want) {
+			t.Fatalf("formatted log missing %q", want)
+		}
+	}
+}

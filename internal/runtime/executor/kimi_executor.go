@@ -38,6 +38,8 @@ func NewKimiExecutor(cfg *config.Config) *KimiExecutor { return &KimiExecutor{cf
 // Identifier returns the executor identifier.
 func (e *KimiExecutor) Identifier() string { return "kimi" }
 
+func (*KimiExecutor) DeferAuthRequestCommitUntilUpstream() bool { return true }
+
 // PrepareRequest injects Kimi credentials into the outgoing HTTP request.
 func (e *KimiExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Auth) error {
 	if req == nil {

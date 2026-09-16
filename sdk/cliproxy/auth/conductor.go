@@ -2644,7 +2644,7 @@ func (m *Manager) executeStreamWithModelPool(ctx, resultCtx context.Context, exe
 			return nil, &Error{Code: "request_body_released", Message: "request body released; retry disabled"}
 		}
 		attemptCtx, usageAttempt := cliproxyexecutor.WithRequestUsageAttempt(ctx)
-		attemptCtx = cliproxyexecutor.WithUpstreamAttempt(attemptCtx)
+		attemptCtx = cliproxyexecutor.WithUpstreamAttemptSlot(attemptCtx, execOpts.AuthRequestSlot)
 		streamResult, errStream := executeProviderStream(attemptCtx, executor, auth, execReq, execOpts)
 		streamResult, errStream = validateStreamResult(streamResult, errStream)
 		errStream = recordExecutionAttemptError(attemptCtx, auth, provider, errStream)
@@ -5873,7 +5873,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				break
 			}
 			roundState.markAttempted(auth)
-			runtimeCtx = cliproxyexecutor.WithUpstreamAttempt(runtimeCtx)
+			runtimeCtx = cliproxyexecutor.WithUpstreamAttemptSlot(runtimeCtx, opts.AuthRequestSlot)
 			resp, errExec := executeProviderRequest(runtimeCtx, executor, auth, execReq, opts)
 			retiredDuringExecution := releaseExecution()
 			if !retiredDuringExecution {
@@ -5939,7 +5939,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 						authErr = nil
 						break
 					}
-					retryCtx = cliproxyexecutor.WithUpstreamAttempt(retryCtx)
+					retryCtx = cliproxyexecutor.WithUpstreamAttemptSlot(retryCtx, opts.AuthRequestSlot)
 					resp, errExec = executeProviderRequest(retryCtx, executor, auth, execReq, opts)
 					retiredDuringRetry := releaseRetry()
 					if !retiredDuringRetry {
@@ -6160,7 +6160,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 				break
 			}
 			roundState.markAttempted(auth)
-			runtimeCtx = cliproxyexecutor.WithUpstreamAttempt(runtimeCtx)
+			runtimeCtx = cliproxyexecutor.WithUpstreamAttemptSlot(runtimeCtx, opts.AuthRequestSlot)
 			resp, errExec := executor.CountTokens(runtimeCtx, auth, execReq, opts)
 			retiredDuringExecution := releaseExecution()
 			if !retiredDuringExecution {
@@ -6220,7 +6220,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 						authErr = nil
 						break
 					}
-					retryCtx = cliproxyexecutor.WithUpstreamAttempt(retryCtx)
+					retryCtx = cliproxyexecutor.WithUpstreamAttemptSlot(retryCtx, opts.AuthRequestSlot)
 					resp, errExec = executor.CountTokens(retryCtx, auth, execReq, opts)
 					retiredDuringRetry := releaseRetry()
 					if !retiredDuringRetry {
@@ -6977,6 +6977,8 @@ func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxy
 	if !requestBodyReplayable(ctx, opts) {
 		return cliproxyexecutor.Response{}, false, nil
 	}
+	opts.AuthRequestSlot = newAuthRequestSlot(opts.ExecutionDiagnostics, opts.ExecutionMetrics)
+	defer opts.AuthRequestSlot.Release()
 	routeModel := req.Model
 	_, maxRetryCredentials, _ := m.retrySettings(ctx)
 	roundState := newRequestRoundState()
@@ -6993,6 +6995,7 @@ func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxy
 			return cliproxyexecutor.Response{}, false, errPick
 		}
 		c := *candidate
+		commitImmediateAuthRequestReservation(c.executor, opts.AuthRequestSlot)
 		roundState.tried[c.auth.ID] = struct{}{}
 		roundState.markAttempted(c.auth)
 		resolvedAuth, errProxy := m.ResolveProxyAuth(ctx, c.auth)
@@ -7035,9 +7038,14 @@ func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxy
 			continue
 		}
 		pooled := len(models) > 1
-		for _, upstreamModel := range models {
+		for modelIndex, upstreamModel := range models {
 			if !requestBodyReplayable(creditsCtx, creditsOpts) {
 				return cliproxyexecutor.Response{}, false, nil
+			}
+			if modelIndex > 0 {
+				if errLimit := m.acquireAdditionalAuthRequest(c.auth, c.executor, creditsOpts.AuthRequestSlot); errLimit != nil {
+					return cliproxyexecutor.Response{}, false, errLimit
+				}
 			}
 			resultModel := m.stateModelForExecution(c.auth, routeModel, upstreamModel, pooled)
 			execReq := req
@@ -7048,7 +7056,7 @@ func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxy
 				break
 			}
 			lastPrepareErr = nil
-			runtimeCtx = cliproxyexecutor.WithUpstreamAttempt(runtimeCtx)
+			runtimeCtx = cliproxyexecutor.WithUpstreamAttemptSlot(runtimeCtx, creditsOpts.AuthRequestSlot)
 			resp, errExec := executeProviderRequest(runtimeCtx, c.executor, c.auth, execReq, creditsOpts)
 			retiredDuringExecution := releaseExecution()
 			if !retiredDuringExecution {
@@ -7082,6 +7090,8 @@ func (m *Manager) tryAntigravityCreditsExecuteStream(ctx context.Context, req cl
 	if !requestBodyReplayable(ctx, opts) {
 		return nil, false, nil
 	}
+	opts.AuthRequestSlot = newAuthRequestSlot(opts.ExecutionDiagnostics, opts.ExecutionMetrics)
+	defer opts.AuthRequestSlot.Release()
 	routeModel := req.Model
 	_, maxRetryCredentials, _ := m.retrySettings(ctx)
 	roundState := newRequestRoundState()
@@ -7098,6 +7108,7 @@ func (m *Manager) tryAntigravityCreditsExecuteStream(ctx context.Context, req cl
 			return nil, false, errPick
 		}
 		c := *candidate
+		commitImmediateAuthRequestReservation(c.executor, opts.AuthRequestSlot)
 		roundState.tried[c.auth.ID] = struct{}{}
 		roundState.markAttempted(c.auth)
 		resolvedAuth, errProxy := m.ResolveProxyAuth(ctx, c.auth)

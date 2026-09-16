@@ -366,6 +366,9 @@ func NewCodexExecutor(cfg *config.Config) *CodexExecutor { return &CodexExecutor
 
 func (e *CodexExecutor) Identifier() string { return "codex" }
 
+// DeferAuthRequestCommitUntilUpstream excludes local validation and policy rejections.
+func (*CodexExecutor) DeferAuthRequestCommitUntilUpstream() bool { return true }
+
 type codexPreparedSessionIdentity struct {
 	MultiAgentV2                  helps.CodexMultiAgentPolicy
 	StreamBootstrapBuffering      bool
@@ -2969,7 +2972,7 @@ func disabledImageGenerationToolError(cfg *config.Config) statusErr {
 	body, _ = sjson.SetBytes(body, "error.message", errCfg.Message)
 	body, _ = sjson.SetBytes(body, "error.type", errCfg.Type)
 	body, _ = sjson.SetBytes(body, "error.code", errCfg.Code)
-	return statusErr{code: errCfg.StatusCode, msg: string(body), skipAuthResult: true}
+	return statusErr{code: errCfg.StatusCode, msg: string(body), skipAuthResult: true, localPolicy: "disabled_image_generation_tool"}
 }
 
 func removeCodexImageGenerationTool(body []byte) []byte {

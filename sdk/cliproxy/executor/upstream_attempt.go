@@ -4,19 +4,31 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"sync"
 	"sync/atomic"
 	"time"
 )
 
 type upstreamAttemptContextKey struct{}
-type upstreamAttemptState struct{ attempted atomic.Bool }
+type upstreamAttemptState struct {
+	attempted atomic.Bool
+	once      sync.Once
+	commit    authRequestCommit
+}
 
 // WithUpstreamAttempt isolates transport evidence for one executor attempt.
 func WithUpstreamAttempt(ctx context.Context) context.Context {
+	return WithUpstreamAttemptSlot(ctx, nil)
+}
+
+// WithUpstreamAttemptSlot commits the captured request reservation only when
+// the executor observes model-request transport activity. Local failures leave
+// it reserved so the manager can release it without consuming the window.
+func WithUpstreamAttemptSlot(ctx context.Context, slot *AuthRequestSlot) context.Context {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	return context.WithValue(ctx, upstreamAttemptContextKey{}, &upstreamAttemptState{})
+	return context.WithValue(ctx, upstreamAttemptContextKey{}, &upstreamAttemptState{commit: slot.commitSnapshot()})
 }
 
 func TracksUpstreamAttempt(ctx context.Context) bool {
@@ -32,7 +44,10 @@ func MarkUpstreamAttempt(ctx context.Context) {
 		return
 	}
 	if state, ok := ctx.Value(upstreamAttemptContextKey{}).(*upstreamAttemptState); ok {
-		state.attempted.Store(true)
+		state.once.Do(func() {
+			state.commit.commit()
+			state.attempted.Store(true)
+		})
 	}
 }
 

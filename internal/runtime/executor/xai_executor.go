@@ -104,6 +104,8 @@ func NewXAIExecutor(cfg *config.Config) *XAIExecutor {
 	return &XAIExecutor{cfg: cfg}
 }
 
+func (*XAIExecutor) DeferAuthRequestCommitUntilUpstream() bool { return true }
+
 // Identifier returns the provider identifier.
 func (e *XAIExecutor) Identifier() string {
 	return "xai"

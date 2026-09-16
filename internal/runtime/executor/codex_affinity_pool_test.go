@@ -39,6 +39,8 @@ func (e *codexPoolCaptureExecutor) Execute(ctx context.Context, auth *coreauth.A
 	if err != nil {
 		return core.Response{}, err
 	}
+	// Simulate the upstream dispatch represented by this capture executor.
+	core.MarkUpstreamAttempt(ctx)
 	e.calls = append(e.calls, codexPoolCapture{auth.ID, prepared, fingerprint})
 	if len(e.calls) == 1 && e.failFirst != nil {
 		e.failFirst()

@@ -335,6 +335,8 @@ func prepareAntigravityWebSearchTranslationPayload(auth *cliproxyauth.Auth, mode
 // Identifier returns the executor identifier.
 func (e *AntigravityExecutor) Identifier() string { return antigravityAuthType }
 
+func (*AntigravityExecutor) DeferAuthRequestCommitUntilUpstream() bool { return true }
+
 // PrepareRequest injects Antigravity credentials into the outgoing HTTP request.
 func (e *AntigravityExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Auth) error {
 	if req == nil {

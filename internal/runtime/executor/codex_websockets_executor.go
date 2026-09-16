@@ -2500,6 +2500,8 @@ func NewCodexAutoExecutor(cfg *config.Config) *CodexAutoExecutor {
 
 func (e *CodexAutoExecutor) Identifier() string { return "codex" }
 
+func (*CodexAutoExecutor) DeferAuthRequestCommitUntilUpstream() bool { return true }
+
 func (e *CodexAutoExecutor) PrepareProviderRequest(ctx context.Context, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, operation cliproxyexecutor.RequestOperation) (any, error) {
 	if e == nil || e.httpExec == nil {
 		return nil, fmt.Errorf("codex auto executor: http executor is nil")

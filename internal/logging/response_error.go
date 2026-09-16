@@ -19,6 +19,7 @@ type responseErrorDiagnostic struct {
 	status              int
 	code, message, body string
 	truncated           bool
+	localPolicy         string
 }
 
 // errorResponseWriter observes only failed HTTP responses and preserves all transport methods.
@@ -151,12 +152,16 @@ func buildResponseErrorDiagnostic(c *gin.Context, status int, raw []byte) respon
 }
 
 // RecordResponseError retains a bounded public error summary for streams whose HTTP status is already committed.
-func RecordResponseError(c *gin.Context, status int, body []byte) {
+func RecordResponseError(c *gin.Context, status int, body []byte, causes ...error) {
 	if c == nil {
 		return
 	}
 	if status <= 0 || status > 599 {
 		status = http.StatusInternalServerError
 	}
-	c.Set(responseErrorContextKey, buildResponseErrorDiagnostic(c, status, body))
+	diagnostic := buildResponseErrorDiagnostic(c, status, body)
+	if len(causes) > 0 {
+		diagnostic.localPolicy = LocalPolicyReason(causes[0])
+	}
+	c.Set(responseErrorContextKey, diagnostic)
 }

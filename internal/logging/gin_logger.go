@@ -95,13 +95,21 @@ func GinLogrusLogger() gin.HandlerFunc {
 			diagnostic, _ = value.(responseErrorDiagnostic)
 		}
 		if statusCode >= http.StatusBadRequest && (len(response.body) > 0 || diagnostic.status == 0) {
+			localPolicy := diagnostic.localPolicy
 			diagnostic = buildResponseErrorDiagnostic(c, statusCode, response.body)
+			diagnostic.localPolicy = localPolicy
 			diagnostic.truncated = diagnostic.truncated || response.truncated
 		}
 		if diagnostic.status != 0 {
 			logLine += fmt.Sprintf(" | error_status=%d code=%q error=%q", diagnostic.status, diagnostic.code, diagnostic.message)
 			fields["code"] = diagnostic.code
 			fields["stage"] = "response"
+			if diagnostic.localPolicy != "" {
+				fields["stage"] = "local_policy"
+				fields["error_origin"] = "local"
+				fields["policy"] = diagnostic.localPolicy
+				logLine += " | local policy rejection"
+			}
 			fields["response_body"] = managementdiag.NewManagementOnlyValue(diagnostic.body)
 			fields["response_body_truncated"] = diagnostic.truncated
 			if diagnostic.status > levelStatus {

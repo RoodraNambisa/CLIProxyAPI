@@ -190,6 +190,8 @@ func NewGeminiVertexExecutor(cfg *config.Config) *GeminiVertexExecutor {
 // Identifier returns the executor identifier.
 func (e *GeminiVertexExecutor) Identifier() string { return "vertex" }
 
+func (*GeminiVertexExecutor) DeferAuthRequestCommitUntilUpstream() bool { return true }
+
 // PrepareRequest injects Vertex credentials into the outgoing HTTP request.
 func (e *GeminiVertexExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Auth) error {
 	if req == nil {

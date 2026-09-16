@@ -741,23 +741,37 @@ func (s *AuthRequestSlot) current() AuthRequestReservation {
 
 // Commit keeps the reserved capacity until its original request window ends.
 func (s *AuthRequestSlot) Commit() bool {
+	return s.commitSnapshot().commit()
+}
+
+type authRequestCommit struct {
+	reservation AuthRequestReservation
+	diagnostics *RequestExecutionDiagnostics
+	metrics     *RequestExecutionMetrics
+}
+
+// commitSnapshot pins one reservation so late transport callbacks cannot
+// consume the next credential's slot after a retry rebinds AuthRequestSlot.
+func (s *AuthRequestSlot) commitSnapshot() authRequestCommit {
 	if s == nil {
-		return false
+		return authRequestCommit{}
 	}
 	s.mu.RLock()
-	reservation := s.reservation
-	diagnostics := s.diagnostics
-	metrics := s.metrics
+	snapshot := authRequestCommit{s.reservation, s.diagnostics, s.metrics}
 	s.mu.RUnlock()
-	if reservation == nil {
+	return snapshot
+}
+
+func (s authRequestCommit) commit() bool {
+	if s.reservation == nil {
 		return false
 	}
-	committed := reservation.Commit()
-	if committed && metrics != nil {
-		metrics.upstreamCommitted.Add(1)
+	committed := s.reservation.Commit()
+	if committed && s.metrics != nil {
+		s.metrics.upstreamCommitted.Add(1)
 	}
-	if committed || reservation.Committed() {
-		diagnostics.markUpstreamCommitted(reservation.Consumed())
+	if committed || s.reservation.Committed() {
+		s.diagnostics.markUpstreamCommitted(s.reservation.Consumed())
 	}
 	return committed
 }

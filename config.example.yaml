@@ -527,6 +527,9 @@ routing:
   fill-first-per-auth-rpm: 0 # fill-first only; 0 disables; mutually exclusive with fill-first-range > 1
   per-auth-request-limit: 0 # all strategies; 0 disables the generic per-auth fixed-window limit
   per-auth-request-window-minutes: 1 # UTC-aligned fixed window; minimum 1 minute
+  # Built-in executors reserve capacity during preparation and consume it at upstream dispatch.
+  # Local validation/policy rejections and local token counting release the reservation;
+  # requests that reached the transport still count, including upstream errors.
   # A positive generic limit takes precedence over fill-first-per-auth-rpm at the same priority.
   # Optional per-priority overrides. These take precedence over routing.strategy
   # and the global max-retry-credentials for the matching priority.

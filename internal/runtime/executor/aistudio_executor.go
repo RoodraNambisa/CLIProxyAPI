@@ -49,6 +49,8 @@ func NewAIStudioExecutor(cfg *config.Config, provider string, relay *wsrelay.Man
 // Identifier returns the executor identifier.
 func (e *AIStudioExecutor) Identifier() string { return "aistudio" }
 
+func (*AIStudioExecutor) DeferAuthRequestCommitUntilUpstream() bool { return true }
+
 // PrepareRequest prepares the HTTP request for execution.
 func (e *AIStudioExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Auth) error {
 	if req == nil {

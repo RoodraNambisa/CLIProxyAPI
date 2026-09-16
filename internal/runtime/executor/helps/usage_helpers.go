@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	translatorcommon "github.com/router-for-me/CLIProxyAPI/v6/internal/translator/common"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
@@ -323,7 +324,7 @@ func (r *UsageReporter) publishWithOutcome(ctx context.Context, detail usage.Det
 			}
 		}
 		populateUsageFailure(ctx, &primaryRecord, cause, r.diagnosticSecrets...)
-		logUsageAttemptFailure(ctx, primaryRecord, r.authName)
+		logUsageAttemptFailure(ctx, primaryRecord, r.authName, logging.LocalPolicyReason(cause))
 	}
 	additionalRecords := make([]usage.Record, 0, len(additional))
 	if !failed {

@@ -12,6 +12,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
+	coreexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
 	log "github.com/sirupsen/logrus"
 	logtest "github.com/sirupsen/logrus/hooks/test"
@@ -100,5 +101,76 @@ func TestAccessErrorLoggingPreservesCancellationAndPublicRewrite(t *testing.T) {
 				t.Fatal("client cancellation was logged as an upstream failure")
 			}
 		})
+	}
+}
+
+type accessLogPolicyError struct{ error }
+
+func (accessLogPolicyError) LocalPolicyReason() string { return "disabled_image_generation_tool" }
+
+func TestAccessErrorLoggingDistinguishesLocalPolicyAfterRewrite(t *testing.T) {
+	const originalBody = `{"error":{"message":"Rate limit exceeded for image_generation. Please try again later.","type":"rate_limit_exceeded","code":"rate_limit_exceeded"}}`
+	publicBody := map[string]any{"error": map[string]any{"code": "public_failure", "message": "public explanation"}}
+	for _, transportStatus := range []int{429, 200, 101} {
+		for _, scenario := range []string{"local", "rewritten local", "identical upstream", "upstream after local"} {
+			t.Run(fmt.Sprintf("%d/%s", transportStatus, scenario), func(t *testing.T) {
+				gin.SetMode(gin.TestMode)
+				hook := logtest.NewGlobal()
+				defer hook.Reset()
+				handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{RequestLog: false, ErrorResponseRewrites: []sdkconfig.ErrorResponseRewriteRule{{
+					Sources: []string{"codex"}, AuthPriorities: []int{3}, StatusCode: 429, MessageContains: "image_generation", ResponseStatusCode: 503, ResponseBody: &publicBody,
+				}}}, nil)
+				router := gin.New()
+				router.Use(logging.GinLogrusLogger())
+				router.GET("/error", func(c *gin.Context) {
+					ctx := context.WithValue(c.Request.Context(), "gin", c)
+					failure := &interfaces.ErrorMessage{StatusCode: 429, Error: accessLogPolicyError{errors.New(originalBody)}}
+					if scenario == "upstream after local" {
+						handler.LoggingAPIResponseError(ctx, failure)
+					}
+					if strings.Contains(scenario, "upstream") {
+						failure.Error = errors.New(originalBody)
+					}
+					failure.Error = coreexecutor.WithErrorResponseSource(failure.Error, coreexecutor.CredentialErrorResponseSource("codex", 3))
+					if scenario == "rewritten local" {
+						failure = handler.RewriteExecutionErrorResponse(failure)
+					}
+					if transportStatus == 429 {
+						handler.WriteErrorResponse(c, failure)
+						return
+					}
+					// SSE and WebSocket errors retain their already-committed HTTP status.
+					c.Status(transportStatus)
+					c.Writer.WriteHeaderNow()
+					handler.LoggingAPIResponseError(ctx, failure)
+				})
+				writer := httptest.NewRecorder()
+				router.ServeHTTP(writer, httptest.NewRequest(http.MethodGet, "/error", nil))
+				entry := hook.LastEntry()
+				wantStatus, wantBody := transportStatus, originalBody
+				if scenario == "rewritten local" {
+					wantBody = `{"error":{"code":"public_failure","message":"public explanation"}}`
+					if transportStatus == 429 {
+						wantStatus = 503
+					}
+					if entry == nil || !strings.Contains(entry.Message, "public explanation") || strings.Contains(entry.Message, "Rate limit exceeded") {
+						t.Fatalf("access log did not retain public rewrite: %+v", entry)
+					}
+				}
+				if writer.Code != wantStatus || entry == nil || entry.Data["status"] != wantStatus {
+					t.Fatalf("changed transport status: %d, %+v", writer.Code, entry)
+				}
+				if transportStatus == 429 && writer.Body.String() != wantBody {
+					t.Fatalf("changed public body: %s", writer.Body.String())
+				}
+				if strings.Contains(scenario, "upstream") {
+					if entry.Data["stage"] != "response" || entry.Data["error_origin"] != nil || entry.Data["policy"] != nil || strings.Contains(entry.Message, "local policy") {
+						t.Fatalf("upstream error mislabeled: %+v", entry)
+					}
+				} else if entry.Data["stage"] != "local_policy" || entry.Data["error_origin"] != "local" || entry.Data["policy"] != "disabled_image_generation_tool" || !strings.Contains(entry.Message, "local policy rejection") {
+					t.Fatalf("local rejection metadata missing: %+v", entry)
+				}
+			})
+		}
 	}
 }

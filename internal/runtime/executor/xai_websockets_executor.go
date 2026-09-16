@@ -1860,6 +1860,8 @@ func NewXAIAutoExecutor(cfg *config.Config) *XAIAutoExecutor {
 
 func (e *XAIAutoExecutor) Identifier() string { return "xai" }
 
+func (*XAIAutoExecutor) DeferAuthRequestCommitUntilUpstream() bool { return true }
+
 func (e *XAIAutoExecutor) PrepareProviderRequest(ctx context.Context, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, operation cliproxyexecutor.RequestOperation) (any, error) {
 	return e.httpExec.PrepareProviderRequest(ctx, req, opts, operation)
 }

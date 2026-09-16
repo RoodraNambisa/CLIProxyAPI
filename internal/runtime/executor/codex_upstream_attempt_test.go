@@ -60,7 +60,9 @@ func TestCodexEntrypointsRecordActualUpstreamAttempt(t *testing.T) {
 				opts.SourceFormat = translator.FromString(codexOpenAIImageSourceFormat)
 				opts.Alt = codexOpenAIImageGenerations
 			}
-			ctx := core.WithUpstreamAttempt(t.Context())
+			slot := &core.AuthRequestSlot{}
+			slot.Bind(&chatGPTWebUsageTestReservation{reserved: true})
+			ctx := core.WithUpstreamAttemptSlot(t.Context(), slot)
 			var err error
 			if strings.HasSuffix(operation, "stream") {
 				var result *core.StreamResult
@@ -79,6 +81,9 @@ func TestCodexEntrypointsRecordActualUpstreamAttempt(t *testing.T) {
 			var status core.StatusError
 			if calls.Load() != 1 || !core.IsUpstreamAttemptError(marked) || !errors.As(marked, &status) || status.StatusCode() != 503 {
 				t.Fatalf("upstream evidence, status or attempt count changed: calls=%d, marked=%t", calls.Load(), core.IsUpstreamAttemptError(marked))
+			}
+			if !slot.Committed() || slot.Release() {
+				t.Fatal("real upstream failure did not consume the request slot")
 			}
 		})
 	}

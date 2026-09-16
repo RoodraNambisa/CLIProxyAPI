@@ -2,6 +2,7 @@ package helps
 
 import (
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/http/httptrace"
@@ -45,5 +46,34 @@ func TestWebsocketAttemptObservationExcludesSuccessfulHandshakeAndLocalErrors(t 
 	ObserveUpstreamWebsocketWrite(ctx, nil)
 	if !executor.IsUpstreamAttemptError(executor.ErrorFromUpstreamAttempt(ctx, local)) {
 		t.Fatal("successful frame write did not mark the attempt")
+	}
+}
+
+func TestHTTPRequestLimitCountsDisconnectButNotLocalValidation(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		_ = conn.Close()
+	}))
+	defer server.Close()
+	for _, target := range []string{"unsupported://invalid", server.URL} {
+		slot := &executor.AuthRequestSlot{}
+		slot.Bind(&usageReporterTestReservation{consumed: true})
+		ctx := executor.WithUpstreamAttemptSlot(t.Context(), slot)
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, target, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = DoUpstreamHTTPRequest(server.Client(), req)
+		if target == server.URL {
+			if !errors.Is(err, io.EOF) || !slot.Committed() || slot.Release() {
+				t.Fatalf("upstream disconnect refunded request capacity: %v", err)
+			}
+		} else if err == nil || slot.Committed() || !slot.Release() {
+			t.Fatalf("local URL rejection consumed request capacity: %v", err)
+		}
 	}
 }

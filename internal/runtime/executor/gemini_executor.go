@@ -54,6 +54,8 @@ func NewGeminiExecutor(cfg *config.Config) *GeminiExecutor {
 	return &GeminiExecutor{cfg: cfg, identifier: "gemini"}
 }
 
+func (*GeminiExecutor) DeferAuthRequestCommitUntilUpstream() bool { return true }
+
 // Identifier returns the executor identifier.
 func (e *GeminiExecutor) Identifier() string {
 	if e == nil || strings.TrimSpace(e.identifier) == "" {

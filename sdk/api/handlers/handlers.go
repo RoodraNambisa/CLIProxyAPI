@@ -1881,7 +1881,11 @@ func (h *BaseAPIHandler) WriteErrorResponse(c *gin.Context, msg *interfaces.Erro
 	}
 
 	body := BuildErrorResponseBodyForMessage(status, errText, msg)
-	logging.RecordResponseError(c, status, body)
+	var cause error
+	if msg != nil {
+		cause = msg.Error
+	}
+	logging.RecordResponseError(c, status, body, cause)
 	// Append first to preserve upstream response logs, then drop duplicate payloads if already recorded.
 	var previous []byte
 	if existing, exists := c.Get("API_RESPONSE"); exists {
@@ -1915,7 +1919,7 @@ func (h *BaseAPIHandler) recordResponseError(c *gin.Context, msg *interfaces.Err
 	if projected != nil && projected.StatusCode > 0 {
 		status = projected.StatusCode
 	}
-	logging.RecordResponseError(c, status, body)
+	logging.RecordResponseError(c, status, body, msg.Error)
 }
 
 func (h *BaseAPIHandler) LoggingAPIResponseError(ctx context.Context, err *interfaces.ErrorMessage) {

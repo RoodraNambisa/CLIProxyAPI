@@ -22,6 +22,45 @@ type diagnosticStatusError struct {
 	body   string
 }
 
+type diagnosticLocalPolicyError struct{ diagnosticStatusError }
+
+func (diagnosticLocalPolicyError) LocalPolicyReason() string { return "disabled_image_generation_tool" }
+
+func TestUsageFailureDistinguishesLocalPolicyFromIdenticalUpstreamError(t *testing.T) {
+	const body = `{"error":{"type":"rate_limit_exceeded","code":"rate_limit_exceeded","message":"Rate limit exceeded for image_generation. Please try again later."}}`
+	for _, local := range []bool{false, true} {
+		t.Run(fmt.Sprint(local), func(t *testing.T) {
+			hook := logtest.NewGlobal()
+			defer hook.Reset()
+			cause := error(diagnosticStatusError{429, body})
+			if local {
+				cause = fmt.Errorf("execution: %w", diagnosticLocalPolicyError{diagnosticStatusError{429, body}})
+			}
+			record := usage.Record{Provider: "codex", Failed: true, UpstreamCommitted: true, AuthRequestSlotConsumed: true}
+			populateUsageFailure(t.Context(), &record, cause)
+			wantStage, wantMessage := "upstream", "provider request attempt failed"
+			if local {
+				wantStage, wantMessage = "local_policy", "provider request rejected by local policy"
+			}
+			if record.FailureStage != wantStage || record.StatusCode != 429 || record.ErrorCode != "rate_limit_exceeded" || record.ErrorType != "rate_limit_exceeded" || !record.UpstreamCommitted || !record.AuthRequestSlotConsumed {
+				t.Fatalf("incorrect classification or changed accounting: %+v", record)
+			}
+			logUsageAttemptFailure(t.Context(), record, "fixture.json", logging.LocalPolicyReason(cause))
+			entry := hook.LastEntry()
+			if entry == nil || !strings.HasPrefix(entry.Message, wantMessage+": Rate limit exceeded for image_generation.") || entry.Data["stage"] != wantStage {
+				t.Fatalf("incorrect failure log: %+v", entry)
+			}
+			if local {
+				if entry.Data["error_origin"] != "local" || entry.Data["policy"] != "disabled_image_generation_tool" {
+					t.Fatal("local policy metadata missing")
+				}
+			} else if entry.Data["error_origin"] != nil || entry.Data["policy"] != nil {
+				t.Fatal("upstream error incorrectly labeled as local")
+			}
+		})
+	}
+}
+
 func TestUsageFailureFreezesCredentialNameAcrossAttempts(t *testing.T) {
 	hook := logtest.NewGlobal()
 	defer hook.Reset()

@@ -36,6 +36,8 @@ func NewOpenAICompatExecutor(provider string, cfg *config.Config) *OpenAICompatE
 // Identifier implements cliproxyauth.ProviderExecutor.
 func (e *OpenAICompatExecutor) Identifier() string { return e.provider }
 
+func (*OpenAICompatExecutor) DeferAuthRequestCommitUntilUpstream() bool { return true }
+
 // PrepareRequest injects OpenAI-compatible credentials into the outgoing HTTP request.
 func (e *OpenAICompatExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Auth) error {
 	if req == nil {
@@ -496,6 +498,7 @@ type statusErr struct {
 	retryAfter     *time.Duration
 	skipAuthResult bool
 	retryOtherAuth bool
+	localPolicy    string
 }
 
 func (e statusErr) Error() string {
@@ -514,6 +517,7 @@ func (e statusErr) ResponseBody() []byte {
 func (e statusErr) RetryAfter() *time.Duration { return e.retryAfter }
 func (e statusErr) SkipAuthResult() bool       { return e.skipAuthResult }
 func (e statusErr) RetryOtherAuth() bool       { return e.retryOtherAuth }
+func (e statusErr) LocalPolicyReason() string  { return e.localPolicy }
 func (e statusErr) Headers() http.Header {
 	if e.retryAfter == nil {
 		return nil

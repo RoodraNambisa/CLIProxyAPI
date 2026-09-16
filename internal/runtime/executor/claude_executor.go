@@ -86,6 +86,8 @@ func NewClaudeExecutor(cfg *config.Config) *ClaudeExecutor { return &ClaudeExecu
 
 func (e *ClaudeExecutor) Identifier() string { return "claude" }
 
+func (*ClaudeExecutor) DeferAuthRequestCommitUntilUpstream() bool { return true }
+
 // PrepareRequest injects Claude credentials into the outgoing HTTP request.
 func (e *ClaudeExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Auth) error {
 	if req == nil {

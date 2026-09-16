@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -56,5 +57,46 @@ func TestObservedUpstreamErrorKeepsDirectStatusHeadersAndRetryInterfaces(t *test
 	}
 	if value := err.(interface{ RetryAfter() *time.Duration }).RetryAfter(); value == nil || *value != 12*time.Second {
 		t.Fatal("retry hint was lost")
+	}
+}
+
+type attemptTestReservation struct{ state atomic.Int32 }
+
+func (r *attemptTestReservation) Commit() bool    { return r.state.CompareAndSwap(0, 1) }
+func (r *attemptTestReservation) Release() bool   { return r.state.CompareAndSwap(0, 2) }
+func (r *attemptTestReservation) Reserved() bool  { return r.state.Load() == 0 }
+func (r *attemptTestReservation) Committed() bool { return r.state.Load() == 1 }
+func (*attemptTestReservation) Consumed() bool    { return true }
+
+func TestUpstreamAttemptCommitsOnlyItsCapturedReservationOnce(t *testing.T) {
+	for _, dispatch := range []bool{false, true} {
+		first, next := &attemptTestReservation{}, &attemptTestReservation{}
+		slot := &AuthRequestSlot{}
+		metrics, diagnostics := &RequestExecutionMetrics{}, &RequestExecutionDiagnostics{}
+		slot.SetMetrics(metrics)
+		slot.SetDiagnostics(diagnostics)
+		slot.Bind(first)
+		ctx := WithUpstreamAttemptSlot(t.Context(), slot)
+		if dispatch {
+			var work sync.WaitGroup
+			for range 16 {
+				work.Go(func() { MarkUpstreamAttempt(ctx) })
+			}
+			work.Wait()
+			if !first.Committed() || metrics.Snapshot().UpstreamCommitted != 1 || !diagnostics.CurrentAttemptCommitted() {
+				t.Fatal("transport did not commit exactly once")
+			}
+		} else if !slot.Release() || metrics.Snapshot().UpstreamCommitted != 0 {
+			t.Fatal("local rejection consumed its reservation")
+		}
+		slot.Bind(next)
+		MarkUpstreamAttempt(ctx)
+		if !next.Reserved() || diagnostics.CurrentAttemptCommitted() {
+			t.Fatal("late callback consumed or attributed the next attempt")
+		}
+		MarkUpstreamAttempt(WithUpstreamAttemptSlot(t.Context(), slot))
+		if !next.Committed() {
+			t.Fatal("new attempt could not commit its own reservation")
+		}
 	}
 }

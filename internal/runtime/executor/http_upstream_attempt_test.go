@@ -29,8 +29,10 @@ func TestProviderHTTPAttemptObservationPreservesDispatchAndCancellation(t *testi
 			credential := &auth.Auth{Provider: exec.Identifier(), Attributes: map[string]string{"api_key": "test"}, Metadata: map[string]any{"access_token": "test", "expired": time.Now().Add(time.Hour).Format(time.RFC3339)}}
 			for _, tracked := range []bool{false, true} {
 				ctx := t.Context()
+				slot := &core.AuthRequestSlot{}
+				slot.Bind(&chatGPTWebUsageTestReservation{reserved: true})
 				if tracked {
-					ctx = core.WithUpstreamAttempt(ctx)
+					ctx = core.WithUpstreamAttemptSlot(ctx, slot)
 				}
 				req, err := http.NewRequestWithContext(ctx, http.MethodGet, server.URL, nil)
 				if err != nil {
@@ -44,12 +46,17 @@ func TestProviderHTTPAttemptObservationPreservesDispatchAndCancellation(t *testi
 				if response.StatusCode != 429 || core.IsUpstreamAttemptError(core.ErrorFromUpstreamAttempt(ctx, errors.New("observed response"))) != tracked {
 					t.Fatal("tracking changed dispatch or missed the upstream response")
 				}
+				if slot.Committed() != tracked {
+					t.Fatal("HTTP attempt did not commit only the tracked slot")
+				}
 			}
-			ctx, cancel := context.WithCancel(core.WithUpstreamAttempt(t.Context()))
+			slot := &core.AuthRequestSlot{}
+			slot.Bind(&chatGPTWebUsageTestReservation{reserved: true})
+			ctx, cancel := context.WithCancel(core.WithUpstreamAttemptSlot(t.Context(), slot))
 			cancel()
 			req, _ := http.NewRequestWithContext(ctx, http.MethodGet, server.URL, nil)
 			_, err := exec.HttpRequest(ctx, credential, req)
-			if !errors.Is(err, context.Canceled) || calls.Load() != 2 {
+			if !errors.Is(err, context.Canceled) || calls.Load() != 2 || slot.Committed() || !slot.Release() {
 				t.Fatalf("cancellation or request count changed: calls=%d", calls.Load())
 			}
 		})

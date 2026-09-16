@@ -35,7 +35,11 @@ func populateUsageFailure(ctx context.Context, record *usage.Record, cause error
 	}
 	record.RequestID = safe(logging.GetRequestID(ctx), 128)
 	record.UpstreamRequestID = safe(record.UpstreamRequestID, 128)
-	if record.FailureStage == "" {
+	if logging.LocalPolicyReason(cause) != "" {
+		// A request-slot commit is not evidence that a locally rejected request
+		// reached the upstream. Keep the existing accounting flags unchanged.
+		record.FailureStage = "local_policy"
+	} else if record.FailureStage == "" {
 		record.FailureStage = "execution"
 		if executor.IsUpstreamAttemptError(executor.ErrorFromUpstreamAttempt(ctx, cause)) || record.UpstreamCommitted {
 			record.FailureStage = "upstream"
@@ -146,7 +150,7 @@ func populateUsageFailure(ctx context.Context, record *usage.Record, cause error
 	}
 }
 
-func logUsageAttemptFailure(ctx context.Context, record usage.Record, authName string) {
+func logUsageAttemptFailure(ctx context.Context, record usage.Record, authName, localPolicy string) {
 	fields := log.Fields{
 		"request_id": record.RequestID, "provider": record.Provider, "auth_index": record.AuthIndex,
 		"auth_name": authName,
@@ -161,6 +165,11 @@ func logUsageAttemptFailure(ctx context.Context, record usage.Record, authName s
 		fields["error_message"] = record.ErrorMessage
 	}
 	message := "provider request attempt failed"
+	if localPolicy != "" {
+		fields["error_origin"] = "local"
+		fields["policy"] = localPolicy
+		message = "provider request rejected by local policy"
+	}
 	if record.ErrorMessage != "" {
 		message += ": " + record.ErrorMessage
 	}
