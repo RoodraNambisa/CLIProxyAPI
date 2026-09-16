@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	translatorcommon "github.com/router-for-me/CLIProxyAPI/v6/internal/translator/common"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -25,6 +26,7 @@ type ConvertAnthropicResponseToOpenAIParams struct {
 	CreatedAt    int64
 	ResponseID   string
 	FinishReason string
+	Usage        translatorcommon.ClaudeUsage
 	// Tool calls accumulator for streaming
 	ToolCallsAccumulator map[int]*ToolCallAccumulator
 }
@@ -36,16 +38,20 @@ type ToolCallAccumulator struct {
 	Arguments strings.Builder
 }
 
-func calculateClaudeUsageTokens(usage gjson.Result) (promptTokens, completionTokens, totalTokens, cachedTokens int64) {
-	inputTokens := usage.Get("input_tokens").Int()
-	completionTokens = usage.Get("output_tokens").Int()
-	cachedTokens = usage.Get("cache_read_input_tokens").Int()
-	cacheCreationInputTokens := usage.Get("cache_creation_input_tokens").Int()
-
-	promptTokens = inputTokens + cacheCreationInputTokens + cachedTokens
-	totalTokens = promptTokens + completionTokens
-
-	return promptTokens, completionTokens, totalTokens, cachedTokens
+func applyClaudeChatUsage(out []byte, usage translatorcommon.ClaudeUsage) []byte {
+	if !usage.HasUsage {
+		return out
+	}
+	input, output, total := usage.Totals()
+	out, _ = sjson.SetBytes(out, "usage.prompt_tokens", input)
+	out, _ = sjson.SetBytes(out, "usage.completion_tokens", output)
+	out, _ = sjson.SetBytes(out, "usage.total_tokens", total)
+	out, _ = sjson.SetBytes(out, "usage.prompt_tokens_details.cached_tokens", usage.CacheReadTokens)
+	out, _ = sjson.SetBytes(out, "usage.prompt_tokens_details.cache_creation_tokens", usage.CacheCreationTokens)
+	if usage.HasReasoning {
+		out, _ = sjson.SetBytes(out, "usage.completion_tokens_details.reasoning_tokens", usage.ReasoningTokens)
+	}
+	return out
 }
 
 // ConvertClaudeResponseToOpenAI converts Claude Code streaming response format to OpenAI Chat Completions format.
@@ -100,6 +106,8 @@ func ConvertClaudeResponseToOpenAI(_ context.Context, modelName string, original
 		if message := root.Get("message"); message.Exists() {
 			(*param).(*ConvertAnthropicResponseToOpenAIParams).ResponseID = message.Get("id").String()
 			(*param).(*ConvertAnthropicResponseToOpenAIParams).CreatedAt = time.Now().Unix()
+			(*param).(*ConvertAnthropicResponseToOpenAIParams).Usage = translatorcommon.ClaudeUsage{}
+			(*param).(*ConvertAnthropicResponseToOpenAIParams).Usage.Merge(message.Get("usage"))
 
 			template, _ = sjson.SetBytes(template, "id", (*param).(*ConvertAnthropicResponseToOpenAIParams).ResponseID)
 			template, _ = sjson.SetBytes(template, "model", modelName)
@@ -215,12 +223,9 @@ func ConvertClaudeResponseToOpenAI(_ context.Context, modelName string, original
 
 		// Handle usage information for token counts
 		if usage := root.Get("usage"); usage.Exists() {
-			promptTokens, completionTokens, totalTokens, cachedTokens := calculateClaudeUsageTokens(usage)
-			template, _ = sjson.SetBytes(template, "usage.prompt_tokens", promptTokens)
-			template, _ = sjson.SetBytes(template, "usage.completion_tokens", completionTokens)
-			template, _ = sjson.SetBytes(template, "usage.total_tokens", totalTokens)
-			template, _ = sjson.SetBytes(template, "usage.prompt_tokens_details.cached_tokens", cachedTokens)
+			(*param).(*ConvertAnthropicResponseToOpenAIParams).Usage.Merge(usage)
 		}
+		template = applyClaudeChatUsage(template, (*param).(*ConvertAnthropicResponseToOpenAIParams).Usage)
 		return [][]byte{template}
 
 	case "message_stop":
@@ -294,6 +299,7 @@ func ConvertClaudeResponseToOpenAINonStream(_ context.Context, _ string, origina
 	var model string
 	var createdAt int64
 	var stopReason string
+	var usageTokens translatorcommon.ClaudeUsage
 	var contentParts []string
 	var reasoningParts []string
 	toolCallsAccumulator := make(map[int]*ToolCallAccumulator)
@@ -309,6 +315,8 @@ func ConvertClaudeResponseToOpenAINonStream(_ context.Context, _ string, origina
 				messageID = message.Get("id").String()
 				model = message.Get("model").String()
 				createdAt = time.Now().Unix()
+				usageTokens = translatorcommon.ClaudeUsage{}
+				usageTokens.Merge(message.Get("usage"))
 			}
 
 		case "content_block_start":
@@ -371,14 +379,11 @@ func ConvertClaudeResponseToOpenAINonStream(_ context.Context, _ string, origina
 				}
 			}
 			if usage := root.Get("usage"); usage.Exists() {
-				promptTokens, completionTokens, totalTokens, cachedTokens := calculateClaudeUsageTokens(usage)
-				out, _ = sjson.SetBytes(out, "usage.prompt_tokens", promptTokens)
-				out, _ = sjson.SetBytes(out, "usage.completion_tokens", completionTokens)
-				out, _ = sjson.SetBytes(out, "usage.total_tokens", totalTokens)
-				out, _ = sjson.SetBytes(out, "usage.prompt_tokens_details.cached_tokens", cachedTokens)
+				usageTokens.Merge(usage)
 			}
 		}
 	}
+	out = applyClaudeChatUsage(out, usageTokens)
 
 	// Set basic response fields including message ID, creation time, and model
 	out, _ = sjson.SetBytes(out, "id", messageID)

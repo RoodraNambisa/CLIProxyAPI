@@ -17,11 +17,11 @@ func (m *Manager) ProbeCredential(ctx context.Context, expected *Auth, executor 
 	if m == nil || expected == nil || executor == nil || probe == nil {
 		return fmt.Errorf("credential probe is unavailable")
 	}
-	provider := strings.ToLower(expected.Provider)
-	if (provider != "codex" && provider != "xai") || executor.Identifier() != provider {
-		return fmt.Errorf("credential probe supports only Codex and Grok")
+	provider := strings.ToLower(executorKeyFromAuth(expected))
+	if IsRetiredGeminiCLIAuth(expected) || provider == "qwen" || provider == "iflow" || !strings.EqualFold(executor.Identifier(), provider) {
+		return fmt.Errorf("credential probe requires its active provider executor")
 	}
-	ctx = m.WithRoutingPolicySnapshot(coreusage.WithStreamDefault(ctx, opts.Stream))
+	ctx = m.WithRoutingPolicySnapshot(core.WithSingleAttempt(coreusage.WithStreamDefault(ctx, opts.Stream)))
 	ctx = m.withCodexQuotaObservation(ctx)
 	ctx, _, releaseProducer, err := m.beginResultPersistenceProducer(ctx)
 	if err != nil {

@@ -57,6 +57,7 @@ type upstreamAttempt struct {
 
 // RecordAPIRequest stores the upstream request metadata in Gin context for request logging.
 func RecordAPIRequest(ctx context.Context, cfg *config.Config, info UpstreamRequestLog) {
+	traceRequest(ctx, info.URL, info.Body)
 	if cfg == nil || !cfg.RequestLog {
 		return
 	}
@@ -99,6 +100,7 @@ func RecordAPIRequest(ctx context.Context, cfg *config.Config, info UpstreamRequ
 
 // RecordAPIResponseMetadata captures upstream response status/header information for the latest attempt.
 func RecordAPIResponseMetadata(ctx context.Context, cfg *config.Config, status int, headers http.Header) {
+	traceResponse(ctx, status, headers)
 	if cfg == nil || !cfg.RequestLog {
 		return
 	}
