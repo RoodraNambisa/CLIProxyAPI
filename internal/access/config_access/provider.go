@@ -40,9 +40,10 @@ func Register(cfg *sdkconfig.SDKConfig) {
 }
 
 type provider struct {
-	name     string
-	keys     map[string][]string
-	lastUsed map[string]*atomic.Int64
+	name      string
+	keys      map[string][]string
+	lastUsed  map[string]*atomic.Int64
+	targeting map[string]bool
 }
 
 func newProvider(name string, keys []string, groups []sdkconfig.APIKeyGroup) *provider {
@@ -51,11 +52,13 @@ func newProvider(name string, keys []string, groups []sdkconfig.APIKeyGroup) *pr
 		providerName = sdkaccess.DefaultAccessProviderName
 	}
 	groupProviders := make(map[string][]string, len(groups))
+	targeting := make(map[string]bool, len(groups))
 	for _, group := range groups {
 		key := strings.TrimSpace(group.APIKey)
 		if key == "" {
 			continue
 		}
+		targeting[key] = group.AllowCredentialTargeting
 		providers := normalizeProviders(group.Providers)
 		if len(providers) > 0 {
 			groupProviders[key] = providers
@@ -65,7 +68,7 @@ func newProvider(name string, keys []string, groups []sdkconfig.APIKeyGroup) *pr
 	for _, key := range keys {
 		keySet[key] = append([]string(nil), groupProviders[key]...)
 	}
-	return &provider{name: providerName, keys: keySet}
+	return &provider{name: providerName, keys: keySet, targeting: targeting}
 }
 
 func (p *provider) Identifier() string {
@@ -112,15 +115,39 @@ func (p *provider) Authenticate(_ context.Context, r *http.Request) (*sdkaccess.
 		if candidate.value == "" {
 			continue
 		}
-		if allowedProviders, ok := p.keys[candidate.value]; ok {
-			noteAPIKeyUse(p.lastUsed[candidate.value], time.Now())
+		key, target := candidate.value, ""
+		allowedProviders, ok := p.keys[key]
+		// Exact configured keys always win. Otherwise use the longest configured
+		// prefix, allowing existing keys and aliases to contain the separator.
+		if !ok {
+			for end := strings.LastIndex(key, sdkaccess.CredentialTargetSuffix); end >= 0; end = strings.LastIndex(key[:end], sdkaccess.CredentialTargetSuffix) {
+				base := key[:end]
+				if providers, exists := p.keys[base]; exists {
+					if !p.targeting[base] {
+						return nil, &sdkaccess.AuthError{Code: "credential_targeting_disabled", Message: "This API key does not allow credential targeting", StatusCode: http.StatusForbidden}
+					}
+					var errTarget error
+					target, errTarget = sdkaccess.NormalizeCredentialTarget(key[end+len(sdkaccess.CredentialTargetSuffix):])
+					if errTarget != nil {
+						return nil, &sdkaccess.AuthError{Code: "invalid_credential_target", Message: errTarget.Error(), StatusCode: http.StatusBadRequest}
+					}
+					key, allowedProviders, ok = base, providers, true
+					break
+				}
+			}
+		}
+		if ok {
+			noteAPIKeyUse(p.lastUsed[key], time.Now())
 			metadata := map[string]string{"source": candidate.source}
+			if target != "" {
+				metadata[sdkaccess.MetadataCredentialTarget] = target
+			}
 			if len(allowedProviders) > 0 {
 				metadata[sdkaccess.MetadataAllowedProviders] = strings.Join(allowedProviders, ",")
 			}
 			return &sdkaccess.Result{
 				Provider:  p.Identifier(),
-				Principal: candidate.value,
+				Principal: key,
 				Metadata:  metadata,
 			}, nil
 		}

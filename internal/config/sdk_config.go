@@ -122,6 +122,8 @@ type APIKeyGroup struct {
 	// Name is an optional display label and never participates in authorization.
 	Name      string   `yaml:"name,omitempty" json:"name,omitempty"`
 	Providers []string `yaml:"providers" json:"providers"`
+	// AllowCredentialTargeting enables explicit credential selection in client keys.
+	AllowCredentialTargeting bool `yaml:"allow-credential-targeting,omitempty" json:"allow-credential-targeting,omitempty"`
 	// Empty allow lists impose no priority restriction; exclusions always win.
 	AllowedPriorities  APIKeyPriorityList `yaml:"allowed-priorities,omitempty" json:"allowed-priorities,omitempty"`
 	ExcludedPriorities APIKeyPriorityList `yaml:"excluded-priorities,omitempty" json:"excluded-priorities,omitempty"`

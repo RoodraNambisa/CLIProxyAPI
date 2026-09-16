@@ -808,7 +808,7 @@ func (e *AntigravityExecutor) attemptCreditsFallback(
 	baseURL string,
 	originalBody []byte,
 ) (*http.Response, bool) {
-	if !antigravityCreditsRetryEnabled(e.cfg) {
+	if cliproxyexecutor.SingleAttempt(ctx) || !antigravityCreditsRetryEnabled(e.cfg) {
 		return nil, false
 	}
 	if decideAntigravity429(originalBody).kind != antigravity429DecisionFullQuotaExhausted {
@@ -987,8 +987,14 @@ func (e *AntigravityExecutor) Execute(ctx context.Context, auth *cliproxyauth.Au
 	opts.OriginalRequest = nil
 
 	baseURLs := antigravityBaseURLFallbackOrder(auth)
+	if cliproxyexecutor.SingleAttempt(ctx) && len(baseURLs) > 1 {
+		baseURLs = baseURLs[:1]
+	}
 	httpClient := newAntigravityHTTPClient(ctx, e.cfg, auth, 0)
 	attempts := antigravityRetryAttempts(auth, e.cfg)
+	if cliproxyexecutor.SingleAttempt(ctx) {
+		attempts = 1
+	}
 	useCredits := cliproxyauth.AntigravityCreditsRequested(ctx) && antigravityCreditsRetryEnabled(e.cfg)
 
 attemptLoop:
@@ -1084,7 +1090,7 @@ attemptLoop:
 						recordAntigravityCreditsFailure(auth, time.Now())
 					} else {
 						var creditsResp *http.Response
-						if helps.RequestBodyReplayable(ctx, opts) {
+						if !cliproxyexecutor.SingleAttempt(ctx) && helps.RequestBodyReplayable(ctx, opts) {
 							creditsResp, _ = e.attemptCreditsFallback(ctx, auth, httpClient, token, baseModel, requestPayload, false, opts.Alt, baseURL, bodyBytes)
 						}
 						if creditsResp != nil {
@@ -1247,9 +1253,15 @@ func (e *AntigravityExecutor) executeClaudeNonStream(ctx context.Context, auth *
 	opts.OriginalRequest = nil
 
 	baseURLs := antigravityBaseURLFallbackOrder(auth)
+	if cliproxyexecutor.SingleAttempt(ctx) && len(baseURLs) > 1 {
+		baseURLs = baseURLs[:1]
+	}
 	httpClient := newAntigravityHTTPClient(ctx, e.cfg, auth, 0)
 
 	attempts := antigravityRetryAttempts(auth, e.cfg)
+	if cliproxyexecutor.SingleAttempt(ctx) {
+		attempts = 1
+	}
 	useCredits := cliproxyauth.AntigravityCreditsRequested(ctx) && antigravityCreditsRetryEnabled(e.cfg)
 
 attemptLoop:
@@ -1754,9 +1766,15 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
 	opts.OriginalRequest = nil
 
 	baseURLs := antigravityBaseURLFallbackOrder(auth)
+	if cliproxyexecutor.SingleAttempt(ctx) && len(baseURLs) > 1 {
+		baseURLs = baseURLs[:1]
+	}
 	httpClient := newAntigravityHTTPClient(ctx, e.cfg, auth, 0)
 
 	attempts := antigravityRetryAttempts(auth, e.cfg)
+	if cliproxyexecutor.SingleAttempt(ctx) {
+		attempts = 1
+	}
 	useCredits := cliproxyauth.AntigravityCreditsRequested(ctx) && antigravityCreditsRetryEnabled(e.cfg)
 
 attemptLoop:
@@ -2160,6 +2178,9 @@ func (e *AntigravityExecutor) CountTokens(ctx context.Context, auth *cliproxyaut
 	opts.OriginalRequest = nil
 
 	baseURLs := antigravityBaseURLFallbackOrder(auth)
+	if cliproxyexecutor.SingleAttempt(ctx) && len(baseURLs) > 1 {
+		baseURLs = baseURLs[:1]
+	}
 	httpClient := newAntigravityHTTPClient(ctx, e.cfg, auth, 0)
 
 	var authID, authLabel, authType, authValue string

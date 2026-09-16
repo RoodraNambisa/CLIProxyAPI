@@ -515,7 +515,7 @@ func (s *Server) setupRoutes() {
 
 	// OpenAI compatible API routes
 	v1 := s.engine.Group("/v1")
-	v1.Use(AuthMiddleware(s.accessManager))
+	v1.Use(AuthMiddleware(s.accessManager, s.handlers.AuthManager))
 	v1.Use(s.proxyReadinessMiddleware())
 	v1.Use(s.requestBodyAuditMiddleware())
 	{
@@ -558,11 +558,11 @@ func (s *Server) setupRoutes() {
 	liveV1.POST("/realtime/calls", s.codexLive.HandleCall)
 
 	// Codex CLI search alias uses the same authentication and request policies.
-	s.engine.POST("/backend-api/codex/alpha/search", AuthMiddleware(s.accessManager), s.proxyReadinessMiddleware(), s.requestBodyAuditMiddleware(), codexSearchHandlers.Search)
+	s.engine.POST("/backend-api/codex/alpha/search", AuthMiddleware(s.accessManager, s.handlers.AuthManager), s.proxyReadinessMiddleware(), s.requestBodyAuditMiddleware(), codexSearchHandlers.Search)
 
 	// Gemini compatible API routes
 	v1beta := s.engine.Group("/v1beta")
-	v1beta.Use(AuthMiddleware(s.accessManager))
+	v1beta.Use(AuthMiddleware(s.accessManager, s.handlers.AuthManager))
 	v1beta.Use(s.proxyReadinessMiddleware())
 	v1beta.Use(s.requestBodyAuditMiddleware())
 	{
@@ -1647,7 +1647,7 @@ func (s *Server) SetWebsocketAuthChangeHandler(fn func(bool, bool)) {
 // AuthMiddleware returns a Gin middleware handler that authenticates requests
 // using the configured authentication providers. When no providers are available,
 // it allows all requests (legacy behaviour).
-func AuthMiddleware(manager *sdkaccess.Manager) gin.HandlerFunc {
+func AuthMiddleware(manager *sdkaccess.Manager, authManagers ...*auth.Manager) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if manager == nil {
 			c.Next()
@@ -1661,6 +1661,13 @@ func AuthMiddleware(manager *sdkaccess.Manager) gin.HandlerFunc {
 				c.Set("accessProvider", result.Provider)
 				if len(result.Metadata) > 0 {
 					c.Set("accessMetadata", result.Metadata)
+				}
+				var authManager *auth.Manager
+				if len(authManagers) > 0 {
+					authManager = authManagers[0]
+				}
+				if !applyCredentialTarget(c, authManager, result) {
+					return
 				}
 			}
 			c.Next()

@@ -26,6 +26,7 @@ type patchAuthFileFieldsRequest struct {
 	Names                []string                `json:"names"`
 	Fields               json.RawMessage         `json:"fields"`
 	Prefix               *string                 `json:"prefix"`
+	RoutingAlias         *string                 `json:"routing_alias"`
 	ProxyURL             *string                 `json:"proxy_url"`
 	BaseURL              *string                 `json:"base_url"`
 	Headers              map[string]string       `json:"headers"`
@@ -43,6 +44,7 @@ type patchAuthFileFieldsRequest struct {
 
 type authFileFieldValues struct {
 	prefix               *string
+	routingAlias         *string
 	proxyURL             *string
 	baseURL              *string
 	xaiCatalogSources    *[]string
@@ -115,6 +117,7 @@ func (h *Handler) patchAuthFileFieldsLegacy(c *gin.Context, req *patchAuthFileFi
 
 	values := authFileFieldValues{
 		prefix:          req.Prefix,
+		routingAlias:    req.RoutingAlias,
 		proxyURL:        req.ProxyURL,
 		baseURL:         req.BaseURL,
 		note:            req.Note,
@@ -240,6 +243,12 @@ func decodeAuthFileFieldValues(raw json.RawMessage) (authFileFieldValues, error)
 	values := authFileFieldValues{}
 	for name, value := range fields {
 		switch name {
+		case "routing_alias":
+			var decoded string
+			if err := decodeNonNullAuthField(value, &decoded); err != nil {
+				return authFileFieldValues{}, fmt.Errorf("invalid routing_alias")
+			}
+			values.routingAlias = &decoded
 		case "prefix":
 			var decoded string
 			if err := decodeNonNullAuthField(value, &decoded); err != nil {
@@ -390,18 +399,23 @@ func decodeNonNullAuthField(raw json.RawMessage, target any) error {
 }
 
 func (v authFileFieldValues) hasFields() bool {
-	return v.prefix != nil || v.proxyURL != nil || v.baseURL != nil || v.xaiCatalogSources != nil || v.xaiModelRoutes != nil || v.headersSet || v.prioritySet || v.weightSet || v.note != nil ||
+	return v.routingAlias != nil || v.prefix != nil || v.proxyURL != nil || v.baseURL != nil || v.xaiCatalogSources != nil || v.xaiModelRoutes != nil || v.headersSet || v.prioritySet || v.weightSet || v.note != nil ||
 		v.usingAPI != nil || v.websockets != nil || v.excludedSet || v.disableCooling != nil ||
 		v.loginMethod != nil || v.api798URL != nil || v.codexFingerprintMode != nil || v.errorRules.set
 }
 
 func (v authFileFieldValues) hasNonHeaderFields() bool {
-	return v.prefix != nil || v.proxyURL != nil || v.baseURL != nil || v.xaiCatalogSources != nil || v.xaiModelRoutes != nil || v.prioritySet || v.weightSet || v.note != nil || v.usingAPI != nil ||
+	return v.routingAlias != nil || v.prefix != nil || v.proxyURL != nil || v.baseURL != nil || v.xaiCatalogSources != nil || v.xaiModelRoutes != nil || v.prioritySet || v.weightSet || v.note != nil || v.usingAPI != nil ||
 		v.websockets != nil || v.excludedSet || v.disableCooling != nil || v.loginMethod != nil ||
 		v.api798URL != nil || v.codexFingerprintMode != nil || v.errorRules.set
 }
 
 func validateBatchAuthFileFields(auth *coreauth.Auth, values authFileFieldValues) error {
+	if values.routingAlias != nil {
+		if _, err := coreauth.NormalizeCredentialRoutingAlias(*values.routingAlias); err != nil {
+			return err
+		}
+	}
 	provider := strings.ToLower(strings.TrimSpace(auth.Provider))
 	if (values.xaiCatalogSources != nil || values.xaiModelRoutes != nil) && provider != "xai" {
 		return errors.New("Grok model sources and routes are only supported for xai auth files")
@@ -488,6 +502,18 @@ func (h *Handler) updateAuthFileFields(ctx context.Context, auth *coreauth.Auth,
 		unlockAuth()
 		return nil, http.StatusConflict, "credential is retained for Web dependents; restore it before editing"
 	}
+	if values.routingAlias != nil {
+		alias, _ := coreauth.NormalizeCredentialRoutingAlias(*values.routingAlias)
+		if alias != "" && alias != coreauth.CredentialRoutingAlias(current) {
+			found, errTarget := h.authManager.ResolveCredentialTarget(alias)
+			var targetError *coreauth.Error
+			missing := errors.As(errTarget, &targetError) && targetError.Code == "credential_target_not_found"
+			if !missing && (found == nil || found.ID != current.ID) {
+				unlockAuth()
+				return nil, http.StatusConflict, "routing alias is already in use"
+			}
+		}
+	}
 	updatedCandidate := current.Clone()
 	h.applyAuthFileFieldValues(updatedCandidate, values)
 	updatedCandidate.UpdatedAt = time.Now()
@@ -534,6 +560,10 @@ func (h *Handler) applyAuthFileFieldValues(auth *coreauth.Auth, values authFileF
 		value := strings.TrimSpace(*values.prefix)
 		auth.Prefix = value
 		setOrDeleteAuthString(auth, "prefix", value)
+	}
+	if values.routingAlias != nil {
+		value, _ := coreauth.NormalizeCredentialRoutingAlias(*values.routingAlias)
+		setOrDeleteAuthString(auth, coreauth.RoutingAliasMetadataKey, value)
 	}
 	if values.proxyURL != nil {
 		value := strings.TrimSpace(*values.proxyURL)

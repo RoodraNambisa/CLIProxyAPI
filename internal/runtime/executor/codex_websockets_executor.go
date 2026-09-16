@@ -422,7 +422,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		if respHS != nil {
 			helps.RecordAPIWebsocketUpgradeRejection(ctx, e.cfg, websocketUpgradeRequestLog(wsReqLog), respHS.StatusCode, respHS.Header.Clone(), bodyErr)
 		}
-		if respHS != nil && respHS.StatusCode == http.StatusUpgradeRequired && !helps.IsCodexUsageLimitError(bodyErr) {
+		if !cliproxyexecutor.SingleAttempt(ctx) && respHS != nil && respHS.StatusCode == http.StatusUpgradeRequired && !helps.IsCodexUsageLimitError(bodyErr) {
 			fallbackReq, fallbackOpts := req, opts
 			fallbackReq.Payload = fallbackPayloadRef.Bytes()
 			fallbackOpts.OriginalRequest = fallbackOriginalRef.Bytes()
@@ -482,7 +482,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		}
 		if sess != nil {
 			e.invalidateUpstreamConn(sess, conn, "send_error", errSend)
-			if helps.IsWebsocketMessageTooBig(errSend) || !helps.RequestBodyReplayable(ctx, opts) {
+			if cliproxyexecutor.SingleAttempt(ctx) || helps.IsWebsocketMessageTooBig(errSend) || !helps.RequestBodyReplayable(ctx, opts) {
 				helps.RecordAPIWebsocketError(ctx, e.cfg, "send", errSend)
 				return resp, errSend
 			}
@@ -811,7 +811,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		if respHS != nil {
 			helps.RecordAPIWebsocketUpgradeRejection(ctx, e.cfg, websocketUpgradeRequestLog(wsReqLog), respHS.StatusCode, respHS.Header.Clone(), bodyErr)
 		}
-		if respHS != nil && respHS.StatusCode == http.StatusUpgradeRequired && !helps.IsCodexUsageLimitError(bodyErr) {
+		if !cliproxyexecutor.SingleAttempt(ctx) && respHS != nil && respHS.StatusCode == http.StatusUpgradeRequired && !helps.IsCodexUsageLimitError(bodyErr) {
 			fallbackReq, fallbackOpts := req, opts
 			fallbackReq.Payload = fallbackPayloadRef.Bytes()
 			fallbackOpts.OriginalRequest = fallbackOriginalRef.Bytes()
@@ -871,7 +871,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		helps.RecordAPIWebsocketError(ctx, e.cfg, "send", errSend)
 		if sess != nil {
 			e.invalidateUpstreamConn(sess, conn, "send_error", errSend)
-			if helps.IsWebsocketMessageTooBig(errSend) || !helps.RequestBodyReplayable(ctx, opts) {
+			if cliproxyexecutor.SingleAttempt(ctx) || helps.IsWebsocketMessageTooBig(errSend) || !helps.RequestBodyReplayable(ctx, opts) {
 				sess.clearActiveForConn(readCh, conn)
 				sess.reqMu.Unlock()
 				cleanupBodies()

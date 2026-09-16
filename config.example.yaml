@@ -249,6 +249,7 @@ sentinel-solver:
 # api-key-groups:
 #   - api-key: "your-api-key-1"
 #     name: "Work" # Optional display name; empty means unnamed, up to 100 Unicode characters, no control characters.
+#     allow-credential-targeting: false # Opt in to <api-key>-auth-<auth_index or routing_alias> single-attempt tests.
 #     providers: ["codex", "xai"]
 #     allowed-priorities: [1, 2]
 #     excluded-priorities: [2]

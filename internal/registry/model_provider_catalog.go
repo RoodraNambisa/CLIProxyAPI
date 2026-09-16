@@ -13,6 +13,26 @@ type ModelCatalogSnapshot struct {
 	Providers map[string][]string
 }
 
+// GetModelCatalogForClient keeps a targeted key's list and capabilities scoped
+// to the selected credential, including its configured aliases and exclusions.
+func (r *ModelRegistry) GetModelCatalogForClient(handlerType, clientID string) ModelCatalogSnapshot {
+	catalog := ModelCatalogSnapshot{Models: []map[string]any{}, Metadata: map[string]*ModelInfo{}, Providers: map[string][]string{}}
+	r.mutex.RLock()
+	defer r.mutex.RUnlock()
+	provider := r.clientProviders[clientID]
+	for _, info := range r.clientModelInfos[clientID] {
+		if info == nil {
+			continue
+		}
+		if model := r.convertModelToMap(info, handlerType); model != nil {
+			catalog.Models = append(catalog.Models, model)
+			catalog.Metadata[info.ID] = cloneModelInfo(info)
+			catalog.Providers[info.ID] = []string{provider}
+		}
+	}
+	return catalog
+}
+
 // GetOpenAIModelCatalog captures the unrestricted catalog and capability
 // metadata together, retaining the existing global metadata selection rules.
 func (r *ModelRegistry) GetOpenAIModelCatalog() ModelCatalogSnapshot {

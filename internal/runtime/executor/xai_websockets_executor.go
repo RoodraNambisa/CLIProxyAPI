@@ -703,6 +703,10 @@ func (e *XAIWebsocketsExecutor) executeStream(ctx context.Context, auth *cliprox
 		if sess != nil {
 			sess.clearActiveForConn(readCh, conn)
 			e.invalidateUpstreamConn(sess, conn, "send_error", errSend)
+			if cliproxyexecutor.SingleAttempt(ctx) {
+				sess.reqMu.Unlock()
+				return nil, errSend
+			}
 			if plan := helps.XAIPlanFromOptions(opts); plan != nil {
 				plan.ApplyAttemptHeader(wsHeaders)
 			}

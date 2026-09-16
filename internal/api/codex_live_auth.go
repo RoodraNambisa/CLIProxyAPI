@@ -11,6 +11,10 @@ func (s *Server) codexLiveAuthMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		result, errAuth := s.accessManager.Authenticate(c.Request.Context(), c.Request)
 		if errAuth == nil && result != nil {
+			if result.Metadata[sdkaccess.MetadataCredentialTarget] != "" {
+				c.AbortWithStatusJSON(400, gin.H{"error": "fixed credential tests are not supported for realtime sessions; use chat/completions or responses"})
+				return
+			}
 			c.Set("apiKey", result.Principal)
 			c.Set("accessProvider", result.Provider)
 			if len(result.Metadata) > 0 {

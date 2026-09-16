@@ -9,6 +9,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
+	sdkaccess "github.com/router-for-me/CLIProxyAPI/v6/sdk/access"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	"golang.org/x/net/context"
 )
@@ -83,6 +84,9 @@ func (h *BaseAPIHandler) RewriteExecutionErrorResponse(msg *interfaces.ErrorMess
 
 // RewriteExecutionErrorResponseForContext applies rewrite filters using request-scoped credential source state.
 func (h *BaseAPIHandler) RewriteExecutionErrorResponseForContext(ctx context.Context, msg *interfaces.ErrorMessage) *interfaces.ErrorMessage {
+	if coreexecutor.SingleAttempt(ctx) {
+		return msg
+	}
 	var err error
 	if msg != nil {
 		err = msg.Error
@@ -92,6 +96,9 @@ func (h *BaseAPIHandler) RewriteExecutionErrorResponseForContext(ctx context.Con
 
 // RewriteExecutionErrorResponseForGin applies rewrite filters using the current Gin request source state.
 func (h *BaseAPIHandler) RewriteExecutionErrorResponseForGin(c *gin.Context, msg *interfaces.ErrorMessage) *interfaces.ErrorMessage {
+	if c != nil && c.GetString(sdkaccess.CredentialTargetAuthIDContextKey) != "" {
+		return msg
+	}
 	var err error
 	if msg != nil {
 		err = msg.Error

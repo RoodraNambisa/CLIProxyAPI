@@ -2673,7 +2673,7 @@ func (m *Manager) executeStreamWithModelPool(ctx, resultCtx context.Context, exe
 				m.markExecutionResult(ctx, result, replayOpts)
 			}
 			errStream = wrapRequestScopedAction(errStream, action, matchedAction)
-			if isResponsesCompactRequestFaultError(opts, errStream) || m.isRequestInvalidError(errStream, ctx) {
+			if cliproxyexecutor.SingleAttempt(ctx) || isResponsesCompactRequestFaultError(opts, errStream) || m.isRequestInvalidError(errStream, ctx) {
 				return nil, errStream
 			}
 			lastErr = errStream
@@ -2697,7 +2697,7 @@ func (m *Manager) executeStreamWithModelPool(ctx, resultCtx context.Context, exe
 			m.projectFailedImageGenerationQuota(ctx, auth, provider, executionResultModelForError(resultModel, bootstrapErr), opts)
 			action, matchedAction := m.matchRequestScopedErrorAction(ctx, auth, replayOpts, bootstrapErr)
 			bootstrapErr = wrapRequestScopedAction(bootstrapErr, action, matchedAction)
-			if isResponsesCompactRequestFaultError(opts, bootstrapErr) || m.isRequestInvalidError(bootstrapErr, ctx) {
+			if cliproxyexecutor.SingleAttempt(ctx) || isResponsesCompactRequestFaultError(opts, bootstrapErr) || m.isRequestInvalidError(bootstrapErr, ctx) {
 				rerr := &Error{Message: bootstrapErr.Error()}
 				if se, ok := errors.AsType[cliproxyexecutor.StatusError](bootstrapErr); ok && se != nil {
 					rerr.HTTPStatus = se.StatusCode()
@@ -4622,7 +4622,7 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 			break
 		}
 		lastErr = errExec
-		if !requestBodyReplayable(ctx, opts) {
+		if cliproxyexecutor.SingleAttempt(ctx) || !requestBodyReplayable(ctx, opts) {
 			break
 		}
 		if wait, shouldWait := cooldownWaitFromError(errExec, maxWait); shouldWait {
@@ -4649,7 +4649,7 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 		roundState = newRequestRoundState()
 	}
 	if lastErr != nil {
-		if requestBodyReplayable(ctx, opts) && !strictSessionAffinity && shouldAttemptAntigravityCreditsFallback(m, lastErr, normalized) {
+		if !cliproxyexecutor.SingleAttempt(ctx) && requestBodyReplayable(ctx, opts) && !strictSessionAffinity && shouldAttemptAntigravityCreditsFallback(m, lastErr, normalized) {
 			if resp, ok, errCredits := m.tryAntigravityCreditsExecute(ctx, req, opts); ok {
 				return resp, nil
 			} else if errCredits != nil {
@@ -4719,7 +4719,7 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 			break
 		}
 		lastErr = errExec
-		if !requestBodyReplayable(ctx, opts) {
+		if cliproxyexecutor.SingleAttempt(ctx) || !requestBodyReplayable(ctx, opts) {
 			break
 		}
 		if wait, shouldWait := cooldownWaitFromError(errExec, maxWait); shouldWait {
@@ -4817,7 +4817,7 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 			break
 		}
 		lastErr = errStream
-		if !requestBodyReplayable(ctx, opts) {
+		if cliproxyexecutor.SingleAttempt(ctx) || !requestBodyReplayable(ctx, opts) {
 			break
 		}
 		if wait, shouldWait := cooldownWaitFromError(errStream, maxWait); shouldWait {
@@ -4844,7 +4844,7 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 		roundState = newRequestRoundState()
 	}
 	if lastErr != nil {
-		if requestBodyReplayable(ctx, opts) && !strictSessionAffinity && shouldAttemptAntigravityCreditsFallback(m, lastErr, normalized) {
+		if !cliproxyexecutor.SingleAttempt(ctx) && requestBodyReplayable(ctx, opts) && !strictSessionAffinity && shouldAttemptAntigravityCreditsFallback(m, lastErr, normalized) {
 			if result, ok, errCredits := m.tryAntigravityCreditsExecuteStream(ctx, req, opts); ok {
 				return result, nil
 			} else if errCredits != nil {
@@ -5889,6 +5889,9 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				return resp, nil
 			}
 			if retiredDuringExecution {
+				if cliproxyexecutor.SingleAttempt(execCtx) {
+					return cliproxyexecutor.Response{}, withAuthErrorResponseSource(errExec, auth, provider)
+				}
 				releaseRetiredAuthRequestSlot(opts)
 				roundState.forgetRetiredAttempt(auth)
 				if errWait := waitForRetiredAuthInstanceCleanup(execCtx, auth); errWait != nil {
@@ -5988,7 +5991,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				return cliproxyexecutor.Response{}, withAuthErrorResponseSource(&requestScopedActionError{error: errExec, action: action}, auth, provider)
 			}
 			triggerChatGPTWebUnauthorizedRequestRefresh(errExec)
-			if isResponsesCompactRequestFaultError(opts, errExec) || m.isRequestInvalidError(errExec, ctx) {
+			if cliproxyexecutor.SingleAttempt(execCtx) || isResponsesCompactRequestFaultError(opts, errExec) || m.isRequestInvalidError(errExec, ctx) {
 				return cliproxyexecutor.Response{}, withAuthErrorResponseSource(errExec, auth, provider)
 			}
 			authErr = errExec
@@ -5998,7 +6001,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			continue
 		}
 		if authErr != nil {
-			if isResponsesCompactRequestFaultError(opts, authErr) || m.isRequestInvalidError(authErr, ctx) {
+			if cliproxyexecutor.SingleAttempt(execCtx) || isResponsesCompactRequestFaultError(opts, authErr) || m.isRequestInvalidError(authErr, ctx) {
 				return cliproxyexecutor.Response{}, withAuthErrorResponseSource(authErr, auth, provider)
 			}
 			if strictSessionAffinity {
@@ -6172,6 +6175,9 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 				return resp, nil
 			}
 			if retiredDuringExecution {
+				if cliproxyexecutor.SingleAttempt(execCtx) {
+					return cliproxyexecutor.Response{}, withAuthErrorResponseSource(errExec, auth, provider)
+				}
 				releaseRetiredAuthRequestSlot(opts)
 				roundState.forgetRetiredAttempt(auth)
 				if errWait := waitForRetiredAuthInstanceCleanup(execCtx, auth); errWait != nil {
@@ -6261,7 +6267,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 				return cliproxyexecutor.Response{}, withAuthErrorResponseSource(&requestScopedActionError{error: errExec, action: action}, auth, provider)
 			}
 			triggerChatGPTWebUnauthorizedRequestRefresh(errExec)
-			if m.isRequestInvalidError(errExec, ctx) {
+			if cliproxyexecutor.SingleAttempt(execCtx) || m.isRequestInvalidError(errExec, ctx) {
 				return cliproxyexecutor.Response{}, withAuthErrorResponseSource(errExec, auth, provider)
 			}
 			authErr = errExec
@@ -6271,7 +6277,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			continue
 		}
 		if authErr != nil {
-			if m.isRequestInvalidError(authErr, ctx) {
+			if cliproxyexecutor.SingleAttempt(execCtx) || m.isRequestInvalidError(authErr, ctx) {
 				return cliproxyexecutor.Response{}, withAuthErrorResponseSource(authErr, auth, provider)
 			}
 			if strictSessionAffinity {
@@ -6422,6 +6428,9 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		unregisterAttemptRelease()
 		if errStream != nil {
 			retiredDuringExecution := releaseExecution()
+			if cliproxyexecutor.SingleAttempt(execCtx) {
+				return nil, withAuthErrorResponseSource(errStream, auth, provider)
+			}
 			if retiredDuringExecution {
 				releaseRetiredAuthRequestSlot(opts)
 				roundState.forgetRetiredAttempt(auth)
@@ -6507,7 +6516,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 				m.markExecutionResult(execCtx, result)
 			}
 			triggerChatGPTWebUnauthorizedRequestRefresh(errStream)
-			if isResponsesCompactRequestFaultError(opts, errStream) || m.isRequestInvalidError(errStream, ctx) {
+			if cliproxyexecutor.SingleAttempt(ctx) || isResponsesCompactRequestFaultError(opts, errStream) || m.isRequestInvalidError(errStream, ctx) {
 				return nil, withAuthErrorResponseSource(errStream, auth, provider)
 			}
 			if strictSessionAffinity {
@@ -6575,6 +6584,9 @@ type sessionAffinityInvalidator interface {
 }
 
 func (m *Manager) bindSessionAffinity(ctx context.Context, providers []string, routeModel string, opts cliproxyexecutor.Options, auth *Auth) {
+	if cliproxyexecutor.SingleAttempt(ctx) {
+		return
+	}
 	if m == nil || auth == nil || auth.ID == "" {
 		return
 	}
@@ -11372,7 +11384,7 @@ func (m *Manager) tryRefreshAfterUnauthorized(ctx context.Context, executor Prov
 	if _, handled := requestScopedActionFromError(execErr); handled {
 		return auth, false, nil
 	}
-	if m == nil || auth == nil || alreadyTried || execErr == nil || isKnownRequestFault(execErr) {
+	if cliproxyexecutor.SingleAttempt(ctx) || m == nil || auth == nil || alreadyTried || execErr == nil || isKnownRequestFault(execErr) {
 		return auth, false, nil
 	}
 	if recoverer, ok := executor.(UnauthorizedAuthRecoverer); ok && recoverer.ShouldRecoverUnauthorized(auth, execErr) {

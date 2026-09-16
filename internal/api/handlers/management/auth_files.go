@@ -684,6 +684,7 @@ func (h *Handler) buildAuthFileEntryAtWithRuntime(auth *coreauth.Auth, now time.
 	entry := gin.H{
 		"id":             auth.ID,
 		"auth_index":     auth.Index,
+		"routing_alias":  coreauth.CredentialRoutingAlias(auth),
 		"name":           name,
 		"type":           strings.TrimSpace(auth.Provider),
 		"provider":       strings.TrimSpace(auth.Provider),

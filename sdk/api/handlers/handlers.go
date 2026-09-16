@@ -446,6 +446,11 @@ func (h *BaseAPIHandler) ModelsForProviderAccess(c *gin.Context, handlerType str
 // RestrictedModelCatalog captures derived capabilities together with the
 // formatted catalog. The boolean is false when the request is unrestricted.
 func (h *BaseAPIHandler) RestrictedModelCatalog(c *gin.Context, handlerType string) (registry.ModelCatalogSnapshot, bool) {
+	if c != nil {
+		if target := c.GetString(sdkaccess.CredentialTargetAuthIDContextKey); target != "" {
+			return registry.GetGlobalRegistry().GetModelCatalogForClient(handlerType, target), true
+		}
+	}
 	allowed, restricted := allowedProviderSetFromGin(c)
 	if !restricted {
 		return registry.ModelCatalogSnapshot{}, false
@@ -459,6 +464,25 @@ func (h *BaseAPIHandler) RestrictedModelCatalog(c *gin.Context, handlerType stri
 
 // FilterModelsByProviderAccess removes models that cannot use any provider allowed for the request API key.
 func (h *BaseAPIHandler) FilterModelsByProviderAccess(c *gin.Context, models []map[string]any) []map[string]any {
+	if c != nil {
+		if target := c.GetString(sdkaccess.CredentialTargetAuthIDContextKey); target != "" {
+			allowedModels := make(map[string]bool)
+			for _, model := range registry.GetGlobalRegistry().GetModelsForClient(target) {
+				allowedModels[model.ID] = true
+			}
+			filtered := make([]map[string]any, 0, len(models))
+			for _, model := range models {
+				id, _ := model["id"].(string)
+				if id == "" {
+					id, _ = model["name"].(string)
+				}
+				if allowedModels[strings.TrimPrefix(id, "models/")] {
+					filtered = append(filtered, model)
+				}
+			}
+			return filtered
+		}
+	}
 	allowed, restricted := allowedProviderSetFromGin(c)
 	if !restricted {
 		return models
@@ -798,6 +822,11 @@ func requestBodyReleaseControllerFromContext(ctx context.Context) *coreexecutor.
 func pinnedAuthIDFromContext(ctx context.Context) string {
 	if ctx == nil {
 		return ""
+	}
+	if c, ok := ctx.Value("gin").(*gin.Context); ok && c != nil {
+		if target := c.GetString(sdkaccess.CredentialTargetAuthIDContextKey); target != "" {
+			return target
+		}
 	}
 	raw := ctx.Value(pinnedAuthContextKey{})
 	switch v := raw.(type) {
@@ -1383,6 +1412,9 @@ func (h *BaseAPIHandler) executeStreamWithResolvedProviders(ctx context.Context,
 		sentPayload := false
 		bootstrapRetries := 0
 		maxBootstrapRetries := StreamingBootstrapRetries(h.Cfg)
+		if coreexecutor.SingleAttempt(ctx) {
+			maxBootstrapRetries = 0
+		}
 		errorSent := false
 		defer func() {
 			if msg := h.ImageRequestTimeoutResponse(ctx); msg != nil && !errorSent {
