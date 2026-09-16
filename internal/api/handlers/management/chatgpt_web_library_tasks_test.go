@@ -164,3 +164,56 @@ func TestLibraryCleanupHandlerRejectsMissingConfirmationAndInvalidConcurrency(t 
 		}
 	}
 }
+
+func TestLibraryCleanupScopeContainsOnlyChatGPTWebCredentials(t *testing.T) {
+	for _, all := range []bool{false, true} {
+		t.Run(map[bool]string{false: "mixed selection rejected", true: "all limited to web"}[all], func(t *testing.T) {
+			manager := coreauth.NewManager(nil, nil, nil)
+			var calls atomic.Int32
+			executor := &libraryTaskTestExecutor{accountInfoControllerTestExecutor: &accountInfoControllerTestExecutor{}, cleanup: func(_ context.Context, a *coreauth.Auth, _ func(chatgptwebauth.LibraryCleanupProgress)) (chatgptwebauth.LibraryCleanupProgress, error) {
+				if a.Provider != chatgptwebauth.Provider {
+					t.Error("non-Web credential reached cleanup")
+				}
+				calls.Add(1)
+				return chatgptwebauth.LibraryCleanupProgress{}, nil
+			}}
+			manager.RegisterExecutor(executor)
+			for _, provider := range []string{"chatgpt-web", "codex", "xai"} {
+				if _, err := manager.Register(t.Context(), &coreauth.Auth{ID: provider + ".json", FileName: provider + ".json", Provider: provider}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			h := &Handler{authManager: manager}
+			body := `{"names":["chatgpt-web.json","codex.json","xai.json"],"confirm_delete_all_files":true,"concurrency":4}`
+			if all {
+				body = `{"all":true,"confirm_delete_all_files":true,"concurrency":4}`
+			}
+			c, r := newChatGPTWebAccountInfoRequest(http.MethodPost, body)
+			h.StartChatGPTWebLibraryCleanup(c)
+			if !all {
+				if r.Code != 400 || calls.Load() != 0 {
+					t.Fatalf("mixed request: %d calls=%d", r.Code, calls.Load())
+				}
+				return
+			}
+			if r.Code != 202 {
+				t.Fatalf("all: %d %s", r.Code, r.Body.String())
+			}
+			select {
+			case <-manager.LibraryCleanup().Done():
+			case <-time.After(3 * time.Second):
+				t.Fatal("cleanup did not complete")
+			}
+			task := manager.LibraryCleanup().Snapshot()
+			if calls.Load() != 1 || len(task.Results) != 1 || task.Results[0].Name != "chatgpt-web.json" {
+				t.Fatalf("wrong cleanup scope: %+v calls=%d", task, calls.Load())
+			}
+			for _, provider := range []string{"chatgpt-web", "codex", "xai"} {
+				auth, ok := manager.GetByID(provider + ".json")
+				if !ok || auth.Disabled || manager.AuthMaintenanceActive(auth.ID) {
+					t.Fatal("cleanup changed a credential record")
+				}
+			}
+		})
+	}
+}

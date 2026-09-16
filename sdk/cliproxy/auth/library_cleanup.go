@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"time"
 
@@ -116,6 +117,15 @@ func (m *LibraryCleanupManager) startLocked(targets []LibraryCleanupTarget, conc
 	if m.cancel != nil {
 		return nil, ErrAuthMaintenanceBusy
 	}
+	manager.mu.RLock()
+	for _, target := range targets {
+		auth := manager.auths[target.AuthID]
+		if auth == nil || !strings.EqualFold(auth.Provider, chatgptwebauth.Provider) {
+			manager.mu.RUnlock()
+			return nil, errors.New("library cleanup requires ChatGPT Web credentials")
+		}
+	}
+	manager.mu.RUnlock()
 	targets = append([]LibraryCleanupTarget(nil), targets...)
 	ctx, cancel := context.WithCancel(context.Background())
 	m.cancel, m.done = cancel, make(chan struct{})
@@ -206,7 +216,7 @@ func (m *LibraryCleanupManager) run(ctx context.Context, targets []LibraryCleanu
 				progress := chatgptwebauth.LibraryCleanupProgress{Stage: "waiting"}
 				update(progress)
 				err := manager.RunAuthMaintenance(ctx, target.AuthID, func(ctx context.Context, auth *Auth, executor ProviderExecutor) error {
-					if auth.RuntimeInstanceID() != target.InstanceID {
+					if !strings.EqualFold(auth.Provider, chatgptwebauth.Provider) || auth.RuntimeInstanceID() != target.InstanceID {
 						return errors.New("credential changed before cleanup")
 					}
 					cleaner, ok := executor.(LibraryCleanupExecutor)

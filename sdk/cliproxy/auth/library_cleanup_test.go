@@ -95,3 +95,23 @@ func TestLibraryCleanupPublicProgressPagination(t *testing.T) {
 		t.Fatal("out-of-range page did not clamp")
 	}
 }
+
+func TestLibraryCleanupRejectsNonWebTargetsBeforeStarting(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	for _, provider := range []string{"codex", "xai"} {
+		a, err := m.Register(t.Context(), &Auth{ID: provider, Provider: provider})
+		if err != nil {
+			t.Fatal(err)
+		}
+		jobs := m.LibraryCleanup()
+		if _, err := jobs.Start([]LibraryCleanupTarget{{AuthID: a.ID, InstanceID: a.RuntimeInstanceID()}}, 1, m); err == nil {
+			t.Fatalf("accepted %s credential", provider)
+		}
+		if jobs.Snapshot() != nil || m.AuthMaintenanceActive(a.ID) {
+			t.Fatal("invalid target created a task or blocked requests")
+		}
+		if jobs.ScheduleAutomatic(a, 100, m) {
+			t.Fatal("scheduled automatic cleanup for non-Web credential")
+		}
+	}
+}
