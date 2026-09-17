@@ -547,10 +547,14 @@ routing:
   #     # Optional provider/plan refinements. Empty providers match every provider.
   #     # Each field independently inherits from this priority, then from global routing.
   #     subscription-overrides:
+  #       - providers: [xai] # Omit plan-types to match every Grok credential, including unknown plans.
+  #         per-auth-request-limit: 10
+  #         per-auth-request-window-minutes: 1
   #       - providers: [codex]
   #         plan-types: [pro]
   #         per-auth-request-limit: 180
-  #       - plan-types: [plus]
+  #       - providers: [codex, chatgpt-web]
+  #         plan-types: [plus]
   #         per-auth-request-limit: 60
   #         per-auth-request-window-minutes: 10
   #     max-retry-credentials: 2

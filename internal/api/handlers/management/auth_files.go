@@ -698,6 +698,10 @@ func (h *Handler) buildAuthFileEntryAtWithRuntime(auth *coreauth.Auth, now time.
 		"size":           int64(0),
 	}
 	applyAuthCooldownStatus(entry, summarizeAuthCooldown(auth, now))
+	entry["proxy_route"] = h.authFileProxyRoute(auth, runtimeSummary)
+	if manager := h.coreAuthRuntimeManager(); manager != nil {
+		entry["request_limit"] = manager.AuthRequestLimitSummary(auth)
+	}
 	if email := authEmail(auth); email != "" {
 		entry["email"] = email
 	}

@@ -101,6 +101,7 @@ type Handler struct {
 	usagePruneTasks         *usagePruneTaskManager
 	usagePruneRunner        usagePruneRunner
 	proxyPoolManager        *proxypool.Manager
+	authProxyChecks         authFileProxyChecks
 	runtimeConfigApplier    func(context.Context, *config.Config) (config.RuntimeApplyResult, error)
 	chatGPTWebTasks         *chatGPTWebLoginTaskManager
 	chatGPTWebMutationTasks *chatGPTWebMutationTaskManager

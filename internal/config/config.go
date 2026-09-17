@@ -1732,7 +1732,8 @@ type RoutingSubscriptionOverride struct {
 	// Providers optionally limits this rule to exact runtime provider IDs.
 	// An empty list matches every provider.
 	Providers []string `yaml:"providers,omitempty" json:"providers,omitempty"`
-	// PlanTypes matches normalized credential plan_type values.
+	// PlanTypes matches normalized credential plan_type values. Empty matches all plans,
+	// including credentials without plan metadata, when Providers is specified.
 	PlanTypes []string `yaml:"plan-types" json:"plan-types"`
 	// PerAuthRequestLimit optionally overrides the inherited per-auth request limit.
 	// A non-nil zero value disables the generic request limit for matching credentials.
@@ -3572,8 +3573,8 @@ func normalizeRoutingSubscriptionOverrides(priorityIndex, priority int, override
 	for index, override := range overrides {
 		providers := normalizeStringListLower(override.Providers)
 		planTypes := normalizeRoutingPlanTypes(override.PlanTypes)
-		if len(planTypes) == 0 {
-			return nil, fmt.Errorf("routing.priority-overrides[%d] (priority %d).subscription-overrides[%d].plan-types: at least one plan type is required", priorityIndex, priority, index)
+		if len(planTypes) == 0 && len(providers) == 0 {
+			return nil, fmt.Errorf("routing.priority-overrides[%d] (priority %d).subscription-overrides[%d].plan-types: at least one provider or plan type is required", priorityIndex, priority, index)
 		}
 		if override.PerAuthRequestLimit == nil && override.PerAuthRequestWindowMinutes == nil {
 			return nil, fmt.Errorf("routing.priority-overrides[%d] (priority %d).subscription-overrides[%d]: at least one request limit field is required", priorityIndex, priority, index)
@@ -3593,6 +3594,9 @@ func normalizeRoutingSubscriptionOverrides(priorityIndex, priority int, override
 		for previousIndex, previous := range out {
 			if !routingProviderScopesOverlap(previous.Providers, providers) {
 				continue
+			}
+			if len(previous.PlanTypes) == 0 || len(planTypes) == 0 {
+				return nil, fmt.Errorf("routing.priority-overrides[%d] (priority %d).subscription-overrides: all-plan provider scope overlaps in rules %d and %d", priorityIndex, priority, previousIndex, index)
 			}
 			previousPlans := make(map[string]struct{}, len(previous.PlanTypes))
 			for _, planType := range previous.PlanTypes {

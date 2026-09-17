@@ -235,7 +235,7 @@ func TestNormalizeRoutingPriorityOverrides_RejectsInvalidSubscriptionRules(t *te
 		{
 			name: "missing plan",
 			rule: RoutingSubscriptionOverride{PerAuthRequestLimit: &limit},
-			want: "at least one plan type",
+			want: "at least one provider or plan type",
 		},
 		{
 			name: "missing fields",
@@ -253,6 +253,31 @@ func TestNormalizeRoutingPriorityOverrides_RejectsInvalidSubscriptionRules(t *te
 				t.Fatalf("NormalizeRoutingPriorityOverrides() error = %v, want %q", err, test.want)
 			}
 		})
+	}
+}
+
+func TestRoutingProviderOnlyRequestLimitsAndWildcardOverlap(t *testing.T) {
+	limit := 10
+	providerOnly := RoutingSubscriptionOverride{Providers: []string{" XAI "}, PerAuthRequestLimit: &limit}
+	for _, rules := range [][]RoutingSubscriptionOverride{
+		{providerOnly},
+		{providerOnly, {Providers: []string{"codex"}, PlanTypes: []string{"pro"}, PerAuthRequestLimit: &limit}},
+	} {
+		normalized, err := NormalizeRoutingPriorityOverrides([]RoutingPriorityOverride{{Priority: 3, SubscriptionOverrides: rules}})
+		if err != nil || normalized[0].SubscriptionOverrides[0].Providers[0] != "xai" || len(normalized[0].SubscriptionOverrides[0].PlanTypes) != 0 {
+			t.Fatalf("provider-only rule rejected: %v", err)
+		}
+	}
+	for _, other := range []RoutingSubscriptionOverride{
+		{Providers: []string{"xai"}, PlanTypes: []string{"supergrok"}, PerAuthRequestLimit: &limit},
+		{PlanTypes: []string{"pro"}, PerAuthRequestLimit: &limit},
+		providerOnly,
+	} {
+		for _, rules := range [][]RoutingSubscriptionOverride{{providerOnly, other}, {other, providerOnly}} {
+			if _, err := NormalizeRoutingPriorityOverrides([]RoutingPriorityOverride{{Priority: 3, SubscriptionOverrides: rules}}); err == nil {
+				t.Fatal("overlapping all-plan rule accepted")
+			}
+		}
 	}
 }
 

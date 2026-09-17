@@ -67,10 +67,10 @@ func routingAuthPlanType(auth *Auth) string {
 }
 
 func routingSubscriptionOverrideMatches(override internalconfig.RoutingSubscriptionOverride, auth *Auth, planType string) bool {
-	if auth == nil || planType == "" {
+	if auth == nil || len(override.PlanTypes) == 0 && len(override.Providers) == 0 {
 		return false
 	}
-	planMatched := false
+	planMatched := len(override.PlanTypes) == 0
 	for _, candidate := range override.PlanTypes {
 		if internalconfig.NormalizeRoutingPlanType(candidate) == planType {
 			planMatched = true
@@ -97,9 +97,6 @@ func applyRoutingSubscriptionRequestLimitPolicy(policy authRequestLimitPolicy, a
 		return normalizeAuthRequestLimitPolicy(policy)
 	}
 	planType := routingAuthPlanType(auth)
-	if planType == "" {
-		return normalizeAuthRequestLimitPolicy(policy)
-	}
 	for _, override := range overrides {
 		if !routingSubscriptionOverrideMatches(override, auth, planType) {
 			continue

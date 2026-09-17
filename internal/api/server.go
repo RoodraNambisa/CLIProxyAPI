@@ -965,6 +965,7 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/auth-files/models", s.mgmt.GetAuthFileModels)
 		mgmt.POST("/auth-files/xai/models/refresh", s.mgmt.RefreshXAIModels)
 		mgmt.POST("/auth-files/models/probe", s.mgmt.ProbeAuthFileModel)
+		mgmt.POST("/auth-files/proxy/check", s.mgmt.CheckAuthFileProxy)
 		mgmt.GET("/model-definitions/:channel", s.mgmt.GetStaticModelDefinitions)
 		mgmt.GET("/auth-files/download", s.mgmt.DownloadAuthFile)
 		mgmt.POST("/auth-files/archive", s.mgmt.DownloadAuthFilesArchive)
