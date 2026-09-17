@@ -435,7 +435,7 @@ func providerNotAllowedError() *interfaces.ErrorMessage {
 }
 
 // ModelsForProviderAccess returns model metadata from the request's allowed
-// providers, while keeping the unrestricted catalog behavior unchanged.
+// providers and credential priorities, preserving unrestricted behavior.
 func (h *BaseAPIHandler) ModelsForProviderAccess(c *gin.Context, handlerType string) []map[string]any {
 	if catalog, restricted := h.RestrictedModelCatalog(c, handlerType); restricted {
 		return catalog.Models
@@ -447,66 +447,48 @@ func (h *BaseAPIHandler) ModelsForProviderAccess(c *gin.Context, handlerType str
 // formatted catalog. The boolean is false when the request is unrestricted.
 func (h *BaseAPIHandler) RestrictedModelCatalog(c *gin.Context, handlerType string) (registry.ModelCatalogSnapshot, bool) {
 	if c != nil {
+		// Catalog contents vary by authenticated key and credential scope. Do not
+		// let a browser or reverse proxy reuse another key's model list.
+		c.Header("Cache-Control", "private, no-store")
+		c.Writer.Header().Add("Vary", "Authorization, X-Api-Key, X-Goog-Api-Key")
 		if target := c.GetString(sdkaccess.CredentialTargetAuthIDContextKey); target != "" {
 			return registry.GetGlobalRegistry().GetModelCatalogForClient(handlerType, target), true
 		}
 	}
 	allowed, restricted := allowedProviderSetFromGin(c)
-	if !restricted {
-		return registry.ModelCatalogSnapshot{}, false
-	}
 	providers := make([]string, 0, len(allowed))
 	for provider := range allowed {
 		providers = append(providers, provider)
 	}
+	if h != nil && h.AuthManager != nil && c != nil && c.Request != nil {
+		ctx := context.WithValue(c.Request.Context(), "gin", c)
+		if clients, scoped := h.AuthManager.ClientAPIKeyCatalogClients(ctx); scoped {
+			return registry.GetGlobalRegistry().GetModelCatalogForClients(handlerType, clients, providers), true
+		}
+	}
+	if !restricted {
+		return registry.ModelCatalogSnapshot{}, false
+	}
 	return registry.GetGlobalRegistry().GetModelCatalogForProviders(handlerType, providers), true
 }
 
-// FilterModelsByProviderAccess removes models that cannot use any provider allowed for the request API key.
+// FilterModelsByProviderAccess removes models outside the request key's catalog scope.
 func (h *BaseAPIHandler) FilterModelsByProviderAccess(c *gin.Context, models []map[string]any) []map[string]any {
-	if c != nil {
-		if target := c.GetString(sdkaccess.CredentialTargetAuthIDContextKey); target != "" {
-			allowedModels := make(map[string]bool)
-			for _, model := range registry.GetGlobalRegistry().GetModelsForClient(target) {
-				allowedModels[model.ID] = true
+	if catalog, scoped := h.RestrictedModelCatalog(c, "openai"); scoped {
+		allowed := catalog.Metadata
+		filtered := make([]map[string]any, 0, len(models))
+		for _, model := range models {
+			id, _ := model["id"].(string)
+			if strings.TrimSpace(id) == "" {
+				id, _ = model["name"].(string)
 			}
-			filtered := make([]map[string]any, 0, len(models))
-			for _, model := range models {
-				id, _ := model["id"].(string)
-				if id == "" {
-					id, _ = model["name"].(string)
-				}
-				if allowedModels[strings.TrimPrefix(id, "models/")] {
-					filtered = append(filtered, model)
-				}
+			if allowed[strings.TrimPrefix(strings.TrimSpace(id), "models/")] != nil {
+				filtered = append(filtered, model)
 			}
-			return filtered
 		}
+		return filtered
 	}
-	allowed, restricted := allowedProviderSetFromGin(c)
-	if !restricted {
-		return models
-	}
-	filtered := make([]map[string]any, 0, len(models))
-	modelRegistry := registry.GetGlobalRegistry()
-	for _, model := range models {
-		modelID, _ := model["id"].(string)
-		if strings.TrimSpace(modelID) == "" {
-			modelID, _ = model["name"].(string)
-		}
-		modelID = strings.TrimPrefix(strings.TrimSpace(modelID), "models/")
-		if modelID == "" {
-			continue
-		}
-		for _, provider := range modelRegistry.GetModelProviders(modelID) {
-			if _, ok := allowed[strings.ToLower(strings.TrimSpace(provider))]; !ok {
-				continue
-			}
-			filtered = append(filtered, model)
-			break
-		}
-	}
-	return filtered
+	return models
 }
 
 // WithSelectedAuthIDCallback returns a child context that receives the selected auth ID.

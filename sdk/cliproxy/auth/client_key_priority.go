@@ -61,6 +61,38 @@ func compileClientKeyPriorities(cfg *config.Config) map[[sha256.Size]byte]client
 	return result
 }
 
+// ClientAPIKeyCatalogClients returns credential IDs permitted by the current
+// key's priority policy. The caller must also apply provider restrictions.
+// It neither clones credentials nor selects an account. False preserves the
+// existing catalog path when the key has no priority restrictions.
+func (m *Manager) ClientAPIKeyCatalogClients(ctx context.Context) ([]string, bool) {
+	if m == nil {
+		return nil, false
+	}
+	ctx = m.WithRoutingPolicySnapshot(ctx)
+	snapshot, _ := ctx.Value(clientKeyPrioritySnapshotKey{}).(*clientKeyPrioritySnapshot)
+	if snapshot == nil {
+		return nil, false
+	}
+	policy := snapshot.policy
+	if !policy.denyAll && len(policy.allowed) == 0 && len(policy.excluded) == 0 {
+		return nil, false
+	}
+	ids := make([]string, 0)
+	if policy.denyAll {
+		return ids, true
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for id, credential := range m.auths {
+		if credential == nil || credential.Disabled || credential.Status == StatusDisabled || !clientKeyPriorityAllowed(ctx, credential) || IsRetiredGeminiCLIAuth(credential) || ChatGPTWebAuthRetainedForDependents(credential) {
+			continue
+		}
+		ids = append(ids, id)
+	}
+	return ids, true
+}
+
 func clientKeyScope(ctx context.Context) (digest [sha256.Size]byte, required bool) {
 	if ctx == nil {
 		return

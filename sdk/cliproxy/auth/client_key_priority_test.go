@@ -123,6 +123,9 @@ func TestClientKeyPrioritySnapshotHotReloadAndPinnedAuth(t *testing.T) {
 		ctx  context.Context
 		want string
 	}{{captured, "1"}, {m.WithRoutingPolicySnapshot(base), "2"}} {
+		if ids, scoped := m.ClientAPIKeyCatalogClients(tc.ctx); !scoped || !reflect.DeepEqual(ids, []string{tc.want}) {
+			t.Fatalf("catalog changed its priority snapshot: %v", ids)
+		}
 		picked, _, err := m.pickNext(tc.ctx, "test", "", core.Options{}, nil)
 		if err != nil || picked.ID != tc.want {
 			t.Fatal("retry changed its priority snapshot", err)
@@ -162,5 +165,30 @@ func TestClientKeyPriorityDerivedGrantKeepsIssuerScope(t *testing.T) {
 	m.SetConfig(&config.Config{})
 	if clientKeyPriorityAllowed(m.WithRoutingPolicySnapshot(grant), allowed) {
 		t.Fatal("removed issuer became unrestricted")
+	}
+	if ids, scoped := m.ClientAPIKeyCatalogClients(grant); !scoped || len(ids) != 0 {
+		t.Fatal("removed issuer catalog became unrestricted")
+	}
+}
+
+func TestClientKeyCatalogOmitsDisabledCredentials(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	m.SetConfig(clientPriorityConfig([]int{0}, nil))
+	for _, credential := range []*Auth{
+		{ID: "active", Provider: "xai"},
+		{ID: "disabled", Provider: "xai", Disabled: true},
+		{ID: "status-disabled", Provider: "xai", Status: StatusDisabled},
+		{ID: "other-tier", Provider: "xai", Attributes: map[string]string{"priority": "3"}},
+	} {
+		if _, err := m.Register(WithSkipPersist(t.Context()), credential); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if ids, scoped := m.ClientAPIKeyCatalogClients(clientPriorityContext(t, "priority-fixture")); !scoped || !reflect.DeepEqual(ids, []string{"active"}) {
+		t.Fatalf("restricted catalog clients=%v, scoped=%v", ids, scoped)
+	}
+	m.SetConfig(clientPriorityConfig(nil, nil))
+	if _, scoped := m.ClientAPIKeyCatalogClients(clientPriorityContext(t, "priority-fixture")); scoped {
+		t.Fatal("unrestricted key lost its existing catalog path")
 	}
 }
