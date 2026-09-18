@@ -949,7 +949,7 @@ func (m *Manager) Rebind(ctx context.Context, authIDs []string) []RebindResult {
 			results = append(results, result)
 			continue
 		}
-		if resolved.Source == "pool" {
+		if resolved.Source == "pool" || resolved.Source == "direct" {
 			if _, errRemember := m.RememberCredentialBinding(memoryCtx, auth, resolved.BindingID); errRemember != nil {
 				unlockMemory()
 				result.Error = "proxy binding changed but could not be saved to credential"

@@ -3,13 +3,11 @@ package proxypool
 import (
 	"context"
 	"crypto/sha256"
-	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"net/url"
 	"reflect"
-	"sort"
 	"strconv"
 	"strings"
 
@@ -35,6 +33,9 @@ func rememberedNodeID(raw string) string {
 }
 
 func memoryForBinding(binding Binding, rawURL string) *coreauth.ProxyBindingMemory {
+	if binding.Direct {
+		return &coreauth.ProxyBindingMemory{Version: 1, Direct: true}
+	}
 	parsed, err := url.Parse(rawURL)
 	if err != nil {
 		return nil
@@ -55,14 +56,24 @@ func (m *Manager) restoreCredentialBinding(snapshot *configSnapshot, auth *corea
 	m.mu.RUnlock()
 	hasCurrent := exists && bindingCredentialGenerationMatches(current.CredentialUID, coreauth.ChatGPTWebCredentialUID(auth)) && bindingMatchesRuleTargets(current, targets)
 	if hasCurrent {
+		if current.Direct && (memory == nil || memory.Direct) {
+			return nil
+		}
 		if raw, valid := m.bindingURL(snapshot, current); valid && (memory == nil || rememberedNodeID(raw) == memory.NodeID) {
 			return nil
 		}
 	}
 	if memory != nil {
 		for _, target := range targets {
+			if target.Direct {
+				if memory.Direct {
+					_, err := m.resolveDirectBinding(snapshot, auth.ID, coreauth.ChatGPTWebCredentialUID(auth))
+					return err
+				}
+				continue
+			}
 			pool, ok := snapshot.pools[strings.ToLower(target.Pool)]
-			if target.Direct || !ok || !pool.config.RememberCredentialBinding {
+			if !ok || memory.Direct {
 				continue
 			}
 			for _, entry := range pool.entries {
@@ -88,80 +99,8 @@ func (m *Manager) restoreCredentialBinding(snapshot *configSnapshot, auth *corea
 			}
 		}
 	}
-	if hasCurrent {
-		if _, valid := m.bindingURL(snapshot, current); valid {
-			return nil
-		}
-	}
-	return m.seedCredentialBinding(snapshot, auth, targets)
-}
-
-// Initial selection is deterministic across replicas, independent of local
-// load, credential filenames and token rotation. Explicit rebind remains random.
-func (m *Manager) seedCredentialBinding(snapshot *configSnapshot, auth *coreauth.Auth, targets []config.ProxyRuleTargetConfig) error {
-	seed := stableProxyCredentialSeed(auth)
-	ordered := append([]config.ProxyRuleTargetConfig(nil), targets...)
-	sort.Slice(ordered, func(i, j int) bool {
-		if ordered[i].Priority != ordered[j].Priority {
-			return ordered[i].Priority > ordered[j].Priority
-		}
-		return rememberedNodeID(seed+proxyRuleTargetKey(ordered[i])) < rememberedNodeID(seed+proxyRuleTargetKey(ordered[j]))
-	})
-	if len(ordered) == 0 || ordered[0].Direct {
-		return nil
-	}
-	pool, ok := snapshot.pools[strings.ToLower(ordered[0].Pool)]
-	if !ok || !pool.config.RememberCredentialBinding {
-		return nil
-	}
-	// Sorting by the configured template also keeps entry renames/reordering
-	// from changing an as-yet-unwritten selection on another server.
-	pool.entries = append([]runtimeEntry(nil), pool.entries...)
-	sort.Slice(pool.entries, func(i, j int) bool {
-		a, b := pool.entries[i], pool.entries[j]
-		return a.config.URLTemplate+"|"+a.config.Ports < b.config.URLTemplate+"|"+b.config.Ports
-	})
-	count := poolCandidateCount(pool)
-	if count == 0 {
-		return nil
-	}
-	sum := sha256.Sum256([]byte(seed + "/node"))
-	ordinal := int(binary.BigEndian.Uint64(sum[:8]) % uint64(count))
-	source := &credentialBindingRandom{seed: seed + "/session"}
-	binding, _, err := m.bindingAtOrdinalWithSource(pool, auth.ID, ordinal, source)
-	if err != nil {
-		return err
-	}
-	binding.CredentialUID = coreauth.ChatGPTWebCredentialUID(auth)
-	return m.saveBindingForSnapshot(snapshot, binding)
-}
-
-func stableProxyCredentialSeed(auth *coreauth.Auth) string {
-	for _, key := range []string{"account_id", "user_id", "email", "credential_uid"} {
-		if value, ok := auth.Metadata[key].(string); ok && strings.TrimSpace(value) != "" {
-			return "proxy-binding-v1/" + strings.ToLower(auth.Provider) + "/" + key + "/" + strings.ToLower(strings.TrimSpace(value))
-		}
-	}
-	return "proxy-binding-v1/" + strings.ToLower(auth.Provider) + "/" + auth.ID
-}
-
-type credentialBindingRandom struct {
-	seed    string
-	counter uint64
-	pending []byte
-}
-
-func (r *credentialBindingRandom) Read(target []byte) (int, error) {
-	for i := range target {
-		if len(r.pending) == 0 {
-			sum := sha256.Sum256([]byte(r.seed + "/" + strconv.FormatUint(r.counter, 10)))
-			r.counter++
-			r.pending = sum[:]
-		}
-		target[i] = r.pending[0]
-		r.pending = r.pending[1:]
-	}
-	return len(target), nil
+	// No portable match: keep the existing allocator, load balancing and failover.
+	return nil
 }
 
 func (m *Manager) lockCredentialMemory(ctx context.Context, auth *coreauth.Auth) (context.Context, *coreauth.Auth, func(), error) {
@@ -169,18 +108,11 @@ func (m *Manager) lockCredentialMemory(ctx context.Context, auth *coreauth.Auth)
 	if snapshot == nil || auth.Metadata == nil {
 		return ctx, auth, func() {}, nil
 	}
-	targets, _ := config.MatchProxyRuleTargets(snapshot.rules, auth.Provider, authPriority(auth))
-	enabled := false
-	for _, target := range targets {
-		if pool, ok := snapshot.pools[strings.ToLower(target.Pool)]; ok && pool.config.RememberCredentialBinding {
-			enabled = true
-			break
-		}
-	}
+	_, matched := config.MatchProxyRuleTargets(snapshot.rules, auth.Provider, authPriority(auth))
 	m.mu.RLock()
 	writer, ok := m.auths.(credentialBindingWriter)
 	m.mu.RUnlock()
-	if !enabled || !ok || auth.RuntimeInstanceID() == "" {
+	if !matched || !ok || auth.RuntimeInstanceID() == "" {
 		return ctx, auth, func() {}, nil
 	}
 	locked, unlock, err := writer.LockProxyBindingMutation(ctx, auth)
@@ -207,12 +139,7 @@ func (m *Manager) RememberCredentialBinding(ctx context.Context, auth *coreauth.
 	source, ok := m.auths.(credentialBindingWriter)
 	binding, found := m.bindings[auth.ID]
 	m.mu.RUnlock()
-	if !ok || !found || binding.ID != bindingID || binding.Direct {
-		return auth, nil
-	}
-	snapshot := m.snapshot()
-	pool, exists := snapshot.pools[strings.ToLower(binding.Pool)]
-	if !exists || !pool.config.RememberCredentialBinding {
+	if !ok || !found || (!binding.Direct && binding.ID != bindingID) || (binding.Direct && bindingID != "") {
 		return auth, nil
 	}
 	lockedCtx, unlockAuth, err := source.LockProxyBindingMutation(ctx, auth)
@@ -231,16 +158,15 @@ func (m *Manager) RememberCredentialBinding(ctx context.Context, auth *coreauth.
 	}
 	m.configMu.RLock()
 	defer m.configMu.RUnlock()
-	snapshot = m.snapshot()
+	snapshot := m.snapshot()
 	m.mu.RLock()
 	binding, found = m.bindings[auth.ID]
 	m.mu.RUnlock()
-	if !found || binding.ID != bindingID || binding.Direct {
+	if !found || (!binding.Direct && binding.ID != bindingID) || (binding.Direct && bindingID != "") {
 		return current, nil
 	}
-	pool, exists = snapshot.pools[strings.ToLower(binding.Pool)]
 	targets, matched := config.MatchProxyRuleTargets(snapshot.rules, current.Provider, authPriority(current))
-	if !exists || !pool.config.RememberCredentialBinding || !matched || !bindingMatchesRuleTargets(binding, targets) || current.ProxyURL != "" {
+	if !matched || !bindingMatchesRuleTargets(binding, targets) || current.ProxyURL != "" {
 		return current, nil
 	}
 	raw, valid := m.bindingURL(snapshot, binding)

@@ -320,11 +320,9 @@ proxy-url: ""
 #     check-interval-seconds: 300
 #     bind-attempts: 3
 #     spread-bindings: false # Prefer unused entry/port/placeholder bindings without probing exit IPs.
-#     remember-credential-binding: false # Store a node fingerprint/session hint in file credentials.
-#     # Credential field takes precedence over server-local bindings after download/migration.
-#     # New bindings use a stable account seed across replicas. Unhealthy pins do not auto-failover;
-#     # use explicit rebind to change nodes. Removed/disallowed nodes are selected again.
-#     # Stores no proxy address/password or exit IP. Dynamic exits still depend on the provider.
+#     # Bindings are also saved in credential proxy_binding metadata for download/migration.
+#     # Restoring a permitted node preserves the normal health checks, failover and allocation rules.
+#     # Only fingerprints and session hints are stored, never proxy addresses/passwords or exit IPs.
 #     entries:
 #       - id: "home"
 #         url-template: "socks5h://user:pass@10.0.0.6"

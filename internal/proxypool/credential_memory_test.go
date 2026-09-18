@@ -3,6 +3,7 @@ package proxypool
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -50,7 +51,6 @@ func credentialMemoryFixture(t *testing.T, cfg *config.Config, id string, metada
 
 func TestCredentialProxyMemorySurvivesDownloadAndMoveWithoutSidecar(t *testing.T) {
 	cfg := proxyPoolTestConfig("3334-3336")
-	cfg.ProxyPools[0].RememberCredentialBinding = true
 	m, auths, a, store, root := credentialMemoryFixture(t, cfg, "original.json", nil)
 	before := store.writes.Load()
 	resolved, err := auths.ResolveProxyAuth(t.Context(), a)
@@ -107,30 +107,40 @@ func TestCredentialProxyMemorySurvivesDownloadAndMoveWithoutSidecar(t *testing.T
 	}
 }
 
-func TestCredentialProxyMemoryInitialReplicaSelectionIsDeterministic(t *testing.T) {
-	cfg := proxyPoolTestConfig("3334-3344")
-	cfg.ProxyPools[0].RememberCredentialBinding = true
+func TestCredentialProxyMemoryPreservesSpreadAllocation(t *testing.T) {
+	cfg := proxyPoolTestConfig("3334-3337")
 	cfg.ProxyPools[0].SpreadBindings = true
-	cfg.ProxyPools[0].Entries = append(cfg.ProxyPools[0].Entries, config.ProxyPoolEntryConfig{ID: "other", URLTemplate: "http://other-{5}:pw@other.example", Ports: "8000-8010"})
-	_, first, a, _, _ := credentialMemoryFixture(t, cfg, "one.json", nil)
-	x, err := first.ResolveProxyAuth(t.Context(), a)
-	if err != nil {
-		t.Fatal(err)
-	}
-	cfg.ProxyPools[0].Entries[0], cfg.ProxyPools[0].Entries[1] = cfg.ProxyPools[0].Entries[1], cfg.ProxyPools[0].Entries[0]
-	_, second, b, _, _ := credentialMemoryFixture(t, cfg, "another-name.json", map[string]any{"type": "codex", "account_id": "stable-test-account", "access_token": "rotated-token"})
-	y, err := second.ResolveProxyAuth(t.Context(), b)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if x.EffectiveProxyURL() != y.EffectiveProxyURL() {
-		t.Fatal("replicas chose different initial nodes or sessions")
+	cfg.ProxyPools[0].Entries[0].URLTemplate = "http://user:password@proxy.example"
+	_, auths, first, _, _ := credentialMemoryFixture(t, cfg, "one.json", nil)
+	seen := make(map[string]bool)
+	for i := range 4 {
+		a := first
+		if i > 0 {
+			var err error
+			a, err = auths.Register(t.Context(), &coreauth.Auth{ID: fmt.Sprintf("copy-%d.json", i), Provider: first.Provider, Metadata: first.Metadata})
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		resolved, err := auths.ResolveProxyAuth(t.Context(), a)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if seen[resolved.EffectiveProxyURL()] {
+			t.Fatal("credential persistence bypassed spread allocation")
+		}
+		seen[resolved.EffectiveProxyURL()] = true
+		current, _ := auths.GetByID(a.ID)
+		if coreauth.ReadProxyBindingMemory(current) == nil {
+			t.Fatal("chosen binding was not saved automatically")
+		}
 	}
 }
 
-func TestCredentialProxyMemoryStrictFailureAndExplicitRebind(t *testing.T) {
+func TestCredentialProxyMemoryFailsOverAndUpdatesReference(t *testing.T) {
 	cfg := proxyPoolTestConfig("3334-3340")
-	cfg.ProxyPools[0].RememberCredentialBinding = true
+	cfg.ProxyPools[0].SpreadBindings = true
+	cfg.ProxyPools[0].Entries[0].URLTemplate = "http://user:password@proxy.example"
 	m, auths, a, _, _ := credentialMemoryFixture(t, cfg, "stable.json", nil)
 	first, err := auths.ResolveProxyAuth(t.Context(), a)
 	if err != nil {
@@ -138,37 +148,149 @@ func TestCredentialProxyMemoryStrictFailureAndExplicitRebind(t *testing.T) {
 	}
 	fresh, _ := auths.GetByID(a.ID)
 	original := coreauth.ReadProxyBindingMemory(fresh)
-	// Mark the current node unhealthy. Do not jump to another IP automatically.
-	m.check = func(context.Context, string) TraceResult { return TraceResult{Error: "offline"} }
-	m.CheckNow(t.Context())
-	if _, err = auths.ResolveProxyAuth(t.Context(), fresh); err == nil {
-		t.Fatal("unhealthy pin silently switched node")
+	m.check = func(ctx context.Context, raw string) TraceResult {
+		if raw == first.EffectiveProxyURL() {
+			return TraceResult{Error: "offline"}
+		}
+		return successfulTrace(ctx, raw)
 	}
-	if len(m.SortedBindings()) != 1 || m.SortedBindings()[0].ID != first.EffectiveProxyBindingID() {
-		t.Fatal("failed pin allocated another node")
+	m.CheckNow(t.Context())
+	resolved, err := auths.ResolveProxyAuth(t.Context(), fresh)
+	if err != nil {
+		t.Fatalf("unhealthy node did not fail over: %v", err)
+	}
+	if resolved.EffectiveProxyURL() == first.EffectiveProxyURL() {
+		t.Fatal("unhealthy node was retained")
+	}
+	updated, _ := auths.GetByID(a.ID)
+	if reflect.DeepEqual(original, coreauth.ReadProxyBindingMemory(updated)) {
+		t.Fatal("automatic failover did not update the portable reference")
+	}
+	_, movedAuths, moved, _, _ := credentialMemoryFixture(t, cfg, "moved.json", updated.Metadata)
+	afterMove, err := movedAuths.ResolveProxyAuth(t.Context(), moved)
+	if err != nil || afterMove.EffectiveProxyURL() != resolved.EffectiveProxyURL() {
+		t.Fatalf("download after failover did not preserve replacement: %v", err)
 	}
 	m.check = successfulTrace
 	result := m.Rebind(t.Context(), []string{a.ID})
 	if len(result) != 1 || !result[0].Updated {
 		t.Fatalf("manual rebind failed: %+v", result)
 	}
-	updated, _ := auths.GetByID(a.ID)
-	if reflect.DeepEqual(original, coreauth.ReadProxyBindingMemory(updated)) {
+	manual, _ := auths.GetByID(a.ID)
+	if reflect.DeepEqual(coreauth.ReadProxyBindingMemory(updated), coreauth.ReadProxyBindingMemory(manual)) {
 		t.Fatal("manual rebind did not update the portable reference")
 	}
-	// Even a stale request snapshot must not resurrect the previous node.
-	resolved, err := auths.ResolveProxyAuth(t.Context(), fresh)
+	// A stale request must not restore the previous binding after manual rebind.
+	again, err := auths.ResolveProxyAuth(t.Context(), fresh)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resolved.EffectiveProxyURL() == first.EffectiveProxyURL() {
-		t.Fatal("stale caller restored old binding after manual rebind")
+	binding := m.SortedBindings()[0]
+	raw, _ := m.bindingURL(m.snapshot(), binding)
+	if again.EffectiveProxyURL() != raw || coreauth.ReadProxyBindingMemory(manual).NodeID != rememberedNodeID(raw) {
+		t.Fatal("stale caller restored an old binding")
+	}
+}
+
+func TestCredentialProxyMemoryPreservesTargetBalancing(t *testing.T) {
+	cfg := proxyMultiTargetTestConfig()
+	m, auths, a, _, _ := credentialMemoryFixture(t, cfg, "first.json", nil)
+	first, err := auths.ResolveProxyAuth(t.Context(), a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := auths.Register(t.Context(), &coreauth.Auth{ID: "second.json", Provider: a.Provider, Metadata: a.Metadata})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := auths.ResolveProxyAuth(t.Context(), b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.EffectiveProxyURL() == second.EffectiveProxyURL() {
+		t.Fatal("portable persistence bypassed equal-priority target balancing")
+	}
+	m.check = func(ctx context.Context, raw string) TraceResult {
+		if raw == first.EffectiveProxyURL() {
+			return TraceResult{Error: "offline"}
+		}
+		return successfulTrace(ctx, raw)
+	}
+	m.CheckNow(t.Context())
+	fresh, _ := auths.GetByID(a.ID)
+	after, err := auths.ResolveProxyAuth(t.Context(), fresh)
+	if err != nil || after.EffectiveProxyURL() != second.EffectiveProxyURL() {
+		t.Fatalf("pool failure did not fall back to another allowed target: %v", err)
+	}
+	current, _ := auths.GetByID(a.ID)
+	if coreauth.ReadProxyBindingMemory(current).NodeID != rememberedNodeID(after.EffectiveProxyURL()) {
+		t.Fatal("fallback target was not persisted")
+	}
+}
+
+func TestCredentialProxyMemoryPreservesDirectFallback(t *testing.T) {
+	cfg := proxyPoolTestConfig("3334")
+	cfg.ProxyRules[0].Pool = ""
+	cfg.ProxyRules[0].Targets = []config.ProxyRuleTargetConfig{{Pool: "residential", Priority: 1}, {Direct: true}}
+	m, auths, a, _, root := credentialMemoryFixture(t, cfg, "direct.json", nil)
+	if _, err := auths.ResolveProxyAuth(t.Context(), a); err != nil {
+		t.Fatal(err)
+	}
+	m.check = func(context.Context, string) TraceResult { return TraceResult{Error: "offline"} }
+	m.CheckNow(t.Context())
+	stale, _ := auths.GetByID(a.ID)
+	for range 2 {
+		resolved, err := auths.ResolveProxyAuth(t.Context(), stale)
+		if err != nil || resolved.EffectiveProxyURL() != "direct" {
+			t.Fatalf("direct fallback was blocked or an old node resurrected: %v", err)
+		}
+	}
+	current, _ := auths.GetByID(a.ID)
+	if memory := coreauth.ReadProxyBindingMemory(current); memory == nil || !memory.Direct {
+		t.Fatal("direct fallback retained stale proxy metadata")
+	}
+	data, err := os.ReadFile(filepath.Join(root, a.FileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !authfileguard.ConsumeManagerPersistedGeneration(filepath.Join(root, a.FileName), coreauth.SourceHashFromBytes(data)) {
+		t.Fatal("direct fallback write was not marked as manager-owned")
+	}
+	for _, allowed := range []bool{true, false} {
+		if !allowed {
+			cfg.ProxyRules[0].Targets = cfg.ProxyRules[0].Targets[:1]
+		}
+		_, movedAuths, moved, _, _ := credentialMemoryFixture(t, cfg, "moved.json", current.Metadata)
+		resolved, err := movedAuths.ResolveProxyAuth(t.Context(), moved)
+		if err != nil || (resolved.EffectiveProxyURL() == "direct") != allowed {
+			t.Fatalf("migrated direct binding did not respect routing scope (allowed=%t): %v", allowed, err)
+		}
+	}
+}
+
+func TestCredentialProxyMemoryBackfillsExistingSidecarWithoutReallocation(t *testing.T) {
+	cfg := proxyPoolTestConfig("3334-3340")
+	m, auths, a, store, _ := credentialMemoryFixture(t, cfg, "existing.json", nil)
+	binding, raw, err := m.randomBinding(m.snapshot().pools["residential"], a.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = m.saveBinding(binding); err != nil {
+		t.Fatal(err)
+	}
+	before := store.writes.Load()
+	resolved, err := auths.ResolveProxyAuth(t.Context(), a)
+	if err != nil || resolved.EffectiveProxyURL() != raw || resolved.EffectiveProxyBindingID() != binding.ID {
+		t.Fatalf("backfilling changed the existing sidecar binding: %v", err)
+	}
+	current, _ := auths.GetByID(a.ID)
+	if coreauth.ReadProxyBindingMemory(current) == nil || store.writes.Load() != before+1 {
+		t.Fatal("existing binding was not saved to the credential")
 	}
 }
 
 func TestCredentialProxyMemoryWinsOverOtherServerSidecar(t *testing.T) {
 	cfg := proxyPoolTestConfig("3334-3340")
-	cfg.ProxyPools[0].RememberCredentialBinding = true
 	m, auths, a, _, _ := credentialMemoryFixture(t, cfg, "pin.json", nil)
 	first, err := auths.ResolveProxyAuth(t.Context(), a)
 	if err != nil {
@@ -191,19 +313,17 @@ func TestCredentialProxyMemoryWinsOverOtherServerSidecar(t *testing.T) {
 	}
 }
 
-func TestCredentialProxyMemoryRespectsScopeAndOptOut(t *testing.T) {
+func TestCredentialProxyMemoryRespectsScope(t *testing.T) {
 	cfg := proxyPoolTestConfig("3334-3340")
-	cfg.ProxyPools[0].RememberCredentialBinding = true
 	_, auths, a, _, _ := credentialMemoryFixture(t, cfg, "pin.json", nil)
 	first, err := auths.ResolveProxyAuth(t.Context(), a)
 	if err != nil {
 		t.Fatal(err)
 	}
 	fresh, _ := auths.GetByID(a.ID)
-	for _, mode := range []string{"off", "outside-rule", "removed-node"} {
+	for _, mode := range []string{"outside-rule", "removed-node"} {
 		t.Run(mode, func(t *testing.T) {
 			other := proxyPoolTestConfig("3334-3340")
-			other.ProxyPools[0].RememberCredentialBinding = mode != "off"
 			if mode == "outside-rule" {
 				other.ProxyRules[0].Providers = []string{"xai"}
 			}
@@ -223,7 +343,7 @@ func TestCredentialProxyMemoryRespectsScopeAndOptOut(t *testing.T) {
 				t.Fatal("removed node was resurrected")
 			}
 			if mode != "removed-node" && store.writes.Load() != before {
-				t.Fatal("disabled/nonmatching feature wrote metadata")
+				t.Fatal("nonmatching rule wrote metadata")
 			}
 		})
 	}
@@ -231,7 +351,6 @@ func TestCredentialProxyMemoryRespectsScopeAndOptOut(t *testing.T) {
 
 func TestCredentialProxyMemoryConcurrentResolveAndRebind(t *testing.T) {
 	cfg := proxyPoolTestConfig("3334-3340")
-	cfg.ProxyPools[0].RememberCredentialBinding = true
 	m, auths, a, _, _ := credentialMemoryFixture(t, cfg, "parallel.json", nil)
 	if _, err := auths.ResolveProxyAuth(t.Context(), a); err != nil {
 		t.Fatal(err)
@@ -264,7 +383,6 @@ func TestCredentialProxyMemoryConcurrentResolveAndRebind(t *testing.T) {
 
 func TestCredentialProxyMemoryRejectsRetiredCredential(t *testing.T) {
 	cfg := proxyPoolTestConfig("3334")
-	cfg.ProxyPools[0].RememberCredentialBinding = true
 	m, auths, a, _, _ := credentialMemoryFixture(t, cfg, "replace.json", nil)
 	resolved, err := auths.ResolveProxyAuth(t.Context(), a)
 	if err != nil {

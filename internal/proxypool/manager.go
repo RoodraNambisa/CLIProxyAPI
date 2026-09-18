@@ -497,7 +497,7 @@ func (m *Manager) Resolve(ctx context.Context, auth *coreauth.Auth) (coreauth.Re
 			continue
 		}
 		unlockBinding()
-		if errResolve == nil && resolved.Source == "pool" {
+		if errResolve == nil && (resolved.Source == "pool" || resolved.Source == "direct") {
 			_, errResolve = m.RememberCredentialBinding(ctx, auth, resolved.BindingID)
 		}
 		return resolved, errResolve
@@ -680,9 +680,6 @@ func (m *Manager) resolveRuleBinding(ctx context.Context, snapshot *configSnapsh
 		if ctx != nil && ctx.Err() != nil {
 			return coreauth.ResolvedProxy{}, ctx.Err()
 		}
-		if pool, ok := snapshot.pools[strings.ToLower(current.Pool)]; ok && pool.config.RememberCredentialBinding {
-			return resolved, errResolve
-		}
 		attempted["pool:"+strings.ToLower(strings.TrimSpace(current.Pool))] = struct{}{}
 	}
 
@@ -839,9 +836,6 @@ func (m *Manager) resolvePoolBinding(ctx context.Context, snapshot *configSnapsh
 						return coreauth.ResolvedProxy{}, errProxyConfigurationChanged
 					}
 					return resolvedProxy(current, resolvedURL), nil
-				}
-				if pool.config.RememberCredentialBinding {
-					return coreauth.ResolvedProxy{}, &UnavailableError{Pool: pool.config.Name}
 				}
 			}
 		}
@@ -1224,15 +1218,11 @@ func poolCandidateCount(pool runtimePool) int {
 }
 
 func (m *Manager) bindingAtOrdinal(pool runtimePool, authID string, ordinal int) (Binding, string, error) {
-	return m.bindingAtOrdinalWithSource(pool, authID, ordinal, m.random)
-}
-
-func (m *Manager) bindingAtOrdinalWithSource(pool runtimePool, authID string, ordinal int, source io.Reader) (Binding, string, error) {
 	selected, port, ok := poolEntryAtOrdinal(pool, ordinal)
 	if !ok {
 		return Binding{}, "", errors.New("proxy candidate ordinal is out of range")
 	}
-	resolvedURL, values, errExpand := proxyutil.ExpandURLTemplate(selected.config.URLTemplate, pool.config.PlaceholderCharset, source)
+	resolvedURL, values, errExpand := proxyutil.ExpandURLTemplate(selected.config.URLTemplate, pool.config.PlaceholderCharset, m.random)
 	if errExpand != nil {
 		return Binding{}, "", errExpand
 	}
@@ -1243,7 +1233,7 @@ func (m *Manager) bindingAtOrdinalWithSource(pool runtimePool, authID string, or
 			return Binding{}, "", errPort
 		}
 	}
-	bindingID, errID := randomBindingID(source)
+	bindingID, errID := randomBindingID(m.random)
 	if errID != nil {
 		return Binding{}, "", errID
 	}

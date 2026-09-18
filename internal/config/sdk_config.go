@@ -73,13 +73,12 @@ type SDKConfig struct {
 
 // ProxyPoolConfig defines one named proxy pool.
 type ProxyPoolConfig struct {
-	Name                      string                 `yaml:"name" json:"name"`
-	PlaceholderCharset        string                 `yaml:"placeholder-charset,omitempty" json:"placeholder-charset,omitempty"`
-	CheckIntervalSeconds      int                    `yaml:"check-interval-seconds,omitempty" json:"check-interval-seconds,omitempty"`
-	BindAttempts              int                    `yaml:"bind-attempts,omitempty" json:"bind-attempts,omitempty"`
-	SpreadBindings            bool                   `yaml:"spread-bindings,omitempty" json:"spread-bindings,omitempty"`
-	RememberCredentialBinding bool                   `yaml:"remember-credential-binding" json:"remember-credential-binding"`
-	Entries                   []ProxyPoolEntryConfig `yaml:"entries" json:"entries"`
+	Name                 string                 `yaml:"name" json:"name"`
+	PlaceholderCharset   string                 `yaml:"placeholder-charset,omitempty" json:"placeholder-charset,omitempty"`
+	CheckIntervalSeconds int                    `yaml:"check-interval-seconds,omitempty" json:"check-interval-seconds,omitempty"`
+	BindAttempts         int                    `yaml:"bind-attempts,omitempty" json:"bind-attempts,omitempty"`
+	SpreadBindings       bool                   `yaml:"spread-bindings,omitempty" json:"spread-bindings,omitempty"`
+	Entries              []ProxyPoolEntryConfig `yaml:"entries" json:"entries"`
 }
 
 // ProxyPoolEntryConfig defines a URL template and an optional compact port set.

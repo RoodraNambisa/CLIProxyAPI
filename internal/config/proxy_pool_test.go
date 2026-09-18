@@ -4,9 +4,36 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
+
+func TestProxyPoolSaveRemovesRetiredMemorySwitch(t *testing.T) {
+	for _, value := range []string{"true", "false"} {
+		t.Run(value, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			original := "proxy-pools:\n  - name: residential\n    remember-credential-binding: " + value + "\n    spread-bindings: true\n    entries:\n      - id: node\n        url-template: http://proxy.example:8080\n"
+			if err := os.WriteFile(path, []byte(original), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := LoadConfig(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := SaveConfigPreserveComments(path, cfg); err != nil {
+				t.Fatal(err)
+			}
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(string(data), "remember-credential-binding") || !strings.Contains(string(data), "spread-bindings: true") {
+				t.Fatal("save retained the retired switch or changed existing proxy settings")
+			}
+		})
+	}
+}
 
 func TestNormalizeProxyConfiguration(t *testing.T) {
 	pools, rules, err := NormalizeProxyConfiguration(

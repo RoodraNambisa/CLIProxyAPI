@@ -13,9 +13,10 @@ const ProxyBindingMemoryKey = "proxy_binding"
 // password or observed exit IP. Placeholder values are generated session IDs.
 type ProxyBindingMemory struct {
 	Version      int      `json:"version"`
-	NodeID       string   `json:"node_id"`
-	Port         int      `json:"port"`
+	NodeID       string   `json:"node_id,omitempty"`
+	Port         int      `json:"port,omitempty"`
 	Placeholders []string `json:"placeholders,omitempty"`
+	Direct       bool     `json:"direct,omitempty"`
 }
 
 type proxyBindingRecorder interface {
@@ -41,7 +42,7 @@ func ReadProxyBindingMemory(auth *Auth) *ProxyBindingMemory {
 		return nil
 	}
 	value, ok := auth.Metadata[ProxyBindingMemoryKey].(map[string]any)
-	if !ok || len(value) > 4 {
+	if !ok || len(value) > 5 {
 		return nil
 	}
 	raw, err := json.Marshal(value)
@@ -49,7 +50,16 @@ func ReadProxyBindingMemory(auth *Auth) *ProxyBindingMemory {
 		return nil
 	}
 	var memory ProxyBindingMemory
-	if json.Unmarshal(raw, &memory) != nil || memory.Version != 1 || memory.Port < 1 || memory.Port > 65535 || len(memory.NodeID) != 64 || len(memory.Placeholders) > 32 {
+	if json.Unmarshal(raw, &memory) != nil || memory.Version != 1 {
+		return nil
+	}
+	if memory.Direct {
+		if memory.NodeID != "" || memory.Port != 0 || len(memory.Placeholders) != 0 {
+			return nil
+		}
+		return &memory
+	}
+	if memory.Port < 1 || memory.Port > 65535 || len(memory.NodeID) != 64 || len(memory.Placeholders) > 32 {
 		return nil
 	}
 	if _, err := hex.DecodeString(memory.NodeID); err != nil {
