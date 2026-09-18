@@ -51,6 +51,7 @@ type Snapshot struct {
 	Exhausted           bool      `json:"exhausted"`
 	Invalidations       uint64    `json:"invalidations"`
 	LastInvalidation    string    `json:"last_invalidation,omitempty"`
+	ManualOnly          bool      `json:"manual_only,omitempty"`
 }
 type entry struct {
 	credential Credential
@@ -77,7 +78,7 @@ func New() *Manager           { return &Manager{entries: make(map[string]*entry)
 func key(c Credential) string { return c.ID + "\x00" + c.Owner + "\x00" + c.Model }
 
 // Sync retires removed/replaced credentials and cancels obsolete acquisition tasks.
-func (m *Manager) Sync(cfg config.CodexStateOverrideConfig, credentials []Credential) {
+func (m *Manager) Sync(cfg config.CodexStateOverrideConfig, credentials []Credential, manualScopes ...Credential) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	cfg = cfg.Resolved()
@@ -104,12 +105,35 @@ func (m *Manager) Sync(cfg config.CodexStateOverrideConfig, credentials []Creden
 	}
 	if !cfg.Enabled {
 		credentials = nil
+		manualScopes = nil
+	}
+	// Keep explicitly requested diagnostic pairs while their credential/model scope
+	// remains eligible. They never expand the scheduler's registered model catalog.
+	registered := make(map[string]bool, len(credentials))
+	for _, c := range credentials {
+		registered[key(c)] = true
+	}
+	scopes := make(map[string]Credential, len(manualScopes))
+	for _, c := range manualScopes {
+		scopes[c.ID+"\x00"+c.Owner] = c
+	}
+	for k, e := range m.entries {
+		if !e.ManualOnly || registered[k] {
+			continue
+		}
+		if c, ok := scopes[e.credential.ID+"\x00"+e.credential.Owner]; ok && (len(cfg.Models) == 0 || slices.Contains(cfg.Models, e.Model) || slices.Contains(cfg.Models, e.credential.Route)) {
+			c.Model, c.Route = e.Model, e.credential.Route
+			credentials = append(credentials, c)
+		}
 	}
 	wanted := make(map[string]bool, len(credentials))
 	for _, c := range credentials {
 		k := key(c)
 		wanted[k] = true
 		if old := m.entries[k]; old != nil {
+			if registered[k] {
+				old.ManualOnly = false
+			}
 			if old.credential.Instance == c.Instance && old.credential.Plan == c.Plan {
 				old.credential = c
 				continue
@@ -144,6 +168,49 @@ func (m *Manager) Sync(cfg config.CodexStateOverrideConfig, credentials []Creden
 			delete(m.entries, k)
 		}
 	}
+}
+
+// QueueManual creates a bounded diagnostic entry without registering a model.
+// The caller must validate current credential and configured model scope first.
+func (m *Manager) QueueManual(c Credential) (bool, uint64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.cfg.Enabled {
+		return false, 0
+	}
+	e := m.entries[key(c)]
+	if e == nil {
+		count := 0
+		for _, existing := range m.entries {
+			if existing.credential.ID == c.ID && existing.ManualOnly {
+				count++
+			}
+		}
+		if count >= 256 {
+			return false, 0
+		}
+		e = &entry{credential: c, Snapshot: Snapshot{Model: c.Model, ManualOnly: true}}
+		m.entries[key(c)] = e
+	}
+	if e.credential.Instance != c.Instance || e.credential.Plan != c.Plan {
+		return false, e.Acquired
+	}
+	e.ManualOnly = true
+	e.credential = c
+	if !e.busy {
+		e.manual, e.paused = true, false
+		e.NextAttempt = time.Time{}
+		e.failures, e.ConsecutiveFailures = 0, 0
+		e.Exhausted = false
+	}
+	return true, e.Acquired
+}
+
+func (m *Manager) HasManual(c Credential) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	e := m.entries[key(c)]
+	return m.cfg.Enabled && e != nil && e.ManualOnly && e.credential.Instance == c.Instance && e.credential.Plan == c.Plan
 }
 
 // Pick freezes a value for an outgoing attempt. Acquiring a replacement never blocks inference.
@@ -203,7 +270,7 @@ func (m *Manager) ObserveResponse(c Credential, version uint64, value, returnedM
 	e.Invalidations++
 	e.LastInvalidation = reason
 	// Keep failure limits and backoff. An already-running renewal supplies the replacement.
-	if !e.busy && !e.Exhausted {
+	if !e.busy && !e.Exhausted && !e.ManualOnly {
 		e.manual = true
 	}
 	log.WithFields(log.Fields{"auth_id": c.ID, "model": c.Model, "reason": reason, "state_version": version, "returned_state_length": returnedLength}).Warn("Codex managed state invalidated by upstream response")
@@ -335,7 +402,7 @@ func (m *Manager) Tick(ctx context.Context, now time.Time, probe Probe) {
 		if e.busy || e.paused || e.Exhausted || now.Before(e.NextAttempt) {
 			continue
 		}
-		active := m.cfg.Acquisition == "all" || (m.cfg.Acquisition == "active" && !e.LastUsed.IsZero() && now.Sub(e.LastUsed) <= time.Duration(m.cfg.ActiveMinutes)*time.Minute)
+		active := !e.ManualOnly && (m.cfg.Acquisition == "all" || (m.cfg.Acquisition == "active" && !e.LastUsed.IsZero() && now.Sub(e.LastUsed) <= time.Duration(m.cfg.ActiveMinutes)*time.Minute))
 		if !e.manual && (!active || (e.state != "" && now.Before(e.ExpiresAt.Add(-time.Duration(m.cfg.RefreshBeforeMinutes)*time.Minute)))) {
 			continue
 		}

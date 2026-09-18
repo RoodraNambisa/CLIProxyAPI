@@ -163,6 +163,37 @@ func TestStateResponseInvalidationDoesNotDuplicateActiveRenewal(t *testing.T) {
 		t.Fatalf("renewal duplicated: %+v", s)
 	}
 }
+
+func TestStateManualUnregisteredModelSurvivesSyncWithoutAutomaticRenewal(t *testing.T) {
+	m, c, cfg := fixture()
+	cfg.Models = []string{c.Model}
+	m.Sync(cfg, nil, c)
+	if ok, _ := m.QueueManual(c); !ok {
+		t.Fatal("manual acquisition rejected")
+	}
+	m.Sync(cfg, nil, c)
+	m.Tick(t.Context(), time.Now(), func(context.Context, Credential, config.CodexStateOverrideConfig) (Result, error) { return good(), nil })
+	m.Wait()
+	s := m.Snapshots(c.ID, time.Now())[0]
+	if !s.ManualOnly || s.Status != "valid" {
+		t.Fatalf("manual result not retained: %+v", s)
+	}
+	m.Tick(t.Context(), time.Now().Add(2*time.Hour), func(context.Context, Credential, config.CodexStateOverrideConfig) (Result, error) {
+		t.Error("manual model auto-renewed")
+		return good(), nil
+	})
+	m.Wait()
+	// A later catalog registration promotes the pair into normal managed behavior.
+	m.Sync(cfg, []Credential{c}, c)
+	if m.Snapshots(c.ID, time.Now())[0].ManualOnly {
+		t.Fatal("registered model remained manual-only")
+	}
+	// Scope removal retires diagnostic cache immediately on the next synchronization.
+	m.Sync(cfg, nil)
+	if len(m.Snapshots(c.ID, time.Now())) != 0 {
+		t.Fatal("removed credential retained manual state")
+	}
+}
 func finishFixture(m *Manager, c Credential, result Result, err error, now time.Time) {
 	m.mu.Lock()
 	e := m.entries[key(c)]

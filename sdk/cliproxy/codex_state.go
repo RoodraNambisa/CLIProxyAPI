@@ -60,12 +60,16 @@ func (s *Service) syncCodexState(cfg *internalconfig.Config) {
 		return
 	}
 	var credentials []codexstate.Credential
+	var manualScopes []codexstate.Credential
 	if cfg.Codex.StateOverride.Enabled {
 		for _, a := range s.coreManager.List() {
 			credentials = append(credentials, helps.ManagedStateModels(cfg, a)...)
+			if helps.ManagedStateCredentialEligible(cfg, a) {
+				manualScopes = append(manualScopes, helps.StateCredential(a, ""))
+			}
 		}
 	}
-	codexstate.Default.Sync(cfg.Codex.StateOverride, credentials)
+	codexstate.Default.Sync(cfg.Codex.StateOverride, credentials, manualScopes...)
 }
 
 func (s *Service) acquireCodexState(ctx context.Context, credential codexstate.Credential, policy internalconfig.CodexStateOverrideConfig) (result codexstate.Result, err error) {

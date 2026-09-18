@@ -79,33 +79,30 @@ func StateCredential(a *auth.Auth, model string) codexstate.Credential {
 	return codexstate.Credential{ID: a.ID, Name: a.FileName, Owner: owner, Instance: a.RuntimeInstanceID(), Model: thinking.ParseSuffix(model).ModelName, Plan: config.NormalizeCodexStatePlanType(plan)}
 }
 
-// ManagedStateModels uses the credential's registered catalog, including exclusions.
-func ManagedStateModels(cfg *config.Config, a *auth.Auth) []codexstate.Credential {
+// ManagedStateCredentialEligible checks credential scope without requiring a registered model.
+func ManagedStateCredentialEligible(cfg *config.Config, a *auth.Auth) bool {
 	if cfg == nil || !cfg.Codex.StateOverride.Enabled || cfg.Codex.ResolvedTurnStatePolicy() == config.CodexTurnStatePolicyStrip || a == nil || a.Disabled || a.Status == auth.StatusDisabled || a.RuntimeInstanceRetired() || a.ExecutionProvider() != "codex" || a.Attributes["api_key"] != "" {
-		return nil
+		return false
 	}
 	c := cfg.Codex.StateOverride
 	if slices.Contains(c.ExcludedCredentials, a.ID) || slices.Contains(c.ExcludedCredentials, a.Index) || slices.Contains(c.ExcludedCredentials, a.FileName) {
-		return nil
+		return false
 	}
-	priority := 0
-	if p := a.Attributes["priority"]; p != "" {
-		priority, _ = strconv.Atoi(p)
-	} else {
-		switch p := a.Metadata["priority"].(type) {
-		case int:
-			priority = p
-		case float64:
-			priority = int(p)
-		case string:
-			priority, _ = strconv.Atoi(p)
-		}
-	}
+	priority := StateCredentialPriority(a)
 	included := slices.Contains(c.IncludedCredentials, a.ID) || slices.Contains(c.IncludedCredentials, a.Index) || slices.Contains(c.IncludedCredentials, a.FileName)
 	// Explicit credentials extend the priority scope. Empty selectors preserve all-credential scope.
 	if (len(c.Priorities) > 0 || len(c.IncludedCredentials) > 0) && !included && !slices.Contains(c.Priorities, priority) {
+		return false
+	}
+	return true
+}
+
+// ManagedStateModels uses the credential's registered catalog, including exclusions.
+func ManagedStateModels(cfg *config.Config, a *auth.Auth) []codexstate.Credential {
+	if !ManagedStateCredentialEligible(cfg, a) {
 		return nil
 	}
+	c := cfg.Codex.StateOverride
 	result := []codexstate.Credential{}
 	seen := map[string]bool{}
 	for _, info := range registry.GetGlobalRegistry().GetModelsForClient(a.ID) {
@@ -117,8 +114,7 @@ func ManagedStateModels(cfg *config.Config, a *auth.Auth) []codexstate.Credentia
 			model = info.ID
 		}
 		model = thinking.ParseSuffix(model).ModelName
-		lower := strings.ToLower(model)
-		if strings.Contains(lower, "image") || strings.Contains(lower, "audio") || strings.Contains(lower, "video") || strings.Contains(lower, "realtime") || strings.Contains(lower, "search") {
+		if !StateTextModel(model) {
 			continue
 		}
 		if len(info.SupportedOutputModalities) > 0 {
@@ -142,6 +138,41 @@ func ManagedStateModels(cfg *config.Config, a *auth.Auth) []codexstate.Credentia
 		result = append(result, item)
 	}
 	return result
+}
+
+// StateTextModel excludes non-text protocols from both managed and manual acquisition.
+func StateTextModel(model string) bool {
+	model = strings.ToLower(strings.TrimSpace(model))
+	if model == "" {
+		return false
+	}
+	for _, kind := range []string{"image", "audio", "video", "realtime", "search"} {
+		if strings.Contains(model, kind) {
+			return false
+		}
+	}
+	return true
+}
+
+// StateCredentialPriority shares the effective default-zero priority with option discovery.
+func StateCredentialPriority(a *auth.Auth) int {
+	if a == nil {
+		return 0
+	}
+	if p := a.Attributes["priority"]; p != "" {
+		value, _ := strconv.Atoi(p)
+		return value
+	}
+	switch p := a.Metadata["priority"].(type) {
+	case int:
+		return p
+	case float64:
+		return int(p)
+	case string:
+		value, _ := strconv.Atoi(p)
+		return value
+	}
+	return 0
 }
 
 type stateUnavailableError struct{ body string }
@@ -216,6 +247,9 @@ func ApplyManagedState(ctx context.Context, cfg *config.Config, a *auth.Auth, mo
 			inScope = true
 			break
 		}
+	}
+	if !inScope && requireManaged && ManagedStateCredentialEligible(cfg, a) && (len(cfg.Codex.StateOverride.Models) == 0 || slices.Contains(cfg.Codex.StateOverride.Models, c.Model)) && codexstate.Default.HasManual(c) {
+		inScope = true
 	}
 	if !inScope {
 		if requireManaged {

@@ -69,6 +69,22 @@ func TestCodexStateManualAcquisitionUsesBackendPolicyAndAlias(t *testing.T) {
 	if status, _ := run("outside"); status != 400 {
 		t.Fatal("out-of-scope model accepted")
 	}
+	cfg.Codex.StateOverride.Models = []string{"unregistered-text-model"}
+	if err := h.SetConfig(cfg); err != nil {
+		t.Fatal(err)
+	}
+	codexstate.Default.Sync(cfg.Codex.StateOverride, nil, helps.StateCredential(a, ""))
+	status, response = run("unregistered-text-model")
+	if status != 200 || string(response["model"]) != `"unregistered-text-model"` {
+		t.Fatal("explicit unregistered acquisition rejected")
+	}
+	snapshot := codexstate.Default.Snapshots(a.ID, time.Now())[0]
+	if !snapshot.ManualOnly || snapshot.Status != "queued" {
+		t.Fatalf("not a manual diagnostic pair: %+v", snapshot)
+	}
+	if status, _ := run(""); status != 200 {
+		t.Fatal("card acquisition ignored its existing manual pair")
+	}
 	cfg.Codex.StateOverride.Enabled = false
 	if err := h.SetConfig(cfg); err != nil {
 		t.Fatal(err)

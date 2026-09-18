@@ -39,8 +39,24 @@ func (h *Handler) CodexStateAction(c *gin.Context) {
 		return
 	}
 	cfg := h.currentConfig()
+	if !helps.ManagedStateCredentialEligible(cfg, a) {
+		c.JSON(400, gin.H{"error": "State is disabled or this credential is outside the configured priority/credential scope"})
+		return
+	}
 	allowed := helps.ManagedStateModels(cfg, a)
-	if len(allowed) == 0 {
+	// Explicit card actions also include diagnostic pairs already visible there.
+	for _, snapshot := range codexstate.Default.Snapshots(a.ID, time.Now()) {
+		if !snapshot.ManualOnly || (len(cfg.Codex.StateOverride.Models) > 0 && !slices.Contains(cfg.Codex.StateOverride.Models, snapshot.Model)) {
+			continue
+		}
+		if slices.ContainsFunc(allowed, func(candidate codexstate.Credential) bool { return candidate.Model == snapshot.Model }) {
+			continue
+		}
+		credential := helps.StateCredential(a, snapshot.Model)
+		credential.Route = snapshot.Model
+		allowed = append(allowed, credential)
+	}
+	if len(allowed) == 0 && strings.TrimSpace(input.Model) == "" {
 		c.JSON(400, gin.H{"error": "credential has no eligible managed state models"})
 		return
 	}
@@ -49,7 +65,25 @@ func (h *Handler) CodexStateAction(c *gin.Context) {
 	if input.Model != "" {
 		resolvedModel = resolveManagedStateActionModel(a.ID, input.Model, allowed)
 		if resolvedModel == "" {
-			c.JSON(400, gin.H{"error": "model is outside the configured State scope or unsupported by this credential"})
+			resolvedModel = thinking.ParseSuffix(input.Model).ModelName
+			if !helps.StateTextModel(resolvedModel) || len(resolvedModel) > 256 || strings.ContainsAny(resolvedModel, "\r\n\x00") || (len(cfg.Codex.StateOverride.Models) > 0 && !slices.Contains(cfg.Codex.StateOverride.Models, resolvedModel)) {
+				c.JSON(400, gin.H{"error": "model is outside the configured State model scope"})
+				return
+			}
+			credential := helps.StateCredential(a, resolvedModel)
+			credential.Route = resolvedModel
+			var matched bool
+			var previous uint64
+			if input.Action == "acquire" {
+				matched, previous = codexstate.Default.QueueManual(credential)
+			} else if codexstate.Default.HasManual(credential) {
+				matched, previous = codexstate.Default.ActionWithBaseline(a.ID, resolvedModel, input.Action)
+			}
+			if !matched {
+				c.JSON(409, gin.H{"error": "State runtime is not ready or the manual model limit was reached"})
+				return
+			}
+			c.JSON(200, gin.H{"model": resolvedModel, "previous_acquired": previous, "models": codexstate.Default.Snapshots(a.ID, time.Now())})
 			return
 		}
 	}
