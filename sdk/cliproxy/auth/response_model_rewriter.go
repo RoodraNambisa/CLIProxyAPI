@@ -2,6 +2,7 @@ package auth
 
 import (
 	"bytes"
+	"encoding/json"
 
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
@@ -104,6 +105,7 @@ func (r *StreamRewriter) RewriteChunk(chunk []byte) []byte {
 		r.pendingBuf = nil
 	}
 	chunk = normalizeGluedSSEEvents(chunk)
+	chunk = joinMultilineSSEJSON(chunk)
 	trimmed := bytes.TrimSpace(chunk)
 	if len(trimmed) > 0 && trimmed[0] == '{' && gjson.ValidBytes(trimmed) {
 		return rewriteModelWithOptions(trimmed, r.options)
@@ -112,20 +114,27 @@ func (r *StreamRewriter) RewriteChunk(chunk []byte) []byte {
 		return rewriteSSEPayloadLinesWithOptions(chunk, r.options)
 	}
 	lastDoubleNewline := bytes.LastIndex(chunk, []byte("\n\n"))
-	var processChunk []byte
+	completeEnd := 0
 	if lastDoubleNewline >= 0 {
-		afterComplete := chunk[lastDoubleNewline+2:]
+		completeEnd = lastDoubleNewline + 2
+	}
+	if crlf := bytes.LastIndex(chunk, []byte("\r\n\r\n")); crlf >= 0 && crlf+4 > completeEnd {
+		completeEnd = crlf + 4
+	}
+	var processChunk []byte
+	if completeEnd > 0 {
+		afterComplete := chunk[completeEnd:]
 		if len(afterComplete) > 0 && !bytes.Equal(afterComplete, []byte("\n")) {
-			if gjson.ValidBytes(extractLastDataPayload(afterComplete)) {
+			if completeSingleSSEDataJSON(afterComplete) {
 				processChunk = chunk
 			} else {
-				processChunk = chunk[:lastDoubleNewline+2]
+				processChunk = chunk[:completeEnd]
 				r.pendingBuf = append(r.pendingBuf[:0], afterComplete...)
 			}
 		} else {
 			processChunk = chunk
 		}
-	} else if gjson.ValidBytes(extractLastDataPayload(chunk)) {
+	} else if completeSingleSSEDataJSON(chunk) {
 		processChunk = chunk
 	} else if len(bytes.TrimSpace(chunk)) == 0 {
 		return chunk
@@ -187,14 +196,77 @@ func (r *StreamRewriter) RewriteChunk(chunk []byte) []byte {
 	return joined
 }
 
-func extractLastDataPayload(chunk []byte) []byte {
-	lines := bytes.Split(chunk, []byte("\n"))
-	for i := len(lines) - 1; i >= 0; i-- {
-		if _, jsonData, found := extractSSEDataLine(lines[i]); found && len(jsonData) > 0 {
-			return jsonData
+// An individually valid JSON string or array in a later data line can still be
+// a fragment of a multiline event. Only emit a single complete object early.
+func completeSingleSSEDataJSON(chunk []byte) bool {
+	var data []byte
+	count := 0
+	for _, line := range bytes.Split(chunk, []byte("\n")) {
+		if _, value, ok := extractSSEDataLine(line); ok {
+			count++
+			data = bytes.TrimSpace(value)
 		}
 	}
-	return nil
+	return count == 1 && len(data) > 0 && data[0] == '{' && gjson.ValidBytes(data)
+}
+
+// Join complete multiline JSON events before the line-oriented compatibility
+// rewriter. SSE joins data fields with newlines, not as separate JSON documents.
+func joinMultilineSSEJSON(chunk []byte) []byte {
+	if !bytes.Contains(chunk, []byte("\ndata:")) {
+		return chunk
+	}
+	var out []byte
+	frameStart, lineStart := 0, 0
+	for lineStart < len(chunk) {
+		end := bytes.IndexByte(chunk[lineStart:], '\n')
+		if end < 0 {
+			break
+		}
+		end += lineStart
+		line := bytes.TrimSuffix(chunk[lineStart:end], []byte("\r"))
+		if len(line) == 0 {
+			out = append(out, joinSSEJSONFrame(chunk[frameStart:end+1])...)
+			frameStart = end + 1
+		}
+		lineStart = end + 1
+	}
+	return append(out, chunk[frameStart:]...)
+}
+
+func joinSSEJSONFrame(frame []byte) []byte {
+	lines := bytes.Split(frame, []byte("\n"))
+	var fields [][]byte
+	for _, line := range lines {
+		if _, data, ok := extractSSEDataLine(bytes.TrimSuffix(line, []byte("\r"))); ok {
+			fields = append(fields, data)
+		}
+	}
+	if len(fields) < 2 {
+		return frame
+	}
+	var compact bytes.Buffer
+	if err := json.Compact(&compact, bytes.Join(fields, []byte("\n"))); err != nil {
+		return frame
+	}
+	result := make([][]byte, 0, len(lines))
+	written := false
+	for _, line := range lines {
+		prefix, _, isData := extractSSEDataLine(bytes.TrimSuffix(line, []byte("\r")))
+		if !isData {
+			result = append(result, line)
+			continue
+		}
+		if !written {
+			joined := append(bytes.Clone(prefix), compact.Bytes()...)
+			if bytes.HasSuffix(line, []byte("\r")) {
+				joined = append(joined, '\r')
+			}
+			result = append(result, joined)
+			written = true
+		}
+	}
+	return bytes.Join(result, []byte("\n"))
 }
 
 func extractSSEDataLine(line []byte) (prefix []byte, jsonData []byte, ok bool) {

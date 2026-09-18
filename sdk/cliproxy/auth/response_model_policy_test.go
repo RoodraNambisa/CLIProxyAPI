@@ -106,6 +106,33 @@ func TestResponseModelRewriteIgnoresErrorsAndUnchangedFields(t *testing.T) {
 	}
 }
 
+func TestResponseModelRewriteMultilineSSEAndCounters(t *testing.T) {
+	for _, newline := range []string{"\n", "\r\n"} {
+		for _, split := range []bool{false, true} {
+			t.Run(fmt.Sprintf("crlf=%v/split=%v", newline == "\r\n", split), func(t *testing.T) {
+				m, auth, opts := responseModelFixture(t)
+				frame := []byte(strings.Join([]string{"event: response.completed", "id: fixture", `data: {"type":"response.completed",`, `data: "response":{"model":"gpt-5.6-luna","status":"completed",`, `data: "output":[{"text":"keep gpt-5.6-luna"}],"usage":{"total_tokens":12}}}`, "", ""}, newline))
+				rewriter := NewStreamRewriter(*m.responseModelRewriteOptions(t.Context(), auth, opts, true))
+				var output []byte
+				if split {
+					for _, b := range frame {
+						output = append(output, rewriter.RewriteChunk([]byte{b})...)
+					}
+				} else {
+					output = rewriter.RewriteChunk(frame)
+				}
+				output = append(output, rewriter.Finish()...)
+				if !bytes.Contains(output, []byte(`"model":"team/gpt-6-astra(high)"`)) || !bytes.Contains(output, []byte(`"text":"keep gpt-5.6-luna"`)) || !bytes.Contains(output, []byte("id: fixture")) {
+					t.Fatalf("multiline event changed or not rewritten: %s", output)
+				}
+				if stats := m.AuthResponseModelRewriteSummary(auth, true); stats.Total != 1 || len(stats.Recent) != 1 {
+					t.Fatalf("wrong multiline counter: %+v", stats)
+				}
+			})
+		}
+	}
+}
+
 func TestResponseModelRewriteCountersConcurrentAndBounded(t *testing.T) {
 	m, auth, opts := responseModelFixture(t)
 	var wg sync.WaitGroup
