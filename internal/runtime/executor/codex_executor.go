@@ -875,6 +875,7 @@ func (e *CodexExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth
 }
 
 func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
+	ctx = cliproxyexecutor.WithCodexStateSnapshot(ctx)
 	if opts.SourceFormat == sdktranslator.FormatCodexLive {
 		return resp, helps.CodexLiveNativeRouteError{}
 	}
@@ -1002,6 +1003,8 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	helps.ObserveCodexHTTPQuota(ctx, auth, httpResp.Header)
 	reporter.ObserveHTTPResponse(httpResp.StatusCode, httpResp.Header)
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
+	managedStateUse := helps.ManagedStateUse(ctx, auth, req.Model, httpReq.Header)
+	managedStateUse.Observe(httpResp.Header, nil)
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		b, _ := io.ReadAll(httpResp.Body)
 		upstreamBody := applyCodexIdentityConfuseResponsePayload(b, identityState)
@@ -1067,6 +1070,10 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 			if !isCodexSuccessfulCompletion(eventData) && !helps.IsCodexPartialResponse(eventData) {
 				return true
 			}
+			if isCodexSuccessfulCompletion(eventData) {
+				rawData := bytes.TrimSpace(bytes.TrimSpace(rawLine)[len(dataTag):])
+				managedStateUse.Observe(nil, rawData)
+			}
 			completedEvent = bytes.Clone(eventData)
 			return true
 		})
@@ -1113,6 +1120,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 }
 
 func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
+	ctx = cliproxyexecutor.WithCodexStateSnapshot(ctx)
 	if cliproxyexecutor.RequiredUpstreamWebsocket(ctx) {
 		if errCurrent := codexWebsocketExecutionStateError(ctx, auth); errCurrent != nil {
 			return resp, errCurrent
@@ -1211,6 +1219,8 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	helps.ObserveCodexHTTPQuota(ctx, auth, httpResp.Header)
 	reporter.ObserveHTTPResponse(httpResp.StatusCode, httpResp.Header)
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
+	managedStateUse := helps.ManagedStateUse(ctx, auth, req.Model, httpReq.Header)
+	managedStateUse.Observe(httpResp.Header, nil)
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		b, _ := io.ReadAll(httpResp.Body)
 		upstreamBody := applyCodexIdentityConfuseResponsePayload(b, identityState)
@@ -1226,6 +1236,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return resp, err
 	}
+	managedStateUse.Observe(nil, data)
 	upstreamData := applyCodexIdentityConfuseResponsePayload(data, identityState)
 	helps.AppendAPIResponseChunk(ctx, e.cfg, upstreamData)
 	reporter.Publish(ctx, helps.ParseOpenAIUsage(upstreamData))
@@ -1246,6 +1257,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 }
 
 func (e *CodexExecutor) executeStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, translated bool) (_ *cliproxyexecutor.StreamResult, err error) {
+	ctx = cliproxyexecutor.WithCodexStateSnapshot(ctx)
 	isGrokClient := grokbuild.IsGrokClientContext(ctx, opts.Headers)
 	if opts.SourceFormat == sdktranslator.FormatCodexLive {
 		return nil, helps.CodexLiveNativeRouteError{}
@@ -1375,6 +1387,8 @@ func (e *CodexExecutor) executeStream(ctx context.Context, auth *cliproxyauth.Au
 	helps.ObserveCodexHTTPQuota(ctx, auth, httpResp.Header)
 	reporter.ObserveHTTPResponse(httpResp.StatusCode, httpResp.Header)
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
+	managedStateUse := helps.ManagedStateUse(ctx, auth, req.Model, httpReq.Header)
+	managedStateUse.Observe(httpResp.Header, nil)
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		defer cleanupBodies()
 		data, readErr := io.ReadAll(httpResp.Body)
@@ -1466,6 +1480,11 @@ func (e *CodexExecutor) executeStream(ctx context.Context, auth *cliproxyauth.Au
 			}
 			frame := trustedFrame
 			trustedFrame = nil
+			if managedStateUse.Version > 0 {
+				if data, ok := codexSSEFrameDataPayload(frame); ok && isCodexSuccessfulCompletion(normalizeCodexCompletion(data)) {
+					managedStateUse.Observe(nil, data)
+				}
+			}
 			if transformed, ok := grokbuild.TransformKeepaliveSSEFrame(frame, isGrokClient); ok {
 				return emit(cliproxyexecutor.StreamChunk{Payload: transformed}), false
 			}
@@ -1492,6 +1511,12 @@ func (e *CodexExecutor) executeStream(ctx context.Context, auth *cliproxyauth.Au
 		for scanner.Scan() {
 			line := scanner.Bytes()
 			if !trustUpstreamSSE {
+				if managedStateUse.Version > 0 && bytes.HasPrefix(line, dataTag) {
+					data := bytes.TrimSpace(line[len(dataTag):])
+					if isCodexSuccessfulCompletion(normalizeCodexCompletion(data)) {
+						managedStateUse.Observe(nil, data)
+					}
+				}
 				line = applyCodexIdentityConfuseResponsePayload(line, identityState)
 				line = multiAgentResponse.RewriteSSEFrame(line)
 			}

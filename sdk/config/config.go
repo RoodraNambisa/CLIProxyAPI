@@ -45,6 +45,7 @@ type StreamingConfig = internalconfig.StreamingConfig
 type CodexFingerprintConfig = internalconfig.CodexFingerprintConfig
 type CodexStateOverrideConfig = internalconfig.CodexStateOverrideConfig
 type CodexStateModelOverride = internalconfig.CodexStateModelOverride
+type CodexStatePlanLengths = internalconfig.CodexStatePlanLengths
 
 type CodexQuotaAutoDisableConfig = internalconfig.CodexQuotaAutoDisableConfig
 type CodexQuotaAutoDisableRule = internalconfig.CodexQuotaAutoDisableRule

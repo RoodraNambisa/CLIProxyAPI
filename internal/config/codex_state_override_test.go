@@ -1,6 +1,9 @@
 package config
 
-import "testing"
+import (
+	"reflect"
+	"testing"
+)
 
 func TestCodexStateOverrideDefaultsAndValidation(t *testing.T) {
 	cfg := &Config{}
@@ -31,6 +34,64 @@ func TestCodexStateOverrideDefaultsAndValidation(t *testing.T) {
 	cfg.Codex.TurnStatePolicy = CodexTurnStatePolicyStrip
 	if cfg.ValidateCodexStateOverride() == nil {
 		t.Fatal("contradictory strip accepted")
+	}
+}
+
+func TestCodexStateSubscriptionLengthPrecedence(t *testing.T) {
+	policy := CodexStateOverrideConfig{
+		Lengths:        []int{200},
+		ModelOverrides: []CodexStateModelOverride{{Model: "model-a", Lengths: []int{292}, Prompt: "model prompt"}},
+		PlanLengths: []CodexStatePlanLengths{
+			{PlanTypes: []string{"plus", "pro"}, Lengths: []int{292}},
+			{PlanTypes: []string{"business"}, Lengths: []int{332}},
+			{PlanTypes: []string{"team"}, Models: []string{"model-a"}, Lengths: []int{312}},
+			{PlanTypes: []string{"free"}, Lengths: []int{}},
+			{PlanTypes: []string{"TEAM"}, Lengths: []int{444}},
+		},
+	}
+	for _, tc := range []struct {
+		plan, model string
+		lengths     []int
+	}{
+		{"plus", "other", []int{292}}, {"ChatGPTProPlan", "other", []int{292}},
+		{"business", "other", []int{332}}, {"team", "other", []int{332}},
+		{"ChatGPTBusinessPlan", "model-a", []int{312}}, {"business", "model-a", []int{312}},
+		{"enterprise", "model-a", []int{292}}, {"", "other", []int{200}},
+		{"free", "model-a", []int{}},
+	} {
+		t.Run(tc.plan+"/"+tc.model, func(t *testing.T) {
+			got := policy.ForCredential(tc.plan, tc.model)
+			if !reflect.DeepEqual(got.Lengths, tc.lengths) {
+				t.Fatalf("lengths=%v, want %v", got.Lengths, tc.lengths)
+			}
+			if tc.model == "model-a" && got.Prompt != "model prompt" {
+				t.Fatal("plan length changed another model setting")
+			}
+		})
+	}
+	cfg := &Config{Codex: CodexConfig{StateOverride: policy}}
+	if err := cfg.ValidateCodexStateOverride(); err != nil {
+		t.Fatal(err)
+	}
+	cloned, err := Clone(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved := cloned.Codex.StateOverride.Resolved()
+	resolved.PlanLengths[0].PlanTypes[0] = "changed"
+	resolved.PlanLengths[0].Lengths[0] = 999
+	if cloned.Codex.StateOverride.PlanLengths[0].PlanTypes[0] != "plus" || policy.PlanLengths[0].Lengths[0] != 292 {
+		t.Fatal("plan length policy aliases its source")
+	}
+	for _, invalid := range []CodexStatePlanLengths{
+		{Lengths: []int{292}}, {PlanTypes: []string{"pro"}},
+		{PlanTypes: []string{"pro"}, Lengths: []int{-1}},
+		{PlanTypes: []string{"bad\x00plan"}, Lengths: []int{292}},
+	} {
+		cfg.Codex.StateOverride.PlanLengths = []CodexStatePlanLengths{invalid}
+		if cfg.ValidateCodexStateOverride() == nil {
+			t.Fatal("invalid plan length rule accepted")
+		}
 	}
 }
 

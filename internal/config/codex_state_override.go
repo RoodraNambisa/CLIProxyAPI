@@ -11,30 +11,72 @@ import (
 
 // CodexStateOverrideConfig manages short-lived state in memory only.
 type CodexStateOverrideConfig struct {
-	Enabled              bool                      `yaml:"enabled" json:"enabled"`
-	Priorities           APIKeyPriorityList        `yaml:"priorities" json:"priorities"`
-	IncludedCredentials  []string                  `yaml:"included-credentials" json:"included-credentials"`
-	ExcludedCredentials  []string                  `yaml:"excluded-credentials" json:"excluded-credentials"`
-	Models               []string                  `yaml:"models" json:"models"`
-	Mode                 string                    `yaml:"mode" json:"mode"`
-	MissingPolicy        string                    `yaml:"missing-policy" json:"missing-policy"`
-	Acquisition          string                    `yaml:"acquisition" json:"acquisition"`
-	ActiveMinutes        int                       `yaml:"active-minutes" json:"active-minutes"`
-	TTLMinutes           int                       `yaml:"ttl-minutes" json:"ttl-minutes"`
-	RefreshBeforeMinutes int                       `yaml:"refresh-before-minutes" json:"refresh-before-minutes"`
-	Concurrency          int                       `yaml:"concurrency" json:"concurrency"`
-	RetrySeconds         int                       `yaml:"retry-seconds" json:"retry-seconds"`
-	MaxAttempts          int                       `yaml:"max-attempts" json:"max-attempts"`
-	ProxyMode            string                    `yaml:"proxy-mode" json:"proxy-mode"`
-	ProxyURL             string                    `yaml:"proxy-url" json:"proxy-url"`
-	Lengths              []int                     `yaml:"lengths" json:"lengths"`
-	MatchModel           *bool                     `yaml:"match-model,omitempty" json:"match-model,omitempty"`
-	Prompt               string                    `yaml:"prompt" json:"prompt"`
-	ResponseContains     string                    `yaml:"response-contains" json:"response-contains"`
-	ErrorType            string                    `yaml:"error-type" json:"error-type"`
-	ErrorCode            string                    `yaml:"error-code" json:"error-code"`
-	ErrorMessage         string                    `yaml:"error-message" json:"error-message"`
-	ModelOverrides       []CodexStateModelOverride `yaml:"model-overrides" json:"model-overrides"`
+	Enabled                         bool                      `yaml:"enabled" json:"enabled"`
+	Priorities                      APIKeyPriorityList        `yaml:"priorities" json:"priorities"`
+	IncludedCredentials             []string                  `yaml:"included-credentials" json:"included-credentials"`
+	ExcludedCredentials             []string                  `yaml:"excluded-credentials" json:"excluded-credentials"`
+	Models                          []string                  `yaml:"models" json:"models"`
+	Mode                            string                    `yaml:"mode" json:"mode"`
+	MissingPolicy                   string                    `yaml:"missing-policy" json:"missing-policy"`
+	Acquisition                     string                    `yaml:"acquisition" json:"acquisition"`
+	ActiveMinutes                   int                       `yaml:"active-minutes" json:"active-minutes"`
+	TTLMinutes                      int                       `yaml:"ttl-minutes" json:"ttl-minutes"`
+	RefreshBeforeMinutes            int                       `yaml:"refresh-before-minutes" json:"refresh-before-minutes"`
+	Concurrency                     int                       `yaml:"concurrency" json:"concurrency"`
+	RetrySeconds                    int                       `yaml:"retry-seconds" json:"retry-seconds"`
+	MaxAttempts                     int                       `yaml:"max-attempts" json:"max-attempts"`
+	ProxyMode                       string                    `yaml:"proxy-mode" json:"proxy-mode"`
+	ProxyURL                        string                    `yaml:"proxy-url" json:"proxy-url"`
+	Lengths                         []int                     `yaml:"lengths" json:"lengths"`
+	MatchModel                      *bool                     `yaml:"match-model,omitempty" json:"match-model,omitempty"`
+	Prompt                          string                    `yaml:"prompt" json:"prompt"`
+	ResponseContains                string                    `yaml:"response-contains" json:"response-contains"`
+	ErrorType                       string                    `yaml:"error-type" json:"error-type"`
+	ErrorCode                       string                    `yaml:"error-code" json:"error-code"`
+	ErrorMessage                    string                    `yaml:"error-message" json:"error-message"`
+	ModelOverrides                  []CodexStateModelOverride `yaml:"model-overrides" json:"model-overrides"`
+	PlanLengths                     []CodexStatePlanLengths   `yaml:"plan-lengths" json:"plan-lengths"`
+	InvalidateOnStateLengthMismatch bool                      `yaml:"invalidate-on-state-length-mismatch" json:"invalidate-on-state-length-mismatch"`
+	InvalidateOnModelMismatch       bool                      `yaml:"invalidate-on-model-mismatch" json:"invalidate-on-model-mismatch"`
+}
+
+type CodexStatePlanLengths struct {
+	PlanTypes []string `yaml:"plan-types" json:"plan-types"`
+	Models    []string `yaml:"models,omitempty" json:"models,omitempty"`
+	Lengths   []int    `yaml:"lengths" json:"lengths"`
+}
+
+// NormalizeCodexStatePlanType treats Business and Team as the same subscription family.
+func NormalizeCodexStatePlanType(value string) string {
+	value = NormalizeRoutingPlanType(value)
+	if value == "business" {
+		return "team"
+	}
+	if value == "" {
+		return "unknown"
+	}
+	return value
+}
+
+// ForCredential prioritizes plan/model rules, then plan rules, over model/global lengths.
+// Equally specific rules use the first match. Other probe settings retain their model policy.
+func (c CodexStateOverrideConfig) ForCredential(plan, model string) CodexStateOverrideConfig {
+	c = c.ForModel(model)
+	plan = NormalizeCodexStatePlanType(plan)
+	for _, specific := range []bool{true, false} {
+		for _, rule := range c.PlanLengths {
+			if (len(rule.Models) > 0) != specific || (specific && !slices.Contains(rule.Models, model)) {
+				continue
+			}
+			for _, candidate := range rule.PlanTypes {
+				if NormalizeCodexStatePlanType(candidate) == plan {
+					c.Lengths = slices.Clone(rule.Lengths)
+					return c
+				}
+			}
+		}
+	}
+	return c
 }
 
 type CodexStateModelOverride struct {
@@ -70,6 +112,12 @@ func (c CodexStateOverrideConfig) ForModel(model string) CodexStateOverrideConfi
 }
 
 func (c CodexStateOverrideConfig) Resolved() CodexStateOverrideConfig {
+	c.PlanLengths = slices.Clone(c.PlanLengths)
+	for i, v := range c.PlanLengths {
+		c.PlanLengths[i].PlanTypes = slices.Clone(v.PlanTypes)
+		c.PlanLengths[i].Models = slices.Clone(v.Models)
+		c.PlanLengths[i].Lengths = slices.Clone(v.Lengths)
+	}
 	c.ModelOverrides = slices.Clone(c.ModelOverrides)
 	for i, v := range c.ModelOverrides {
 		c.ModelOverrides[i].Lengths = slices.Clone(v.Lengths)
@@ -150,6 +198,26 @@ func (cfg *Config) ValidateCodexStateOverride() error {
 	}
 	c := cfg.Codex.StateOverride.Resolved()
 	invalid := func(message string) error { return fmt.Errorf("codex.state-override: %s", message) }
+	if len(c.PlanLengths) > 64 {
+		return invalid("too many plan length rules")
+	}
+	for _, rule := range c.PlanLengths {
+		if len(rule.PlanTypes) == 0 || len(rule.PlanTypes) > 32 || len(rule.Models) > 256 || rule.Lengths == nil || len(rule.Lengths) > 32 {
+			return invalid("plan length rules require plan-types and a lengths array")
+		}
+		for _, values := range [][]string{rule.PlanTypes, rule.Models} {
+			for _, value := range values {
+				if strings.TrimSpace(value) == "" || value != strings.TrimSpace(value) || len(value) > 256 || strings.ContainsAny(value, "\r\n\x00") {
+					return invalid("invalid plan type or model in plan length rule")
+				}
+			}
+		}
+		for _, length := range rule.Lengths {
+			if length < 1 || length > 8192 {
+				return invalid("plan state length out of range")
+			}
+		}
+	}
 	if len(c.ModelOverrides) > 256 {
 		return invalid("too many model overrides")
 	}

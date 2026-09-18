@@ -125,4 +125,11 @@ func TestManagedStateAdmissionAndFrozenRetry(t *testing.T) {
 	if fresh.Get("X-Codex-Turn-State") != strings.Repeat("b", 292) {
 		t.Fatal("new request ignored refreshed state")
 	}
+	a.Metadata["plan_type"] = "business"
+	c = StateCredential(a, "model")
+	codexstate.Default.Sync(cfg.Codex.StateOverride, []codexstate.Credential{c})
+	acquire("c")
+	if err := ApplyManagedState(ctx, cfg, a, "model", headers); err != nil || headers.Get("X-Codex-Turn-State") != strings.Repeat("c", 292) {
+		t.Fatal("retry reused a state frozen for the previous subscription")
+	}
 }

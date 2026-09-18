@@ -21,7 +21,7 @@ import (
 )
 
 // Credential contains routing identities only, never bearer tokens.
-type Credential struct{ ID, Name, Owner, Instance, Model, Route string }
+type Credential struct{ ID, Name, Owner, Instance, Model, Route, Plan string }
 type Result struct {
 	State, Model, Answer string
 	Completed            bool
@@ -49,22 +49,26 @@ type Snapshot struct {
 	LastStatus          int       `json:"last_status,omitempty"`
 	ConsecutiveFailures int       `json:"consecutive_failures"`
 	Exhausted           bool      `json:"exhausted"`
+	Invalidations       uint64    `json:"invalidations"`
+	LastInvalidation    string    `json:"last_invalidation,omitempty"`
 }
 type entry struct {
 	credential Credential
 	Snapshot
 	state                string
+	valueVersion         uint64
 	busy, paused, manual bool
 	failures             int
 	cancel               context.CancelFunc
 }
 type Manager struct {
-	mu      sync.Mutex
-	wg      sync.WaitGroup
-	cfg     config.CodexStateOverrideConfig
-	entries map[string]*entry
-	version uint64
-	running int
+	mu               sync.Mutex
+	wg               sync.WaitGroup
+	cfg              config.CodexStateOverrideConfig
+	entries          map[string]*entry
+	version          uint64
+	running          int
+	nextValueVersion uint64
 }
 
 var Default = New()
@@ -87,10 +91,11 @@ func (m *Manager) Sync(cfg config.CodexStateOverrideConfig, credentials []Creden
 			e.busy = false
 			e.cancel = nil
 		}
-		if !reflect.DeepEqual(cfg.Lengths, m.cfg.Lengths) || !reflect.DeepEqual(cfg.MatchModel, m.cfg.MatchModel) || cfg.Prompt != m.cfg.Prompt || cfg.ResponseContains != m.cfg.ResponseContains || cfg.TTLMinutes != m.cfg.TTLMinutes || !reflect.DeepEqual(cfg.ModelOverrides, m.cfg.ModelOverrides) {
+		if !reflect.DeepEqual(cfg.Lengths, m.cfg.Lengths) || !reflect.DeepEqual(cfg.MatchModel, m.cfg.MatchModel) || cfg.Prompt != m.cfg.Prompt || cfg.ResponseContains != m.cfg.ResponseContains || cfg.TTLMinutes != m.cfg.TTLMinutes || !reflect.DeepEqual(cfg.ModelOverrides, m.cfg.ModelOverrides) || !reflect.DeepEqual(cfg.PlanLengths, m.cfg.PlanLengths) {
 			for _, e := range m.entries {
 				e.state = ""
 				e.Length = 0
+				e.CurrentUses = 0
 				e.Digest = ""
 				e.ExpiresAt = time.Time{}
 			}
@@ -105,7 +110,7 @@ func (m *Manager) Sync(cfg config.CodexStateOverrideConfig, credentials []Creden
 		k := key(c)
 		wanted[k] = true
 		if old := m.entries[k]; old != nil {
-			if old.credential.Instance == c.Instance {
+			if old.credential.Instance == c.Instance && old.credential.Plan == c.Plan {
 				old.credential = c
 				continue
 			}
@@ -118,6 +123,14 @@ func (m *Manager) Sync(cfg config.CodexStateOverrideConfig, credentials []Creden
 			next.credential = c
 			next.busy = false
 			next.cancel = nil
+			if old.credential.Plan != c.Plan {
+				next.state, next.Digest = "", ""
+				next.Length, next.CurrentUses = 0, 0
+				next.ExpiresAt, next.NextAttempt = time.Time{}, time.Time{}
+				next.failures, next.ConsecutiveFailures = 0, 0
+				next.Exhausted, next.LastError = false, ""
+				next.manual = old.manual || old.busy
+			}
 			m.entries[k] = &next
 			continue
 		}
@@ -135,23 +148,66 @@ func (m *Manager) Sync(cfg config.CodexStateOverrideConfig, credentials []Creden
 
 // Pick freezes a value for an outgoing attempt. Acquiring a replacement never blocks inference.
 func (m *Manager) Pick(c Credential, clientState string, now time.Time) (string, string, bool) {
+	value, policy, _, eligible := m.PickVersion(c, clientState, now)
+	return value, policy, eligible
+}
+
+func (m *Manager) PickVersion(c Credential, clientState string, now time.Time) (string, string, uint64, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	e := m.entries[key(c)]
-	if !m.cfg.Enabled || e == nil || e.credential.Instance != c.Instance || e.paused {
-		return "", "", false
+	if !m.cfg.Enabled || e == nil || e.credential.Instance != c.Instance || e.credential.Plan != c.Plan || e.paused {
+		return "", "", 0, false
 	}
 	e.LastUsed = now
 	if m.cfg.Mode == "missing" && strings.TrimSpace(clientState) != "" {
-		return "", "", true
+		return "", "", 0, true
 	}
 	if e.state != "" && now.Before(e.ExpiresAt) {
 		e.Uses++
 		e.CurrentUses++
-		return e.state, "", true
+		return e.state, "", e.valueVersion, true
 	}
 	e.Misses++
-	return "", m.cfg.MissingPolicy, true
+	return "", m.cfg.MissingPolicy, 0, true
+}
+
+// ObserveResponse invalidates only the value used by this request. Versions also
+// distinguish equal opaque values acquired at different times (the ABA case).
+// A nonempty reason still identifies a rejected old connection when a newer cache value exists.
+func (m *Manager) ObserveResponse(c Credential, version uint64, value, returnedModel string, returnedLength int) string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	e := m.entries[key(c)]
+	if !m.cfg.Enabled || version == 0 || e == nil || e.paused || e.credential.Plan != c.Plan || (!m.cfg.InvalidateOnModelMismatch && !m.cfg.InvalidateOnStateLengthMismatch) {
+		return ""
+	}
+	reason := ""
+	if m.cfg.InvalidateOnModelMismatch && returnedModel != "" && returnedModel != c.Model {
+		reason = "response_model_mismatch"
+	} else if m.cfg.InvalidateOnStateLengthMismatch && returnedLength > 0 {
+		lengths := m.cfg.ForCredential(c.Plan, c.Model).Lengths
+		if len(lengths) > 0 && !slices.Contains(lengths, returnedLength) {
+			reason = "response_state_length_mismatch"
+		}
+	}
+	if reason == "" {
+		return ""
+	}
+	if e.valueVersion != version || e.state != value || e.state == "" {
+		return reason
+	}
+	e.state, e.Digest = "", ""
+	e.valueVersion, e.CurrentUses, e.Length = 0, 0, 0
+	e.ExpiresAt = time.Time{}
+	e.Invalidations++
+	e.LastInvalidation = reason
+	// Keep failure limits and backoff. An already-running renewal supplies the replacement.
+	if !e.busy && !e.Exhausted {
+		e.manual = true
+	}
+	log.WithFields(log.Fields{"auth_id": c.ID, "model": c.Model, "reason": reason, "state_version": version, "returned_state_length": returnedLength}).Warn("Codex managed state invalidated by upstream response")
+	return reason
 }
 
 func (m *Manager) Complete(c Credential, state string) {
@@ -160,6 +216,12 @@ func (m *Manager) Complete(c Credential, state string) {
 	if e := m.entries[key(c)]; e != nil && e.credential.Instance == c.Instance && e.state == state {
 		e.Completed++
 	}
+}
+
+func (m *Manager) WatchesResponses() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.cfg.Enabled && (m.cfg.InvalidateOnModelMismatch || m.cfg.InvalidateOnStateLengthMismatch)
 }
 
 func (m *Manager) Snapshots(id string, now time.Time) []Snapshot {
@@ -176,6 +238,8 @@ func (m *Manager) Snapshots(id string, now time.Time) []Snapshot {
 			s.Status = "paused"
 		case e.busy:
 			s.Status = "acquiring"
+		case e.manual:
+			s.Status = "queued"
 		case e.state != "" && now.Before(e.ExpiresAt):
 			s.Status = "valid"
 		case e.Exhausted:
@@ -195,14 +259,23 @@ func (m *Manager) Snapshots(id string, now time.Time) []Snapshot {
 
 // Action queues work; management requests never wait for an upstream response.
 func (m *Manager) Action(id, model, action string) bool {
+	matched, _ := m.ActionWithBaseline(id, model, action)
+	return matched
+}
+
+// ActionWithBaseline reads the acquisition counter under the same lock used to
+// queue work, so a concurrent renewal cannot be mistaken for this manual action.
+func (m *Manager) ActionWithBaseline(id, model, action string) (bool, uint64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	matched := false
+	var previousAcquired uint64
 	for _, e := range m.entries {
 		if e.credential.ID != id || (model != "" && model != e.Model) {
 			continue
 		}
 		matched = true
+		previousAcquired += e.Acquired
 		switch action {
 		case "acquire":
 			if e.busy {
@@ -239,7 +312,7 @@ func (m *Manager) Action(id, model, action string) bool {
 			e.CurrentUses = 0
 		}
 	}
-	return matched
+	return matched, previousAcquired
 }
 
 // Tick starts at most the configured concurrency; tasks are deduplicated per pair.
@@ -273,7 +346,7 @@ func (m *Manager) Tick(ctx context.Context, now time.Time, probe Probe) {
 		e.Attempts++
 		m.running++
 		m.wg.Add(1)
-		version, cfg, credential := m.version, m.cfg.ForModel(e.Model), e.credential
+		version, cfg, credential := m.version, m.cfg.ForCredential(e.credential.Plan, e.Model), e.credential
 		go func() {
 			defer m.wg.Done()
 			defer cancel()
@@ -302,7 +375,7 @@ func (m *Manager) finish(k string, expected *entry, version uint64, canceled err
 	e.Tokens += result.Tokens
 	e.LastStatus = result.Status
 	reason := ""
-	validation := m.cfg.ForModel(e.Model)
+	validation := m.cfg.ForCredential(e.credential.Plan, e.Model)
 	switch {
 	case err != nil:
 		reason = result.FailureReason
@@ -335,6 +408,8 @@ func (m *Manager) finish(k string, expected *entry, version uint64, canceled err
 		return
 	}
 	e.state = result.State
+	m.nextValueVersion++
+	e.valueVersion = m.nextValueVersion
 	e.Length = len(result.State)
 	d := sha256.Sum256([]byte(result.State))
 	e.Digest = hex.EncodeToString(d[:8])

@@ -79,7 +79,8 @@ func (s *Service) acquireCodexState(ctx context.Context, credential codexstate.C
 		}
 	}()
 	a, ok := s.coreManager.GetByID(credential.ID)
-	if !ok || helps.StateCredential(a, credential.Model).Owner != credential.Owner || a.RuntimeInstanceID() != credential.Instance || a.Disabled {
+	current := helps.StateCredential(a, credential.Model)
+	if !ok || current.Owner != credential.Owner || current.Plan != credential.Plan || a.RuntimeInstanceID() != credential.Instance || a.Disabled {
 		return result, fmt.Errorf("credential no longer available")
 	}
 	s.cfgMu.RLock()

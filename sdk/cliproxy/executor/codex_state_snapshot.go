@@ -9,10 +9,39 @@ type codexStateSnapshotKey struct{}
 type CodexStateChoice struct {
 	Value, Policy string
 	Eligible      bool
+	Version       uint64
 }
+
+func CodexStateChoiceForRequest(ctx context.Context, key string) (CodexStateChoice, bool) {
+	if ctx == nil {
+		return CodexStateChoice{}, false
+	}
+	snapshot, _ := ctx.Value(codexStateSnapshotKey{}).(*codexStateChoices)
+	if snapshot == nil {
+		return CodexStateChoice{}, false
+	}
+	snapshot.mu.Lock()
+	defer snapshot.mu.Unlock()
+	choice, ok := snapshot.choices[key]
+	return choice, ok
+}
+
 type codexStateChoices struct {
 	mu      sync.Mutex
 	choices map[string]CodexStateChoice
+}
+
+func HasCodexStateChoice(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	snapshot, _ := ctx.Value(codexStateSnapshotKey{}).(*codexStateChoices)
+	if snapshot == nil {
+		return false
+	}
+	snapshot.mu.Lock()
+	defer snapshot.mu.Unlock()
+	return len(snapshot.choices) > 0
 }
 
 // WithCodexStateSnapshot freezes managed state per account/model across retries.

@@ -1006,6 +1006,15 @@ xai:
 #     proxy-mode: inherit           # inherit | direct | custom; inference route is unchanged.
 #     proxy-url: ""                 # {12} generates 12 digits, fixed within an acquisition attempt.
 #     lengths: [292]                # [] accepts any nonempty length.
+#     plan-lengths: []              # Optional plan-types, models (empty: all), lengths rules.
+#     # Example only: configure accepted lengths based on your own observations.
+#     # plan-lengths:
+#     #   - { plan-types: [plus, pro], lengths: [292] }
+#     #   - { plan-types: [business], lengths: [332] } # Business and Team match the same family.
+#     # Plan+model rules take precedence over plan-only, model-overrides, then global lengths.
+#     invalidate-on-state-length-mismatch: false # Nonempty business response State must match the resolved length rules.
+#     invalidate-on-model-mismatch: false        # Compare the original completed response model with the upstream request model.
+#     # Invalidate only the version actually used and queue acquisition without replaying the business request.
 #     match-model: true
 #     prompt: "Reply with exactly OK."
 #     response-contains: ""

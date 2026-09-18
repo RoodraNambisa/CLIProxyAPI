@@ -72,7 +72,11 @@ func StateCredential(a *auth.Auth, model string) codexstate.Credential {
 	if owner == "" {
 		owner = a.ID
 	}
-	return codexstate.Credential{ID: a.ID, Name: a.FileName, Owner: owner, Instance: a.RuntimeInstanceID(), Model: thinking.ParseSuffix(model).ModelName}
+	plan := strings.TrimSpace(a.Attributes["plan_type"])
+	if plan == "" {
+		plan = codexauth.EffectivePlanType(a.Metadata)
+	}
+	return codexstate.Credential{ID: a.ID, Name: a.FileName, Owner: owner, Instance: a.RuntimeInstanceID(), Model: thinking.ParseSuffix(model).ModelName, Plan: config.NormalizeCodexStatePlanType(plan)}
 }
 
 // ManagedStateModels uses the credential's registered catalog, including exclusions.
@@ -219,13 +223,13 @@ func ApplyManagedState(ctx context.Context, cfg *config.Config, a *auth.Auth, mo
 		}
 		return nil
 	}
-	choice := core.CodexStateForRequest(ctx, c.ID+"\x00"+c.Owner+"\x00"+c.Model, func() core.CodexStateChoice {
+	choice := core.CodexStateForRequest(ctx, codexStateRequestKey(c), func() core.CodexStateChoice {
 		clientState := headers.Get("X-Codex-Turn-State")
 		if requireManaged {
 			clientState = ""
 		}
-		value, policy, eligible := codexstate.Default.Pick(c, clientState, time.Now())
-		return core.CodexStateChoice{Value: value, Policy: policy, Eligible: eligible}
+		value, policy, version, eligible := codexstate.Default.PickVersion(c, clientState, time.Now())
+		return core.CodexStateChoice{Value: value, Policy: policy, Version: version, Eligible: eligible}
 	})
 	state, policy, eligible := choice.Value, choice.Policy, choice.Eligible
 	if !eligible {
