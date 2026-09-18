@@ -46,6 +46,8 @@ type authFileFieldValues struct {
 	prefix               *string
 	routingAlias         *string
 	proxyURL             *string
+	proxyBinding         map[string]any
+	proxyBindingSet      bool
 	baseURL              *string
 	xaiCatalogSources    *[]string
 	xaiModelRoutes       *[]config.XAIModelRoute
@@ -261,6 +263,14 @@ func decodeAuthFileFieldValues(raw json.RawMessage) (authFileFieldValues, error)
 				return authFileFieldValues{}, fmt.Errorf("invalid proxy_url")
 			}
 			values.proxyURL = &decoded
+		case "proxy_binding":
+			values.proxyBindingSet = true
+			if err := json.Unmarshal(value, &values.proxyBinding); err != nil {
+				return authFileFieldValues{}, errors.New("invalid proxy_binding")
+			}
+			if values.proxyBinding != nil && !validEditableProxyBinding(values.proxyBinding) {
+				return authFileFieldValues{}, errors.New("invalid proxy_binding: expected a versioned node reference or direct binding")
+			}
 		case "headers":
 			var decoded map[string]string
 			if err := decodeNonNullAuthField(value, &decoded); err != nil || decoded == nil {
@@ -399,13 +409,13 @@ func decodeNonNullAuthField(raw json.RawMessage, target any) error {
 }
 
 func (v authFileFieldValues) hasFields() bool {
-	return v.routingAlias != nil || v.prefix != nil || v.proxyURL != nil || v.baseURL != nil || v.xaiCatalogSources != nil || v.xaiModelRoutes != nil || v.headersSet || v.prioritySet || v.weightSet || v.note != nil ||
+	return v.proxyBindingSet || v.routingAlias != nil || v.prefix != nil || v.proxyURL != nil || v.baseURL != nil || v.xaiCatalogSources != nil || v.xaiModelRoutes != nil || v.headersSet || v.prioritySet || v.weightSet || v.note != nil ||
 		v.usingAPI != nil || v.websockets != nil || v.excludedSet || v.disableCooling != nil ||
 		v.loginMethod != nil || v.api798URL != nil || v.codexFingerprintMode != nil || v.errorRules.set
 }
 
 func (v authFileFieldValues) hasNonHeaderFields() bool {
-	return v.routingAlias != nil || v.prefix != nil || v.proxyURL != nil || v.baseURL != nil || v.xaiCatalogSources != nil || v.xaiModelRoutes != nil || v.prioritySet || v.weightSet || v.note != nil || v.usingAPI != nil ||
+	return v.proxyBindingSet || v.routingAlias != nil || v.prefix != nil || v.proxyURL != nil || v.baseURL != nil || v.xaiCatalogSources != nil || v.xaiModelRoutes != nil || v.prioritySet || v.weightSet || v.note != nil || v.usingAPI != nil ||
 		v.websockets != nil || v.excludedSet || v.disableCooling != nil || v.loginMethod != nil ||
 		v.api798URL != nil || v.codexFingerprintMode != nil || v.errorRules.set
 }
@@ -569,6 +579,13 @@ func (h *Handler) applyAuthFileFieldValues(auth *coreauth.Auth, values authFileF
 		value := strings.TrimSpace(*values.proxyURL)
 		auth.ProxyURL = value
 		setOrDeleteAuthString(auth, "proxy_url", value)
+	}
+	if values.proxyBindingSet {
+		if values.proxyBinding == nil {
+			delete(auth.Metadata, coreauth.ProxyBindingMemoryKey)
+		} else {
+			auth.Metadata[coreauth.ProxyBindingMemoryKey] = values.proxyBinding
+		}
 	}
 	if values.headersSet {
 		if values.legacyHeaderOps {

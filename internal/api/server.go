@@ -986,6 +986,7 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.POST("/auth-files/cooldowns/clear-selected", s.mgmt.ClearSelectedAuthCooldowns)
 		mgmt.PATCH("/auth-files/status", s.mgmt.PatchAuthFileStatus)
 		mgmt.PATCH("/auth-files/fields", s.mgmt.PatchAuthFileFields)
+		mgmt.PUT("/auth-files/content", s.mgmt.PutAuthFileContent)
 		mgmt.POST("/vertex/import", s.mgmt.ImportVertexCredential)
 		mgmt.POST("/chatgpt-web/login-tasks", s.mgmt.StartChatGPTWebLoginTask)
 		mgmt.GET("/chatgpt-web/login-tasks/:id", s.mgmt.GetChatGPTWebLoginTask)
