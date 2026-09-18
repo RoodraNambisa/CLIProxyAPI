@@ -966,6 +966,8 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.POST("/auth-files/xai/models/refresh", s.mgmt.RefreshXAIModels)
 		mgmt.POST("/auth-files/models/probe", s.mgmt.ProbeAuthFileModel)
 		mgmt.POST("/auth-files/proxy/check", s.mgmt.CheckAuthFileProxy)
+		mgmt.POST("/auth-files/codex/state", s.mgmt.CodexStateAction)
+		mgmt.GET("/auth-files/codex/state", s.mgmt.GetCodexState)
 		mgmt.GET("/auth-files/response-model-rewrite", s.mgmt.GetAuthFileResponseModelRewrite)
 		mgmt.GET("/model-definitions/:channel", s.mgmt.GetStaticModelDefinitions)
 		mgmt.GET("/auth-files/download", s.mgmt.DownloadAuthFile)
@@ -1452,6 +1454,9 @@ func (s *Server) updateClients(cfg *config.Config, rollbackOnError bool) error {
 	}
 	if errQuota := runtimeCfg.ValidateCodexQuotaAutoDisable(); errQuota != nil {
 		return errQuota
+	}
+	if errState := runtimeCfg.ValidateCodexStateOverride(); errState != nil {
+		return errState
 	}
 	if errRewrite := runtimeCfg.ValidateResponseModelRewrite(); errRewrite != nil {
 		return errRewrite

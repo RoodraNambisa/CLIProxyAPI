@@ -76,6 +76,7 @@ type codexWebsocketSession struct {
 	proxyIdentity      string
 	softwareIdentity   codexauth.SoftwareIdentity
 	cacheSessionDigest [sha256.Size]byte
+	managedStateModel  string
 	xaiHeaderDigest    string
 	// multiAgentResponse describes only the tools committed on the current conn.
 	// It is guarded by connMu and contains no request bodies or connection pointer.
@@ -1977,6 +1978,11 @@ func (e *CodexWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *
 		if cliproxyexecutor.RequiredUpstreamWebsocket(ctx) {
 			return nil, nil, cliproxyexecutor.NewUpstreamWebsocketReplayRequiredError()
 		}
+		if len(models) > 0 {
+			if errState := helps.ApplyManagedState(ctx, e.cfg, auth, models[0], headers); errState != nil {
+				return nil, nil, errState
+			}
+		}
 		conn, resp, errDial := e.dialCodexWebsocket(ctx, auth, wsURL, headers)
 		if errDial != nil {
 			if errCurrent := codexWebsocketExecutionStateError(ctx, auth); errCurrent != nil {
@@ -2014,6 +2020,7 @@ func (e *CodexWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *
 	currentProxyIdentity := strings.TrimSpace(sess.proxyIdentity)
 	currentWSURL := strings.TrimSpace(sess.wsURL)
 	currentSoftwareIdentity := sess.softwareIdentity
+	currentManagedStateModel := sess.managedStateModel
 	currentCacheSessionDigest := sess.cacheSessionDigest
 	sess.connMu.Unlock()
 	requestedAuthID := strings.TrimSpace(authID)
@@ -2023,17 +2030,30 @@ func (e *CodexWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *
 	requestedWSURL := strings.TrimSpace(wsURL)
 	requestedCacheSessionDigest := helps.CodexCacheSessionDigest(ctx)
 	cacheSessionChanged := conn != nil && currentCacheSessionDigest != requestedCacheSessionDigest
+	requestedStateModel := ""
+	if len(models) > 0 && e.cfg != nil && e.cfg.Codex.StateOverride.Enabled {
+		for _, candidate := range helps.ManagedStateModels(e.cfg, auth) {
+			if candidate.Model == thinking.ParseSuffix(models[0]).ModelName {
+				requestedStateModel = candidate.Model
+				break
+			}
+		}
+	}
+	stateModelChanged := conn != nil && currentManagedStateModel != requestedStateModel
+
 	softwareChanged := conn != nil && len(models) > 0 && codexEnforceSoftwareIdentity(e.cfg) && !codexAuthUsesAPIKey(auth) &&
 		!codexauth.SoftwareIdentitySupportsModel(currentSoftwareIdentity, thinking.ParseSuffix(models[0]).ModelName)
-	if cliproxyexecutor.RequiredUpstreamWebsocket(ctx) && (conn == nil || currentAuthID != requestedAuthID || currentAuthInstanceID != requestedAuthInstanceID || currentProxyBindingID != requestedProxyBindingID || currentProxyIdentity != requestedProxyIdentity || currentWSURL != requestedWSURL || softwareChanged || cacheSessionChanged) {
+	if cliproxyexecutor.RequiredUpstreamWebsocket(ctx) && (conn == nil || currentAuthID != requestedAuthID || currentAuthInstanceID != requestedAuthInstanceID || currentProxyBindingID != requestedProxyBindingID || currentProxyIdentity != requestedProxyIdentity || currentWSURL != requestedWSURL || softwareChanged || cacheSessionChanged || stateModelChanged) {
 		return nil, nil, cliproxyexecutor.NewUpstreamWebsocketReplayRequiredError()
 	}
-	if conn != nil && (currentAuthID != requestedAuthID || currentAuthInstanceID != requestedAuthInstanceID || currentProxyBindingID != requestedProxyBindingID || currentProxyIdentity != requestedProxyIdentity || currentWSURL != requestedWSURL || softwareChanged || cacheSessionChanged) {
+	if conn != nil && (currentAuthID != requestedAuthID || currentAuthInstanceID != requestedAuthInstanceID || currentProxyBindingID != requestedProxyBindingID || currentProxyIdentity != requestedProxyIdentity || currentWSURL != requestedWSURL || softwareChanged || cacheSessionChanged || stateModelChanged) {
 		reason := "auth_changed"
 		if softwareChanged {
 			reason = "software_version"
 		} else if cacheSessionChanged {
 			reason = "cache_session_changed"
+		} else if stateModelChanged {
+			reason = "managed_state_model_changed"
 		}
 		e.invalidateUpstreamConnWithoutDisconnectNotify(sess, conn, reason, nil)
 		conn = nil
@@ -2076,6 +2096,12 @@ func (e *CodexWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *
 	sess.pendingProxyIdentity = requestedProxyIdentity
 	sess.connMu.Unlock()
 
+	if len(models) > 0 {
+		if errState := helps.ApplyManagedState(ctx, e.cfg, auth, models[0], headers); errState != nil {
+			clearCodexPendingWebsocketDial(sess, dialGeneration)
+			return nil, nil, errState
+		}
+	}
 	conn, resp, errDial := e.dialCodexWebsocket(ctx, auth, wsURL, headers)
 	if errDial != nil {
 		clearCodexPendingWebsocketDial(sess, dialGeneration)
@@ -2125,6 +2151,7 @@ func (e *CodexWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *
 	sess.authInstanceID = auth.RuntimeInstanceID()
 	sess.proxyBindingID = requestedProxyBindingID
 	sess.proxyIdentity = requestedProxyIdentity
+	sess.managedStateModel = requestedStateModel
 	sess.cacheSessionDigest = requestedCacheSessionDigest
 	sess.softwareIdentity = codexauth.SoftwareIdentity{
 		UserAgent:  headers.Get("User-Agent"),

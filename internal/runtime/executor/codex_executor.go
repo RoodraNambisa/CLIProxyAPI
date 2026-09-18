@@ -1090,6 +1090,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		publishCodexImageToolUsage(ctx, reporter, bodyRef.Bytes(), completedEvent)
 
 		completedData := patchCodexCompletedOutput(completedEvent, outputItemsByIndex, outputItemsFallback)
+		helps.CaptureStateCompletion(ctx, httpResp.Header, completedData)
 		completedEvent = nil
 		outputItemsByIndex = nil
 		outputItemsFallback = nil
@@ -1101,6 +1102,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 			out = helps.EnsureResponsesUsageDetails(out)
 		}
 		if isCodexSuccessfulCompletion(completedData) {
+			helps.ObserveManagedStateCompletion(ctx, auth, baseModel, httpReq.Header)
 			helps.CacheCodexReasoningReplayFromCompleted(replayScope, completedData, ctx)
 		}
 		resp = cliproxyexecutor.Response{Payload: out, Headers: codexSuccessfulResponseHeaders(auth, httpResp.Header)}
@@ -1635,6 +1637,7 @@ func (e *CodexExecutor) executeStream(ctx context.Context, auth *cliproxyauth.Au
 					observeCodexImageToolUsage(reporter, streamBody.Bytes(), data)
 					data = patchCodexCompletedOutput(data, outputItemsByIndex, outputItemsFallback)
 					if isCodexSuccessfulCompletion(data) {
+						helps.ObserveManagedStateCompletion(ctx, auth, baseModel, httpReq.Header)
 						completedReplay = data
 					}
 					translatedLine = append([]byte("data: "), data...)
@@ -2018,6 +2021,9 @@ func (e *CodexExecutor) applyCodexHTTPSessionIdentity(
 		httpReq.ContentLength = int64(bodyReader.Len())
 	}
 	guardCodexTurnStateHeader(e.cfg, auth, httpReq.Header)
+	if errState := helps.ApplyManagedState(ctx, e.cfg, auth, req.Model, httpReq.Header); errState != nil {
+		return nil, errState
+	}
 	return projected, nil
 }
 

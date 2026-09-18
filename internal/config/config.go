@@ -566,11 +566,12 @@ type CodexConfig struct {
 	ObserveQuota     bool                        `yaml:"observe-quota" json:"observe-quota"`
 	QuotaAutoDisable CodexQuotaAutoDisableConfig `yaml:"quota-auto-disable" json:"quota-auto-disable"`
 	// PassthroughPromptCacheKey pins client cache keys and session IDs after identity projection.
-	PassthroughPromptCacheKey bool                 `yaml:"passthrough-prompt-cache-key" json:"passthrough-prompt-cache-key"`
-	IdentityConfuse           bool                 `yaml:"identity-confuse" json:"identity-confuse"`
-	SpoofSessionIdentity      bool                 `yaml:"spoof-session-identity" json:"spoof-session-identity"`
-	TurnStatePolicy           CodexTurnStatePolicy `yaml:"turn-state-policy" json:"turn-state-policy"`
-	EnforceSoftwareIdentity   *bool                `yaml:"enforce-software-identity,omitempty" json:"enforce-software-identity,omitempty"`
+	PassthroughPromptCacheKey bool                     `yaml:"passthrough-prompt-cache-key" json:"passthrough-prompt-cache-key"`
+	IdentityConfuse           bool                     `yaml:"identity-confuse" json:"identity-confuse"`
+	SpoofSessionIdentity      bool                     `yaml:"spoof-session-identity" json:"spoof-session-identity"`
+	TurnStatePolicy           CodexTurnStatePolicy     `yaml:"turn-state-policy" json:"turn-state-policy"`
+	StateOverride             CodexStateOverrideConfig `yaml:"state-override" json:"state-override"`
+	EnforceSoftwareIdentity   *bool                    `yaml:"enforce-software-identity,omitempty" json:"enforce-software-identity,omitempty"`
 }
 
 // CodexTurnStatePolicy controls how client turn-state headers are forwarded to Codex OAuth upstreams.
@@ -2368,6 +2369,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	if errQuota := cfg.ValidateCodexQuotaAutoDisable(); errQuota != nil {
 		return nil, errQuota
 	}
+	if errState := cfg.ValidateCodexStateOverride(); errState != nil {
+		return nil, errState
+	}
 	if errRewrite := cfg.ValidateResponseModelRewrite(); errRewrite != nil {
 		return nil, errRewrite
 	}
@@ -4052,6 +4056,9 @@ func SaveConfigPreserveComments(configFile string, cfg *Config) error {
 	}
 	if errQuota := cfg.ValidateCodexQuotaAutoDisable(); errQuota != nil {
 		return errQuota
+	}
+	if errState := cfg.ValidateCodexStateOverride(); errState != nil {
+		return errState
 	}
 	if errRewrite := cfg.ValidateResponseModelRewrite(); errRewrite != nil {
 		return errRewrite

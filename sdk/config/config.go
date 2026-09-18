@@ -43,6 +43,9 @@ type RuntimeApplyResult = internalconfig.RuntimeApplyResult
 
 type StreamingConfig = internalconfig.StreamingConfig
 type CodexFingerprintConfig = internalconfig.CodexFingerprintConfig
+type CodexStateOverrideConfig = internalconfig.CodexStateOverrideConfig
+type CodexStateModelOverride = internalconfig.CodexStateModelOverride
+
 type CodexQuotaAutoDisableConfig = internalconfig.CodexQuotaAutoDisableConfig
 type CodexQuotaAutoDisableRule = internalconfig.CodexQuotaAutoDisableRule
 type CodexLiveMediaRelayConfig = internalconfig.CodexLiveMediaRelayConfig

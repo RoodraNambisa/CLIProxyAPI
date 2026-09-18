@@ -4589,7 +4589,7 @@ func authFilePathQuarantined(auth *Auth, authDir string) bool {
 // Execute performs a non-streaming execution using the configured selector and executor.
 // It supports multiple providers for the same model and round-robins the starting provider per model.
 func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (response cliproxyexecutor.Response, err error) {
-	ctx = coreusage.WithStreamDefault(ctx, false)
+	ctx = cliproxyexecutor.WithCodexStateSnapshot(coreusage.WithStreamDefault(ctx, false))
 	ctx = contextWithGenerateMetadata(ctx, opts)
 	ctx = m.WithRoutingPolicySnapshot(ctx)
 	ctx = m.withCodexQuotaObservation(ctx)
@@ -4689,7 +4689,7 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 // ExecuteCount performs a non-streaming execution using the configured selector and executor.
 // It supports multiple providers for the same model and round-robins the starting provider per model.
 func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (response cliproxyexecutor.Response, err error) {
-	ctx = coreusage.WithStreamDefault(ctx, false)
+	ctx = cliproxyexecutor.WithCodexStateSnapshot(coreusage.WithStreamDefault(ctx, false))
 	ctx = contextWithGenerateMetadata(ctx, opts)
 	ctx = m.WithRoutingPolicySnapshot(ctx)
 	ctx = cliproxyexecutor.WithCodexQuotaObserver(ctx, nil)
@@ -4779,7 +4779,7 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 // ExecuteStream performs a streaming execution using the configured selector and executor.
 // It supports multiple providers for the same model and round-robins the starting provider per model.
 func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (result *cliproxyexecutor.StreamResult, err error) {
-	ctx = coreusage.WithStreamDefault(ctx, true)
+	ctx = cliproxyexecutor.WithCodexStateSnapshot(coreusage.WithStreamDefault(ctx, true))
 	ctx = contextWithGenerateMetadata(ctx, opts)
 	ctx = m.WithRoutingPolicySnapshot(ctx)
 	ctx = m.withCodexQuotaObservation(ctx)

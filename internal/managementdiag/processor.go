@@ -76,7 +76,7 @@ var permanentlySensitiveKeys = map[string]struct{}{
 	"credentialid": {}, "rawid": {}, "userhandle": {},
 	"recoverykey": {}, "recoverykeys": {}, "recoverycode": {}, "recoverycodes": {}, "recoverysecret": {}, "accountrecoverycode": {},
 	"proxyurl": {}, "api798url": {}, "authcode": {}, "authorizationcode": {}, "oauthcode": {},
-	"codeverifier": {}, "codechallenge": {}, "oauthstate": {}, "state": {}, "nonce": {},
+	"codeverifier": {}, "codechallenge": {}, "oauthstate": {}, "state": {}, "xcodexturnstate": {}, "nonce": {},
 }
 
 var sensitiveQueryKeys = map[string]struct{}{

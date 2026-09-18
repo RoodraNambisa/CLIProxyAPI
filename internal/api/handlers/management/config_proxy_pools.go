@@ -432,6 +432,7 @@ func cloneConfigWithMaskedProxyURLs(input *config.Config) (config.Config, error)
 		return config.Config{}, errUnmarshal
 	}
 	snapshot.ProxyURL = proxyutil.MaskProxyURL(snapshot.ProxyURL)
+	snapshot.Codex.StateOverride.ProxyURL = proxyutil.MaskProxyURL(snapshot.Codex.StateOverride.ProxyURL)
 	snapshot.ProxyPools = maskProxyPools(snapshot.ProxyPools)
 	snapshot.GeminiKey = append([]config.GeminiKey(nil), snapshot.GeminiKey...)
 	for index := range snapshot.GeminiKey {

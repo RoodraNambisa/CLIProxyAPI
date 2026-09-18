@@ -987,6 +987,31 @@ xai:
 #   optimize-multi-agent-v2: false
 #   spoof-session-identity: false
 #   turn-state-policy: "guard-cross-account"
+#   # Memory-only state per credential account and upstream model. Disabled by default.
+#   state-override:
+#     enabled: false
+#     priorities: []                # Empty matches all (unspecified credential priority is 0).
+#     excluded-credentials: []       # Credential IDs, short IDs or filenames.
+#     models: []                    # Intersect with each credential's supported text models.
+#     mode: override                # override | missing (fill only absent client state)
+#     missing-policy: continue      # continue | error (local HTTP 429)
+#     acquisition: active           # active | all | manual
+#     active-minutes: 60
+#     ttl-minutes: 60
+#     refresh-before-minutes: 5
+#     concurrency: 1
+#     retry-seconds: 60
+#     max-attempts: 3                # Stop automatic acquisition until manual retry.
+#     proxy-mode: inherit           # inherit | direct | custom; inference route is unchanged.
+#     proxy-url: ""                 # {12} generates 12 digits, fixed within an acquisition attempt.
+#     lengths: [292]                # [] accepts any nonempty length.
+#     match-model: true
+#     prompt: "Reply with exactly OK."
+#     response-contains: ""
+#     model-overrides: []            # Optional model, lengths, match-model, prompt, response-contains.
+#     error-type: rate_limit_exceeded
+#     error-code: rate_limit_exceeded
+#     error-message: "Rate limit exceeded for image_generation. Please try again later."
 #   enforce-software-identity: true # normalize outbound User-Agent, Originator, and Version; default true
 
 # Optional Codex upstream fingerprinting. Disabled by default.

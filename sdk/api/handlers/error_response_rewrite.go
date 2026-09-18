@@ -107,7 +107,7 @@ func (h *BaseAPIHandler) RewriteExecutionErrorResponseForGin(c *gin.Context, msg
 }
 
 func (h *BaseAPIHandler) rewriteExecutionErrorResponse(msg *interfaces.ErrorMessage, source coreexecutor.ErrorResponseSourceSnapshot) *interfaces.ErrorMessage {
-	if msg == nil || h == nil || h.Cfg == nil || len(h.Cfg.ErrorResponseRewrites) == 0 {
+	if msg == nil || coreexecutor.PreserveErrorResponse(msg.Error) || h == nil || h.Cfg == nil || len(h.Cfg.ErrorResponseRewrites) == 0 {
 		return msg
 	}
 	originalStatus := msg.StatusCode

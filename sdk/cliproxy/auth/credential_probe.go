@@ -9,6 +9,13 @@ import (
 	coreusage "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
 )
 
+type credentialProbeProxyKey struct{}
+
+// WithCredentialProbeProxy isolates a diagnostic probe from inference proxy pools.
+func WithCredentialProbeProxy(ctx context.Context, proxyURL string) context.Context {
+	return context.WithValue(ctx, credentialProbeProxyKey{}, proxyURL)
+}
+
 // ProbeCredential prepares one explicitly selected credential without invoking
 // the scheduler, retrying another account, or changing cooldown/affinity state.
 // The callback must finish consuming its stream before returning. Preparation
@@ -43,9 +50,17 @@ func (m *Manager) ProbeCredential(ctx context.Context, expected *Auth, executor 
 		}
 		opts = core.WithProviderPreparedRequest(opts, provider, prepared)
 	}
-	auth, err := m.ResolveProxyAuth(ctx, expected)
-	if err != nil {
-		return err
+	var auth *Auth
+	if proxyURL, override := ctx.Value(credentialProbeProxyKey{}).(string); override {
+		auth = expected.Clone()
+		auth.ProxyURL = proxyURL
+		auth.RuntimeProxyURL = ""
+		auth.RuntimeProxyBindingID = ""
+	} else {
+		auth, err = m.ResolveProxyAuth(ctx, expected)
+		if err != nil {
+			return err
+		}
 	}
 	if rt := m.roundTripperFor(auth); rt != nil {
 		ctx = context.WithValue(ctx, roundTripperContextKey{}, rt)

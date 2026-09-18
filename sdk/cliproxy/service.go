@@ -50,6 +50,9 @@ type Service struct {
 	// cfg holds the current application configuration.
 	cfg *config.Config
 
+	codexStateCancel  context.CancelFunc
+	codexStateWG      sync.WaitGroup
+	codexStateStopped bool
 	// cfgMu protects concurrent access to the configuration.
 	cfgMu sync.RWMutex
 
@@ -4997,6 +5000,7 @@ func (s *Service) applyRuntimeConfigState(ctx context.Context, previousCfg, next
 		s.coreManager.SetOAuthModelAlias(nextCfg.OAuthModelAlias)
 	}
 	s.rebindExecutors()
+	s.syncCodexState(nextCfg)
 	if errCatalog := s.refreshConfiguredModelCatalog(ctx, previousCfg, nextCfg); errCatalog != nil {
 		return errCatalog
 	}
@@ -5356,6 +5360,7 @@ func (s *Service) Run(ctx context.Context) error {
 		log.Infof("core auth auto-refresh started (interval=%s)", interval)
 	}
 	finishRouting(authCount, "")
+	s.startCodexState(ctx)
 	s.startupState.MarkReady()
 	s.startUsageRestore()
 	s.startUsagePersistenceLoop()
@@ -5439,6 +5444,15 @@ func (s *Service) Shutdown(ctx context.Context) error {
 func (s *Service) runShutdown() {
 	defer close(s.shutdownDone)
 	var shutdownErr error
+	s.cfgMu.Lock()
+	s.codexStateStopped = true
+	stopState := s.codexStateCancel
+	s.codexStateCancel = nil
+	s.cfgMu.Unlock()
+	if stopState != nil {
+		stopState()
+	}
+	s.codexStateWG.Wait()
 
 	if s.watcherCancel != nil {
 		s.watcherCancel()

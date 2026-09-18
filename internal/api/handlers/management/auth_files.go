@@ -32,6 +32,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/kimi"
 	xaiauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/xai"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/authfileguard"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/codexstate"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/credentialweight"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
@@ -699,6 +700,9 @@ func (h *Handler) buildAuthFileEntryAtWithRuntime(auth *coreauth.Auth, now time.
 	}
 	applyAuthCooldownStatus(entry, summarizeAuthCooldown(auth, now))
 	entry["proxy_route"] = h.authFileProxyRoute(auth, runtimeSummary)
+	if auth.ExecutionProvider() == "codex" {
+		entry["codex_state"] = gin.H{"enabled": h.currentConfig() != nil && h.currentConfig().Codex.StateOverride.Enabled, "models": codexstate.Default.Snapshots(auth.ID, now)}
+	}
 	if manager := h.coreAuthRuntimeManager(); manager != nil {
 		entry["request_limit"] = manager.AuthRequestLimitSummary(auth)
 		entry["response_model_rewrite"] = manager.AuthResponseModelRewriteSummary(auth, false)
