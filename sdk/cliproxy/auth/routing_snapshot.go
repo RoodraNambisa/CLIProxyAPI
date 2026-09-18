@@ -11,19 +11,20 @@ import (
 // routingRequestPolicy freezes selection choices, not credential availability or
 // limiter generations. Retired instances and current capacity remain authoritative.
 type routingRequestPolicy struct {
-	manager             *Manager
-	selector            Selector
-	strategy            schedulerStrategy
-	strategies          map[int]schedulerStrategy
-	fillRange           int
-	fillRPM             int
-	priorityRange       map[int]int
-	priorityRPM         map[int]int
-	priorityMaxRetries  map[int]int
-	strictAffinity      bool
-	observeCodexQuota   bool
-	oauthErrorRules     map[string]*config.CompiledRequestScopedErrors
-	clientKeyPriorities map[[sha256.Size]byte]clientKeyPriorityPolicy
+	manager              *Manager
+	selector             Selector
+	strategy             schedulerStrategy
+	strategies           map[int]schedulerStrategy
+	fillRange            int
+	fillRPM              int
+	priorityRange        map[int]int
+	priorityRPM          map[int]int
+	priorityMaxRetries   map[int]int
+	strictAffinity       bool
+	observeCodexQuota    bool
+	oauthErrorRules      map[string]*config.CompiledRequestScopedErrors
+	clientKeyPriorities  map[[sha256.Size]byte]clientKeyPriorityPolicy
+	responseModelRewrite config.ResponseModelRewriteConfig
 }
 
 type routingRequestPolicyKey struct{}

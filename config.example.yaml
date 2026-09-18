@@ -442,6 +442,17 @@ oauth-request-scoped-errors: {}
 # Remove route models from matching credentials before model prefixing and registry registration.
 # Matching fields use non-secret auth metadata only.
 auth-model-exclusions: []
+response-model-rewrite:
+  enabled: false
+  rules: []
+# rules match the selected credential; empty conditions match all values.
+# response-model-rewrite:
+#   enabled: true
+#   rules:
+#     - providers: [codex]
+#       auth-priorities: [0, 3]
+#       credential-ids: [] # Stable short IDs displayed on credential cards.
+#       request-models: [gpt-6-astra] # Supports * and ?; empty matches all models.
 # auth-model-exclusions:
 #   - models: ["gpt-image-2"]
 #     priorities: [-1, 0]

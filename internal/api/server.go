@@ -966,6 +966,7 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.POST("/auth-files/xai/models/refresh", s.mgmt.RefreshXAIModels)
 		mgmt.POST("/auth-files/models/probe", s.mgmt.ProbeAuthFileModel)
 		mgmt.POST("/auth-files/proxy/check", s.mgmt.CheckAuthFileProxy)
+		mgmt.GET("/auth-files/response-model-rewrite", s.mgmt.GetAuthFileResponseModelRewrite)
 		mgmt.GET("/model-definitions/:channel", s.mgmt.GetStaticModelDefinitions)
 		mgmt.GET("/auth-files/download", s.mgmt.DownloadAuthFile)
 		mgmt.POST("/auth-files/archive", s.mgmt.DownloadAuthFilesArchive)
@@ -1448,6 +1449,9 @@ func (s *Server) updateClients(cfg *config.Config, rollbackOnError bool) error {
 	}
 	if errRules := runtimeCfg.ValidateRequestScopedErrorRules(); errRules != nil {
 		return errRules
+	}
+	if errRewrite := runtimeCfg.ValidateResponseModelRewrite(); errRewrite != nil {
+		return errRewrite
 	}
 	if errModels := runtimeCfg.ValidateModelContextLengths(); errModels != nil {
 		return errModels

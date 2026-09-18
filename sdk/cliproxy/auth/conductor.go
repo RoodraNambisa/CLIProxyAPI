@@ -402,13 +402,14 @@ type hookState struct {
 
 // Manager orchestrates auth lifecycle, selection, execution, and persistence.
 type Manager struct {
-	store     Store
-	executors map[string]ProviderExecutor
-	selector  Selector
-	hookValue atomic.Value
-	loadMu    sync.Mutex
-	mu        sync.RWMutex
-	auths     map[string]*Auth
+	responseModelStats responseModelStats
+	store              Store
+	executors          map[string]ProviderExecutor
+	selector           Selector
+	hookValue          atomic.Value
+	loadMu             sync.Mutex
+	mu                 sync.RWMutex
+	auths              map[string]*Auth
 	// backingPathAuthIDs indexes runtime auths by their normalized backing path.
 	// All fields in this block are protected by mu and are updated atomically
 	// with auths through installAuthLocked and removeAuthLocked.
@@ -787,6 +788,7 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 	manager.apiKeyModelRouting.Store(&apiKeyModelRoutingSnapshot{config: manager.currentConfig()})
 	manager.scheduler = newAuthScheduler(selector)
 	manager.executionMetrics = &cliproxyexecutor.RequestExecutionMetrics{}
+	manager.responseModelStats.since = time.Now().UTC()
 	manager.refreshPersistence.Store(newRefreshPersistenceCoordinator(store))
 	manager.resultPersistence = newResultPersistenceCoordinator(manager)
 	manager.resultProducers = make(map[*resultPersistenceProducer]struct{})
@@ -1179,6 +1181,7 @@ func (m *Manager) SetSelector(selector Selector) {
 	if previous := m.routingPolicy.Load(); previous != nil {
 		policy.oauthErrorRules = previous.oauthErrorRules
 		policy.clientKeyPriorities = previous.clientKeyPriorities
+		policy.responseModelRewrite = previous.responseModelRewrite
 	}
 	m.routingPolicy.Store(policy)
 	m.mu.Unlock()
@@ -1291,6 +1294,10 @@ func (m *Manager) SetConfig(cfg *internalconfig.Config) {
 	if m == nil {
 		return
 	}
+	if err := cfg.ValidateResponseModelRewrite(); err != nil {
+		log.WithError(err).Warn("ignoring invalid response model rewrite configuration")
+		return
+	}
 	if cfg.ValidateAPIKeyPriorities() != nil {
 		log.Warn("ignoring invalid client API key priority configuration")
 		return
@@ -1320,6 +1327,10 @@ func (m *Manager) SetConfig(cfg *internalconfig.Config) {
 // Existing request snapshots keep their selector and priority rules together.
 func (m *Manager) SetConfigAndSelector(cfg *internalconfig.Config, selector Selector) {
 	if m == nil {
+		return
+	}
+	if err := cfg.ValidateResponseModelRewrite(); err != nil {
+		log.WithError(err).Warn("ignoring invalid response model rewrite configuration")
 		return
 	}
 	if cfg.ValidateAPIKeyPriorities() != nil {
@@ -1378,6 +1389,7 @@ func (m *Manager) setConfigLocked(cfg *internalconfig.Config) {
 	policy.observeCodexQuota = cfg.Codex.ObserveQuota
 	policy.oauthErrorRules = oauthErrorRules
 	policy.clientKeyPriorities = compileClientKeyPriorities(cfg)
+	policy.responseModelRewrite = cloneResponseModelRewrite(cfg.ResponseModelRewrite)
 	m.routingPolicy.Store(policy)
 	if m.backingPathAuthDir != strings.TrimSpace(cfg.AuthDir) {
 		m.rebuildBackingPathIndexLocked(cfg)
@@ -1648,7 +1660,7 @@ func rewriteForceMappedStreamChunk(rewriter *StreamRewriter, payload []byte) []b
 		return nil
 	}
 	if bytes.Contains(payload, []byte("data:")) {
-		if lineWise := rewriteSSEPayloadLines(payload, rewriter.options.RewriteModel); len(lineWise) > 0 {
+		if lineWise := rewriteSSEPayloadLinesWithOptions(payload, rewriter.options); len(lineWise) > 0 {
 			return lineWise
 		}
 	}
@@ -2450,8 +2462,11 @@ func (m *Manager) wrapStreamResult(ctx, resultCtx context.Context, auth *Auth, a
 		var failed bool
 		forward := true
 		var rewriter *StreamRewriter
-		if aliasResult.ForceMapping && strings.TrimSpace(aliasResult.OriginalAlias) != "" {
+		if !cliproxyexecutor.SingleAttempt(ctx) && aliasResult.ForceMapping && strings.TrimSpace(aliasResult.OriginalAlias) != "" {
 			rewriter = NewStreamRewriter(StreamRewriteOptions{RewriteModel: aliasResult.OriginalAlias})
+		}
+		if rewrite := m.responseModelRewriteOptions(ctx, auth, opts, true); rewrite != nil {
+			rewriter = NewStreamRewriter(*rewrite)
 		}
 		send := func(chunk cliproxyexecutor.StreamChunk, retiredChunk bool) bool {
 			select {
@@ -5885,7 +5900,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 					m.markExecutionResult(execCtx, successfulExecutionResultForAuth(auth, provider, resultModel, opts))
 					m.bindSessionAffinity(ctx, providers, routeModel, opts, auth)
 				}
-				rewriteForceMappedResponse(&resp, aliasResult)
+				m.rewriteClientResponseModel(execCtx, auth, opts, &resp, aliasResult)
 				return resp, nil
 			}
 			if retiredDuringExecution {
@@ -5950,7 +5965,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 							m.markExecutionResult(execCtx, successfulExecutionResultForAuth(auth, provider, resultModel, opts))
 							m.bindSessionAffinity(ctx, providers, routeModel, opts, auth)
 						}
-						rewriteForceMappedResponse(&resp, aliasResult)
+						m.rewriteClientResponseModel(execCtx, auth, opts, &resp, aliasResult)
 						return resp, nil
 					}
 					if retiredDuringRetry {
@@ -7066,6 +7081,7 @@ func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxy
 				if !retiredDuringExecution {
 					m.markExecutionResult(creditsCtx, resultForAuth(c.auth, c.provider, resultModel, true))
 				}
+				m.rewriteClientResponseModel(creditsCtx, c.auth, creditsOpts, &resp, OAuthModelAliasResult{})
 				return resp, true, nil
 			}
 			if retiredDuringExecution {
@@ -7167,6 +7183,7 @@ func (m *Manager) tryAntigravityCreditsExecuteStream(ctx context.Context, req cl
 }
 
 func ensureRequestedModelMetadata(opts cliproxyexecutor.Options, requestedModel string) cliproxyexecutor.Options {
+	opts = ensureClientResponseModelMetadata(opts, requestedModel)
 	requestedModel = strings.TrimSpace(requestedModel)
 	if requestedModel == "" {
 		return opts

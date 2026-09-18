@@ -2364,6 +2364,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	if errRules := cfg.ValidateRequestScopedErrorRules(); errRules != nil {
 		return nil, errRules
 	}
+	if errRewrite := cfg.ValidateResponseModelRewrite(); errRewrite != nil {
+		return nil, errRewrite
+	}
 	if errModels := cfg.ValidateModelContextLengths(); errModels != nil {
 		return nil, errModels
 	}
@@ -4042,6 +4045,9 @@ func hashSecret(secret string) (string, error) {
 func SaveConfigPreserveComments(configFile string, cfg *Config) error {
 	if cfg == nil {
 		return fmt.Errorf("config is nil")
+	}
+	if errRewrite := cfg.ValidateResponseModelRewrite(); errRewrite != nil {
+		return errRewrite
 	}
 	if errKeys := cfg.ValidateXAIKeys(); errKeys != nil {
 		return errKeys

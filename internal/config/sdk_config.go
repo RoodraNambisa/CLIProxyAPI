@@ -57,6 +57,9 @@ type SDKConfig struct {
 	// ErrorResponseRewrites changes selected final runtime and local-conversion error responses.
 	ErrorResponseRewrites []ErrorResponseRewriteRule `yaml:"error-response-rewrites,omitempty" json:"error-response-rewrites,omitempty"`
 
+	// ResponseModelRewrite optionally projects response model names to the client request.
+	ResponseModelRewrite ResponseModelRewriteConfig `yaml:"response-model-rewrite" json:"response-model-rewrite"`
+
 	// Streaming configures server-side streaming behavior (keep-alives and safe bootstrap retries).
 	Streaming StreamingConfig `yaml:"streaming" json:"streaming"`
 

@@ -701,6 +701,7 @@ func (h *Handler) buildAuthFileEntryAtWithRuntime(auth *coreauth.Auth, now time.
 	entry["proxy_route"] = h.authFileProxyRoute(auth, runtimeSummary)
 	if manager := h.coreAuthRuntimeManager(); manager != nil {
 		entry["request_limit"] = manager.AuthRequestLimitSummary(auth)
+		entry["response_model_rewrite"] = manager.AuthResponseModelRewriteSummary(auth, false)
 	}
 	if email := authEmail(auth); email != "" {
 		entry["email"] = email

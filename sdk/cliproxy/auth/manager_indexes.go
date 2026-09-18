@@ -642,6 +642,9 @@ func (m *Manager) removeAuthLocked(id string) {
 	}
 	removed := m.auths[id]
 	delete(m.auths, id)
+	m.responseModelStats.mu.Lock()
+	delete(m.responseModelStats.auths, id)
+	m.responseModelStats.mu.Unlock()
 	m.removeAuthIndexesLocked(id)
 	m.removeManagementAuthCatalogLocked(id)
 	m.removeAPIKeyModelAliasForAuthLocked(removed)
