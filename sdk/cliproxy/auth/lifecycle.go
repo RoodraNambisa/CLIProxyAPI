@@ -107,7 +107,7 @@ func applyLifecycleRuntimeState(auth *Auth) {
 	state := auth.LifecycleState()
 	if auth.Disabled {
 		auth.Status = StatusDisabled
-		auth.StatusMessage = ""
+		auth.StatusMessage = CodexQuotaAutoDisableReason(auth)
 		if state != "" && state != LifecycleStateActive && auth.Metadata != nil {
 			if reason, _ := auth.Metadata["lifecycle_reason"].(string); strings.TrimSpace(reason) != "" {
 				auth.StatusMessage = lifecycleRuntimeReason(auth, reason)

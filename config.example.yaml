@@ -957,9 +957,24 @@ xai:
 #   estimate-claude-input-tokens: false
 #   # Observe quota headers and WebSocket quota events from actual Codex requests.
 #   # Boolean, missing/null defaults to false; other types are rejected. No extra network query,
-#   # credential persistence, routing or cooldown changes. Hot updates affect new
+#   # credential persistence, routing or cooldown changes unless quota-auto-disable is enabled.
+#   # Hot updates affect new
 #   # logical requests; in-flight retries keep the original setting.
 #   observe-quota: false
+#   # Opt-in permanent disable on NEW main-pool observations only. Requires observe-quota.
+#   # Windows are identified by duration (300 / 10080 minutes), not primary/secondary order.
+#   # Spark and reserve pools never trigger this policy. Re-enable credentials manually.
+#   # Empty filters match all; filter groups are AND, entries within one group are OR.
+#   # Either configured window triggers when remaining percent is strictly BELOW its threshold.
+#   # Omit/null a threshold to ignore that window. Missing usage never triggers.
+#   quota-auto-disable:
+#     enabled: false
+#     rules: []
+#     # - providers: [codex]
+#     #   auth-priorities: [0, 3]
+#     #   credential-ids: []
+#     #   weekly-remaining-percent: 10
+#     #   five-hour-remaining-percent: null
 #   # Convert unpaired Codex app delegation results to user messages only for
 #   # X-Openai-Subagent: collab_spawn. Paired calls and other tools are unchanged.
 #   orphan-delegation-compatibility: false

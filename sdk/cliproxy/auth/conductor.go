@@ -1182,6 +1182,7 @@ func (m *Manager) SetSelector(selector Selector) {
 		policy.oauthErrorRules = previous.oauthErrorRules
 		policy.clientKeyPriorities = previous.clientKeyPriorities
 		policy.responseModelRewrite = previous.responseModelRewrite
+		policy.codexQuotaAutoDisable = previous.codexQuotaAutoDisable
 	}
 	m.routingPolicy.Store(policy)
 	m.mu.Unlock()
@@ -1294,6 +1295,10 @@ func (m *Manager) SetConfig(cfg *internalconfig.Config) {
 	if m == nil {
 		return
 	}
+	if err := cfg.ValidateCodexQuotaAutoDisable(); err != nil {
+		log.WithError(err).Warn("ignoring invalid Codex quota auto-disable configuration")
+		return
+	}
 	if err := cfg.ValidateResponseModelRewrite(); err != nil {
 		log.WithError(err).Warn("ignoring invalid response model rewrite configuration")
 		return
@@ -1327,6 +1332,10 @@ func (m *Manager) SetConfig(cfg *internalconfig.Config) {
 // Existing request snapshots keep their selector and priority rules together.
 func (m *Manager) SetConfigAndSelector(cfg *internalconfig.Config, selector Selector) {
 	if m == nil {
+		return
+	}
+	if err := cfg.ValidateCodexQuotaAutoDisable(); err != nil {
+		log.WithError(err).Warn("ignoring invalid Codex quota auto-disable configuration")
 		return
 	}
 	if err := cfg.ValidateResponseModelRewrite(); err != nil {
@@ -1387,6 +1396,7 @@ func (m *Manager) setConfigLocked(cfg *internalconfig.Config) {
 	m.rebuildAPIKeyModelAliasLocked(cfg)
 	policy := newRoutingRequestPolicy(m, m.selector, cfg.Routing)
 	policy.observeCodexQuota = cfg.Codex.ObserveQuota
+	policy.codexQuotaAutoDisable = cloneCodexQuotaAutoDisable(cfg.Codex.QuotaAutoDisable)
 	policy.oauthErrorRules = oauthErrorRules
 	policy.clientKeyPriorities = compileClientKeyPriorities(cfg)
 	policy.responseModelRewrite = cloneResponseModelRewrite(cfg.ResponseModelRewrite)
@@ -8278,7 +8288,7 @@ func (m *Manager) markResult(
 
 		if !result.Success && isInvalidGrantResultError(result.Error) {
 			disableAuthForInvalidGrant(auth, result.Error, now)
-		} else if !result.Success && (auth.Disabled || auth.Status == StatusDisabled) {
+		} else if auth.Disabled || auth.Status == StatusDisabled {
 			// Preserve an explicit disabled state against late in-flight results.
 		} else if !result.Success && (availabilityNeutral || isCredentialNeutralFailure(result.Error)) {
 			// Request faults and connection lifecycles do not change credential availability.
@@ -13378,7 +13388,7 @@ func carryForwardConcurrentRefreshRuntimeState(baseline, current, next *Auth) {
 	if baseline == nil || current == nil || next == nil {
 		return
 	}
-	if baseline.Status == current.Status &&
+	if baseline.Disabled == current.Disabled && baseline.Status == current.Status &&
 		baseline.StatusMessage == current.StatusMessage &&
 		baseline.Unavailable == current.Unavailable &&
 		reflect.DeepEqual(baseline.LastError, current.LastError) &&
@@ -13390,6 +13400,7 @@ func carryForwardConcurrentRefreshRuntimeState(baseline, current, next *Auth) {
 		applyLifecycleRuntimeState(next)
 		return
 	}
+	next.Disabled = current.Disabled
 	next.Status = current.Status
 	next.StatusMessage = current.StatusMessage
 	next.Unavailable = current.Unavailable

@@ -562,8 +562,9 @@ type CodexConfig struct {
 	StreamBootstrapBuffering bool `yaml:"stream-bootstrap-buffering" json:"stream-bootstrap-buffering"`
 	// EstimateClaudeInputTokens fills empty Claude message_start input usage with a local estimate.
 	EstimateClaudeInputTokens bool `yaml:"estimate-claude-input-tokens" json:"estimate-claude-input-tokens"`
-	// ObserveQuota records passive Codex quota signals without changing availability.
-	ObserveQuota bool `yaml:"observe-quota" json:"observe-quota"`
+	// ObserveQuota records passive Codex quota signals. Actions require QuotaAutoDisable.
+	ObserveQuota     bool                        `yaml:"observe-quota" json:"observe-quota"`
+	QuotaAutoDisable CodexQuotaAutoDisableConfig `yaml:"quota-auto-disable" json:"quota-auto-disable"`
 	// PassthroughPromptCacheKey pins client cache keys and session IDs after identity projection.
 	PassthroughPromptCacheKey bool                 `yaml:"passthrough-prompt-cache-key" json:"passthrough-prompt-cache-key"`
 	IdentityConfuse           bool                 `yaml:"identity-confuse" json:"identity-confuse"`
@@ -2364,6 +2365,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	if errRules := cfg.ValidateRequestScopedErrorRules(); errRules != nil {
 		return nil, errRules
 	}
+	if errQuota := cfg.ValidateCodexQuotaAutoDisable(); errQuota != nil {
+		return nil, errQuota
+	}
 	if errRewrite := cfg.ValidateResponseModelRewrite(); errRewrite != nil {
 		return nil, errRewrite
 	}
@@ -4045,6 +4049,9 @@ func hashSecret(secret string) (string, error) {
 func SaveConfigPreserveComments(configFile string, cfg *Config) error {
 	if cfg == nil {
 		return fmt.Errorf("config is nil")
+	}
+	if errQuota := cfg.ValidateCodexQuotaAutoDisable(); errQuota != nil {
+		return errQuota
 	}
 	if errRewrite := cfg.ValidateResponseModelRewrite(); errRewrite != nil {
 		return errRewrite

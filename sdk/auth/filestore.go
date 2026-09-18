@@ -914,7 +914,7 @@ func (s *FileTokenStore) save(ctx context.Context, auth *cliproxyauth.Auth, requ
 				fmt.Errorf("auth filestore: sync persisted storage auth failed: %w", errSync),
 			)
 		}
-		markManagerOwnedChatGPTWebPersistence(ctx, auth, path, data)
+		markManagerOwnedRuntimePersistence(ctx, auth, path, data)
 	case auth.Metadata != nil:
 		raw, errMarshal := cliproxyauth.CanonicalMetadataBytes(auth)
 		if errMarshal != nil {
@@ -950,7 +950,7 @@ func (s *FileTokenStore) save(ctx context.Context, auth *cliproxyauth.Auth, requ
 				persistenceCommitted = true
 			}
 			cliproxyauth.SetSourceHashAttribute(auth, raw)
-			markManagerOwnedChatGPTWebPersistence(ctx, auth, path, raw)
+			markManagerOwnedRuntimePersistence(ctx, auth, path, raw)
 			return finishFileTokenSave(auth, persistedPath, committedWarning)
 		}
 		if errWrite := writeRootFileAtomicallyForSnapshotTargetLocked(ctx, parentRoot, leaf, raw, &initialSnapshot, path, s.syncRootDirectory); errWrite != nil {
@@ -966,7 +966,7 @@ func (s *FileTokenStore) save(ctx context.Context, auth *cliproxyauth.Auth, requ
 			persistenceCommitted = true
 		}
 		cliproxyauth.SetSourceHashAttribute(auth, raw)
-		markManagerOwnedChatGPTWebPersistence(ctx, auth, path, raw)
+		markManagerOwnedRuntimePersistence(ctx, auth, path, raw)
 	default:
 		return "", fmt.Errorf("auth filestore: nothing to persist for %s", auth.ID)
 	}
@@ -974,9 +974,9 @@ func (s *FileTokenStore) save(ctx context.Context, auth *cliproxyauth.Auth, requ
 	return finishFileTokenSave(auth, persistedPath, committedWarning)
 }
 
-func markManagerOwnedChatGPTWebPersistence(ctx context.Context, auth *cliproxyauth.Auth, path string, data []byte) {
+func markManagerOwnedRuntimePersistence(ctx context.Context, auth *cliproxyauth.Auth, path string, data []byte) {
 	if !authfileguard.ManagerOwnedPersistence(ctx) || auth == nil ||
-		!strings.EqualFold(strings.TrimSpace(auth.Provider), "chatgpt-web") {
+		(!strings.EqualFold(strings.TrimSpace(auth.Provider), "chatgpt-web") && cliproxyauth.CodexQuotaAutoDisableReason(auth) == "") {
 		return
 	}
 	authfileguard.MarkManagerPersistedGeneration(path, cliproxyauth.SourceHashFromBytes(data))

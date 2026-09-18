@@ -1450,6 +1450,9 @@ func (s *Server) updateClients(cfg *config.Config, rollbackOnError bool) error {
 	if errRules := runtimeCfg.ValidateRequestScopedErrorRules(); errRules != nil {
 		return errRules
 	}
+	if errQuota := runtimeCfg.ValidateCodexQuotaAutoDisable(); errQuota != nil {
+		return errQuota
+	}
 	if errRewrite := runtimeCfg.ValidateResponseModelRewrite(); errRewrite != nil {
 		return errRewrite
 	}

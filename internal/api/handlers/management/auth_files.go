@@ -3291,6 +3291,7 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 		}
 		if targetAuth.Metadata != nil {
 			delete(targetAuth.Metadata, "disabled")
+			delete(targetAuth.Metadata, "codex_quota_auto_disable_reason")
 			for key := range targetAuth.Metadata {
 				if strings.HasPrefix(key, "auth_maintenance_") {
 					delete(targetAuth.Metadata, key)

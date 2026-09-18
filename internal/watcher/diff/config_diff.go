@@ -334,6 +334,9 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	if oldCfg.Codex.EstimateClaudeInputTokens != newCfg.Codex.EstimateClaudeInputTokens {
 		changes = append(changes, fmt.Sprintf("codex.estimate-claude-input-tokens: %t -> %t", oldCfg.Codex.EstimateClaudeInputTokens, newCfg.Codex.EstimateClaudeInputTokens))
 	}
+	if !reflect.DeepEqual(oldCfg.Codex.QuotaAutoDisable, newCfg.Codex.QuotaAutoDisable) {
+		changes = append(changes, "codex.quota-auto-disable: updated")
+	}
 	if oldCfg.Codex.ObserveQuota != newCfg.Codex.ObserveQuota {
 		changes = append(changes, fmt.Sprintf("codex.observe-quota: %t -> %t", oldCfg.Codex.ObserveQuota, newCfg.Codex.ObserveQuota))
 	}

@@ -18,7 +18,7 @@ const (
 	maxCodexQuotaSignalText = 512
 )
 
-// CodexQuotaObservation is passive upstream information, never scheduler state.
+// CodexQuotaObservation is passive upstream information, separate from scheduler state.
 // It must not be serialized into credential or cooldown storage.
 type CodexQuotaObservation struct {
 	ObservedAt time.Time         `json:"observed_at"`
@@ -54,7 +54,10 @@ func (m *Manager) withCodexQuotaObservation(ctx context.Context) context.Context
 	var observer cliproxyexecutor.CodexQuotaObserver
 	if policy := m.selectionPolicy(ctx); policy != nil && policy.observeCodexQuota {
 		observer = func(authID, instanceID, source string, headers http.Header) {
-			m.recordCodexQuotaObservation(authID, instanceID, source, headers, time.Now())
+			observedAt := time.Now()
+			if m.recordCodexQuotaObservation(authID, instanceID, source, headers, observedAt) && policy.codexQuotaAutoDisable.Enabled {
+				m.applyCodexQuotaAutoDisable(ctx, policy.codexQuotaAutoDisable, authID, instanceID, newCodexQuotaObservation(headers, source, observedAt))
+			}
 		}
 	}
 	return cliproxyexecutor.WithCodexQuotaObserver(ctx, observer)
