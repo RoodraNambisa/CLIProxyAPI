@@ -1224,6 +1224,7 @@ func (s *GitTokenStore) saveRefreshBatch(requests []*gitRefreshSaveRequest) []gi
 			))
 			continue
 		}
+		markProxyBindingMemoryPersistence(candidate.request.ctx, candidate.request.auth, candidate.path, candidate.data)
 		complete(candidate.requestIndex, candidate.path, nil)
 	}
 	return results
@@ -1545,6 +1546,11 @@ func (s *GitTokenStore) save(ctx context.Context, auth *cliproxyauth.Auth, requi
 
 	var persistedData []byte
 	installedSnapshot := localSnapshot
+	defer func() {
+		if committed {
+			markProxyBindingMemoryPersistence(ctx, auth, path, installedSnapshot.data)
+		}
+	}()
 	switch {
 	case auth.Storage != nil:
 		data, errData := prepareAuthStorageData(auth, runtimeSnapshot)

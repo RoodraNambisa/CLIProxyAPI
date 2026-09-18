@@ -70,13 +70,14 @@ func (h *Handler) PatchProxyPool(c *gin.Context) {
 		Ports       *string `json:"ports"`
 	}
 	var body struct {
-		Name                 *string       `json:"name"`
-		PlaceholderCharset   *string       `json:"placeholder-charset"`
-		CheckIntervalSeconds *int          `json:"check-interval-seconds"`
-		BindAttempts         *int          `json:"bind-attempts"`
-		SpreadBindings       *bool         `json:"spread-bindings"`
-		Entries              *[]entryPatch `json:"entries"`
-		DeleteEntryIDs       []string      `json:"delete-entry-ids"`
+		Name                      *string       `json:"name"`
+		PlaceholderCharset        *string       `json:"placeholder-charset"`
+		CheckIntervalSeconds      *int          `json:"check-interval-seconds"`
+		BindAttempts              *int          `json:"bind-attempts"`
+		SpreadBindings            *bool         `json:"spread-bindings"`
+		RememberCredentialBinding *bool         `json:"remember-credential-binding"`
+		Entries                   *[]entryPatch `json:"entries"`
+		DeleteEntryIDs            []string      `json:"delete-entry-ids"`
 	}
 	if errBind := c.ShouldBindJSON(&body); errBind != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
@@ -110,6 +111,9 @@ func (h *Handler) PatchProxyPool(c *gin.Context) {
 	}
 	if body.BindAttempts != nil {
 		pools[index].BindAttempts = *body.BindAttempts
+	}
+	if body.RememberCredentialBinding != nil {
+		pools[index].RememberCredentialBinding = *body.RememberCredentialBinding
 	}
 	if body.SpreadBindings != nil {
 		pools[index].SpreadBindings = *body.SpreadBindings

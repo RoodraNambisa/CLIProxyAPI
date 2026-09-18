@@ -366,6 +366,11 @@ func (s *PostgresStore) save(ctx context.Context, auth *cliproxyauth.Auth, requi
 	runtimeSnapshot := captureAuthRuntimeSnapshot(auth)
 
 	var persistedData []byte
+	defer func() {
+		if committed {
+			markProxyBindingMemoryPersistence(ctx, auth, path, persistedData)
+		}
+	}()
 	installedSnapshot := localSnapshot
 	switch {
 	case auth.Storage != nil:

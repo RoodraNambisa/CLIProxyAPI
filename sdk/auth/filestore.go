@@ -976,7 +976,7 @@ func (s *FileTokenStore) save(ctx context.Context, auth *cliproxyauth.Auth, requ
 
 func markManagerOwnedRuntimePersistence(ctx context.Context, auth *cliproxyauth.Auth, path string, data []byte) {
 	if !authfileguard.ManagerOwnedPersistence(ctx) || auth == nil ||
-		(!strings.EqualFold(strings.TrimSpace(auth.Provider), "chatgpt-web") && cliproxyauth.CodexQuotaAutoDisableReason(auth) == "") {
+		(!strings.EqualFold(strings.TrimSpace(auth.Provider), "chatgpt-web") && cliproxyauth.CodexQuotaAutoDisableReason(auth) == "" && cliproxyauth.ReadProxyBindingMemory(auth) == nil) {
 		return
 	}
 	authfileguard.MarkManagerPersistedGeneration(path, cliproxyauth.SourceHashFromBytes(data))

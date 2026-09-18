@@ -919,16 +919,26 @@ func (m *Manager) Rebind(ctx context.Context, authIDs []string) []RebindResult {
 			}
 			targets = directTargets
 		}
-		unlock, errLock := m.lockBinding(ctx, authID)
+		memoryCtx, current, unlockMemory, errMemory := m.lockCredentialMemory(ctx, auth)
+		if errMemory != nil {
+			result.Error = "credential changed before proxy rebind"
+			result.HTTPStatus = http.StatusConflict
+			results = append(results, result)
+			continue
+		}
+		auth = current
+		unlock, errLock := m.lockBinding(memoryCtx, authID)
 		if errLock != nil {
+			unlockMemory()
 			result.Error = errLock.Error()
 			result.HTTPStatus = http.StatusRequestTimeout
 			results = append(results, result)
 			continue
 		}
-		resolved, errResolve := m.resolveRuleBinding(ctx, snapshot, authID, coreauth.ChatGPTWebCredentialUID(auth), targets, true)
+		resolved, errResolve := m.resolveRuleBinding(memoryCtx, snapshot, authID, coreauth.ChatGPTWebCredentialUID(auth), targets, true)
 		unlock()
 		if errResolve != nil {
+			unlockMemory()
 			var unavailable *UnavailableError
 			if errors.As(errResolve, &unavailable) {
 				result.Error = unavailable.Message()
@@ -939,6 +949,16 @@ func (m *Manager) Rebind(ctx context.Context, authIDs []string) []RebindResult {
 			results = append(results, result)
 			continue
 		}
+		if resolved.Source == "pool" {
+			if _, errRemember := m.RememberCredentialBinding(memoryCtx, auth, resolved.BindingID); errRemember != nil {
+				unlockMemory()
+				result.Error = "proxy binding changed but could not be saved to credential"
+				result.HTTPStatus = http.StatusInternalServerError
+				results = append(results, result)
+				continue
+			}
+		}
+		unlockMemory()
 		result.Updated = true
 		for _, status := range m.BindingStatuses() {
 			if status.AuthID == authID && (resolved.BindingID == "" || status.BindingID == resolved.BindingID) {

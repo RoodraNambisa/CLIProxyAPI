@@ -326,6 +326,11 @@ func (s *ObjectTokenStore) save(ctx context.Context, auth *cliproxyauth.Auth, re
 	runtimeSnapshot := captureAuthRuntimeSnapshot(auth)
 
 	var persistedData []byte
+	defer func() {
+		if committed {
+			markProxyBindingMemoryPersistence(ctx, auth, path, persistedData)
+		}
+	}()
 	installedSnapshot := localSnapshot
 	switch {
 	case auth.Storage != nil:

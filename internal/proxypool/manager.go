@@ -459,11 +459,18 @@ func (m *Manager) Resolve(ctx context.Context, auth *coreauth.Auth) (coreauth.Re
 		}
 		return coreauth.ResolvedProxy{URL: explicit, Source: "auth"}, nil
 	}
+	ctx, auth, unlockMemory, errMemory := m.lockCredentialMemory(ctx, auth)
+	if errMemory != nil {
+		return coreauth.ResolvedProxy{}, errMemory
+	}
+	defer unlockMemory()
 	lock, errLock := m.lockBinding(ctx, auth.ID)
 	if errLock != nil {
 		return coreauth.ResolvedProxy{}, errLock
 	}
-	defer lock()
+	var releaseBinding sync.Once
+	unlockBinding := func() { releaseBinding.Do(lock) }
+	defer unlockBinding()
 	for {
 		if ctx != nil && ctx.Err() != nil {
 			return coreauth.ResolvedProxy{}, ctx.Err()
@@ -479,9 +486,19 @@ func (m *Manager) Resolve(ctx context.Context, auth *coreauth.Auth) (coreauth.Re
 			}
 			return coreauth.ResolvedProxy{Source: "inherit"}, nil
 		}
+		if errRestore := m.restoreCredentialBinding(snapshot, auth, targets); errRestore != nil {
+			if errors.Is(errRestore, errProxyConfigurationChanged) {
+				continue
+			}
+			return coreauth.ResolvedProxy{}, errRestore
+		}
 		resolved, errResolve := m.resolveRuleBinding(ctx, snapshot, auth.ID, coreauth.ChatGPTWebCredentialUID(auth), targets, false)
 		if errors.Is(errResolve, errProxyConfigurationChanged) {
 			continue
+		}
+		unlockBinding()
+		if errResolve == nil && resolved.Source == "pool" {
+			_, errResolve = m.RememberCredentialBinding(ctx, auth, resolved.BindingID)
 		}
 		return resolved, errResolve
 	}
@@ -663,6 +680,9 @@ func (m *Manager) resolveRuleBinding(ctx context.Context, snapshot *configSnapsh
 		if ctx != nil && ctx.Err() != nil {
 			return coreauth.ResolvedProxy{}, ctx.Err()
 		}
+		if pool, ok := snapshot.pools[strings.ToLower(current.Pool)]; ok && pool.config.RememberCredentialBinding {
+			return resolved, errResolve
+		}
 		attempted["pool:"+strings.ToLower(strings.TrimSpace(current.Pool))] = struct{}{}
 	}
 
@@ -819,6 +839,9 @@ func (m *Manager) resolvePoolBinding(ctx context.Context, snapshot *configSnapsh
 						return coreauth.ResolvedProxy{}, errProxyConfigurationChanged
 					}
 					return resolvedProxy(current, resolvedURL), nil
+				}
+				if pool.config.RememberCredentialBinding {
+					return coreauth.ResolvedProxy{}, &UnavailableError{Pool: pool.config.Name}
 				}
 			}
 		}
@@ -1201,11 +1224,15 @@ func poolCandidateCount(pool runtimePool) int {
 }
 
 func (m *Manager) bindingAtOrdinal(pool runtimePool, authID string, ordinal int) (Binding, string, error) {
+	return m.bindingAtOrdinalWithSource(pool, authID, ordinal, m.random)
+}
+
+func (m *Manager) bindingAtOrdinalWithSource(pool runtimePool, authID string, ordinal int, source io.Reader) (Binding, string, error) {
 	selected, port, ok := poolEntryAtOrdinal(pool, ordinal)
 	if !ok {
 		return Binding{}, "", errors.New("proxy candidate ordinal is out of range")
 	}
-	resolvedURL, values, errExpand := proxyutil.ExpandURLTemplate(selected.config.URLTemplate, pool.config.PlaceholderCharset, m.random)
+	resolvedURL, values, errExpand := proxyutil.ExpandURLTemplate(selected.config.URLTemplate, pool.config.PlaceholderCharset, source)
 	if errExpand != nil {
 		return Binding{}, "", errExpand
 	}
@@ -1216,7 +1243,7 @@ func (m *Manager) bindingAtOrdinal(pool runtimePool, authID string, ordinal int)
 			return Binding{}, "", errPort
 		}
 	}
-	bindingID, errID := randomBindingID(m.random)
+	bindingID, errID := randomBindingID(source)
 	if errID != nil {
 		return Binding{}, "", errID
 	}

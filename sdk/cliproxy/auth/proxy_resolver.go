@@ -108,6 +108,16 @@ func (m *Manager) ResolveProxyAuth(ctx context.Context, auth *Auth) (*Auth, erro
 	if errResolve != nil {
 		return auth, errResolve
 	}
+	if recorder, ok := resolver.(proxyBindingRecorder); ok && resolved.Source == "pool" {
+		updated, errRemember := recorder.RememberCredentialBinding(ctx, resolverAuth, resolved.BindingID)
+		if errRemember != nil {
+			return auth, errRemember
+		}
+		if resolverAuth == auth && updated != nil {
+			auth = updated
+			resolverAuth = updated
+		}
+	}
 	clone := auth.Clone()
 	if clone == nil {
 		return clone, nil

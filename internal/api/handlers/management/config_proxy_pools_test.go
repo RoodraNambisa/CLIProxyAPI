@@ -1068,3 +1068,35 @@ func performProxyConfigRequest(router http.Handler, method, target, body string)
 	router.ServeHTTP(recorder, request)
 	return recorder
 }
+
+func TestProxyPoolManagementPatchesRememberCredentialBinding(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	if errWrite := os.WriteFile(configPath, []byte("proxy-pools: []\nproxy-rules: []\n"), 0o600); errWrite != nil {
+		t.Fatalf("write config: %v", errWrite)
+	}
+	cfg := &config.Config{}
+	h := NewHandler(cfg, configPath, nil)
+	router := gin.New()
+	router.POST("/proxy-pools", h.PostProxyPool)
+	router.GET("/proxy-pools", h.GetProxyPools)
+	router.PATCH("/proxy-pools/:name", h.PatchProxyPool)
+
+	create := performProxyConfigRequest(router, http.MethodPost, "/proxy-pools", `{
+		"name":"residential",
+		"remember-credential-binding":true,
+		"entries":[{"id":"node","url-template":"http://proxy.example:8080"}]
+	}`)
+	if create.Code != http.StatusOK || len(cfg.ProxyPools) != 1 || !cfg.ProxyPools[0].RememberCredentialBinding {
+		t.Fatalf("create spread pool status/config = %d/%#v; body=%s", create.Code, cfg.ProxyPools, create.Body.String())
+	}
+
+	patch := performProxyConfigRequest(router, http.MethodPatch, "/proxy-pools/residential", `{"remember-credential-binding":false}`)
+	if patch.Code != http.StatusOK || cfg.ProxyPools[0].RememberCredentialBinding {
+		t.Fatalf("patch spread pool status/config = %d/%#v; body=%s", patch.Code, cfg.ProxyPools[0], patch.Body.String())
+	}
+	get := performProxyConfigRequest(router, http.MethodGet, "/proxy-pools", "")
+	if get.Code != http.StatusOK || strings.Contains(get.Body.String(), `"remember-credential-binding":true`) {
+		t.Fatalf("get spread pool response = %d %s", get.Code, get.Body.String())
+	}
+}
