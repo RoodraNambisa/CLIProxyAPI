@@ -3,6 +3,7 @@ package helps
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"slices"
 	"strconv"
@@ -22,6 +23,16 @@ import (
 
 type stateProbeKey struct{}
 type stateCaptureKey struct{}
+type codexStateDiagnosticKey struct{}
+type codexStateDiagnostic struct {
+	mode, value string
+	observe     func(string, string)
+}
+
+// WithCodexStateDiagnostic applies temporary management-test options after normal header guards.
+func WithCodexStateDiagnostic(ctx context.Context, mode, value string, observe func(string, string)) context.Context {
+	return context.WithValue(ctx, codexStateDiagnosticKey{}, &codexStateDiagnostic{mode, value, observe})
+}
 
 func WithStateCapture(ctx context.Context, capture *codexstate.Result) context.Context {
 	return context.WithValue(WithStateProbe(ctx), stateCaptureKey{}, capture)
@@ -86,7 +97,9 @@ func ManagedStateModels(cfg *config.Config, a *auth.Auth) []codexstate.Credentia
 			priority, _ = strconv.Atoi(p)
 		}
 	}
-	if len(c.Priorities) > 0 && !slices.Contains(c.Priorities, priority) {
+	included := slices.Contains(c.IncludedCredentials, a.ID) || slices.Contains(c.IncludedCredentials, a.Index) || slices.Contains(c.IncludedCredentials, a.FileName)
+	// Explicit credentials extend the priority scope. Empty selectors preserve all-credential scope.
+	if (len(c.Priorities) > 0 || len(c.IncludedCredentials) > 0) && !included && !slices.Contains(c.Priorities, priority) {
 		return nil
 	}
 	result := []codexstate.Credential{}
@@ -136,16 +149,60 @@ func (stateUnavailableError) RetryOtherAuth() bool        { return false }
 func (stateUnavailableError) PreserveErrorResponse() bool { return true }
 
 // ApplyManagedState runs after client headers and account guards. It never changes session IDs.
-func ApplyManagedState(ctx context.Context, cfg *config.Config, a *auth.Auth, model string, headers http.Header) error {
-	if IsStateProbe(ctx) {
+func ApplyManagedState(ctx context.Context, cfg *config.Config, a *auth.Auth, model string, headers http.Header) (err error) {
+	var diagnostic *codexStateDiagnostic
+	if ctx != nil {
+		diagnostic, _ = ctx.Value(codexStateDiagnosticKey{}).(*codexStateDiagnostic)
+	}
+	source := "none"
+	if headers.Get("X-Codex-Turn-State") != "" {
+		source = "configured"
+	}
+	defer func() {
+		if diagnostic != nil && diagnostic.observe != nil {
+			value := headers.Get("X-Codex-Turn-State")
+			if err != nil {
+				value = ""
+			}
+			diagnostic.observe(source, value)
+		}
+	}()
+	setState := func(value string) {
 		for name := range headers {
 			if strings.EqualFold(name, "X-Codex-Turn-State") {
 				delete(headers, name)
 			}
 		}
+		if value != "" {
+			headers.Set("X-Codex-Turn-State", value)
+		}
+	}
+	if IsStateProbe(ctx) {
+		setState("")
+		source = "none"
 		return nil
 	}
+	if diagnostic != nil {
+		switch diagnostic.mode {
+		case "none":
+			setState("")
+			source = "none"
+			return nil
+		case "custom":
+			setState(diagnostic.value)
+			source = "custom"
+			return nil
+		}
+	}
+	requireManaged := diagnostic != nil && diagnostic.mode == "managed"
+	unavailable := func() error {
+		source = "unavailable"
+		return errors.New("no valid managed State is available for this credential and upstream model")
+	}
 	if cfg == nil || !cfg.Codex.StateOverride.Enabled || cfg.Codex.ResolvedTurnStatePolicy() == config.CodexTurnStatePolicyStrip {
+		if requireManaged {
+			return unavailable()
+		}
 		return nil
 	}
 	c := StateCredential(a, model)
@@ -157,24 +214,33 @@ func ApplyManagedState(ctx context.Context, cfg *config.Config, a *auth.Auth, mo
 		}
 	}
 	if !inScope {
+		if requireManaged {
+			return unavailable()
+		}
 		return nil
 	}
 	choice := core.CodexStateForRequest(ctx, c.ID+"\x00"+c.Owner+"\x00"+c.Model, func() core.CodexStateChoice {
-		value, policy, eligible := codexstate.Default.Pick(c, headers.Get("X-Codex-Turn-State"), time.Now())
+		clientState := headers.Get("X-Codex-Turn-State")
+		if requireManaged {
+			clientState = ""
+		}
+		value, policy, eligible := codexstate.Default.Pick(c, clientState, time.Now())
 		return core.CodexStateChoice{Value: value, Policy: policy, Eligible: eligible}
 	})
 	state, policy, eligible := choice.Value, choice.Policy, choice.Eligible
 	if !eligible {
+		if requireManaged {
+			return unavailable()
+		}
 		return nil
 	}
 	if state != "" {
-		for name := range headers {
-			if strings.EqualFold(name, "X-Codex-Turn-State") {
-				delete(headers, name)
-			}
-		}
-		headers.Set("X-Codex-Turn-State", state)
+		setState(state)
+		source = "managed"
 		return nil
+	}
+	if requireManaged {
+		return unavailable()
 	}
 	if policy == "" {
 		return nil
@@ -183,6 +249,7 @@ func ApplyManagedState(ctx context.Context, cfg *config.Config, a *auth.Auth, mo
 	if policy != "error" {
 		return nil
 	}
+	source = "unavailable"
 	resolved := cfg.Codex.StateOverride.Resolved()
 	body, _ := json.Marshal(map[string]any{"error": map[string]string{"type": resolved.ErrorType, "code": resolved.ErrorCode, "message": resolved.ErrorMessage}})
 	return stateUnavailableError{body: string(body)}

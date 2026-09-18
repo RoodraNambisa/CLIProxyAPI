@@ -36,6 +36,49 @@ func TestManagedStateScopePriorityAndCatalogIntersection(t *testing.T) {
 	}
 }
 
+func TestManagedStateIncludedCredentialScope(t *testing.T) {
+	a := &auth.Auth{ID: "state-included", Index: "abc123", FileName: "codex-fixture.json", Provider: "codex"}
+	r := registry.GetGlobalRegistry()
+	r.RegisterClient(a.ID, "codex", []*registry.ModelInfo{{ID: "model"}})
+	defer r.UnregisterClient(a.ID)
+	for _, tc := range []struct {
+		name       string
+		priority   string
+		priorities []int
+		included   []string
+		excluded   []string
+		models     []string
+		disabled   bool
+		want       bool
+	}{
+		{name: "empty selectors include all", want: true},
+		{name: "priority match", priority: "3", priorities: []int{3}, want: true},
+		{name: "priority mismatch", priorities: []int{3}},
+		{name: "explicit ID adds priority zero", priorities: []int{3}, included: []string{a.ID}, want: true},
+		{name: "short ID adds priority zero", priorities: []int{3}, included: []string{a.Index}, want: true},
+		{name: "filename adds priority zero", priorities: []int{3}, included: []string{a.FileName}, want: true},
+		{name: "other priority zero is not added", priorities: []int{3}, included: []string{"other"}},
+		{name: "priority still matches with other explicit ID", priority: "3", priorities: []int{3}, included: []string{"other"}, want: true},
+		{name: "explicit only", included: []string{a.ID}, want: true},
+		{name: "explicit only excludes all other priorities", priority: "3", included: []string{"other"}},
+		{name: "exclusion wins over both selectors", priority: "3", priorities: []int{3}, included: []string{a.ID}, excluded: []string{a.Index}},
+		{name: "included still respects models", included: []string{a.ID}, models: []string{"unsupported"}},
+		{name: "included does not enable a disabled credential", included: []string{a.ID}, disabled: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a.Attributes = map[string]string{"priority": tc.priority}
+			a.Disabled = tc.disabled
+			cfg := &config.Config{Codex: config.CodexConfig{StateOverride: config.CodexStateOverrideConfig{
+				Enabled: true, Priorities: tc.priorities, IncludedCredentials: tc.included,
+				ExcludedCredentials: tc.excluded, Models: tc.models,
+			}}}
+			if got := len(ManagedStateModels(cfg, a)) > 0; got != tc.want {
+				t.Fatalf("in scope = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestManagedStateAdmissionAndFrozenRetry(t *testing.T) {
 	a := &auth.Auth{ID: "state-admission", Provider: "codex", Metadata: map[string]any{"account_id": "owner"}}
 	r := registry.GetGlobalRegistry()

@@ -13,6 +13,7 @@ import (
 type CodexStateOverrideConfig struct {
 	Enabled              bool                      `yaml:"enabled" json:"enabled"`
 	Priorities           APIKeyPriorityList        `yaml:"priorities" json:"priorities"`
+	IncludedCredentials  []string                  `yaml:"included-credentials" json:"included-credentials"`
 	ExcludedCredentials  []string                  `yaml:"excluded-credentials" json:"excluded-credentials"`
 	Models               []string                  `yaml:"models" json:"models"`
 	Mode                 string                    `yaml:"mode" json:"mode"`
@@ -83,6 +84,7 @@ func (c CodexStateOverrideConfig) Resolved() CodexStateOverrideConfig {
 	}
 	c.Priorities = slices.Clone(c.Priorities)
 	c.Models = slices.Clone(c.Models)
+	c.IncludedCredentials = slices.Clone(c.IncludedCredentials)
 	c.ExcludedCredentials = slices.Clone(c.ExcludedCredentials)
 	c.Lengths = slices.Clone(c.Lengths)
 	if c.Mode == "" {
@@ -175,7 +177,7 @@ func (cfg *Config) ValidateCodexStateOverride() error {
 	if c.TTLMinutes < 1 || c.TTLMinutes > 1440 || c.RefreshBeforeMinutes < 1 || c.RefreshBeforeMinutes >= c.TTLMinutes || c.ActiveMinutes < 1 || c.ActiveMinutes > 10080 || c.Concurrency < 1 || c.Concurrency > 16 || c.RetrySeconds < 1 || c.RetrySeconds > 3600 || c.MaxAttempts < 1 || c.MaxAttempts > 10 {
 		return invalid("invalid lifetime, refresh, activity or acquisition limits")
 	}
-	if len(c.Prompt) > 4096 || len(c.ResponseContains) > 1024 || len(c.Models) > 256 || len(c.ExcludedCredentials) > 1024 || len(c.Priorities) > 128 || len(c.Lengths) > 32 {
+	if len(c.Prompt) > 4096 || len(c.ResponseContains) > 1024 || len(c.Models) > 256 || len(c.IncludedCredentials) > 1024 || len(c.ExcludedCredentials) > 1024 || len(c.Priorities) > 128 || len(c.Lengths) > 32 {
 		return invalid("too many matchers or probe text too long")
 	}
 	if len(c.ErrorType) > 128 || len(c.ErrorCode) > 128 || len(c.ErrorMessage) > 4096 {
@@ -191,7 +193,7 @@ func (cfg *Config) ValidateCodexStateOverride() error {
 			return invalid("priority out of range")
 		}
 	}
-	for _, list := range [][]string{c.Models, c.ExcludedCredentials} {
+	for _, list := range [][]string{c.Models, c.IncludedCredentials, c.ExcludedCredentials} {
 		for _, v := range list {
 			if strings.TrimSpace(v) == "" || len(v) > 512 || strings.ContainsAny(v, "\r\n\x00") {
 				return invalid("invalid model or credential selector")

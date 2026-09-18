@@ -990,8 +990,9 @@ xai:
 #   # Memory-only state per credential account and upstream model. Disabled by default.
 #   state-override:
 #     enabled: false
-#     priorities: []                # Empty matches all (unspecified credential priority is 0).
-#     excluded-credentials: []       # Credential IDs, short IDs or filenames.
+#     priorities: []                # OR with included-credentials; both empty matches all. Missing priority is 0.
+#     included-credentials: []       # Credential IDs, short IDs or filenames; can extend priority scope.
+#     excluded-credentials: []       # Credential IDs, short IDs or filenames. Exclusions always win.
 #     models: []                    # Intersect with each credential's supported text models.
 #     mode: override                # override | missing (fill only absent client state)
 #     missing-policy: continue      # continue | error (local HTTP 429)

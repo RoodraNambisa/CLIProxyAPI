@@ -14,6 +14,9 @@ func TestCodexStateOverrideDefaultsAndValidation(t *testing.T) {
 		func(c *CodexStateOverrideConfig) { c.ProxyMode = "custom"; c.ProxyURL = "http://u-{0}:p@proxy:80" },
 		func(c *CodexStateOverrideConfig) { c.Lengths = []int{-1} },
 		func(c *CodexStateOverrideConfig) { c.MissingPolicy = "unknown" },
+		func(c *CodexStateOverrideConfig) { c.IncludedCredentials = []string{""} },
+		func(c *CodexStateOverrideConfig) { c.IncludedCredentials = []string{"bad\x00id"} },
+		func(c *CodexStateOverrideConfig) { c.IncludedCredentials = make([]string, 1025) },
 	} {
 		cfg.Codex.StateOverride = CodexStateOverrideConfig{}
 		change(&cfg.Codex.StateOverride)
@@ -28,5 +31,26 @@ func TestCodexStateOverrideDefaultsAndValidation(t *testing.T) {
 	cfg.Codex.TurnStatePolicy = CodexTurnStatePolicyStrip
 	if cfg.ValidateCodexStateOverride() == nil {
 		t.Fatal("contradictory strip accepted")
+	}
+}
+
+func TestCodexStateIncludedCredentialsSurviveClone(t *testing.T) {
+	cfg := &Config{Codex: CodexConfig{StateOverride: CodexStateOverrideConfig{
+		Priorities: []int{3}, IncludedCredentials: []string{"priority-zero-id"},
+	}}}
+	copyConfig, err := Clone(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := copyConfig.ValidateCodexStateOverride(); err != nil {
+		t.Fatal(err)
+	}
+	resolved := copyConfig.Codex.StateOverride.Resolved()
+	if len(resolved.IncludedCredentials) != 1 || resolved.IncludedCredentials[0] != "priority-zero-id" {
+		t.Fatalf("included credentials lost in clone: %+v", resolved.IncludedCredentials)
+	}
+	resolved.IncludedCredentials[0] = "changed"
+	if cfg.Codex.StateOverride.IncludedCredentials[0] != "priority-zero-id" || copyConfig.Codex.StateOverride.IncludedCredentials[0] != "priority-zero-id" {
+		t.Fatal("resolved configuration aliases credential selectors")
 	}
 }
