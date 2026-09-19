@@ -102,7 +102,7 @@ func TestGetRequestDetails_PreservesSuffix(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			providers, model, errMsg := handler.getRequestDetails(tt.inputModel)
+			providers, model, errMsg := handler.getRequestDetails(nil, tt.inputModel)
 			if (errMsg != nil) != tt.wantErr {
 				t.Fatalf("getRequestDetails() error = %v, wantErr %v", errMsg, tt.wantErr)
 			}
@@ -122,7 +122,7 @@ func TestGetRequestDetails_PreservesSuffix(t *testing.T) {
 func TestGetRequestDetails_ImageModelReturns503(t *testing.T) {
 	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, coreauth.NewManager(nil, nil, nil))
 
-	_, _, errMsg := handler.getRequestDetails("gpt-image-2")
+	_, _, errMsg := handler.getRequestDetails(nil, "gpt-image-2")
 	if errMsg == nil {
 		t.Fatalf("expected error for gpt-image-2, got nil")
 	}
@@ -143,7 +143,7 @@ func TestGetRequestDetails_ConfiguredImageModelReturns503(t *testing.T) {
 		Images: sdkconfig.ImagesConfig{ImageModel: "gpt-image-custom"},
 	}, coreauth.NewManager(nil, nil, nil))
 
-	_, _, errMsg := handler.getRequestDetails("gpt-image-custom")
+	_, _, errMsg := handler.getRequestDetails(nil, "gpt-image-custom")
 	if errMsg == nil {
 		t.Fatalf("expected error for configured image model, got nil")
 	}
@@ -162,7 +162,7 @@ func TestGetRequestDetails_AllConfiguredImageModelsStayImageOnly(t *testing.T) {
 		Native:      sdkconfig.NativeImagesConfig{Generations: sdkconfig.NativeImageEndpointConfig{Enabled: true}},
 	}}, coreauth.NewManager(nil, nil, nil))
 	for _, model := range []string{"gpt-image-2.5", "gpt-image-2.5-flare", "gpt-image-2.5-sunburst", "gpt-image-1.5", "custom-tool", "web-only"} {
-		_, _, failure := handler.getRequestDetails(model)
+		_, _, failure := handler.getRequestDetails(nil, model)
 		if failure == nil || failure.StatusCode != http.StatusServiceUnavailable || !strings.Contains(failure.Error.Error(), "only supported on /v1/images/") {
 			t.Fatalf("%s escaped image-only routing: %v", model, failure)
 		}

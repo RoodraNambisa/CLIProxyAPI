@@ -21,6 +21,7 @@ import (
 	executorhelps "github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
+	sdkaccess "github.com/router-for-me/CLIProxyAPI/v6/sdk/access"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
@@ -182,13 +183,17 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 
 		allowIncrementalInputWithPreviousResponseID := false
 		requestPinnedAuthID := pinnedAuthID
+		fixedTargetID := c.GetString(sdkaccess.CredentialTargetAuthIDContextKey)
+		if fixedTargetID != "" {
+			requestPinnedAuthID = fixedTargetID
+		}
 		if requestPinnedAuthID != "" && h != nil && h.AuthManager != nil {
 			modelName := strings.TrimSpace(gjson.GetBytes(payload, "model").String())
 			if modelName == "" {
 				modelName = strings.TrimSpace(gjson.GetBytes(lastRequest, "model").String())
 			}
 			modelName = util.ResolveAutoModel(thinking.ParseSuffix(modelName).ModelName)
-			if pinnedAuth, ok := h.AuthManager.GetByID(requestPinnedAuthID); ok && h.AuthManager.AuthSupportsRouteModel(pinnedAuth, modelName) {
+			if pinnedAuth, ok := h.AuthManager.GetByID(requestPinnedAuthID); ok && (pinnedAuth.ID == fixedTargetID || h.AuthManager.AuthSupportsRouteModel(pinnedAuth, modelName)) {
 				allowIncrementalInputWithPreviousResponseID = websocketUpstreamSupportsIncrementalInput(pinnedAuth.Attributes, pinnedAuth.Metadata)
 			} else {
 				// A different model may require a different credential. Normalize
