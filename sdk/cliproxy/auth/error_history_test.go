@@ -122,3 +122,15 @@ func TestAuthErrorHistoryConcurrentSnapshots(t *testing.T) {
 		t.Fatal("concurrent updates lost failures")
 	}
 }
+
+func TestAuthErrorHistoryDoesNotMergeDifferentTruncatedMessages(t *testing.T) {
+	prefix := strings.Repeat("same prefix ", 500)
+	first := describeAuthError(&Error{HTTPStatus: 500, Message: prefix + "first reason"})
+	second := describeAuthError(&Error{HTTPStatus: 500, Message: prefix + "second reason"})
+	if first.Message != second.Message || !first.Truncated || !second.Truncated {
+		t.Fatal("fixture did not reach the display limit")
+	}
+	if first.ID == second.ID {
+		t.Fatal("different errors merged after display truncation")
+	}
+}

@@ -93,11 +93,16 @@ func describeAuthError(failure *Error) AuthErrorRecord {
 	}
 	record.Code = boundedAuthErrorText(record.Code, 128)
 	record.Type = boundedAuthErrorText(record.Type, 128)
-	message, messageTruncated := managementdiag.ProcessResponseBody(message, managementdiag.DetailLevelSafe, 4096)
+	message, messageTruncated := managementdiag.ProcessResponseBody(message, managementdiag.DetailLevelSafe, 64*1024)
 	record.Message = strings.TrimSpace(message)
+	if len(record.Message) > 4096 {
+		record.Message = strings.Clone(strings.ToValidUTF8(record.Message[:4096], ""))
+		messageTruncated = true
+	}
 	record.Details, record.Truncated = managementdiag.ProcessResponseBody(raw, managementdiag.DetailLevelSafe, 4096)
 	record.Truncated = record.Truncated || messageTruncated || inputTruncated
-	identity, _ := json.Marshal([]any{record.HTTPStatus, record.Code, record.Type, record.Message})
+	// Display truncation must not merge failures with different retained reasons.
+	identity, _ := json.Marshal([]any{record.HTTPStatus, record.Code, record.Type, strings.TrimSpace(message)})
 	digest := sha256.Sum256(identity)
 	record.ID = hex.EncodeToString(digest[:])
 	return record
