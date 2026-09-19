@@ -46,7 +46,7 @@ func (h *Handler) CodexStateAction(c *gin.Context) {
 	allowed := helps.ManagedStateModels(cfg, a)
 	// Explicit card actions also include diagnostic pairs already visible there.
 	for _, snapshot := range codexstate.Default.Snapshots(a.ID, time.Now()) {
-		if !snapshot.ManualOnly || (len(cfg.Codex.StateOverride.Models) > 0 && !slices.Contains(cfg.Codex.StateOverride.Models, snapshot.Model)) {
+		if !snapshot.ManualOnly || !helps.ManagedStatePairAllowed(cfg, helps.StateCredential(a, snapshot.Model)) {
 			continue
 		}
 		if slices.ContainsFunc(allowed, func(candidate codexstate.Credential) bool { return candidate.Model == snapshot.Model }) {
@@ -65,8 +65,8 @@ func (h *Handler) CodexStateAction(c *gin.Context) {
 	if input.Model != "" {
 		resolvedModel = resolveManagedStateActionModel(a.ID, input.Model, allowed)
 		if resolvedModel == "" {
-			resolvedModel = thinking.ParseSuffix(input.Model).ModelName
-			if !helps.StateTextModel(resolvedModel) || len(resolvedModel) > 256 || strings.ContainsAny(resolvedModel, "\r\n\x00") || (len(cfg.Codex.StateOverride.Models) > 0 && !slices.Contains(cfg.Codex.StateOverride.Models, resolvedModel)) {
+			resolvedModel = helps.ResolveStateModel(a.ID, input.Model)
+			if !helps.StateTextModel(resolvedModel) || len(resolvedModel) > 256 || strings.ContainsAny(resolvedModel, "\r\n\x00") || !helps.ManagedStatePairAllowed(cfg, helps.StateCredential(a, resolvedModel)) {
 				c.JSON(400, gin.H{"error": "model is outside the configured State model scope"})
 				return
 			}

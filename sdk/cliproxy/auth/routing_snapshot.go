@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	sdkaccess "github.com/router-for-me/CLIProxyAPI/v6/sdk/access"
 )
 
 // routingRequestPolicy freezes selection choices, not credential availability or
@@ -142,6 +143,10 @@ func (m *Manager) selectionPolicy(contexts ...context.Context) *routingRequestPo
 
 func (m *Manager) selectorForContext(contexts ...context.Context) Selector {
 	if p := m.selectionPolicy(contexts...); p != nil {
+		if len(contexts) > 0 && sdkaccess.CredentialTargetAuthID(contexts[0]) != "" {
+			// Explicit diagnostics must not follow or alter a normal session's binding.
+			return baseSelector(p.selector)
+		}
 		return p.selector
 	}
 	return &RoundRobinSelector{}

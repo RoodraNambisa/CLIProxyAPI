@@ -1003,6 +1003,26 @@ xai:
 #     concurrency: 1
 #     retry-seconds: 60 # Fixed wait after each failed acquisition; does not increase.
 #     max-attempts: 3                # Stop automatic acquisition until manual retry.
+#     # Optional ordered rules. Omit for the legacy scope; [] manages no pairs.
+#     # Same-field values are OR; different selectors are AND. First match wins.
+#     # Unspecified settings inherit the shared defaults above. A rule does not
+#     # inherit settings from later rules; [] lengths explicitly allows any length.
+#     rules:
+#       - id: selected-accounts
+#         name: Selected accounts
+#         enabled: true
+#         action: manage             # manage | skip; skip stops further matching.
+#         credentials: [credential-short-id]
+#         models: [gpt-6-astra]
+#         settings:
+#           lengths: [332]
+#           acquisition: all
+#       - id: priority-four
+#         priorities: [4]
+#         models: [gpt-6-astra, gpt-5.6-sol]
+#         settings:
+#           lengths: [292]
+#           retry-seconds: 60
 #     proxy-mode: inherit           # inherit | direct | custom; inference route is unchanged.
 #     proxy-url: ""                 # {12} generates 12 digits, fixed within an acquisition attempt.
 #     lengths: [292]                # [] accepts any nonempty length.

@@ -9,7 +9,7 @@ import (
 
 func TestUnroutableModelKeepsGatewayStatusForCallerFailover(t *testing.T) {
 	for _, model := range []string{"unroutable-fixture", "unroutable-fixture(high)", "unroutable-\"quote\"\nline", `unroutable-","code":"injected`} {
-		providers, resolved, failure := (&BaseAPIHandler{}).getRequestDetails(model)
+		providers, resolved, failure := (&BaseAPIHandler{}).getRequestDetails(nil, model)
 		if len(providers) != 0 || resolved != "" || failure == nil || failure.StatusCode != http.StatusBadGateway {
 			t.Fatalf("model routing returned %v, want 502", failure)
 		}

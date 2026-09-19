@@ -6570,7 +6570,7 @@ func sanitizeDownstreamWebsocketFallbackRequest(ctx context.Context, auth *Auth,
 }
 
 func (m *Manager) strictSessionAffinityForRequest(ctx context.Context, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) bool {
-	if m == nil {
+	if m == nil || authenticatedModelTarget(ctx, opts) != "" {
 		return false
 	}
 	if policy := m.selectionPolicy(ctx); policy == nil || !policy.strictAffinity {
@@ -9877,7 +9877,7 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		}
 	}
 	for _, candidate := range m.auths {
-		if candidate.Provider != provider || candidate.Disabled || m.authSelectionBlockedLocked(candidate.ID) {
+		if candidate.ExecutionProvider() != provider || candidate.Disabled || m.authSelectionBlockedLocked(candidate.ID) {
 			continue
 		}
 		if !credentialSupportsExecutionFormat(candidate, opts.SourceFormat) || !clientKeyPriorityAllowed(ctx, candidate) {
@@ -10104,7 +10104,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		if pinnedAuthID != "" && candidate.ID != pinnedAuthID {
 			continue
 		}
-		providerKey := strings.TrimSpace(strings.ToLower(candidate.Provider))
+		providerKey := candidate.ExecutionProvider()
 		if providerKey == "" {
 			continue
 		}
@@ -10236,7 +10236,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 			}
 			continue
 		}
-		providerKey := strings.TrimSpace(strings.ToLower(selected.Provider))
+		providerKey := selected.ExecutionProvider()
 		executor, okExecutor := executors[providerKey]
 		if !okExecutor {
 			return nil, nil, "", &Error{Code: "executor_not_found", Message: "executor not registered"}

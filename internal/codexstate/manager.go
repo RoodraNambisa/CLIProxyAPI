@@ -21,7 +21,16 @@ import (
 )
 
 // Credential contains routing identities only, never bearer tokens.
-type Credential struct{ ID, Name, Owner, Instance, Model, Route, Plan string }
+type Credential struct {
+	ID, Name, Owner, Instance, Model, Route, Plan, ShortID string
+	Priority                                               int
+	Aliases                                                []string
+}
+
+func (c Credential) Scope() config.CodexStateScope {
+	return config.CodexStateScope{ID: c.ID, ShortID: c.ShortID, Name: c.Name, Plan: c.Plan, Model: c.Model, Priority: c.Priority, Aliases: append(append([]string(nil), c.Aliases...), c.Route)}
+}
+
 type Result struct {
 	State, Model, Answer string
 	Completed            bool
@@ -31,6 +40,11 @@ type Result struct {
 }
 type Probe func(context.Context, Credential, config.CodexStateOverrideConfig) (Result, error)
 type Snapshot struct {
+	RuleID              string    `json:"rule_id,omitempty"`
+	RuleName            string    `json:"rule_name,omitempty"`
+	AllowedLengths      []int     `json:"allowed_lengths"`
+	RetrySeconds        int       `json:"retry_seconds"`
+	MaxAttempts         int       `json:"max_attempts"`
 	Model               string    `json:"model"`
 	Status              string    `json:"status"`
 	Length              int       `json:"length"`
@@ -54,7 +68,9 @@ type Snapshot struct {
 	ManualOnly          bool      `json:"manual_only,omitempty"`
 }
 type entry struct {
-	credential Credential
+	credential  Credential
+	policy      config.CodexStateOverrideConfig
+	lastFailure time.Time
 	Snapshot
 	state                string
 	valueVersion         uint64
@@ -82,27 +98,7 @@ func (m *Manager) Sync(cfg config.CodexStateOverrideConfig, credentials []Creden
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	cfg = cfg.Resolved()
-	changed := !reflect.DeepEqual(cfg, m.cfg)
-	if changed {
-		m.version++
-		for _, e := range m.entries {
-			if e.cancel != nil {
-				e.cancel()
-			}
-			e.busy = false
-			e.cancel = nil
-		}
-		if !reflect.DeepEqual(cfg.Lengths, m.cfg.Lengths) || !reflect.DeepEqual(cfg.MatchModel, m.cfg.MatchModel) || cfg.Prompt != m.cfg.Prompt || cfg.ResponseContains != m.cfg.ResponseContains || cfg.TTLMinutes != m.cfg.TTLMinutes || !reflect.DeepEqual(cfg.ModelOverrides, m.cfg.ModelOverrides) || !reflect.DeepEqual(cfg.PlanLengths, m.cfg.PlanLengths) {
-			for _, e := range m.entries {
-				e.state = ""
-				e.Length = 0
-				e.CurrentUses = 0
-				e.Digest = ""
-				e.ExpiresAt = time.Time{}
-			}
-		}
-		m.cfg = cfg
-	}
+	m.cfg = cfg
 	if !cfg.Enabled {
 		credentials = nil
 		manualScopes = nil
@@ -121,44 +117,56 @@ func (m *Manager) Sync(cfg config.CodexStateOverrideConfig, credentials []Creden
 		if !e.ManualOnly || registered[k] {
 			continue
 		}
-		if c, ok := scopes[e.credential.ID+"\x00"+e.credential.Owner]; ok && (len(cfg.Models) == 0 || slices.Contains(cfg.Models, e.Model) || slices.Contains(cfg.Models, e.credential.Route)) {
-			c.Model, c.Route = e.Model, e.credential.Route
+		if c, ok := scopes[e.credential.ID+"\x00"+e.credential.Owner]; ok {
+			c.Model, c.Route, c.Aliases = e.Model, e.credential.Route, e.credential.Aliases
 			credentials = append(credentials, c)
 		}
 	}
 	wanted := make(map[string]bool, len(credentials))
 	for _, c := range credentials {
+		policy, match, managed := resolveEntryPolicy(cfg, c)
+		if !managed {
+			continue
+		}
 		k := key(c)
 		wanted[k] = true
-		if old := m.entries[k]; old != nil {
-			if registered[k] {
-				old.ManualOnly = false
-			}
-			if old.credential.Instance == c.Instance && old.credential.Plan == c.Plan {
-				old.credential = c
-				continue
-			}
+		old := m.entries[k]
+		if old == nil {
+			old = &entry{credential: c, policy: policy, Snapshot: Snapshot{Model: c.Model, Status: "missing"}}
+			m.entries[k] = old
+		} else if old.credential.Instance != c.Instance || old.credential.Plan != c.Plan || !reflect.DeepEqual(old.policy, policy) {
 			if old.cancel != nil {
 				old.cancel()
 			}
-			// Token refresh replaces the runtime instance, not the account/model state.
-			// Publish a new entry so an old in-flight acquisition cannot update it.
 			next := *old
-			next.credential = c
-			next.busy = false
-			next.cancel = nil
-			if old.credential.Plan != c.Plan {
+			next.credential, next.policy = c, policy
+			next.busy, next.cancel = false, nil
+			next.manual = old.manual || old.busy
+			if old.credential.Plan != c.Plan || !sameStateValidation(old.policy, policy) {
 				next.state, next.Digest = "", ""
-				next.Length, next.CurrentUses = 0, 0
+				next.Length, next.CurrentUses, next.valueVersion = 0, 0, 0
 				next.ExpiresAt, next.NextAttempt = time.Time{}, time.Time{}
 				next.failures, next.ConsecutiveFailures = 0, 0
 				next.Exhausted, next.LastError = false, ""
-				next.manual = old.manual || old.busy
+				next.lastFailure = time.Time{}
+			} else {
+				next.Exhausted = next.failures >= policy.MaxAttempts
+				if next.Exhausted {
+					next.NextAttempt = time.Time{}
+				} else if !next.lastFailure.IsZero() {
+					next.NextAttempt = next.lastFailure.Add(time.Duration(policy.RetrySeconds) * time.Second)
+				}
 			}
-			m.entries[k] = &next
-			continue
+			old = &next
+			m.entries[k] = old
 		}
-		m.entries[k] = &entry{credential: c, Snapshot: Snapshot{Model: c.Model, Status: "missing"}}
+		old.credential = c
+		if registered[k] {
+			old.ManualOnly = false
+		}
+		old.RuleID, old.RuleName = match.RuleID, match.RuleName
+		old.AllowedLengths = slices.Clone(policy.Lengths)
+		old.RetrySeconds, old.MaxAttempts = policy.RetrySeconds, policy.MaxAttempts
 	}
 	for k, e := range m.entries {
 		if !wanted[k] {
@@ -170,12 +178,30 @@ func (m *Manager) Sync(cfg config.CodexStateOverrideConfig, credentials []Creden
 	}
 }
 
+// Resolve legacy scopes exactly as before; their eligibility has already been
+// checked by callers. Rule mode validates the complete pair inside the manager.
+func resolveEntryPolicy(cfg config.CodexStateOverrideConfig, c Credential) (config.CodexStateOverrideConfig, config.CodexStateRuleMatch, bool) {
+	policy, match, ok := cfg.PolicyFor(c.Scope())
+	if cfg.Rules == nil {
+		policy, ok = cfg.ForCredential(c.Plan, c.Model), cfg.Enabled
+	}
+	policy.Rules = nil
+	policy.Priorities, policy.IncludedCredentials, policy.ExcludedCredentials, policy.Models = nil, nil, nil, nil
+	policy.ModelOverrides, policy.PlanLengths = nil, nil
+	policy.Concurrency = 0
+	return policy, match, ok
+}
+func sameStateValidation(a, b config.CodexStateOverrideConfig) bool {
+	return reflect.DeepEqual(a.Lengths, b.Lengths) && reflect.DeepEqual(a.MatchModel, b.MatchModel) && a.Prompt == b.Prompt && a.ResponseContains == b.ResponseContains && a.TTLMinutes == b.TTLMinutes
+}
+
 // QueueManual creates a bounded diagnostic entry without registering a model.
 // The caller must validate current credential and configured model scope first.
 func (m *Manager) QueueManual(c Credential) (bool, uint64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if !m.cfg.Enabled {
+	policy, match, managed := resolveEntryPolicy(m.cfg, c)
+	if !managed {
 		return false, 0
 	}
 	e := m.entries[key(c)]
@@ -189,10 +215,10 @@ func (m *Manager) QueueManual(c Credential) (bool, uint64) {
 		if count >= 256 {
 			return false, 0
 		}
-		e = &entry{credential: c, Snapshot: Snapshot{Model: c.Model, ManualOnly: true}}
+		e = &entry{credential: c, policy: policy, Snapshot: Snapshot{Model: c.Model, ManualOnly: true, RuleID: match.RuleID, RuleName: match.RuleName, AllowedLengths: slices.Clone(policy.Lengths), RetrySeconds: policy.RetrySeconds, MaxAttempts: policy.MaxAttempts}}
 		m.entries[key(c)] = e
 	}
-	if e.credential.Instance != c.Instance || e.credential.Plan != c.Plan {
+	if e.credential.Instance != c.Instance || e.credential.Plan != c.Plan || !reflect.DeepEqual(e.policy, policy) {
 		return false, e.Acquired
 	}
 	e.ManualOnly = true
@@ -227,7 +253,7 @@ func (m *Manager) PickVersion(c Credential, clientState string, now time.Time) (
 		return "", "", 0, false
 	}
 	e.LastUsed = now
-	if m.cfg.Mode == "missing" && strings.TrimSpace(clientState) != "" {
+	if e.policy.Mode == "missing" && strings.TrimSpace(clientState) != "" {
 		return "", "", 0, true
 	}
 	if e.state != "" && now.Before(e.ExpiresAt) {
@@ -236,7 +262,7 @@ func (m *Manager) PickVersion(c Credential, clientState string, now time.Time) (
 		return e.state, "", e.valueVersion, true
 	}
 	e.Misses++
-	return "", m.cfg.MissingPolicy, 0, true
+	return "", e.policy.MissingPolicy, 0, true
 }
 
 // ObserveResponse invalidates only the value used by this request. Versions also
@@ -246,14 +272,14 @@ func (m *Manager) ObserveResponse(c Credential, version uint64, value, returnedM
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	e := m.entries[key(c)]
-	if !m.cfg.Enabled || version == 0 || e == nil || e.paused || e.credential.Plan != c.Plan || (!m.cfg.InvalidateOnModelMismatch && !m.cfg.InvalidateOnStateLengthMismatch) {
+	if !m.cfg.Enabled || version == 0 || e == nil || e.paused || e.credential.Plan != c.Plan || (!e.policy.InvalidateOnModelMismatch && !e.policy.InvalidateOnStateLengthMismatch) {
 		return ""
 	}
 	reason := ""
-	if m.cfg.InvalidateOnModelMismatch && returnedModel != "" && returnedModel != c.Model {
+	if e.policy.InvalidateOnModelMismatch && returnedModel != "" && returnedModel != c.Model {
 		reason = "response_model_mismatch"
-	} else if m.cfg.InvalidateOnStateLengthMismatch && returnedLength > 0 {
-		lengths := m.cfg.ForCredential(c.Plan, c.Model).Lengths
+	} else if e.policy.InvalidateOnStateLengthMismatch && returnedLength > 0 {
+		lengths := e.policy.Lengths
 		if len(lengths) > 0 && !slices.Contains(lengths, returnedLength) {
 			reason = "response_state_length_mismatch"
 		}
@@ -288,7 +314,15 @@ func (m *Manager) Complete(c Credential, state string) {
 func (m *Manager) WatchesResponses() bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.cfg.Enabled && (m.cfg.InvalidateOnModelMismatch || m.cfg.InvalidateOnStateLengthMismatch)
+	if !m.cfg.Enabled {
+		return false
+	}
+	for _, e := range m.entries {
+		if e.policy.InvalidateOnModelMismatch || e.policy.InvalidateOnStateLengthMismatch {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *Manager) Snapshots(id string, now time.Time) []Snapshot {
@@ -300,6 +334,7 @@ func (m *Manager) Snapshots(id string, now time.Time) []Snapshot {
 			continue
 		}
 		s := e.Snapshot
+		s.AllowedLengths = slices.Clone(e.AllowedLengths)
 		switch {
 		case e.paused:
 			s.Status = "paused"
@@ -351,6 +386,7 @@ func (m *Manager) ActionWithBaseline(id, model, action string) (bool, uint64) {
 			e.manual = true
 			e.paused = false
 			e.NextAttempt = time.Time{}
+			e.lastFailure = time.Time{}
 			e.failures = 0
 			e.Exhausted = false
 			e.ConsecutiveFailures = 0
@@ -402,8 +438,8 @@ func (m *Manager) Tick(ctx context.Context, now time.Time, probe Probe) {
 		if e.busy || e.paused || e.Exhausted || now.Before(e.NextAttempt) {
 			continue
 		}
-		active := !e.ManualOnly && (m.cfg.Acquisition == "all" || (m.cfg.Acquisition == "active" && !e.LastUsed.IsZero() && now.Sub(e.LastUsed) <= time.Duration(m.cfg.ActiveMinutes)*time.Minute))
-		if !e.manual && (!active || (e.state != "" && now.Before(e.ExpiresAt.Add(-time.Duration(m.cfg.RefreshBeforeMinutes)*time.Minute)))) {
+		active := !e.ManualOnly && (e.policy.Acquisition == "all" || (e.policy.Acquisition == "active" && !e.LastUsed.IsZero() && now.Sub(e.LastUsed) <= time.Duration(e.policy.ActiveMinutes)*time.Minute))
+		if !e.manual && (!active || (e.state != "" && now.Before(e.ExpiresAt.Add(-time.Duration(e.policy.RefreshBeforeMinutes)*time.Minute)))) {
 			continue
 		}
 		taskCtx, cancel := context.WithCancel(ctx)
@@ -413,7 +449,7 @@ func (m *Manager) Tick(ctx context.Context, now time.Time, probe Probe) {
 		e.Attempts++
 		m.running++
 		m.wg.Add(1)
-		version, cfg, credential := m.version, m.cfg.ForCredential(e.credential.Plan, e.Model), e.credential
+		version, cfg, credential := m.version, e.policy, e.credential
 		go func() {
 			defer m.wg.Done()
 			defer cancel()
@@ -442,7 +478,7 @@ func (m *Manager) finish(k string, expected *entry, version uint64, canceled err
 	e.Tokens += result.Tokens
 	e.LastStatus = result.Status
 	reason := ""
-	validation := m.cfg.ForCredential(e.credential.Plan, e.Model)
+	validation := e.policy
 	switch {
 	case err != nil:
 		reason = result.FailureReason
@@ -462,10 +498,11 @@ func (m *Manager) finish(k string, expected *entry, version uint64, canceled err
 	}
 	if reason != "" {
 		e.LastError = reason
+		e.lastFailure = now
 		e.failures++
 		e.ConsecutiveFailures = e.failures
-		delay := time.Duration(m.cfg.RetrySeconds) * time.Second
-		if e.failures >= m.cfg.MaxAttempts {
+		delay := time.Duration(e.policy.RetrySeconds) * time.Second
+		if e.failures >= e.policy.MaxAttempts {
 			e.Exhausted = true
 			e.NextAttempt = time.Time{}
 		} else {
@@ -480,9 +517,10 @@ func (m *Manager) finish(k string, expected *entry, version uint64, canceled err
 	e.Length = len(result.State)
 	d := sha256.Sum256([]byte(result.State))
 	e.Digest = hex.EncodeToString(d[:8])
-	e.ExpiresAt = now.Add(time.Duration(m.cfg.TTLMinutes) * time.Minute)
+	e.ExpiresAt = now.Add(time.Duration(e.policy.TTLMinutes) * time.Minute)
 	e.Acquired++
 	e.CurrentUses = 0
+	e.lastFailure = time.Time{}
 	e.failures = 0
 	e.ConsecutiveFailures = 0
 	e.Exhausted = false
