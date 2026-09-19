@@ -1999,6 +1999,7 @@ type codexIdentityConfuseState struct {
 	promptCacheKey          string
 	turnIDBase              string
 	turnIDs                 []codexIdentityReplacement
+	contextWindows          []helps.CodexResponseIdentityReplacement
 }
 
 type codexIdentityReplacement struct {
@@ -2093,7 +2094,8 @@ func (e *CodexExecutor) projectCodexSessionIdentity(
 	}
 	converged := fingerprint.mode != codexauth.FingerprintModeOff
 	projectSession := prepared.Enabled || fingerprint.mode == codexauth.FingerprintModeSession || fingerprint.mode == codexauth.FingerprintModeFull
-	if !prepared.Enabled && !converged {
+	mapContext := fingerprint.mode == codexauth.FingerprintModeSession || fingerprint.mode == codexauth.FingerprintModeFull || (identityConfuse != nil && identityConfuse.enabled)
+	if !prepared.Enabled && !converged && !mapContext {
 		return rawJSON, codexSessionIdentityState{}, nil
 	}
 	defaults := helps.CodexSessionIdentity{
@@ -2110,6 +2112,15 @@ func (e *CodexExecutor) projectCodexSessionIdentity(
 		ProtectedPromptCacheKey: prepared.PromptCacheKey.Key,
 		InstallationID:          fingerprint.installationID,
 		ProjectSession:          projectSession,
+	}
+	if mapContext {
+		projection.ContextWindowScope = codexFingerprintAccountScope(auth)
+	}
+	if identityConfuse != nil {
+		projection.ContextReplacements = &identityConfuse.contextWindows
+		for _, replacement := range identityConfuse.turnIDs {
+			projection.KnownReplacements = append(projection.KnownReplacements, helps.CodexResponseIdentityReplacement{From: replacement.original, To: replacement.confused, Role: helps.CodexResponseTurnIdentity})
+		}
 	}
 	if fingerprint.mode == codexauth.FingerprintModeSession || fingerprint.mode == codexauth.FingerprintModeFull {
 		projection.ForcedIdentity = helps.CodexSessionIdentity{
@@ -2143,6 +2154,11 @@ func (e *CodexExecutor) projectCodexSessionIdentity(
 	}
 	if projection.PromptCacheKeyAlias != "" && identityConfuse != nil && identityConfuse.enabled {
 		identityConfuse.promptCacheKey = identity.SessionID
+	}
+	if identityConfuse != nil && identity.TurnID != "" {
+		for index := range identityConfuse.turnIDs {
+			identityConfuse.turnIDs[index].confused = identity.TurnID
+		}
 	}
 	return projected, codexSessionIdentityState{
 		enabled: true, projectSession: projectSession, converged: converged,
@@ -2236,6 +2252,7 @@ func codexSessionIdentitySourceFromHeaders(headers http.Header) helps.CodexSessi
 		sessionID = headerValueCaseInsensitive(headers, "Session_id")
 	}
 	return helps.CodexSessionIdentityHeaderSource{
+		ParentThreadID: strings.TrimSpace(headerValueCaseInsensitive(headers, "X-Codex-Parent-Thread-Id")),
 		InstallationID: strings.TrimSpace(headerValueCaseInsensitive(headers, "X-Codex-Installation-Id")),
 		SessionID:      strings.TrimSpace(sessionID),
 		ThreadID:       strings.TrimSpace(headerValueCaseInsensitive(headers, "Thread-Id")),
@@ -2264,6 +2281,10 @@ func applyCodexSessionIdentityHeaders(headers http.Header, state codexSessionIde
 	if state.turnMetadata != "" {
 		deleteHeaderCaseInsensitive(headers, "X-Codex-Turn-Metadata")
 		setHeaderCasePreserved(headers, "X-Codex-Turn-Metadata", state.turnMetadata)
+	}
+	if state.identity.ParentThreadID != "" {
+		deleteHeaderCaseInsensitive(headers, "X-Codex-Parent-Thread-Id")
+		setHeaderCasePreserved(headers, "X-Codex-Parent-Thread-Id", state.identity.ParentThreadID)
 	}
 	if !state.projectSession {
 		return
@@ -2474,6 +2495,9 @@ func (state codexIdentityConfuseState) responseIdentityReplacements(reverse bool
 	for _, turn := range state.turnIDs {
 		add(turn.original, turn.confused, helps.CodexResponseTurnIdentity)
 	}
+	for _, window := range state.contextWindows {
+		add(window.From, window.To, window.Role)
+	}
 	return replacements
 }
 
@@ -2555,6 +2579,7 @@ func applyCodexHeadersFromSources(r *http.Request, auth *cliproxyauth.Auth, toke
 	misc.EnsureHeader(r.Header, ginHeaders, "X-Codex-Installation-Id", "")
 	misc.EnsureHeader(r.Header, ginHeaders, "X-Codex-Window-Id", "")
 	misc.EnsureHeader(r.Header, ginHeaders, "Thread-Id", "")
+	misc.EnsureHeader(r.Header, ginHeaders, "X-Codex-Parent-Thread-Id", "")
 	ensureCodexHTTPSessionHeader(r.Header, ginHeaders)
 	misc.EnsureHeader(r.Header, ginHeaders, "X-OpenAI-Internal-Codex-Responses-Lite", "")
 	cfgUserAgent, cfgOriginator, _ := codexHeaderDefaults(cfg, auth)

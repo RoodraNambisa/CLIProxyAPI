@@ -17,6 +17,7 @@ type CodexSessionIdentity struct {
 	TurnID         string
 	WindowID       string
 	RequestKind    string
+	ParentThreadID string
 }
 
 // CodexSessionIdentityHeaderSource contains identity values supplied through
@@ -27,6 +28,7 @@ type CodexSessionIdentityHeaderSource struct {
 	ThreadID       string
 	WindowID       string
 	TurnMetadata   string
+	ParentThreadID string
 }
 
 // CodexSessionIdentityProjection controls forced per-credential identity while
@@ -38,6 +40,9 @@ type CodexSessionIdentityProjection struct {
 	ProjectSession            bool
 	PromptCacheKeyAlias       string
 	PromptCacheKeyReplacement string
+	ContextWindowScope        string
+	KnownReplacements         []CodexResponseIdentityReplacement
+	ContextReplacements       *[]CodexResponseIdentityReplacement
 }
 
 type codexSessionIdentityRawField struct {
@@ -113,16 +118,21 @@ func ProjectCodexSessionIdentityWithProjection(
 		defaults.InstallationID,
 	)
 	if !projection.ProjectSession {
-		if installationID == "" {
+		if installationID == "" && projection.ContextWindowScope == "" {
 			return nil, CodexSessionIdentity{}, "", fmt.Errorf("Codex installation identity is incomplete")
 		}
-		setCodexRawString(metadata, "x-codex-installation-id", installationID)
+		if installationID != "" {
+			setCodexRawString(metadata, "x-codex-installation-id", installationID)
+		}
+		turnMetadata := cloneCodexRawMap(clientTurn)
+		overlayCodexRawMap(turnMetadata, bodyTurn)
+		overlayCodexRawMap(turnMetadata, adminTurn)
+		parentThreadID := projectCodexRelatedIdentities(metadata, turnMetadata, admin, client, CodexSessionIdentity{}, projection)
 		turnMetadataJSON := []byte(nil)
-		if strings.TrimSpace(admin.TurnMetadata) != "" || strings.TrimSpace(client.TurnMetadata) != "" || len(metadata["x-codex-turn-metadata"]) > 0 {
-			turnMetadata := cloneCodexRawMap(clientTurn)
-			overlayCodexRawMap(turnMetadata, bodyTurn)
-			overlayCodexRawMap(turnMetadata, adminTurn)
-			setCodexRawString(turnMetadata, "installation_id", installationID)
+		if len(turnMetadata) > 0 || len(metadata["x-codex-turn-metadata"]) > 0 {
+			if installationID != "" {
+				setCodexRawString(turnMetadata, "installation_id", installationID)
+			}
 			turnMetadataJSON, err = json.Marshal(turnMetadata)
 			if err != nil {
 				return nil, CodexSessionIdentity{}, "", fmt.Errorf("encode Codex turn metadata: %w", err)
@@ -134,7 +144,7 @@ func ProjectCodexSessionIdentityWithProjection(
 			return nil, CodexSessionIdentity{}, "", fmt.Errorf("encode Codex client_metadata: %w", err)
 		}
 		out := rebuildCodexSessionIdentityPayload(trimmed, rawFields, metadataJSON, projection)
-		return out, CodexSessionIdentity{InstallationID: installationID}, string(turnMetadataJSON), nil
+		return out, CodexSessionIdentity{InstallationID: installationID, ParentThreadID: parentThreadID}, string(turnMetadataJSON), nil
 	}
 
 	bodySessionID := codexRawJSONString(metadata["session_id"])
@@ -209,6 +219,7 @@ func ProjectCodexSessionIdentityWithProjection(
 	turnMetadata := cloneCodexRawMap(clientTurn)
 	overlayCodexRawMap(turnMetadata, bodyTurn)
 	overlayCodexRawMap(turnMetadata, adminTurn)
+	identity.ParentThreadID = projectCodexRelatedIdentities(metadata, turnMetadata, admin, client, identity, projection)
 	setCodexRawString(turnMetadata, "session_id", identity.SessionID)
 	setCodexRawString(turnMetadata, "thread_id", identity.ThreadID)
 	setCodexRawString(turnMetadata, "turn_id", identity.TurnID)
