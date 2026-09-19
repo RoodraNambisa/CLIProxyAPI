@@ -1488,6 +1488,7 @@ func (e *CodexExecutor) executeStream(ctx context.Context, auth *cliproxyauth.Au
 			if transformed, ok := grokbuild.TransformKeepaliveSSEFrame(frame, isGrokClient); ok {
 				return emit(cliproxyexecutor.StreamChunk{Payload: transformed}), false
 			}
+			frame = applyCodexIdentityExposeResponsePayload(frame, identityState)
 			frame = multiAgentResponse.RewriteSSEFrame(frame)
 			hasData := false
 			terminal := false
@@ -2445,41 +2446,35 @@ func applyCodexTurnMetadataIdentityConfuse(rawTurnMetadata string, state *codexI
 }
 
 func applyCodexIdentityConfuseResponsePayload(payload []byte, state codexIdentityConfuseState) []byte {
-	if state.protectedPromptCacheKey != "" || state.protectedSessionID != "" {
-		role := helps.CodexResponseSessionIdentity
-		if state.protectedSessionID != "" {
-			role = helps.CodexResponseThreadAndWindowIdentity
-		}
-		payload = helps.ReplaceCodexResponseIdentityFields(payload, state.originalPromptCacheKey, state.promptCacheKey, role)
-		for _, turnID := range state.turnIDs {
-			payload = helps.ReplaceCodexResponseIdentityFields(payload, turnID.original, turnID.confused, helps.CodexResponseTurnIdentity)
-		}
-		return payload
-	}
-	payload = replaceCodexIdentityResponsePayload(payload, state.originalPromptCacheKey, state.promptCacheKey)
-	for _, turnID := range state.turnIDs {
-		payload = replaceCodexIdentityResponsePayload(payload, turnID.original, turnID.confused)
-	}
-	return payload
+	return helps.ReplaceCodexResponseIdentities(payload, state.responseIdentityReplacements(false))
 }
 
 func applyCodexIdentityExposeResponsePayload(payload []byte, state codexIdentityConfuseState) []byte {
-	if state.protectedPromptCacheKey != "" || state.protectedSessionID != "" {
-		role := helps.CodexResponseSessionIdentity
-		if state.protectedSessionID != "" {
-			role = helps.CodexResponseThreadAndWindowIdentity
-		}
-		payload = helps.ReplaceCodexResponseIdentityFields(payload, state.promptCacheKey, state.originalPromptCacheKey, role)
-		for _, turnID := range state.turnIDs {
-			payload = helps.ReplaceCodexResponseIdentityFields(payload, turnID.confused, turnID.original, helps.CodexResponseTurnIdentity)
-		}
-		return payload
+	return helps.ReplaceCodexResponseIdentities(payload, state.responseIdentityReplacements(true))
+}
+
+func (state codexIdentityConfuseState) responseIdentityReplacements(reverse bool) []helps.CodexResponseIdentityReplacement {
+	role := helps.CodexResponseCacheAndSessionIdentity
+	if state.protectedSessionID != "" {
+		role = helps.CodexResponseThreadAndWindowIdentity
+	} else if state.protectedPromptCacheKey != "" {
+		role = helps.CodexResponseSessionIdentity
 	}
-	payload = replaceCodexIdentityResponsePayload(payload, state.promptCacheKey, state.originalPromptCacheKey)
-	for _, turnID := range state.turnIDs {
-		payload = replaceCodexIdentityResponsePayload(payload, turnID.confused, turnID.original)
+	replacements := make([]helps.CodexResponseIdentityReplacement, 0, 1+len(state.turnIDs))
+	add := func(from, to string, role helps.CodexResponseIdentityRole) {
+		if from == "" || to == "" || from == to {
+			return
+		}
+		if reverse {
+			from, to = to, from
+		}
+		replacements = append(replacements, helps.CodexResponseIdentityReplacement{From: from, To: to, Role: role})
 	}
-	return payload
+	add(state.originalPromptCacheKey, state.promptCacheKey, role)
+	for _, turn := range state.turnIDs {
+		add(turn.original, turn.confused, helps.CodexResponseTurnIdentity)
+	}
+	return replacements
 }
 
 func (state *codexIdentityConfuseState) confuseTurnID(turnID string) string {
@@ -2495,15 +2490,6 @@ func (state *codexIdentityConfuseState) confuseTurnID(turnID string) string {
 	confusedTurnID := codexIdentityConfuseTurnUUID(state.authID, turnID, state.turnIDBase)
 	state.turnIDs = append(state.turnIDs, codexIdentityReplacement{original: turnID, confused: confusedTurnID})
 	return confusedTurnID
-}
-
-func replaceCodexIdentityResponsePayload(payload []byte, from string, to string) []byte {
-	from = strings.TrimSpace(from)
-	to = strings.TrimSpace(to)
-	if len(payload) == 0 || from == "" || to == "" || from == to || !bytes.Contains(payload, []byte(from)) {
-		return payload
-	}
-	return bytes.ReplaceAll(payload, []byte(from), []byte(to))
 }
 
 func codexIdentityConfuseEnabled(cfg *config.Config) bool {

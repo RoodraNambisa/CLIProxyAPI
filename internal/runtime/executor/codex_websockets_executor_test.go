@@ -1265,19 +1265,17 @@ func TestCodexIdentityConfuseStatusErrorRestoresClientPayload(t *testing.T) {
 		originalPromptCacheKey: "cache-ws-1",
 		promptCacheKey:         codexIdentityConfuseUUID("auth-ws-1", "prompt-cache", "cache-ws-1"),
 	}
-	confusedTurnID := state.confuseTurnID("turn-ws-1")
+	_ = state.confuseTurnID("turn-ws-1")
 	rawBody := []byte(`{"error":{"message":"cache-ws-1 turn-ws-1","type":"server_error","code":"server_error"}}`)
 
 	upstreamBody := applyCodexIdentityConfuseResponsePayload(rawBody, state)
-	if !strings.Contains(string(upstreamBody), state.promptCacheKey) || !strings.Contains(string(upstreamBody), confusedTurnID) {
-		t.Fatalf("upstream error body was not confused: %s", upstreamBody)
+	if !bytes.Equal(upstreamBody, rawBody) {
+		t.Fatalf("identity mapping changed an error message: %s", upstreamBody)
 	}
 
 	clientBody := applyCodexIdentityExposeResponsePayload(upstreamBody, state)
 	err := newCodexStatusErr(http.StatusInternalServerError, clientBody)
-	if strings.Contains(err.Error(), state.promptCacheKey) || strings.Contains(err.Error(), confusedTurnID) {
-		t.Fatalf("status error leaked upstream identity: %s", err.Error())
-	}
+
 	if !strings.Contains(err.Error(), "cache-ws-1") || !strings.Contains(err.Error(), "turn-ws-1") {
 		t.Fatalf("status error did not restore client identity: %s", err.Error())
 	}
@@ -1290,12 +1288,12 @@ func TestCodexIdentityConfuseWebsocketErrorRestoresClientPayload(t *testing.T) {
 		originalPromptCacheKey: "cache-ws-1",
 		promptCacheKey:         codexIdentityConfuseUUID("auth-ws-1", "prompt-cache", "cache-ws-1"),
 	}
-	confusedTurnID := state.confuseTurnID("turn-ws-1")
+	_ = state.confuseTurnID("turn-ws-1")
 	rawPayload := []byte(`{"type":"error","status":429,"error":{"code":"server_error","message":"cache-ws-1 turn-ws-1"}}`)
 
 	upstreamPayload := applyCodexIdentityConfuseResponsePayload(rawPayload, state)
-	if !strings.Contains(string(upstreamPayload), state.promptCacheKey) || !strings.Contains(string(upstreamPayload), confusedTurnID) {
-		t.Fatalf("upstream websocket error was not confused: %s", upstreamPayload)
+	if !bytes.Equal(upstreamPayload, rawPayload) {
+		t.Fatalf("identity mapping changed a websocket error message: %s", upstreamPayload)
 	}
 
 	clientPayload := applyCodexIdentityExposeResponsePayload(upstreamPayload, state)
@@ -1303,9 +1301,7 @@ func TestCodexIdentityConfuseWebsocketErrorRestoresClientPayload(t *testing.T) {
 	if !ok {
 		t.Fatalf("parseCodexWebsocketError() did not recognize client payload: %s", clientPayload)
 	}
-	if strings.Contains(err.Error(), state.promptCacheKey) || strings.Contains(err.Error(), confusedTurnID) {
-		t.Fatalf("websocket error leaked upstream identity: %s", err.Error())
-	}
+
 	if !strings.Contains(err.Error(), "cache-ws-1") || !strings.Contains(err.Error(), "turn-ws-1") {
 		t.Fatalf("websocket error did not restore client identity: %s", err.Error())
 	}

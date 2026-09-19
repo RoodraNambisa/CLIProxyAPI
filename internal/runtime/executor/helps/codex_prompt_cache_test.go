@@ -19,6 +19,19 @@ func TestCodexResponseIdentitySSELineEndings(t *testing.T) {
 	}
 }
 
+func TestCodexResponseIdentityMultilineAndMalformedEvents(t *testing.T) {
+	input := []byte("event: response.completed\r\ndata: {\"response\":{\r\ndata: \"turn_id\":\"old\",\"output\":[{\"text\":\"old\"}],\"n\":9007199254740993}}\r\n\r\n: ping\r\n\r\ndata: [DONE]\r\n\r\n")
+	got := ReplaceCodexResponseIdentityFields(input, "old", "new", CodexResponseTurnIdentity)
+	if !bytes.Contains(got, []byte(`"turn_id":"new"`)) || !bytes.Contains(got, []byte(`"text":"old"`)) || !bytes.Contains(got, []byte("9007199254740993")) || !bytes.HasSuffix(got, []byte(": ping\r\n\r\ndata: [DONE]\r\n\r\n")) {
+		t.Fatalf("multiline event changed business data or framing: %s", got)
+	}
+	for _, malformed := range []string{`data: {"turn_id":"old"`, `old`, `{"error":{"message":"old"}}`, `{"window_id":"old:not-a-number"}`} {
+		if got := ReplaceCodexResponseIdentityFields([]byte(malformed), "old", "new", CodexResponseSessionIdentity); !bytes.Equal(got, []byte(malformed)) {
+			t.Fatalf("rewrote non-identity content: %s", got)
+		}
+	}
+}
+
 func TestCodexPromptCacheProtectionRetainsSessionProjection(t *testing.T) {
 	for _, protected := range []string{"", "same"} {
 		body := []byte(`{"prompt_cache_key":"same","client_metadata":{"session_id":"same","x-codex-turn-metadata":"{\"prompt_cache_key\":\"same\"}"}}`)
