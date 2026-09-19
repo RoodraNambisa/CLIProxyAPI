@@ -4,6 +4,8 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+
+	"golang.org/x/net/http/httpguts"
 )
 
 const (
@@ -13,7 +15,7 @@ const (
 	MinimumAstraUserAgentVersion      = "0.153.0"
 )
 
-var codexSoftwareIdentityPattern = regexp.MustCompile(`^([A-Za-z0-9][A-Za-z0-9._-]*)/([0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9.-]+)?)((?:\s.*)?)$`)
+var codexSoftwareIdentityPattern = regexp.MustCompile(`^([A-Za-z0-9][A-Za-z0-9._-]*(?: [A-Za-z0-9][A-Za-z0-9._-]*)*)/([0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9.-]+)?)((?:\s.*)?)$`)
 
 // SoftwareIdentity is the normalized Codex client identity sent upstream.
 type SoftwareIdentity struct {
@@ -71,6 +73,9 @@ func minimumSoftwareVersionForModel(model string) string {
 }
 
 func resolveSoftwareIdentityWithMinimum(candidate, minimumVersion string) SoftwareIdentity {
+	if !httpguts.ValidHeaderFieldValue(candidate) {
+		candidate = DefaultUserAgent
+	}
 	candidate = strings.TrimSpace(candidate)
 	if candidate == "" {
 		candidate = DefaultUserAgent
@@ -86,12 +91,21 @@ func resolveSoftwareIdentityWithMinimum(candidate, minimumVersion string) Softwa
 		return parsed
 	}
 	builtin, _ := parseCodexSoftwareIdentity(DefaultUserAgent)
+	oldVersion := parsed.Version
 	parsed.Version = builtin.Version
-	parsed.UserAgent = parsed.Originator + "/" + parsed.Version + codexSoftwareIdentitySuffix(candidate)
+	suffix := codexSoftwareIdentitySuffix(candidate)
+	oldTrailer := " (" + parsed.Originator + "; " + oldVersion + ")"
+	if strings.HasSuffix(suffix, oldTrailer) {
+		suffix = strings.TrimSuffix(suffix, oldTrailer) + " (" + parsed.Originator + "; " + parsed.Version + ")"
+	}
+	parsed.UserAgent = parsed.Originator + "/" + parsed.Version + suffix
 	return parsed
 }
 
 func parseCodexSoftwareIdentity(userAgent string) (SoftwareIdentity, bool) {
+	if !httpguts.ValidHeaderFieldValue(userAgent) {
+		return SoftwareIdentity{}, false
+	}
 	match := codexSoftwareIdentityPattern.FindStringSubmatch(strings.TrimSpace(userAgent))
 	if len(match) != 4 {
 		return SoftwareIdentity{}, false
@@ -104,6 +118,12 @@ func parseCodexSoftwareIdentity(userAgent string) (SoftwareIdentity, bool) {
 		Originator: match[1],
 		Version:    match[2],
 	}, true
+}
+
+// ValidSoftwareIdentityUserAgent validates before whitespace normalization.
+func ValidSoftwareIdentityUserAgent(value string) bool {
+	_, ok := parseCodexSoftwareIdentity(value)
+	return ok
 }
 
 func codexSoftwareIdentitySuffix(userAgent string) string {

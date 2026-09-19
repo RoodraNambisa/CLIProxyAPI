@@ -280,7 +280,7 @@ func (o *CodexAuth) applySoftwareIdentityHeaders(req *http.Request) {
 // requests. Callers use this to keep credential-specific model and refresh
 // requests on the same outbound identity.
 func (o *CodexAuth) SetSoftwareIdentityUserAgent(userAgent string) {
-	if o == nil || o.softwareIdentity == nil {
+	if o == nil || o.softwareIdentity == nil || !ValidSoftwareIdentityUserAgent(userAgent) {
 		return
 	}
 	identity := ResolveSoftwareIdentity(userAgent)

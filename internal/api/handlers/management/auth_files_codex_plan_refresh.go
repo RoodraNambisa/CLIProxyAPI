@@ -1065,12 +1065,12 @@ func (h *Handler) codexPlanTypeRefreshSoftwareIdentity(auth *coreauth.Auth) inte
 			if !strings.HasPrefix(key, "header:") || !strings.EqualFold(strings.TrimSpace(strings.TrimPrefix(key, "header:")), "User-Agent") {
 				continue
 			}
-			candidate = strings.TrimSpace(value)
+			candidate = value
 			break
 		}
 	}
-	if candidate == "" && h != nil && h.cfg != nil {
-		candidate = strings.TrimSpace(h.cfg.CodexHeaderDefaults.UserAgent)
+	if !internalcodex.ValidSoftwareIdentityUserAgent(candidate) && h != nil && h.cfg != nil {
+		candidate = h.cfg.CodexHeaderDefaults.UserAgent
 	}
 	return internalcodex.ResolveSoftwareIdentity(candidate)
 }

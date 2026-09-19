@@ -1356,6 +1356,10 @@ func (h *Handler) PutCodexKeys(c *gin.Context) {
 	filtered := make([]config.CodexKey, 0, len(arr))
 	for i := range arr {
 		entry := arr[i]
+		if errValidate := validateUserAgentHeader(entry.Headers); errValidate != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": errValidate.Error()})
+			return
+		}
 		normalizeCodexKey(&entry)
 		if entry.BaseURL == "" {
 			continue
@@ -1470,6 +1474,10 @@ func (h *Handler) PatchCodexKey(c *gin.Context) {
 		entry.AlphaSearch = *body.Value.AlphaSearch
 	}
 	if body.Value.Headers != nil {
+		if errValidate := validateUserAgentHeader(*body.Value.Headers); errValidate != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": errValidate.Error()})
+			return
+		}
 		entry.Headers = config.NormalizeHeaders(*body.Value.Headers)
 	}
 	if body.Value.ExcludedModels != nil {

@@ -1,6 +1,30 @@
 package codex
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
+
+func TestSoftwareIdentityRejectsControlCharactersAndPreservesClientVersions(t *testing.T) {
+	for _, bad := range []string{"\x00", "\x7f", "\r", "\n", "\x01"} {
+		for _, candidate := range []string{bad + DefaultUserAgent, DefaultUserAgent + bad, "codex-tui/0.153.4 (Linux;" + bad + " x86_64)"} {
+			if ValidSoftwareIdentityUserAgent(candidate) || ResolveSoftwareIdentity(candidate).UserAgent != DefaultUserAgent {
+				t.Fatalf("accepted invalid header %q", candidate)
+			}
+		}
+	}
+	for _, tc := range []struct{ candidate, want string }{
+		{"Codex Desktop/0.153.4 (Mac OS; arm64) (Codex Desktop; 26.901.51231)", "Codex Desktop/0.153.4 (Mac OS; arm64) (Codex Desktop; 26.901.51231)"},
+		{"codex-tui/0.143.9 (Linux) term (codex-tui; 0.143.9)", "codex-tui/0.153.4 (Linux) term (codex-tui; 0.153.4)"},
+		{"Codex Desktop/0.143.9 (Mac OS) (Codex Desktop; 26.901.51231)", "Codex Desktop/0.153.4 (Mac OS) (Codex Desktop; 26.901.51231)"},
+		{"codex-tui/0.143.9 (Linux) (other-client; 0.143.9)", "codex-tui/0.153.4 (Linux) (other-client; 0.143.9)"},
+	} {
+		got := ResolveSoftwareIdentity(tc.candidate)
+		if got.UserAgent != tc.want || got.Originator != strings.SplitN(tc.candidate, "/", 2)[0] {
+			t.Fatalf("identity = %+v, want %s", got, tc.want)
+		}
+	}
+}
 
 func TestResolveSoftwareIdentity(t *testing.T) {
 	tests := []struct {

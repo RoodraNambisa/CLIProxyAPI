@@ -421,6 +421,11 @@ func (v authFileFieldValues) hasNonHeaderFields() bool {
 }
 
 func validateBatchAuthFileFields(auth *coreauth.Auth, values authFileFieldValues) error {
+	if values.headersSet {
+		if err := validateUserAgentHeader(values.headers); err != nil {
+			return err
+		}
+	}
 	if values.routingAlias != nil {
 		if _, err := coreauth.NormalizeCredentialRoutingAlias(*values.routingAlias); err != nil {
 			return err
@@ -767,6 +772,9 @@ func legacyAuthHeadersWouldChange(auth *coreauth.Auth, updates map[string]string
 }
 
 func normalizeReplacementAuthHeaders(headers map[string]string) (map[string]string, error) {
+	if err := validateUserAgentHeader(headers); err != nil {
+		return nil, err
+	}
 	normalized := make(map[string]string, len(headers))
 	seen := make(map[string]struct{}, len(headers))
 	for rawName, rawValue := range headers {

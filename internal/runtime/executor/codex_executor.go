@@ -27,6 +27,7 @@ import (
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 	"github.com/tiktoken-go/tokenizer"
+	"golang.org/x/net/http/httpguts"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -2634,12 +2635,23 @@ func applyCodexHeadersFromSources(r *http.Request, auth *cliproxyauth.Auth, toke
 }
 
 func applyCodexSoftwareIdentity(headers http.Header, auth *cliproxyauth.Auth, cfg *config.Config, models ...string) {
-	if headers == nil || codexAuthUsesAPIKey(auth) || !codexEnforceSoftwareIdentity(cfg) {
+	if headers == nil {
+		return
+	}
+	if codexAuthUsesAPIKey(auth) || !codexEnforceSoftwareIdentity(cfg) {
+		if value := headerValueCaseInsensitive(headers, "User-Agent"); !httpguts.ValidHeaderFieldValue(value) {
+			candidate := ""
+			if cfg != nil {
+				candidate = cfg.CodexHeaderDefaults.UserAgent
+			}
+			deleteHeaderCaseInsensitive(headers, "User-Agent")
+			setHeaderCasePreserved(headers, "User-Agent", codexauth.ResolveSoftwareIdentity(candidate).UserAgent)
+		}
 		return
 	}
 	candidate := codexCustomHeaderValue(auth, "User-Agent")
-	if candidate == "" && cfg != nil {
-		candidate = strings.TrimSpace(cfg.CodexHeaderDefaults.UserAgent)
+	if !codexauth.ValidSoftwareIdentityUserAgent(candidate) && cfg != nil {
+		candidate = cfg.CodexHeaderDefaults.UserAgent
 	}
 	identity := codexauth.ResolveSoftwareIdentity(candidate)
 	if len(models) > 0 {
@@ -2681,6 +2693,9 @@ func codexCustomHeaderValue(auth *cliproxyauth.Auth, name string) string {
 	for key, value := range auth.Attributes {
 		if !strings.HasPrefix(key, "header:") || !strings.EqualFold(strings.TrimSpace(strings.TrimPrefix(key, "header:")), name) {
 			continue
+		}
+		if strings.EqualFold(name, "User-Agent") {
+			return value
 		}
 		return strings.TrimSpace(value)
 	}

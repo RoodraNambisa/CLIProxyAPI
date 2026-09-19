@@ -18,6 +18,7 @@ import (
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/proxyutil"
 	log "github.com/sirupsen/logrus"
+	"golang.org/x/net/http/httpguts"
 	"gopkg.in/yaml.v3"
 )
 
@@ -155,6 +156,16 @@ func (h *Handler) PutConfigYAML(c *gin.Context) {
 	if err = yaml.Unmarshal(body, &cfg); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_yaml", "message": err.Error()})
 		return
+	}
+	if !httpguts.ValidHeaderFieldValue(cfg.CodexHeaderDefaults.UserAgent) {
+		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": "invalid_config", "message": "codex-header-defaults.user-agent contains invalid HTTP header characters"})
+		return
+	}
+	for _, entry := range cfg.CodexKey {
+		if errValidate := validateUserAgentHeader(entry.Headers); errValidate != nil {
+			c.JSON(http.StatusUnprocessableEntity, gin.H{"error": "invalid_config", "message": errValidate.Error()})
+			return
+		}
 	}
 	// Validate config using LoadConfigOptional with optional=false to enforce parsing
 	tmpDir := filepath.Dir(h.configFilePath)

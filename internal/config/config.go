@@ -24,6 +24,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/proxyutil"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/crypto/bcrypt"
+	"golang.org/x/net/http/httpguts"
 	"gopkg.in/yaml.v3"
 )
 
@@ -2808,7 +2809,11 @@ func (cfg *Config) SanitizeCodexHeaderDefaults() {
 	if cfg == nil {
 		return
 	}
-	cfg.CodexHeaderDefaults.UserAgent = strings.TrimSpace(cfg.CodexHeaderDefaults.UserAgent)
+	if httpguts.ValidHeaderFieldValue(cfg.CodexHeaderDefaults.UserAgent) {
+		cfg.CodexHeaderDefaults.UserAgent = strings.TrimSpace(cfg.CodexHeaderDefaults.UserAgent)
+	} else {
+		cfg.CodexHeaderDefaults.UserAgent = ""
+	}
 	cfg.CodexHeaderDefaults.Originator = strings.TrimSpace(cfg.CodexHeaderDefaults.Originator)
 	cfg.CodexHeaderDefaults.BetaFeatures = strings.TrimSpace(cfg.CodexHeaderDefaults.BetaFeatures)
 }
