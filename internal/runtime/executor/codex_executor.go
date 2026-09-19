@@ -1534,7 +1534,10 @@ func (e *CodexExecutor) executeStream(ctx context.Context, auth *cliproxyauth.Au
 				line = applyCodexIdentityConfuseResponsePayload(line, identityState)
 				line = multiAgentResponse.RewriteSSEFrame(line)
 			}
-			clientLine := applyCodexIdentityExposeResponsePayload(line, identityState)
+			clientLine := line
+			if !trustUpstreamSSE {
+				clientLine = applyCodexIdentityExposeResponsePayload(line, identityState)
+			}
 			if bytes.HasPrefix(clientLine, dataTag) {
 				clientData := bytes.TrimSpace(clientLine[len(dataTag):])
 				if !trustUpstreamSSE {

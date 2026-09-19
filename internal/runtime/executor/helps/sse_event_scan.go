@@ -38,7 +38,12 @@ func SplitSSEDataEvents(data []byte, atEOF bool) (advance int, token []byte, err
 		}
 		following := bytes.TrimLeft(data[offset:offset+partEnd], " \t")
 		if !bytes.HasPrefix(following, []byte("data:")) {
-			return next, line, nil
+			if len(following) == 0 {
+				return next, line, nil
+			}
+			// SSE comments and non-data fields do not terminate the current event.
+			offset += partNext
+			continue
 		}
 		joined = append(joined, '\n')
 		joined = append(joined, bytes.TrimSpace(following[len("data:"):])...)
