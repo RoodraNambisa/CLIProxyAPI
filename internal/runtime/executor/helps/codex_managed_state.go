@@ -94,9 +94,14 @@ func StateCredential(a *auth.Auth, model string) codexstate.Credential {
 	return c
 }
 
+// StateCredentialAvailable validates a live Codex OAuth credential independently of automatic scope.
+func StateCredentialAvailable(a *auth.Auth) bool {
+	return a != nil && !a.Disabled && a.Status != auth.StatusDisabled && !a.RuntimeInstanceRetired() && a.ExecutionProvider() == "codex" && a.Attributes["api_key"] == ""
+}
+
 // ManagedStateCredentialEligible checks credential scope without requiring a registered model.
 func ManagedStateCredentialEligible(cfg *config.Config, a *auth.Auth) bool {
-	if cfg == nil || !cfg.Codex.StateOverride.Enabled || cfg.Codex.ResolvedTurnStatePolicy() == config.CodexTurnStatePolicyStrip || a == nil || a.Disabled || a.Status == auth.StatusDisabled || a.RuntimeInstanceRetired() || a.ExecutionProvider() != "codex" || a.Attributes["api_key"] != "" {
+	if cfg == nil || !cfg.Codex.StateOverride.Enabled || cfg.Codex.ResolvedTurnStatePolicy() == config.CodexTurnStatePolicyStrip || !StateCredentialAvailable(a) {
 		return false
 	}
 	c := cfg.Codex.StateOverride
@@ -250,6 +255,23 @@ func ApplyManagedState(ctx context.Context, cfg *config.Config, a *auth.Auth, mo
 			setState(diagnostic.value)
 			source = "custom"
 			return nil
+		case "acquired":
+			source = "unavailable"
+			if cfg == nil || !StateCredentialAvailable(a) {
+				return errors.New("no valid manually acquired State is available for this credential and upstream model")
+			}
+			c := StateCredential(a, model)
+			policy, _ := codexstate.DiagnosticPolicy(cfg.Codex.StateOverride, c)
+			choice := core.CodexStateForRequest(ctx, "diagnostic:"+codexStateRequestKey(c), func() core.CodexStateChoice {
+				value, missing, version, eligible := codexstate.Diagnostic.PickVersionForPolicy(c, "", time.Now(), policy)
+				return core.CodexStateChoice{Value: value, Policy: missing, Version: version, Eligible: eligible}
+			})
+			if !choice.Eligible || choice.Value == "" {
+				return errors.New("no valid manually acquired State is available for this credential and upstream model")
+			}
+			setState(choice.Value)
+			source = "acquired"
+			return nil
 		}
 	}
 	requireManaged := diagnostic != nil && diagnostic.mode == "managed"
@@ -324,7 +346,13 @@ func ApplyManagedState(ctx context.Context, cfg *config.Config, a *auth.Auth, mo
 // ObserveManagedStateCompletion counts only requests that actually sent a managed value.
 func ObserveManagedStateCompletion(ctx context.Context, a *auth.Auth, model string, headers http.Header) {
 	if !IsStateProbe(ctx) && headers.Get("X-Codex-Turn-State") != "" {
-		codexstate.Default.Complete(StateCredential(a, model), headers.Get("X-Codex-Turn-State"))
+		manager := codexstate.Default
+		if ctx != nil {
+			if diagnostic, _ := ctx.Value(codexStateDiagnosticKey{}).(*codexStateDiagnostic); diagnostic != nil && diagnostic.mode == "acquired" {
+				manager = codexstate.Diagnostic
+			}
+		}
+		manager.Complete(StateCredential(a, model), headers.Get("X-Codex-Turn-State"))
 	}
 }
 

@@ -93,3 +93,59 @@ func TestCodexStateManualAcquisitionUsesBackendPolicyAndAlias(t *testing.T) {
 		t.Fatal("disabled state acquisition accepted")
 	}
 }
+
+func TestCodexStateDiagnosticAcquisitionOutsideScope(t *testing.T) {
+	cfg := &config.Config{Codex: config.CodexConfig{StateOverride: config.CodexStateOverrideConfig{
+		Enabled: true, Priorities: []int{4}, Models: []string{"allowed-model"},
+	}}}
+	m := auth.NewManager(nil, nil, nil)
+	a, err := m.Register(auth.WithSkipPersist(t.Context()), &auth.Auth{ID: "diagnostic.json", FileName: "diagnostic.json", Provider: "codex"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := registry.GetGlobalRegistry()
+	r.RegisterClient(a.ID, "codex", []*registry.ModelInfo{{ID: "alias", UpstreamID: "outside-model"}, {ID: "media", SupportedOutputModalities: []string{"image"}}})
+	defer r.UnregisterClient(a.ID)
+	codexstate.Diagnostic.Sync(cfg.Codex.StateOverride, nil, helps.StateCredential(a, ""))
+	defer codexstate.Diagnostic.Sync(config.CodexStateOverrideConfig{}, nil)
+	h := &Handler{cfg: cfg, authManager: m}
+	for _, tc := range []struct {
+		model      string
+		diagnostic bool
+		status     int
+	}{
+		{"alias", false, 400}, {"alias", true, 200}, {"unregistered-text", true, 200},
+		{"", true, 400}, {"gpt-image-1", true, 400}, {"media", true, 400}, {"bad\nmodel", true, 400},
+	} {
+		body, _ := json.Marshal(map[string]any{"name": a.FileName, "model": tc.model, "action": "acquire", "diagnostic": tc.diagnostic})
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest(http.MethodPost, "/auth-files/codex/state", strings.NewReader(string(body)))
+		h.CodexStateAction(c)
+		if w.Code != tc.status {
+			t.Fatalf("model=%q diagnostic=%v: status=%d body=%s", tc.model, tc.diagnostic, w.Code, w.Body.String())
+		}
+		if tc.status == 200 && !strings.Contains(w.Body.String(), `"diagnostic":true`) {
+			t.Fatal("missing diagnostic acknowledgement")
+		}
+	}
+	for _, diagnostic := range []bool{false, true} {
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		query := "?name=" + a.FileName
+		if diagnostic {
+			query += "&diagnostic=true"
+		}
+		c.Request = httptest.NewRequest(http.MethodGet, "/auth-files/codex/state"+query, nil)
+		h.GetCodexState(c)
+		var response struct {
+			Models []codexstate.Snapshot `json:"models"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+			t.Fatal(err)
+		}
+		if (len(response.Models) == 2) != diagnostic {
+			t.Fatalf("diagnostic cache mixed with regular cache: %s", w.Body.String())
+		}
+	}
+}

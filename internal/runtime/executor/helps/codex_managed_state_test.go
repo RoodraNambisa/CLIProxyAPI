@@ -36,6 +36,45 @@ func TestManagedStateScopePriorityAndCatalogIntersection(t *testing.T) {
 	}
 }
 
+func TestDiagnosticStateObservationCannotChangeNormalCache(t *testing.T) {
+	a := &auth.Auth{ID: "diagnostic-observation", Provider: "codex"}
+	c := StateCredential(a, "model")
+	cfg := &config.Config{Codex: config.CodexConfig{StateOverride: config.CodexStateOverrideConfig{Enabled: true, InvalidateOnModelMismatch: true}}}
+	codexstate.Default.Sync(cfg.Codex.StateOverride, []codexstate.Credential{c})
+	codexstate.Diagnostic.Sync(cfg.Codex.StateOverride, nil, c)
+	defer codexstate.Default.Sync(config.CodexStateOverrideConfig{}, nil)
+	defer codexstate.Diagnostic.Sync(config.CodexStateOverrideConfig{}, nil)
+	for _, manager := range []*codexstate.Manager{codexstate.Default, codexstate.Diagnostic} {
+		if manager == codexstate.Diagnostic {
+			manager.QueueManual(c)
+		} else {
+			manager.Action(c.ID, c.Model, "acquire")
+		}
+		manager.Tick(t.Context(), time.Now(), func(context.Context, codexstate.Credential, config.CodexStateOverrideConfig) (codexstate.Result, error) {
+			return codexstate.Result{State: strings.Repeat("s", 292), Model: c.Model, Completed: true}, nil
+		})
+		manager.Wait()
+	}
+	ctx := WithCodexStateDiagnostic(core.WithCodexStateSnapshot(t.Context()), "acquired", "", nil)
+	headers := http.Header{}
+	if err := ApplyManagedState(ctx, cfg, a, c.Model, headers); err != nil {
+		t.Fatal(err)
+	}
+	ObserveManagedStateCompletion(ctx, a, c.Model, headers)
+	use := ManagedStateUse(ctx, a, c.Model, headers)
+	if !use.Observe(nil, []byte(`{"model":"other"}`)) {
+		t.Fatal("diagnostic response validation ignored")
+	}
+	normal := codexstate.Default.Snapshots(c.ID, time.Now())[0]
+	diagnostic := codexstate.Diagnostic.Snapshots(c.ID, time.Now())[0]
+	if normal.Status != "valid" || normal.Uses != 0 || normal.Completed != 0 || normal.Invalidations != 0 {
+		t.Fatalf("diagnostic changed normal State: %+v", normal)
+	}
+	if diagnostic.Completed != 1 || diagnostic.Invalidations != 1 || diagnostic.Status == "queued" {
+		t.Fatalf("diagnostic observation not isolated: %+v", diagnostic)
+	}
+}
+
 func TestManagedStateIncludedCredentialScope(t *testing.T) {
 	a := &auth.Auth{ID: "state-included", Index: "abc123", FileName: "codex-fixture.json", Provider: "codex"}
 	r := registry.GetGlobalRegistry()

@@ -80,6 +80,7 @@ type entry struct {
 }
 type Manager struct {
 	mu               sync.Mutex
+	diagnostic       bool
 	wg               sync.WaitGroup
 	cfg              config.CodexStateOverrideConfig
 	entries          map[string]*entry
@@ -98,6 +99,11 @@ func (m *Manager) Sync(cfg config.CodexStateOverrideConfig, credentials []Creden
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	cfg = cfg.Resolved()
+	if m.diagnostic {
+		// Explicit tests do not enable or expand automatic acquisition.
+		cfg.Enabled = true
+		credentials = nil
+	}
 	m.cfg = cfg
 	if !cfg.Enabled {
 		credentials = nil
@@ -118,8 +124,11 @@ func (m *Manager) Sync(cfg config.CodexStateOverrideConfig, credentials []Creden
 			continue
 		}
 		if c, ok := scopes[e.credential.ID+"\x00"+e.credential.Owner]; ok {
+			if m.diagnostic && (c.Instance != e.credential.Instance || c.Plan != e.credential.Plan) {
+				continue
+			}
 			c.Model, c.Route, c.Aliases = e.Model, e.credential.Route, e.credential.Aliases
-			if cfg.Rules == nil && len(cfg.Models) > 0 && !slices.Contains(cfg.Models, c.Model) && !slices.Contains(cfg.Models, c.Route) {
+			if !m.diagnostic && cfg.Rules == nil && len(cfg.Models) > 0 && !slices.Contains(cfg.Models, c.Model) && !slices.Contains(cfg.Models, c.Route) {
 				continue
 			}
 			credentials = append(credentials, c)
@@ -127,7 +136,7 @@ func (m *Manager) Sync(cfg config.CodexStateOverrideConfig, credentials []Creden
 	}
 	wanted := make(map[string]bool, len(credentials))
 	for _, c := range credentials {
-		policy, match, managed := resolveEntryPolicy(cfg, c)
+		policy, match, managed := m.resolvePolicy(cfg, c)
 		if !managed {
 			continue
 		}
@@ -144,7 +153,7 @@ func (m *Manager) Sync(cfg config.CodexStateOverrideConfig, credentials []Creden
 			next := *old
 			next.credential, next.policy = c, policy
 			next.busy, next.cancel = false, nil
-			next.manual = old.manual || old.busy
+			next.manual = old.manual || (old.busy && !m.diagnostic)
 			if old.credential.Plan != c.Plan || !sameStateValidation(old.policy, policy) {
 				next.state, next.Digest = "", ""
 				next.Length, next.CurrentUses, next.valueVersion = 0, 0, 0
@@ -194,16 +203,24 @@ func resolveEntryPolicy(cfg config.CodexStateOverrideConfig, c Credential) (conf
 	policy.Concurrency = 0
 	return policy, match, ok
 }
+
+func (m *Manager) resolvePolicy(cfg config.CodexStateOverrideConfig, c Credential) (config.CodexStateOverrideConfig, config.CodexStateRuleMatch, bool) {
+	if m.diagnostic {
+		policy, match := DiagnosticPolicy(cfg, c)
+		return policy, match, true
+	}
+	return resolveEntryPolicy(cfg, c)
+}
 func sameStateValidation(a, b config.CodexStateOverrideConfig) bool {
 	return reflect.DeepEqual(a.Lengths, b.Lengths) && reflect.DeepEqual(a.MatchModel, b.MatchModel) && a.Prompt == b.Prompt && a.ResponseContains == b.ResponseContains && a.TTLMinutes == b.TTLMinutes
 }
 
 // QueueManual creates a bounded diagnostic entry without registering a model.
-// The caller must validate current credential and configured model scope first.
+// Callers must validate the credential; regular managers also require configured scope.
 func (m *Manager) QueueManual(c Credential) (bool, uint64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	policy, match, managed := resolveEntryPolicy(m.cfg, c)
+	policy, match, managed := m.resolvePolicy(m.cfg, c)
 	if !managed {
 		return false, 0
 	}
@@ -450,6 +467,21 @@ func (m *Manager) ActionWithBaseline(id, model, action string) (bool, uint64) {
 
 // Tick starts at most the configured concurrency; tasks are deduplicated per pair.
 func (m *Manager) Tick(ctx context.Context, now time.Time, probe Probe) {
+	m.tick(ctx, now, probe, int(^uint(0)>>1))
+}
+
+// TickWithCapacity shares a concurrency budget with another acquisition manager.
+func (m *Manager) TickWithCapacity(ctx context.Context, now time.Time, probe Probe, capacity int) {
+	m.tick(ctx, now, probe, capacity)
+}
+
+func (m *Manager) Running() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.running
+}
+
+func (m *Manager) tick(ctx context.Context, now time.Time, probe Probe, capacity int) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if !m.cfg.Enabled || probe == nil || ctx.Err() != nil {
@@ -461,7 +493,7 @@ func (m *Manager) Tick(ctx context.Context, now time.Time, probe Probe) {
 	}
 	sort.Strings(keys)
 	for _, k := range keys {
-		if m.running >= m.cfg.Concurrency {
+		if m.running >= min(m.cfg.Concurrency, capacity) {
 			break
 		}
 		e := m.entries[k]

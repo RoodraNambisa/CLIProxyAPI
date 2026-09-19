@@ -55,12 +55,23 @@ func TestModelProbeCodexStateModesAndAccountModelIsolation(t *testing.T) {
 		return codexstate.Result{State: managed, Model: c.Model, Completed: true}, nil
 	})
 	codexstate.Default.Wait()
+	manual := strings.Repeat("d", 292)
+	codexstate.Diagnostic.Sync(cfg.Codex.StateOverride, nil, c)
+	defer codexstate.Diagnostic.Sync(config.CodexStateOverrideConfig{}, nil)
+	codexstate.Diagnostic.QueueManual(c)
+	codexstate.Diagnostic.Tick(t.Context(), time.Now(), func(context.Context, codexstate.Credential, config.CodexStateOverrideConfig) (codexstate.Result, error) {
+		return codexstate.Result{State: manual, Model: c.Model, Completed: true}, nil
+	})
+	codexstate.Diagnostic.Wait()
 	h := &Handler{cfg: cfg, authManager: m}
 	for _, stream := range []bool{false, true} {
-		for _, mode := range []string{"configured", "managed", "none", "custom"} {
+		for _, mode := range []string{"configured", "managed", "acquired", "none", "custom"} {
 			t.Run(mode+map[bool]string{false: "/http", true: "/sse"}[stream], func(t *testing.T) {
 				input := &modelProbeStateInput{Mode: mode}
 				want, source := managed, "managed"
+				if mode == "acquired" {
+					want, source = manual, "acquired"
+				}
 				if mode == "none" {
 					want, source = "", "none"
 				}
@@ -83,10 +94,12 @@ func TestModelProbeCodexStateModesAndAccountModelIsolation(t *testing.T) {
 	for _, input := range []modelProbeRequest{
 		{Name: selected.FileName, Model: "other-model", CodexState: &modelProbeStateInput{Mode: "managed"}},
 		{Name: "other-state-probe.json", Model: "friendly", CodexState: &modelProbeStateInput{Mode: "managed"}},
+		{Name: selected.FileName, Model: "other-model", CodexState: &modelProbeStateInput{Mode: "acquired"}},
+		{Name: "other-state-probe.json", Model: "friendly", CodexState: &modelProbeStateInput{Mode: "acquired"}},
 	} {
 		before := calls.Load()
 		_, result := runModelProbe(t, h, t.Context(), input)
-		if result.Success || calls.Load() != before || !strings.Contains(result.Error, "no valid managed State") || result.CodexState == nil || result.CodexState.Source != "unavailable" {
+		if result.Success || calls.Load() != before || !strings.Contains(result.Error, "no valid") || result.CodexState == nil || result.CodexState.Source != "unavailable" {
 			t.Fatalf("state crossed account/model boundary or silently fell back: %+v", result)
 		}
 	}
