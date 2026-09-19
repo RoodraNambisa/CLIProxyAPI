@@ -48,7 +48,7 @@ func GetProviderName(modelName string) []string {
 		providers = append(providers, name)
 	}
 
-	for _, provider := range registry.GetGlobalRegistry().GetModelProviders(modelName) {
+	for _, provider := range registry.GetGlobalRegistry().GetRoutingModelProviders(modelName) {
 		appendProvider(provider)
 	}
 

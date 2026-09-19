@@ -162,12 +162,12 @@ func TestCredentialTargetUnregisteredWebsocketContinuation(t *testing.T) {
 	}
 }
 
-func TestCredentialTargetUnregisteredCodexHTTPHonorsRequestLimit(t *testing.T) {
+func TestCredentialTargetCodexHTTPBypassesRequestLimitWithoutConsumingIt(t *testing.T) {
 	for _, path := range []string{"/v1/chat/completions", "/v1/responses"} {
 		for _, stream := range []bool{false, true} {
 			t.Run(fmt.Sprintf("%s/stream=%t", path, stream), func(t *testing.T) {
 				var calls atomic.Int32
-				captured := make(chan []byte, 2)
+				captured := make(chan []byte, 8)
 				upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 					calls.Add(1)
 					body, err := io.ReadAll(r.Body)
@@ -193,12 +193,20 @@ func TestCredentialTargetUnregisteredCodexHTTPHonorsRequestLimit(t *testing.T) {
 					t.Fatal(err)
 				}
 				body := fmt.Sprintf(`{"model":"team/unregistered-protocol(high)","input":[{"role":"user","content":"test"}],"messages":[{"role":"user","content":"test"}],"stream":%t}`, stream)
-				for attempt := range 2 {
-					req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
-					req.Header.Set("Authorization", "Bearer test-key-auth-"+a.Index)
+				registry.GetGlobalRegistry().RegisterClient(a.ID, "codex", []*registry.ModelInfo{{ID: "team/registered", UpstreamID: "registered"}})
+				t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(a.ID) })
+				// Tests neither consume ordinary capacity nor fail when it is already exhausted.
+				for attempt, targeted := range []bool{true, true, false, true, false} {
+					requestBody, key := body, "test-key-auth-"+a.Index
+					if !targeted {
+						requestBody = strings.ReplaceAll(body, "unregistered-protocol", "registered")
+						key = "test-key"
+					}
+					req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(requestBody))
+					req.Header.Set("Authorization", "Bearer "+key)
 					w := httptest.NewRecorder()
 					s.engine.ServeHTTP(w, req)
-					if attempt == 0 {
+					if attempt < 4 {
 						if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "OK") {
 							t.Fatalf("protocol failed: %d %s", w.Code, w.Body.String())
 						}
@@ -206,7 +214,7 @@ func TestCredentialTargetUnregisteredCodexHTTPHonorsRequestLimit(t *testing.T) {
 						t.Fatalf("request limit bypassed: %d %s", w.Code, w.Body.String())
 					}
 				}
-				if calls.Load() != 1 {
+				if calls.Load() != 4 {
 					t.Fatalf("upstream received %d attempts", calls.Load())
 				}
 				requestBody := <-captured

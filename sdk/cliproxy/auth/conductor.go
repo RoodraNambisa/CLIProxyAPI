@@ -1734,7 +1734,12 @@ func (m *Manager) availableAuthsForRouteModelWithPreference(ctx context.Context,
 // have different routing and limiter rules than the tier used after failover.
 func (m *Manager) pickBoundAcrossPriorities(ctx context.Context, auths []*Auth, provider, model string, opts cliproxyexecutor.Options, now time.Time, pickAllowed func(*Auth) bool) (*Auth, bool, error) {
 	selector, ok := m.selectorForContext(ctx).(*SessionAffinitySelector)
-	if !ok || selector == nil || !selector.acrossPriorities {
+	if !ok || selector == nil {
+		return nil, false, nil
+	}
+	// A State outage may move a session to a lower priority. Keep its healthy
+	// binding after recovery instead of forcing that session back to the old tier.
+	if !selector.acrossPriorities && !registry.GetGlobalRegistry().ModelHasAvailabilityGate(canonicalModelKey(model)) {
 		return nil, false, nil
 	}
 	preferred := selector.cachedAuthID(provider, model, opts, ctx)
@@ -9899,7 +9904,7 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 	if modelKey != "" {
 		filtered := candidates[:0]
 		for _, candidate := range candidates {
-			if authenticatedModelTarget(ctx, opts) == candidate.ID || m.authSupportsRouteModel(registryRef, candidate, model) {
+			if authenticatedModelTarget(ctx, opts) == candidate.ID || (m.authSupportsRouteModel(registryRef, candidate, model) && registryRef.ClientModelAvailable(candidate.ID, m.selectionModelForAuth(candidate, model))) {
 				filtered = append(filtered, candidate)
 			}
 		}
@@ -9908,6 +9913,17 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 	candidates = m.weightedEligibleAuths(candidates, ctx)
 	if len(candidates) == 0 {
 		return nil, nil, &Error{Code: "auth_not_found", Message: "no auth available"}
+	}
+	if authenticatedModelTarget(ctx, opts) != "" {
+		available, err := m.availableAuthsForRouteModelFiltered(candidates, provider, model, opts, time.Now(), nil)
+		if err != nil {
+			return nil, nil, err
+		}
+		// Preserve transport diagnostics without reserving ordinary request capacity.
+		if opts.AuthRequestSlot != nil {
+			opts.AuthRequestSlot.Bind(&authRequestReservation{noOp: true})
+		}
+		return available[0].Clone(), executor, nil
 	}
 	requestLimiter := m.authRequestLimiter()
 	requestBlocked := authRequestLimitBlock{}
@@ -10127,7 +10143,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 	if modelKey != "" {
 		filtered := candidates[:0]
 		for _, candidate := range candidates {
-			if authenticatedModelTarget(ctx, opts) == candidate.ID || m.authSupportsRouteModel(registryRef, candidate, model) {
+			if authenticatedModelTarget(ctx, opts) == candidate.ID || (m.authSupportsRouteModel(registryRef, candidate, model) && registryRef.ClientModelAvailable(candidate.ID, m.selectionModelForAuth(candidate, model))) {
 				filtered = append(filtered, candidate)
 			}
 		}
@@ -10142,6 +10158,17 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		for providerKey := range providerSet {
 			selectorProvider = providerKey
 		}
+	}
+	if authenticatedModelTarget(ctx, opts) != "" {
+		available, err := m.availableAuthsForRouteModelFiltered(candidates, selectorProvider, model, opts, time.Now(), pickAllowed)
+		if err != nil {
+			return nil, nil, "", err
+		}
+		selected := available[0].Clone()
+		if opts.AuthRequestSlot != nil {
+			opts.AuthRequestSlot.Bind(&authRequestReservation{noOp: true})
+		}
+		return selected, executors[selected.ExecutionProvider()], selected.ExecutionProvider(), nil
 	}
 	requestLimiter := m.authRequestLimiter()
 	requestBlocked := authRequestLimitBlock{}

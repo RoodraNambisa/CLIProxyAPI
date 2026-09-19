@@ -15,6 +15,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
+	sdkaccess "github.com/router-for-me/CLIProxyAPI/v6/sdk/access"
 	auth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	core "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	log "github.com/sirupsen/logrus"
@@ -208,7 +209,7 @@ type stateUnavailableError struct{ body string }
 func (e stateUnavailableError) Error() string             { return e.body }
 func (stateUnavailableError) StatusCode() int             { return 429 }
 func (stateUnavailableError) SkipAuthResult() bool        { return true }
-func (stateUnavailableError) RetryOtherAuth() bool        { return false }
+func (stateUnavailableError) RetryOtherAuth() bool        { return true }
 func (stateUnavailableError) PreserveErrorResponse() bool { return true }
 
 // ApplyManagedState runs after client headers and account guards. It never changes session IDs.
@@ -216,6 +217,9 @@ func ApplyManagedState(ctx context.Context, cfg *config.Config, a *auth.Auth, mo
 	var diagnostic *codexStateDiagnostic
 	if ctx != nil {
 		diagnostic, _ = ctx.Value(codexStateDiagnosticKey{}).(*codexStateDiagnostic)
+	}
+	if diagnostic == nil && sdkaccess.CredentialTargetAuthID(ctx) != "" {
+		diagnostic = &codexStateDiagnostic{mode: "auto"}
 	}
 	source := "none"
 	if headers.Get("X-Codex-Turn-State") != "" {
@@ -247,6 +251,9 @@ func ApplyManagedState(ctx context.Context, cfg *config.Config, a *auth.Auth, mo
 	}
 	if diagnostic != nil {
 		switch diagnostic.mode {
+		case "auto":
+			setState("")
+			source = "none"
 		case "none":
 			setState("")
 			source = "none"
@@ -334,8 +341,11 @@ func ApplyManagedState(ctx context.Context, cfg *config.Config, a *auth.Auth, mo
 	if policy == "" {
 		return nil
 	}
+	if diagnostic != nil && diagnostic.mode == "auto" {
+		return nil
+	}
 	log.WithFields(log.Fields{"auth_id": a.ID, "model": c.Model, "reason": "codex_state_unavailable", "action": policy}).Warn("Codex request has no valid managed state")
-	if policy != "error" {
+	if policy != "error" && policy != "hide" {
 		return nil
 	}
 	source = "unavailable"

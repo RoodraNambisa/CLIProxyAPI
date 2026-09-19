@@ -250,7 +250,7 @@ func (cfg *Config) ValidateCodexStateOverride() error {
 	if c.Enabled && cfg.Codex.ResolvedTurnStatePolicy() == CodexTurnStatePolicyStrip {
 		return invalid("cannot enable while turn-state-policy is strip")
 	}
-	if !slices.Contains([]string{"override", "missing"}, c.Mode) || !slices.Contains([]string{"continue", "error"}, c.MissingPolicy) || !slices.Contains([]string{"active", "all", "manual"}, c.Acquisition) || !slices.Contains([]string{"inherit", "direct", "custom"}, c.ProxyMode) {
+	if !slices.Contains([]string{"override", "missing"}, c.Mode) || !slices.Contains([]string{"continue", "error", "hide"}, c.MissingPolicy) || !slices.Contains([]string{"active", "all", "manual"}, c.Acquisition) || !slices.Contains([]string{"inherit", "direct", "custom"}, c.ProxyMode) {
 		return invalid("invalid mode or policy")
 	}
 	if c.TTLMinutes < 1 || c.TTLMinutes > 1440 || c.RefreshBeforeMinutes < 1 || c.RefreshBeforeMinutes >= c.TTLMinutes || c.ActiveMinutes < 1 || c.ActiveMinutes > 10080 || c.Concurrency < 1 || c.Concurrency > 16 || c.RetrySeconds < 1 || c.RetrySeconds > 3600 || c.MaxAttempts < 1 || c.MaxAttempts > 10 {

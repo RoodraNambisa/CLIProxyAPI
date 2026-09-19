@@ -249,7 +249,7 @@ sentinel-solver:
 # api-key-groups:
 #   - api-key: "your-api-key-1"
 #     name: "Work" # Optional display name; empty means unnamed, up to 100 Unicode characters, no control characters.
-#     allow-credential-targeting: false # Opt in to <api-key>-auth-<auth_index or routing_alias> single-attempt tests.
+#     allow-credential-targeting: false # Opt in to <api-key>-auth-<auth_index or routing_alias> single-attempt tests (bypass local per-credential request limits).
 #     providers: ["codex", "xai"]
 #     allowed-priorities: [1, 2]
 #     excluded-priorities: [2]
@@ -995,7 +995,9 @@ xai:
 #     excluded-credentials: []       # Credential IDs, short IDs or filenames. Exclusions always win.
 #     models: []                    # Intersect with each credential's supported text models.
 #     mode: override                # override | missing (fill only absent client state)
-#     missing-policy: continue      # continue | error (local HTTP 429)
+#     missing-policy: continue      # continue | error (local HTTP 429) | hide (hide and skip this credential/model until valid State)
+#                                   # hide preserves acquisition, expiry and cooldown independently. Active mode bootstraps hidden models even without recent traffic; manual stays manual.
+#                                   # Local State 429 allows credential failover within retry policy; strict session affinity still keeps its binding.
 #     acquisition: active           # active | all | manual
 #     active-minutes: 60
 #     ttl-minutes: 60

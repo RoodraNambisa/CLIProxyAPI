@@ -65,7 +65,7 @@ func TestModelProbeCodexStateModesAndAccountModelIsolation(t *testing.T) {
 	codexstate.Diagnostic.Wait()
 	h := &Handler{cfg: cfg, authManager: m}
 	for _, stream := range []bool{false, true} {
-		for _, mode := range []string{"configured", "managed", "acquired", "none", "custom"} {
+		for _, mode := range []string{"auto", "configured", "managed", "acquired", "none", "custom"} {
 			t.Run(mode+map[bool]string{false: "/http", true: "/sse"}[stream], func(t *testing.T) {
 				input := &modelProbeStateInput{Mode: mode}
 				want, source := managed, "managed"
@@ -103,8 +103,25 @@ func TestModelProbeCodexStateModesAndAccountModelIsolation(t *testing.T) {
 			t.Fatalf("state crossed account/model boundary or silently fell back: %+v", result)
 		}
 	}
-	if snapshots := codexstate.Default.Snapshots(selected.ID, time.Now()); len(snapshots) != 1 || snapshots[0].Acquired != 1 || snapshots[0].Digest != modelProbeStateDigest(managed) || snapshots[0].Uses != 4 {
+	if snapshots := codexstate.Default.Snapshots(selected.ID, time.Now()); len(snapshots) != 1 || snapshots[0].Acquired != 1 || snapshots[0].Digest != modelProbeStateDigest(managed) || snapshots[0].Uses != 6 {
 		t.Fatalf("temporary probe changed managed cache: %+v", snapshots)
+	}
+	codexstate.Default.Action(c.ID, c.Model, "clear")
+	for _, policy := range []string{"error", "hide"} {
+		cfg.Codex.StateOverride.MissingPolicy = policy
+		codexstate.Default.Sync(cfg.Codex.StateOverride, []codexstate.Credential{c})
+		for _, stream := range []bool{false, true} {
+			before := calls.Load()
+			status, result := runModelProbe(t, h, t.Context(), modelProbeRequest{Name: selected.FileName, Model: "friendly", Stream: stream})
+			if status != 200 || !result.Success || calls.Load() != before+1 || received.Load() != "" || result.CodexState.Source != "none" {
+				t.Fatalf("default manual test blocked by missing State: %+v", result)
+			}
+		}
+		before := calls.Load()
+		_, result := runModelProbe(t, h, t.Context(), modelProbeRequest{Name: selected.FileName, Model: "friendly", CodexState: &modelProbeStateInput{Mode: "managed"}})
+		if result.Success || calls.Load() != before {
+			t.Fatal("explicit managed mode silently fell back")
+		}
 	}
 }
 

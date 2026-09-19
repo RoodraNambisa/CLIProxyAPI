@@ -20,8 +20,9 @@ func (r *ModelRegistry) GetModelCatalogForClient(handlerType, clientID string) M
 	r.mutex.RLock()
 	defer r.mutex.RUnlock()
 	provider := r.clientProviders[clientID]
+	availability, now := r.availabilityLocked(), time.Now()
 	for _, info := range r.clientModelInfos[clientID] {
-		if info == nil {
+		if info == nil || !availability.Available(clientID, info.ID, now) {
 			continue
 		}
 		if model := r.convertModelToMap(info, handlerType); model != nil {
@@ -86,6 +87,7 @@ func (r *ModelRegistry) GetModelCatalogForProviders(handlerType string, allowedP
 		if registration == nil {
 			continue
 		}
+		registration = r.availableRegistrationLocked(id, registration, r.availabilityLocked(), now)
 		var selected string
 		var selectedCount int
 		var providers []string

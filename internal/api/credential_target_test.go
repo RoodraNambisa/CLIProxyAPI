@@ -91,6 +91,8 @@ func TestCredentialTargetRequestsNeverSwitchAccounts(t *testing.T) {
 		t.Run(provider, func(t *testing.T) {
 			s := newTestServerWithConfig(t, func(cfg *config.Config) {
 				cfg.APIKeyGroups = []config.APIKeyGroup{{APIKey: "test-key", AllowCredentialTargeting: true}}
+				cfg.Routing.PerAuthRequestLimit = 1
+				cfg.Routing.PerAuthRequestWindowMinutes = 60
 				cfg.RequestRetry = 1
 			})
 			exec := &credentialTargetExecutor{provider: provider}

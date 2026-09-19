@@ -14,9 +14,12 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/managementdiag"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -61,10 +64,15 @@ type Snapshot struct {
 	Tokens              int64     `json:"acquisition_tokens"`
 	LastError           string    `json:"last_error,omitempty"`
 	LastStatus          int       `json:"last_status,omitempty"`
+	LastReturnedLength  *int      `json:"last_returned_length,omitempty"`
+	LastReturnedModel   string    `json:"last_returned_model,omitempty"`
 	ConsecutiveFailures int       `json:"consecutive_failures"`
 	Exhausted           bool      `json:"exhausted"`
 	Invalidations       uint64    `json:"invalidations"`
 	LastInvalidation    string    `json:"last_invalidation,omitempty"`
+	InvalidationLength  *int      `json:"invalidation_length,omitempty"`
+	InvalidationModel   string    `json:"invalidation_model,omitempty"`
+	RoutingHidden       bool      `json:"routing_hidden,omitempty"`
 	ManualOnly          bool      `json:"manual_only,omitempty"`
 }
 type entry struct {
@@ -87,6 +95,7 @@ type Manager struct {
 	version          uint64
 	running          int
 	nextValueVersion uint64
+	availability     atomic.Pointer[registry.ClientModelAvailability]
 }
 
 var Default = New()
@@ -98,6 +107,7 @@ func key(c Credential) string { return c.ID + "\x00" + c.Owner + "\x00" + c.Mode
 func (m *Manager) Sync(cfg config.CodexStateOverrideConfig, credentials []Credential, manualScopes ...Credential) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	defer m.publishAvailabilityLocked()
 	cfg = cfg.Resolved()
 	if m.diagnostic {
 		// Explicit tests do not enable or expand automatic acquisition.
@@ -342,10 +352,13 @@ func (m *Manager) ObserveResponse(c Credential, version uint64, value, returnedM
 	e.ExpiresAt = time.Time{}
 	e.Invalidations++
 	e.LastInvalidation = reason
+	e.InvalidationLength = new(returnedLength)
+	e.InvalidationModel, _ = managementdiag.ProcessText(returnedModel, "safe", 256)
 	// Keep failure limits and retry interval. An already-running renewal supplies the replacement.
 	if !e.busy && !e.Exhausted && !e.ManualOnly {
 		e.manual = true
 	}
+	m.publishAvailabilityLocked()
 	log.WithFields(log.Fields{"auth_id": c.ID, "model": c.Model, "reason": reason, "state_version": version, "returned_state_length": returnedLength}).Warn("Codex managed state invalidated by upstream response")
 	return reason
 }
@@ -382,6 +395,13 @@ func (m *Manager) Snapshots(id string, now time.Time) []Snapshot {
 		}
 		s := e.Snapshot
 		s.AllowedLengths = slices.Clone(e.AllowedLengths)
+		if s.LastReturnedLength != nil {
+			s.LastReturnedLength = new(*s.LastReturnedLength)
+		}
+		if s.InvalidationLength != nil {
+			s.InvalidationLength = new(*s.InvalidationLength)
+		}
+		s.RoutingHidden = e.policy.MissingPolicy == "hide" && !e.ManualOnly && (e.paused || e.state == "" || !now.Before(e.ExpiresAt))
 		switch {
 		case e.paused:
 			s.Status = "paused"
@@ -417,6 +437,7 @@ func (m *Manager) Action(id, model, action string) bool {
 func (m *Manager) ActionWithBaseline(id, model, action string) (bool, uint64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	defer m.publishAvailabilityLocked()
 	matched := false
 	var previousAcquired uint64
 	for _, e := range m.entries {
@@ -501,6 +522,11 @@ func (m *Manager) tick(ctx context.Context, now time.Time, probe Probe, capacity
 			continue
 		}
 		active := !e.ManualOnly && (e.policy.Acquisition == "all" || (e.policy.Acquisition == "active" && !e.LastUsed.IsZero() && now.Sub(e.LastUsed) <= time.Duration(e.policy.ActiveMinutes)*time.Minute))
+		// Hidden routes cannot receive traffic to activate acquisition. Bootstrap
+		// and restore them under the same retry/failure budget; manual stays manual.
+		if !e.ManualOnly && e.policy.MissingPolicy == "hide" && e.policy.Acquisition == "active" && (e.state == "" || !now.Before(e.ExpiresAt)) {
+			active = true
+		}
 		if !e.manual && (!active || (e.state != "" && now.Before(e.ExpiresAt.Add(-time.Duration(e.policy.RefreshBeforeMinutes)*time.Minute)))) {
 			continue
 		}
@@ -527,6 +553,7 @@ func (m *Manager) Wait() { m.wg.Wait() }
 func (m *Manager) finish(k string, expected *entry, version uint64, canceled error, result Result, err error, now time.Time) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	defer m.publishAvailabilityLocked()
 	m.running--
 	e := m.entries[k]
 	if e != expected || version != m.version {
@@ -539,6 +566,12 @@ func (m *Manager) finish(k string, expected *entry, version uint64, canceled err
 	}
 	e.Tokens += result.Tokens
 	e.LastStatus = result.Status
+	e.LastReturnedLength = nil
+	e.LastReturnedModel = ""
+	if result.Status > 0 || result.Completed {
+		e.LastReturnedLength = new(len(result.State))
+		e.LastReturnedModel, _ = managementdiag.ProcessText(result.Model, "safe", 256)
+	}
 	reason := ""
 	validation := e.policy
 	switch {

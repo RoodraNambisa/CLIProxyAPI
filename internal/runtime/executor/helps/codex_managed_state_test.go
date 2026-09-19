@@ -133,7 +133,7 @@ func TestManagedStateAdmissionAndFrozenRetry(t *testing.T) {
 		SkipAuthResult() bool
 		RetryOtherAuth() bool
 	}
-	if !errors.As(err, &status) || status.StatusCode() != 429 || !status.SkipAuthResult() || status.RetryOtherAuth() || !core.PreserveErrorResponse(err) || gjson.Get(err.Error(), "error.code").String() != "rate_limit_exceeded" {
+	if !errors.As(err, &status) || status.StatusCode() != 429 || !status.SkipAuthResult() || !status.RetryOtherAuth() || !core.PreserveErrorResponse(err) || gjson.Get(err.Error(), "error.code").String() != "rate_limit_exceeded" {
 		t.Fatalf("bad admission response: %v", err)
 	}
 	if !strings.Contains(err.Error(), "Rate limit exceeded for image_generation.") {

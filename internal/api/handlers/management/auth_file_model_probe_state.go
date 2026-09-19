@@ -37,13 +37,16 @@ func validModelProbeState(value string) bool {
 
 func validateModelProbeState(input *modelProbeStateInput, provider string) (string, string, error) {
 	if input == nil {
+		if provider == "codex" {
+			return "auto", "", nil
+		}
 		return "configured", "", nil
 	}
 	mode, value := strings.TrimSpace(input.Mode), strings.TrimSpace(input.State)
 	if mode == "" {
-		mode = "configured"
+		mode = "auto"
 	}
-	if provider != "codex" || !slices.Contains([]string{"configured", "none", "custom", "managed", "acquired"}, mode) {
+	if provider != "codex" || !slices.Contains([]string{"auto", "configured", "none", "custom", "managed", "acquired"}, mode) {
 		return "", "", errors.New("State probe options require Codex and a supported mode")
 	}
 	if (mode == "custom" && !validModelProbeState(value)) || (mode != "custom" && value != "") {

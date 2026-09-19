@@ -172,7 +172,8 @@ type ModelRegistry struct {
 	// mutex ensures thread-safe access to the registry
 	mutex *sync.RWMutex
 	// availableModelsCache stores per-handler snapshots for GetAvailableModels.
-	availableModelsCache map[string]availableModelsCacheEntry
+	availableModelsCache    map[string]availableModelsCacheEntry
+	clientModelAvailability func() ClientModelAvailability
 	// hook is an optional callback sink for model registration changes
 	hook ModelRegistryHook
 }
@@ -922,6 +923,11 @@ func (r *ModelRegistry) GetAvailableModels(handlerType string) []map[string]any 
 	now := time.Now()
 
 	r.mutex.RLock()
+	if len(r.availabilityLocked()) > 0 {
+		models, _ := r.buildAvailableModelsLocked(handlerType, now)
+		r.mutex.RUnlock()
+		return cloneModelMaps(models)
+	}
 	if cache, ok := r.availableModelsCache[handlerType]; ok && (cache.expiresAt.IsZero() || now.Before(cache.expiresAt)) {
 		models := cloneModelMaps(cache.models)
 		r.mutex.RUnlock()
@@ -933,6 +939,10 @@ func (r *ModelRegistry) GetAvailableModels(handlerType string) []map[string]any 
 	defer r.mutex.Unlock()
 	r.ensureAvailableModelsCacheLocked()
 
+	if len(r.availabilityLocked()) > 0 {
+		models, _ := r.buildAvailableModelsLocked(handlerType, now)
+		return cloneModelMaps(models)
+	}
 	if cache, ok := r.availableModelsCache[handlerType]; ok && (cache.expiresAt.IsZero() || now.Before(cache.expiresAt)) {
 		return cloneModelMaps(cache.models)
 	}
@@ -950,7 +960,9 @@ func (r *ModelRegistry) buildAvailableModelsLocked(handlerType string, now time.
 	models := make([]map[string]any, 0, len(r.models))
 	var expiresAt time.Time
 
-	for _, registration := range r.models {
+	availability := r.availabilityLocked()
+	for id, registration := range r.models {
+		registration = r.availableRegistrationLocked(id, registration, availability, now)
 		availableClients := registration.Count
 
 		expiredClients := 0
@@ -1103,7 +1115,10 @@ func (r *ModelRegistry) GetAvailableModelsByProvider(provider string) []*ModelIn
 			continue
 		}
 		registration, ok := r.models[modelID]
-		if providerHasCatalogAvailability(registration, provider, entry.count, r.clientProviders, now) {
+		if registration != nil {
+			registration = r.availableRegistrationLocked(modelID, registration, r.availabilityLocked(), now)
+		}
+		if registration != nil && providerHasCatalogAvailability(registration, provider, registration.Providers[provider], r.clientProviders, now) {
 			if entry.info != nil {
 				result = append(result, cloneModelInfo(entry.info))
 				continue
@@ -1129,6 +1144,7 @@ func (r *ModelRegistry) GetModelCount(modelID string) int {
 
 	if registration, exists := r.models[modelID]; exists {
 		now := time.Now()
+		registration = r.availableRegistrationLocked(modelID, registration, r.availabilityLocked(), now)
 
 		// Count clients that have exceeded quota but haven't recovered yet
 		expiredClients := 0
@@ -1163,10 +1179,15 @@ func (r *ModelRegistry) GetModelProviders(modelID string) []string {
 }
 
 func (r *ModelRegistry) modelProvidersLocked(modelID string, now time.Time) []string {
+	return r.modelProvidersWithAvailabilityLocked(modelID, now, r.availabilityLocked())
+}
+
+func (r *ModelRegistry) modelProvidersWithAvailabilityLocked(modelID string, now time.Time, availability ClientModelAvailability) []string {
 	registration, exists := r.models[modelID]
 	if !exists || registration == nil || len(registration.Providers) == 0 {
 		return nil
 	}
+	registration = r.availableRegistrationLocked(modelID, registration, availability, now)
 
 	type providerCount struct {
 		name  string

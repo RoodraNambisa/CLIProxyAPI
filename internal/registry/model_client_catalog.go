@@ -3,6 +3,7 @@ package registry
 import (
 	"sort"
 	"strings"
+	"time"
 )
 
 // GetModelCatalogForClients intersects a credential allowlist with an optional
@@ -21,6 +22,7 @@ func (r *ModelRegistry) GetModelCatalogForClients(handlerType string, clientIDs,
 	owners := make(map[string]string)
 	r.mutex.RLock()
 	defer r.mutex.RUnlock()
+	availability, now := r.availabilityLocked(), time.Now()
 	for _, client := range clients {
 		if seen[client] {
 			continue
@@ -31,7 +33,7 @@ func (r *ModelRegistry) GetModelCatalogForClients(handlerType string, clientIDs,
 			continue
 		}
 		for id, info := range r.clientModelInfos[client] {
-			if info == nil {
+			if info == nil || !availability.Available(client, id, now) {
 				continue
 			}
 			registration := r.models[id]

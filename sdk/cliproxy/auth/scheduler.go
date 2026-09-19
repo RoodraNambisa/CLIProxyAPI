@@ -824,7 +824,7 @@ func (s *authScheduler) pickSingle(ctx context.Context, provider, model string, 
 		if entry == nil || entry.auth == nil {
 			return false
 		}
-		if !credentialSupportsExecutionFormat(entry.auth, opts.SourceFormat) || !clientKeyPriorityAllowed(ctx, entry.auth) {
+		if !credentialSupportsExecutionFormat(entry.auth, opts.SourceFormat) || !clientKeyPriorityAllowed(ctx, entry.auth) || !registry.GetGlobalRegistry().ClientModelAvailable(entry.auth.ID, modelKey) {
 			return false
 		}
 		if strategyForPriority(authPriority(entry.auth)) == schedulerStrategyWeightedRoundRobin && authWeight(entry.auth) <= 0 {
@@ -926,7 +926,7 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 			if entry == nil || entry.auth == nil {
 				return false
 			}
-			return entry.auth.ID == pinnedAuthID && clientKeyPriorityAllowed(ctx, entry.auth) && credentialSupportsExecutionFormat(entry.auth, opts.SourceFormat) && (strategyForPriority(authPriority(entry.auth)) != schedulerStrategyWeightedRoundRobin || authWeight(entry.auth) > 0)
+			return entry.auth.ID == pinnedAuthID && clientKeyPriorityAllowed(ctx, entry.auth) && registry.GetGlobalRegistry().ClientModelAvailable(entry.auth.ID, modelKey) && credentialSupportsExecutionFormat(entry.auth, opts.SourceFormat) && (strategyForPriority(authPriority(entry.auth)) != schedulerStrategyWeightedRoundRobin || authWeight(entry.auth) > 0)
 		}
 		pickPredicate := func(entry *scheduledAuth) bool {
 			if !priorityPredicate(entry) {
@@ -956,7 +956,7 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 	}
 
 	priorityPredicate := func(entry *scheduledAuth) bool {
-		return entry != nil && entry.auth != nil && clientKeyPriorityAllowed(ctx, entry.auth) && credentialSupportsExecutionFormat(entry.auth, opts.SourceFormat) && (strategyForPriority(authPriority(entry.auth)) != schedulerStrategyWeightedRoundRobin || authWeight(entry.auth) > 0)
+		return entry != nil && entry.auth != nil && clientKeyPriorityAllowed(ctx, entry.auth) && registry.GetGlobalRegistry().ClientModelAvailable(entry.auth.ID, modelKey) && credentialSupportsExecutionFormat(entry.auth, opts.SourceFormat) && (strategyForPriority(authPriority(entry.auth)) != schedulerStrategyWeightedRoundRobin || authWeight(entry.auth) > 0)
 	}
 	basePickPredicate := triedPredicate(tried, authAllowed...)
 	pickPredicate := func(entry *scheduledAuth) bool {
