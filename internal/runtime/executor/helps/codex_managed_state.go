@@ -76,7 +76,22 @@ func StateCredential(a *auth.Auth, model string) codexstate.Credential {
 	if plan == "" {
 		plan = codexauth.EffectivePlanType(a.Metadata)
 	}
-	return codexstate.Credential{ID: a.ID, Name: a.FileName, Owner: owner, Instance: a.RuntimeInstanceID(), Model: thinking.ParseSuffix(model).ModelName, Plan: config.NormalizeCodexStatePlanType(plan)}
+	c := codexstate.Credential{ID: a.ID, Name: a.FileName, Owner: owner, Instance: a.RuntimeInstanceID(), Model: thinking.ParseSuffix(model).ModelName, Plan: config.NormalizeCodexStatePlanType(plan), ShortID: a.Index, Priority: StateCredentialPriority(a)}
+	if c.Model != "" {
+		for _, info := range registry.GetGlobalRegistry().GetModelsForClient(a.ID) {
+			if info == nil {
+				continue
+			}
+			upstream := info.UpstreamID
+			if upstream == "" {
+				upstream = info.ID
+			}
+			if thinking.ParseSuffix(upstream).ModelName == c.Model {
+				c.Aliases = append(c.Aliases, thinking.ParseSuffix(info.ID).ModelName)
+			}
+		}
+	}
+	return c
 }
 
 // ManagedStateCredentialEligible checks credential scope without requiring a registered model.
@@ -85,6 +100,9 @@ func ManagedStateCredentialEligible(cfg *config.Config, a *auth.Auth) bool {
 		return false
 	}
 	c := cfg.Codex.StateOverride
+	if c.Rules != nil {
+		return c.MatchesCredential(StateCredential(a, "").Scope())
+	}
 	if slices.Contains(c.ExcludedCredentials, a.ID) || slices.Contains(c.ExcludedCredentials, a.Index) || slices.Contains(c.ExcludedCredentials, a.FileName) {
 		return false
 	}
@@ -126,7 +144,7 @@ func ManagedStateModels(cfg *config.Config, a *auth.Auth) []codexstate.Credentia
 				continue
 			}
 		}
-		if len(c.Models) > 0 && !slices.Contains(c.Models, model) && !slices.Contains(c.Models, info.ID) {
+		if c.Rules == nil && len(c.Models) > 0 && !slices.Contains(c.Models, model) && !slices.Contains(c.Models, info.ID) {
 			continue
 		}
 		if seen[model] {
@@ -135,6 +153,11 @@ func ManagedStateModels(cfg *config.Config, a *auth.Auth) []codexstate.Credentia
 		seen[model] = true
 		item := StateCredential(a, model)
 		item.Route = info.ID
+		if c.Rules != nil {
+			if _, _, ok := c.PolicyFor(item.Scope()); !ok {
+				continue
+			}
+		}
 		result = append(result, item)
 	}
 	return result
@@ -248,7 +271,7 @@ func ApplyManagedState(ctx context.Context, cfg *config.Config, a *auth.Auth, mo
 			break
 		}
 	}
-	if !inScope && requireManaged && ManagedStateCredentialEligible(cfg, a) && (len(cfg.Codex.StateOverride.Models) == 0 || slices.Contains(cfg.Codex.StateOverride.Models, c.Model)) && codexstate.Default.HasManual(c) {
+	if !inScope && requireManaged && ManagedStateCredentialEligible(cfg, a) && ManagedStatePairAllowed(cfg, c) && codexstate.Default.HasManual(c) {
 		inScope = true
 	}
 	if !inScope {
@@ -288,7 +311,7 @@ func ApplyManagedState(ctx context.Context, cfg *config.Config, a *auth.Auth, mo
 		return nil
 	}
 	source = "unavailable"
-	resolved := cfg.Codex.StateOverride.Resolved()
+	resolved, _, _ := cfg.Codex.StateOverride.PolicyFor(c.Scope())
 	body, _ := json.Marshal(map[string]any{"error": map[string]string{"type": resolved.ErrorType, "code": resolved.ErrorCode, "message": resolved.ErrorMessage}})
 	return stateUnavailableError{body: string(body)}
 }
@@ -298,4 +321,22 @@ func ObserveManagedStateCompletion(ctx context.Context, a *auth.Auth, model stri
 	if !IsStateProbe(ctx) && headers.Get("X-Codex-Turn-State") != "" {
 		codexstate.Default.Complete(StateCredential(a, model), headers.Get("X-Codex-Turn-State"))
 	}
+}
+
+// ManagedStatePairAllowed checks the full scope for explicit diagnostic pairs.
+func ManagedStatePairAllowed(cfg *config.Config, c codexstate.Credential) bool {
+	_, _, ok := cfg.Codex.StateOverride.PolicyFor(c.Scope())
+	return ok
+}
+func ResolveStateModel(authID, requested string) string {
+	model := thinking.ParseSuffix(strings.TrimSpace(requested)).ModelName
+	for _, info := range registry.GetGlobalRegistry().GetModelsForClient(authID) {
+		if info != nil && thinking.ParseSuffix(info.ID).ModelName == model {
+			if info.UpstreamID != "" {
+				return thinking.ParseSuffix(info.UpstreamID).ModelName
+			}
+			break
+		}
+	}
+	return model
 }

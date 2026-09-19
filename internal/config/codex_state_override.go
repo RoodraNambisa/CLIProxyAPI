@@ -11,6 +11,7 @@ import (
 
 // CodexStateOverrideConfig manages short-lived state in memory only.
 type CodexStateOverrideConfig struct {
+	Rules                           *[]CodexStateRule         `yaml:"rules,omitempty" json:"rules,omitempty"`
 	Enabled                         bool                      `yaml:"enabled" json:"enabled"`
 	Priorities                      APIKeyPriorityList        `yaml:"priorities" json:"priorities"`
 	IncludedCredentials             []string                  `yaml:"included-credentials" json:"included-credentials"`
@@ -112,6 +113,7 @@ func (c CodexStateOverrideConfig) ForModel(model string) CodexStateOverrideConfi
 }
 
 func (c CodexStateOverrideConfig) Resolved() CodexStateOverrideConfig {
+	c.Rules = cloneCodexStateRules(c.Rules)
 	c.PlanLengths = slices.Clone(c.PlanLengths)
 	for i, v := range c.PlanLengths {
 		c.PlanLengths[i].PlanTypes = slices.Clone(v.PlanTypes)
@@ -287,5 +289,5 @@ func (cfg *Config) ValidateCodexStateOverride() error {
 			return invalid("invalid proxy URL")
 		}
 	}
-	return nil
+	return cfg.validateCodexStateRules()
 }
