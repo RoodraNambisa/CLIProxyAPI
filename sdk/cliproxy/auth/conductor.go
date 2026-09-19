@@ -9892,7 +9892,7 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 	if modelKey != "" {
 		filtered := candidates[:0]
 		for _, candidate := range candidates {
-			if m.authSupportsRouteModel(registryRef, candidate, model) {
+			if authenticatedModelTarget(ctx, opts) == candidate.ID || m.authSupportsRouteModel(registryRef, candidate, model) {
 				filtered = append(filtered, candidate)
 			}
 		}
@@ -10021,7 +10021,7 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 	}
 	allowed := clientKeyPriorityFilter(ctx, nil)
 	m.triggerDueChatGPTWebImageQuotaRefreshes([]string{provider}, model, opts, tried, allowed, false)
-	if !m.useSchedulerFastPath(ctx) {
+	if authenticatedModelTarget(ctx, opts) != "" || !m.useSchedulerFastPath(ctx) {
 		auth, executor, errPick := m.pickNextLegacy(ctx, provider, model, opts, tried)
 		if errPick != nil {
 			errPick = m.preferChatGPTWebImageQuotaError(errPick, []string{provider}, model, opts, tried, allowed)
@@ -10120,7 +10120,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 	if modelKey != "" {
 		filtered := candidates[:0]
 		for _, candidate := range candidates {
-			if m.authSupportsRouteModel(registryRef, candidate, model) {
+			if authenticatedModelTarget(ctx, opts) == candidate.ID || m.authSupportsRouteModel(registryRef, candidate, model) {
 				filtered = append(filtered, candidate)
 			}
 		}
@@ -10267,7 +10267,7 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 	}
 	allowed = clientKeyPriorityFilter(ctx, allowed)
 	m.triggerDueChatGPTWebImageQuotaRefreshes(providers, model, opts, tried, allowed, false)
-	if !m.useSchedulerFastPath(ctx) {
+	if authenticatedModelTarget(ctx, opts) != "" || !m.useSchedulerFastPath(ctx) {
 		auth, executor, provider, errPick := m.pickNextMixedLegacy(ctx, providers, model, opts, tried, allowed)
 		if errPick != nil {
 			errPick = m.preferChatGPTWebImageQuotaError(errPick, providers, model, opts, tried, allowed)
