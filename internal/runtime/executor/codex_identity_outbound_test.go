@@ -109,11 +109,38 @@ func TestCodexIdentityOutboundProjection(t *testing.T) {
 					if headerValueCaseInsensitive(got.headers, "X-Codex-Turn-Metadata") != metadata {
 						t.Fatal("body/header metadata diverged")
 					}
+					if transport == "ws" && headerValueCaseInsensitive(got.headers, "Conversation_id") != gjson.GetBytes(got.body, "prompt_cache_key").Str {
+						t.Fatal("websocket compatibility header retained an old cache key")
+					}
 					if converged && got.headers.Get("X-Codex-Parent-Thread-Id") != gjson.Get(metadata, "parent_thread_id").Str {
 						t.Fatal("parent header lost projection")
 					}
 				})
 			}
+		}
+	}
+}
+
+func TestCodexMemoryProjectionDoesNotInventTurnIdentity(t *testing.T) {
+	exec := NewCodexExecutor(&config.Config{Codex: config.CodexConfig{SpoofSessionIdentity: true}})
+	auth := prepareCodexFingerprintAuthForTest(t, exec, &coreauth.Auth{ID: "memory-test", Provider: "codex", Metadata: map[string]any{"account_id": "account", "codex_fingerprint_mode": "session"}})
+	body := []byte(`{"client_metadata":{"x-codex-turn-metadata":"{\"request_kind\":\"memory\"}"}}`)
+	req := core.Request{Model: "gpt-5.4", Payload: body}
+	opaque, err := exec.PrepareProviderRequest(t.Context(), req, core.Options{}, core.RequestOperationExecute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts := core.WithProviderPreparedRequest(core.Options{}, exec.Identifier(), opaque)
+	out, state, err := exec.projectCodexSessionIdentity(t.Context(), auth, req, opts, body, &codexIdentityConfuseState{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.projectSession {
+		t.Fatal("memory became a user turn")
+	}
+	for _, field := range []string{"session_id", "thread_id", "turn_id", "window_id", "window_number"} {
+		if gjson.Get(state.turnMetadata, field).Exists() || gjson.GetBytes(out, "client_metadata."+field).Exists() {
+			t.Fatalf("invented memory %s", field)
 		}
 	}
 }

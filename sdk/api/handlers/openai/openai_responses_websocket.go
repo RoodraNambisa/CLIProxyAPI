@@ -66,8 +66,8 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 	incoming, readerDone := readResponsesWebsocketRequests(readCtx, stopReading, conn)
 	defer func() { stopReading(context.Canceled); _ = writer.Close(); <-readerDone }()
 	passthroughSessionID := uuid.NewString()
-	downstreamSessionKey := websocketToolPairScopeKey(c, websocketDownstreamSessionKey(c.Request))
-	toolPairState := acquireResponsesWebsocketToolPairState(downstreamSessionKey)
+	var conversations responsesWebsocketConversations
+	defer conversations.close()
 	clientIP := websocketClientAddress(c)
 	log.Infof("responses websocket: client connected id=%s remote=%s", executorhelps.CodexWebsocketSessionLogID(passthroughSessionID), clientIP)
 
@@ -115,7 +115,6 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 	var wsTerminateErr error
 	var wsTimelineLog strings.Builder
 	defer func() {
-		releaseResponsesWebsocketToolPairState(downstreamSessionKey)
 		select {
 		case upstreamErr := <-disconnectCause:
 			if upstreamErr != nil {
@@ -139,12 +138,6 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		}
 	}()
 
-	var lastRequest []byte
-	lastResponseOutput := []byte("[]")
-	lastResponseID := ""
-	pinnedAuthID := ""
-	lastAttemptedAuthID := ""
-
 	for {
 		var message responsesWebsocketRequestMessage
 		select {
@@ -164,6 +157,8 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		if msgType != websocket.TextMessage && msgType != websocket.BinaryMessage {
 			continue
 		}
+		conversation, scopedPayload := conversations.selectRequest(c, payload)
+		payload = scopedPayload
 		// Freeze handler policy once for this logical turn, including a potentially
 		// slow credential/bootstrap phase before the first upstream output.
 		h := NewOpenAIResponsesAPIHandler(handlers.NewBaseAPIHandlers(h.ConfigSnapshot(), h.AuthManager))
@@ -181,11 +176,11 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		appendWebsocketTimelineEvent(&wsTimelineLog, "request", payload, time.Now(), util.PromptCacheLogForGin(c))
 
 		allowIncrementalInputWithPreviousResponseID := false
-		requestPinnedAuthID := pinnedAuthID
+		requestPinnedAuthID := conversation.pinnedAuthID
 		if requestPinnedAuthID != "" && h != nil && h.AuthManager != nil {
 			modelName := strings.TrimSpace(gjson.GetBytes(payload, "model").String())
 			if modelName == "" {
-				modelName = strings.TrimSpace(gjson.GetBytes(lastRequest, "model").String())
+				modelName = strings.TrimSpace(gjson.GetBytes(conversation.lastRequest, "model").String())
 			}
 			modelName = util.ResolveAutoModel(thinking.ParseSuffix(modelName).ModelName)
 			if pinnedAuth, ok := h.AuthManager.GetByID(requestPinnedAuthID); ok && h.AuthManager.AuthSupportsRouteModel(pinnedAuth, modelName) {
@@ -197,14 +192,18 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 			}
 		}
 
+		if conversation.modelChanged(payload) || (conversations.upstreamScope != "" && conversations.upstreamScope != conversation.scope.Key()) {
+			allowIncrementalInputWithPreviousResponseID = false
+		}
+
 		var requestJSON []byte
 		var updatedLastRequest []byte
 		var errMsg *interfaces.ErrorMessage
 		requestJSON, updatedLastRequest, errMsg = normalizeResponsesWebsocketRequestWithContext(
 			payload,
-			lastRequest,
-			lastResponseOutput,
-			lastResponseID,
+			conversation.lastRequest,
+			conversation.lastResponseOutput,
+			conversation.lastResponseID,
 			allowIncrementalInputWithPreviousResponseID,
 		)
 		if errMsg != nil {
@@ -229,7 +228,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 			}
 			continue
 		}
-		if shouldHandleResponsesWebsocketPrewarmLocally(payload, lastRequest, allowIncrementalInputWithPreviousResponseID) {
+		if shouldHandleResponsesWebsocketPrewarmLocally(payload, conversation.lastRequest, allowIncrementalInputWithPreviousResponseID) {
 			accessContext := context.WithValue(context.Background(), "gin", c)
 			modelName := gjson.GetBytes(requestJSON, "model").String()
 			if accessError := h.ValidateModelProviderAccess(accessContext, h.HandlerType(), modelName); accessError != nil {
@@ -255,21 +254,25 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 			if updated, errDelete := sjson.DeleteBytes(updatedLastRequest, "generate"); errDelete == nil {
 				updatedLastRequest = updated
 			}
-			lastRequest = updatedLastRequest
-			lastResponseOutput = []byte("[]")
-			if errWrite := writeResponsesWebsocketSyntheticPrewarm(c, writer, requestJSON, &wsTimelineLog, passthroughSessionID, &lastResponseID); errWrite != nil {
+			conversation.lastRequest = updatedLastRequest
+			conversation.lastResponseOutput = []byte("[]")
+			if errWrite := writeResponsesWebsocketSyntheticPrewarm(c, writer, requestJSON, &wsTimelineLog, passthroughSessionID, &conversation.lastResponseID); errWrite != nil {
 				wsTerminateErr = errWrite
 				return
 			}
+			conversations.prewarmID = conversation.lastResponseID
+			conversations.prewarmScope = conversation.scope
+			conversations.model = gjson.GetBytes(requestJSON, "model").String()
+			conversations.trimHistory(conversation, responsesWebsocketHistoryBytesLimit)
 			continue
 		}
 
 		requestJSON = h.prepareOrphanDelegation(c, requestJSON, func(callID string) bool {
-			_, exists := toolPairState.getCall(callID)
+			_, exists := conversation.tools.getCall(callID)
 			return exists
 		})
 		requestJSON = h.prepareCodexMultiAgentV2(c, requestJSON)
-		toolCacheTurn := newResponsesWebsocketToolCacheTurn(toolPairState)
+		toolCacheTurn := newResponsesWebsocketToolCacheTurn(conversation.tools)
 		requestJSON = toolCacheTurn.repairRequest(requestJSON)
 		requestJSON = dedupeResponsesWebsocketInputItemsByID(requestJSON)
 		h.PinChatGPTWebImageErrorSanitization(c, coreauth.PayloadHasImageGenerationTool(requestJSON))
@@ -282,9 +285,9 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 			cliCtx = cliproxyexecutor.WithRequiredUpstreamWebsocket(cliCtx)
 		}
 		cliCtx = handlers.WithExecutionSessionID(cliCtx, passthroughSessionID)
-		lastAttemptedAuthID = ""
+		conversation.lastAttemptedAuthID = ""
 		if requestPinnedAuthID != "" {
-			lastAttemptedAuthID = requestPinnedAuthID
+			conversation.lastAttemptedAuthID = requestPinnedAuthID
 			cliCtx = handlers.WithPinnedAuthID(cliCtx, requestPinnedAuthID)
 		} else {
 			cliCtx = handlers.WithSelectedAuthIDCallback(cliCtx, func(authID string) {
@@ -292,19 +295,20 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 				if authID == "" || h == nil || h.AuthManager == nil {
 					return
 				}
-				lastAttemptedAuthID = authID
+				conversation.lastAttemptedAuthID = authID
 				selectedAuth, ok := h.AuthManager.GetByID(authID)
 				if !ok || selectedAuth == nil {
 					return
 				}
 				if websocketUpstreamSupportsIncrementalInput(selectedAuth.Attributes, selectedAuth.Metadata) {
-					pinnedAuthID = authID
+					conversation.pinnedAuthID = authID
 				}
 			})
 		}
+		conversations.upstreamScope = conversation.scope.Key()
 		dataChan, errChan, streamDone := h.startResponsesWebsocketStream(cliCtx, modelName, requestJSON)
 
-		completedOutput, forwardErrMsg, errForward := h.forwardResponsesWebsocket(c, writer, cliCancel, dataChan, errChan, &wsTimelineLog, passthroughSessionID, toolPairState, toolCacheTurn)
+		completedOutput, forwardErrMsg, errForward := h.forwardResponsesWebsocket(c, writer, cliCancel, dataChan, errChan, &wsTimelineLog, passthroughSessionID, conversation.tools, toolCacheTurn)
 		cliCancel(nil)
 		<-streamDone
 		if errForward != nil {
@@ -312,14 +316,18 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 			log.Warnf("responses websocket: forward failed id=%s error=%v", executorhelps.CodexWebsocketSessionLogID(passthroughSessionID), executorhelps.CodexWebsocketLogError(errForward, util.PromptCacheLogForGin(c)))
 			return
 		}
-		if shouldClearResponsesWebsocketPinnedAuth(pinnedAuthID, lastAttemptedAuthID, forwardErrMsg) {
-			pinnedAuthID = ""
+		if shouldClearResponsesWebsocketPinnedAuth(conversation.pinnedAuthID, conversation.lastAttemptedAuthID, forwardErrMsg) {
+			conversation.pinnedAuthID = ""
 		}
 		if forwardErrMsg == nil && toolCacheTurn.succeeded {
-			toolCacheTurn.commit()
-			lastRequest = updatedLastRequest
-			lastResponseOutput = completedOutput
-			lastResponseID = toolCacheTurn.responseID
+			if conversation.scope.Kind != "prewarm" {
+				toolCacheTurn.commit()
+			}
+			conversations.model = modelName
+			conversation.lastRequest = updatedLastRequest
+			conversation.lastResponseOutput = completedOutput
+			conversation.lastResponseID = toolCacheTurn.responseID
+			conversations.trimHistory(conversation, responsesWebsocketHistoryBytesLimit)
 		}
 	}
 }

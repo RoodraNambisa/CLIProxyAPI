@@ -102,7 +102,7 @@ func TestCodexAstraMinimumOnReusedWebsocketConnection(t *testing.T) {
 				if err := run("gpt-6-astra(high)", `{"model":"gpt-6-astra","input":[]}`); err != nil {
 					t.Fatal(err)
 				}
-				wantVersion, wantDials := scenario.version, int64(1)
+				wantVersion, wantDials := scenario.version, int64(2)
 				if scenario.enforce && scenario.version == "0.148.0" {
 					wantVersion, wantDials = "0.153.4", 2
 				}
@@ -114,8 +114,8 @@ func TestCodexAstraMinimumOnReusedWebsocketConnection(t *testing.T) {
 					t.Fatal(err)
 				}
 				<-wire
-				if dials.Load() != wantDials || cfg.CodexHeaderDefaults.UserAgent != savedAgent {
-					t.Fatal("compatible return to generic model reconnected or rewrote configuration")
+				if dials.Load() != wantDials+1 || cfg.CodexHeaderDefaults.UserAgent != savedAgent {
+					t.Fatal("model switch did not isolate the connection or rewrote configuration")
 				}
 			})
 		}

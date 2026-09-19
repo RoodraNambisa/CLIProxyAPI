@@ -87,3 +87,15 @@ func TestCodexRelatedProjectionDoesNotAddMissingWindowFields(t *testing.T) {
 		}
 	}
 }
+
+func TestCodexRelatedReferencesDoNotCollapseUnrelatedTurns(t *testing.T) {
+	body := []byte(`{"client_metadata":{"turn_id":"mapped-main","parent_turn_id":"other","x-codex-turn-metadata":"{\"turn_id\":\"mapped-main\",\"root_turn_id\":\"main\",\"parent_turn_id\":\"other\"}"}}`)
+	projection := CodexSessionIdentityProjection{ProjectSession: true, ForcedIdentity: CodexSessionIdentity{SessionID: "s", ThreadID: "t", TurnID: "final", WindowID: "t:0"}, KnownReplacements: []CodexResponseIdentityReplacement{{From: "main", To: "mapped-main", Role: CodexResponseTurnIdentity}, {From: "other", To: "mapped-other", Role: CodexResponseTurnIdentity}}}
+	_, _, turn, err := ProjectCodexSessionIdentityWithProjection(body, CodexSessionIdentityHeaderSource{}, CodexSessionIdentityHeaderSource{}, CodexSessionIdentityHeaderSource{}, CodexSessionIdentity{}, projection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gjson.Get(turn, "root_turn_id").Str != "final" || gjson.Get(turn, "parent_turn_id").Str != "mapped-other" {
+		t.Fatalf("unrelated turn collapsed: %s", turn)
+	}
+}

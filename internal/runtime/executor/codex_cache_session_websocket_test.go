@@ -50,7 +50,7 @@ func newCacheSessionWebsocketUpstream(t *testing.T) (*httptest.Server, <-chan ca
 	return server, frames
 }
 
-func TestCodexCacheSessionWebsocketReuseFollowsFinalIdentity(t *testing.T) {
+func TestCodexCacheSessionWebsocketReuseFollowsOriginalAndFinalIdentity(t *testing.T) {
 	for _, stream := range []bool{false, true} {
 		t.Run(fmt.Sprint(stream), func(t *testing.T) {
 			server, frames := newCacheSessionWebsocketUpstream(t)
@@ -64,13 +64,13 @@ func TestCodexCacheSessionWebsocketReuseFollowsFinalIdentity(t *testing.T) {
 				connections  int32
 			}{
 				{false, "legacy-a", "legacy-a", 1},
-				{false, "legacy-b", "legacy-b", 1},
-				{true, "cache-a", "explicit-session", 2},
-				{true, "cache-b", "explicit-session", 2},
-				{true, "fallback-session", "", 3},
-				{true, "fallback-session", "", 3},
-				{false, "legacy-c", "legacy-c", 4},
-				{false, "legacy-d", "legacy-d", 4},
+				{false, "legacy-b", "legacy-b", 2},
+				{true, "cache-a", "explicit-session", 3},
+				{true, "cache-b", "explicit-session", 3},
+				{true, "fallback-session", "", 4},
+				{true, "fallback-session", "", 4},
+				{false, "legacy-c", "legacy-c", 5},
+				{false, "legacy-d", "legacy-d", 6},
 			} {
 				// A fresh executor models hot reload while the session store is retained.
 				executor := NewCodexWebsocketsExecutor(&config.Config{Codex: config.CodexConfig{PassthroughPromptCacheKey: turn.enabled}})

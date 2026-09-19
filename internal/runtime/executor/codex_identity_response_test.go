@@ -4,6 +4,9 @@ import (
 	"bytes"
 	"testing"
 
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
+	core "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	"github.com/tidwall/gjson"
 )
 
@@ -42,6 +45,24 @@ func TestCodexIdentityResponseShortKeysPreserveBusinessContent(t *testing.T) {
 			if restored := applyCodexIdentityExposeResponsePayload(mapped, state); !bytes.Equal(restored, payload) {
 				t.Fatalf("round trip changed content: %s", restored)
 			}
+		}
+	}
+}
+
+func TestCodexIdentityPolicyFrozenAcrossConfigReplacement(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		cfg := &config.Config{Routing: config.RoutingConfig{SessionAffinity: true}, Codex: config.CodexConfig{IdentityConfuse: enabled}}
+		exec := NewCodexExecutor(cfg)
+		body := []byte(`{"prompt_cache_key":"short"}`)
+		opaque, err := exec.PrepareProviderRequest(t.Context(), core.Request{Payload: body}, core.Options{}, core.RequestOperationExecute)
+		if err != nil {
+			t.Fatal(err)
+		}
+		prepared := opaque.(codexPreparedSessionIdentity)
+		cfg.Codex.IdentityConfuse = !enabled
+		got, state := applyCodexPreparedIdentityConfuseBody(cfg, &coreauth.Auth{ID: "test"}, body, body, prepared)
+		if state.enabled != enabled || (gjson.GetBytes(got, "prompt_cache_key").Str != "short") != enabled {
+			t.Fatal("config replacement changed an in-flight identity policy")
 		}
 	}
 }

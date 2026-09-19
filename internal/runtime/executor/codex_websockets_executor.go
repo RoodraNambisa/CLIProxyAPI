@@ -75,6 +75,8 @@ type codexWebsocketSession struct {
 	proxyBindingID       string
 	proxyIdentity        string
 	softwareIdentity     codexauth.SoftwareIdentity
+	requestScopeDigest   [sha256.Size]byte
+	requestModel         string
 	cacheSessionDigest   [sha256.Size]byte
 	managedStateModel    string
 	managedStateUse      helps.CodexManagedStateUse
@@ -360,13 +362,16 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		return resp, err
 	}
 	applyCodexSessionIdentityHeaders(wsHeaders, sessionIdentity, true)
+	helps.RestoreCodexParentThreadHeader(wsHeaders, upstreamBody)
 	upstreamBody, err = preparedIdentity.PromptCacheKey.ApplyFinal(upstreamBody, wsHeaders)
 	if err != nil {
 		invalid := codexStreamStatusErr(http.StatusInternalServerError, err.Error(), "invalid_prompt_cache_key", "invalid_request_error", nil)
 		invalid.skipAuthResult = true
 		return resp, invalid
 	}
+	helps.SyncCodexWebsocketRoutingHeaders(wsHeaders, upstreamBody)
 	ctx = helps.WithCodexCacheSession(ctx, preparedIdentity.PromptCacheKey)
+	ctx = helps.WithCodexRequestScope(ctx, preparedIdentity.RequestScope, gjson.GetBytes(upstreamBody, "model").String())
 	ensureCodexTurnStateHeader(wsHeaders, opts.Headers)
 	guardCodexTurnStateHeader(e.cfg, auth, wsHeaders)
 	releasedOriginalPayload := slimCodexOriginalPayloadForTranslation(from, originalPayload)
@@ -735,13 +740,16 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		return nil, err
 	}
 	applyCodexSessionIdentityHeaders(wsHeaders, sessionIdentity, true)
+	helps.RestoreCodexParentThreadHeader(wsHeaders, upstreamBody)
 	upstreamBody, err = preparedIdentity.PromptCacheKey.ApplyFinal(upstreamBody, wsHeaders)
 	if err != nil {
 		invalid := codexStreamStatusErr(http.StatusInternalServerError, err.Error(), "invalid_prompt_cache_key", "invalid_request_error", nil)
 		invalid.skipAuthResult = true
 		return nil, invalid
 	}
+	helps.SyncCodexWebsocketRoutingHeaders(wsHeaders, upstreamBody)
 	ctx = helps.WithCodexCacheSession(ctx, preparedIdentity.PromptCacheKey)
+	ctx = helps.WithCodexRequestScope(ctx, preparedIdentity.RequestScope, gjson.GetBytes(upstreamBody, "model").String())
 	ensureCodexTurnStateHeader(wsHeaders, opts.Headers)
 	guardCodexTurnStateHeader(e.cfg, auth, wsHeaders)
 	releasedOriginalPayload := slimCodexOriginalPayloadForTranslation(from, userPayload)
@@ -2040,6 +2048,8 @@ func (e *CodexWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *
 	currentManagedStateModel := sess.managedStateModel
 	stateRejected := sess.managedStateRejected
 	currentCacheSessionDigest := sess.cacheSessionDigest
+	currentRequestScopeDigest := sess.requestScopeDigest
+	currentRequestModel := sess.requestModel
 	sess.connMu.Unlock()
 	requestedAuthID := strings.TrimSpace(authID)
 	requestedAuthInstanceID := auth.RuntimeInstanceID()
@@ -2047,6 +2057,13 @@ func (e *CodexWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *
 	requestedProxyIdentity := websocketProxyIdentity(e.cfg, auth)
 	requestedWSURL := strings.TrimSpace(wsURL)
 	requestedCacheSessionDigest := helps.CodexCacheSessionDigest(ctx)
+	requestedRequestScopeDigest := helps.CodexRequestScopeDigest(ctx)
+	requestScopeChanged := conn != nil && currentRequestScopeDigest != requestedRequestScopeDigest
+	requestedRequestModel := ""
+	if len(models) > 0 {
+		requestedRequestModel = thinking.ParseSuffix(models[0]).ModelName
+	}
+	requestScopeChanged = requestScopeChanged || (conn != nil && currentRequestModel != "" && requestedRequestModel != "" && currentRequestModel != requestedRequestModel)
 	cacheSessionChanged := conn != nil && currentCacheSessionDigest != requestedCacheSessionDigest
 	requestedStateModel := ""
 	if len(models) > 0 && e.cfg != nil && e.cfg.Codex.StateOverride.Enabled {
@@ -2061,15 +2078,17 @@ func (e *CodexWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *
 
 	softwareChanged := conn != nil && len(models) > 0 && codexEnforceSoftwareIdentity(e.cfg) && !codexAuthUsesAPIKey(auth) &&
 		!codexauth.SoftwareIdentitySupportsModel(currentSoftwareIdentity, thinking.ParseSuffix(models[0]).ModelName)
-	if cliproxyexecutor.RequiredUpstreamWebsocket(ctx) && (conn == nil || currentAuthID != requestedAuthID || currentAuthInstanceID != requestedAuthInstanceID || currentProxyBindingID != requestedProxyBindingID || currentProxyIdentity != requestedProxyIdentity || currentWSURL != requestedWSURL || softwareChanged || cacheSessionChanged || stateModelChanged) {
+	if cliproxyexecutor.RequiredUpstreamWebsocket(ctx) && (conn == nil || currentAuthID != requestedAuthID || currentAuthInstanceID != requestedAuthInstanceID || currentProxyBindingID != requestedProxyBindingID || currentProxyIdentity != requestedProxyIdentity || currentWSURL != requestedWSURL || softwareChanged || cacheSessionChanged || stateModelChanged || requestScopeChanged) {
 		return nil, nil, cliproxyexecutor.NewUpstreamWebsocketReplayRequiredError()
 	}
-	if conn != nil && (currentAuthID != requestedAuthID || currentAuthInstanceID != requestedAuthInstanceID || currentProxyBindingID != requestedProxyBindingID || currentProxyIdentity != requestedProxyIdentity || currentWSURL != requestedWSURL || softwareChanged || cacheSessionChanged || stateModelChanged) {
+	if conn != nil && (currentAuthID != requestedAuthID || currentAuthInstanceID != requestedAuthInstanceID || currentProxyBindingID != requestedProxyBindingID || currentProxyIdentity != requestedProxyIdentity || currentWSURL != requestedWSURL || softwareChanged || cacheSessionChanged || stateModelChanged || requestScopeChanged) {
 		reason := "auth_changed"
 		if softwareChanged {
 			reason = "software_version"
 		} else if cacheSessionChanged {
 			reason = "cache_session_changed"
+		} else if requestScopeChanged {
+			reason = "request_scope_changed"
 		} else if stateModelChanged {
 			reason = "managed_state_model_changed"
 		}
@@ -2178,6 +2197,8 @@ func (e *CodexWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *
 	sess.managedStateUse = managedUse
 	sess.managedStateRejected = rejected
 	sess.cacheSessionDigest = requestedCacheSessionDigest
+	sess.requestScopeDigest = requestedRequestScopeDigest
+	sess.requestModel = requestedRequestModel
 	sess.softwareIdentity = codexauth.SoftwareIdentity{
 		UserAgent:  headers.Get("User-Agent"),
 		Version:    headers.Get("Version"),

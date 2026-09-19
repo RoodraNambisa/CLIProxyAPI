@@ -337,6 +337,17 @@ func codexReasoningReplayScopeFromRequest(ctx context.Context, sourceFormat, rep
 		}
 	}
 	if sessionKey != "" {
+		var incoming http.Header
+		if ctx != nil {
+			if gc, ok := ctx.Value("gin").(*gin.Context); ok && gc != nil && gc.Request != nil {
+				incoming = gc.Request.Header
+			}
+		}
+		originalScope := SnapshotCodexRequestScope(requestPayload, headers, incoming)
+		if originalScope.ThreadID != "" || originalScope.Kind != "turn" {
+			digest := sha256.Sum256([]byte(originalScope.Key()))
+			sessionKey += "\x00codex-scope:" + hex.EncodeToString(digest[:])
+		}
 		if agent := codexReplayClaudeAgentIdentity(ctx, requestPayload, headers); agent != "" {
 			digest := sha256.Sum256([]byte(agent))
 			sessionKey += "\x00claude-agent:" + hex.EncodeToString(digest[:])

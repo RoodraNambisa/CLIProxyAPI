@@ -41,7 +41,7 @@ func projectCodexRelatedIdentities(metadata, turn map[string]json.RawMessage, ad
 	// Earlier confusion may already have rewritten the primary turn. Resolve its
 	// original aliases directly to the final turn, without cascading replacements.
 	for index := range replacements {
-		if replacements[index].Role == CodexResponseTurnIdentity && identity.TurnID != "" {
+		if replacements[index].Role == CodexResponseTurnIdentity && identity.TurnID != "" && (replacements[index].To == codexTurnString(turn, "turn_id") || replacements[index].To == codexTurnString(metadata, "turn_id")) {
 			replacements[index].To = identity.TurnID
 		}
 	}
