@@ -1023,68 +1023,68 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	var completedEvent []byte
 	var terminalErr *statusErr
 	var terminalEvent []byte
-	var lineBuffer helps.SSELineBuffer
-	readBuffer := make([]byte, 64*1024)
-	for {
-		bytesRead, readErr := httpResp.Body.Read(readBuffer)
-		keepReading := lineBuffer.Feed(readBuffer[:bytesRead], errors.Is(readErr, io.EOF), func(rawLine []byte) bool {
-			line := applyCodexIdentityConfuseResponsePayload(rawLine, identityState)
-			if terminalErr != nil || len(completedEvent) > 0 {
-				helps.AppendAPIResponseChunk(ctx, e.cfg, line)
-				return true
-			}
-			trimmedLine := bytes.TrimSpace(line)
-			if !bytes.HasPrefix(trimmedLine, dataTag) {
-				helps.AppendAPIResponseChunk(ctx, e.cfg, line)
-				return true
-			}
-
-			eventData := bytes.TrimSpace(trimmedLine[len(dataTag):])
-			helps.ObserveResponsesTokenEvent(reporter, eventData)
-			eventType := gjson.GetBytes(eventData, "type").String()
-			if eventType == "response.output_item.done" {
-				helps.AppendAPIResponseChunk(ctx, e.cfg, line)
-				collectCodexOutputItemDone(eventData, outputItemsByIndex, &outputItemsFallback)
-				return true
-			}
-
-			clientEventData := applyCodexIdentityExposeResponsePayload(eventData, identityState)
-			if originalEventErr, ok := codexTerminalStreamError(clientEventData); ok {
-				line = codexauth.SanitizeAgentIdentityErrorBody(authMetadata(auth), line)
-				helps.AppendAPIResponseChunk(ctx, e.cfg, line)
-				trimmedLine = bytes.TrimSpace(line)
-				eventData = bytes.TrimSpace(trimmedLine[len(dataTag):])
-				clientEventData = applyCodexIdentityExposeResponsePayload(eventData, identityState)
-				eventErr := originalEventErr
-				if sanitizedEventErr, parsed := codexTerminalStreamError(clientEventData); parsed {
-					eventErr = sanitizedEventErr
-				} else {
-					eventErr.msg = string(bytes.TrimSpace(line))
-					eventErr.responseBody = string(clientEventData)
-				}
-				terminalErr = &eventErr
-				terminalEvent = bytes.Clone(clientEventData)
-				return true
-			}
+	processEvent := func(rawLine []byte) bool {
+		line := applyCodexIdentityConfuseResponsePayload(rawLine, identityState)
+		if terminalErr != nil || len(completedEvent) > 0 {
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
-			eventData = normalizeCodexCompletion(eventData)
-			if !isCodexSuccessfulCompletion(eventData) && !helps.IsCodexPartialResponse(eventData) {
-				return true
-			}
-			if isCodexSuccessfulCompletion(eventData) {
-				rawData := bytes.TrimSpace(bytes.TrimSpace(rawLine)[len(dataTag):])
-				managedStateUse.Observe(nil, rawData)
-			}
-			completedEvent = bytes.Clone(eventData)
 			return true
-		})
-		if readErr != nil && !errors.Is(readErr, io.EOF) {
-			helps.RecordAPIResponseError(ctx, e.cfg, readErr)
-			return resp, readErr
 		}
-		if !keepReading || errors.Is(readErr, io.EOF) {
+		trimmedLine := bytes.TrimSpace(line)
+		if !bytes.HasPrefix(trimmedLine, dataTag) {
+			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
+			return true
+		}
+
+		eventData := bytes.TrimSpace(trimmedLine[len(dataTag):])
+		helps.ObserveResponsesTokenEvent(reporter, eventData)
+		eventType := gjson.GetBytes(eventData, "type").String()
+		if eventType == "response.output_item.done" {
+			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
+			collectCodexOutputItemDone(eventData, outputItemsByIndex, &outputItemsFallback)
+			return true
+		}
+
+		clientEventData := applyCodexIdentityExposeResponsePayload(eventData, identityState)
+		if originalEventErr, ok := codexTerminalStreamError(clientEventData); ok {
+			line = codexauth.SanitizeAgentIdentityErrorBody(authMetadata(auth), line)
+			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
+			trimmedLine = bytes.TrimSpace(line)
+			eventData = bytes.TrimSpace(trimmedLine[len(dataTag):])
+			clientEventData = applyCodexIdentityExposeResponsePayload(eventData, identityState)
+			eventErr := originalEventErr
+			if sanitizedEventErr, parsed := codexTerminalStreamError(clientEventData); parsed {
+				eventErr = sanitizedEventErr
+			} else {
+				eventErr.msg = string(bytes.TrimSpace(line))
+				eventErr.responseBody = string(clientEventData)
+			}
+			terminalErr = &eventErr
+			terminalEvent = bytes.Clone(clientEventData)
+			return true
+		}
+		helps.AppendAPIResponseChunk(ctx, e.cfg, line)
+		eventData = normalizeCodexCompletion(eventData)
+		if !isCodexSuccessfulCompletion(eventData) && !helps.IsCodexPartialResponse(eventData) {
+			return true
+		}
+		if isCodexSuccessfulCompletion(eventData) {
+			rawData := bytes.TrimSpace(bytes.TrimSpace(rawLine)[len(dataTag):])
+			managedStateUse.Observe(nil, rawData)
+		}
+		completedEvent = bytes.Clone(eventData)
+		return true
+	}
+	scanner := bufio.NewScanner(httpResp.Body)
+	scanner.Buffer(make([]byte, 64*1024), codexSSEMaxFrameBytes)
+	scanner.Split(helps.SplitSSEDataEvents)
+	for scanner.Scan() {
+		if !processEvent(scanner.Bytes()) {
 			break
 		}
+	}
+	if errRead := scanner.Err(); errRead != nil {
+		helps.RecordAPIResponseError(ctx, e.cfg, errRead)
+		return resp, errRead
 	}
 	if terminalErr != nil {
 		helps.ClearCodexReasoningReplayOnInvalidSignature(replayScope, terminalErr.code, terminalEvent)
@@ -1447,6 +1447,8 @@ func (e *CodexExecutor) executeStream(ctx context.Context, auth *cliproxyauth.Au
 		scanner.Buffer(make([]byte, 64*1024), codexSSEMaxFrameBytes)
 		if trustUpstreamSSE {
 			scanner.Split(splitCodexSSELinesPreserveEndings)
+		} else {
+			scanner.Split(helps.SplitSSEDataEvents)
 		}
 		claudeInputTokens := helps.ClaudeInputTokenState{Estimate: e.codexPreparedSessionIdentity(ctx, req, opts).ClaudeInputTokensEstimate}
 		var param any
