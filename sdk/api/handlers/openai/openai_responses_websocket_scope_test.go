@@ -59,7 +59,7 @@ func TestResponsesWebsocketPrewarmKeepsMainHistoryAndTools(t *testing.T) {
 		t.Fatal("prewarm shares the main scope")
 	}
 	warm.lastResponseID = "synthetic-warm"
-	states.prewarmID, states.prewarmScope, states.model = warm.lastResponseID, warm.scope, "test"
+	states.prewarmID, states.prewarmScope, warm.model = warm.lastResponseID, warm.scope, "test"
 	resumed, body := states.selectRequest(c, []byte(`{"previous_response_id":"synthetic-warm","input":[]}`))
 	if resumed != main || resumed.lastResponseID != "main-response" || gjson.GetBytes(body, "previous_response_id").Exists() || gjson.GetBytes(body, "model").Str != "test" {
 		t.Fatal("prewarm polluted ordinary history")

@@ -195,6 +195,9 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		if conversation.modelChanged(payload) || (conversations.upstreamScope != "" && conversations.upstreamScope != conversation.scope.Key()) {
 			allowIncrementalInputWithPreviousResponseID = false
 		}
+		if owner := conversations.responseOwner(gjson.GetBytes(payload, "previous_response_id").Str); owner != nil && owner != conversation {
+			allowIncrementalInputWithPreviousResponseID = false
+		}
 
 		var requestJSON []byte
 		var updatedLastRequest []byte
@@ -262,7 +265,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 			}
 			conversations.prewarmID = conversation.lastResponseID
 			conversations.prewarmScope = conversation.scope
-			conversations.model = gjson.GetBytes(requestJSON, "model").String()
+			conversation.model = gjson.GetBytes(requestJSON, "model").String()
 			conversations.trimHistory(conversation, responsesWebsocketHistoryBytesLimit)
 			continue
 		}
@@ -323,7 +326,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 			if conversation.scope.Kind != "prewarm" {
 				toolCacheTurn.commit()
 			}
-			conversations.model = modelName
+			conversation.model = modelName
 			conversation.lastRequest = updatedLastRequest
 			conversation.lastResponseOutput = completedOutput
 			conversation.lastResponseID = toolCacheTurn.responseID
