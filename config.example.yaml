@@ -1001,7 +1001,7 @@ xai:
 #     ttl-minutes: 60
 #     refresh-before-minutes: 5
 #     concurrency: 1
-#     retry-seconds: 60
+#     retry-seconds: 60 # Fixed wait after each failed acquisition; does not increase.
 #     max-attempts: 3                # Stop automatic acquisition until manual retry.
 #     proxy-mode: inherit           # inherit | direct | custom; inference route is unchanged.
 #     proxy-url: ""                 # {12} generates 12 digits, fixed within an acquisition attempt.
