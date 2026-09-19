@@ -250,10 +250,6 @@ func codexInstallationIDNeedsPreparation(auth *cliproxyauth.Auth) bool {
 		return false
 	}
 	installationID := canonicalCodexInstallationID(codexMetadataString(auth.Metadata, "openai_device_id"))
-	expected := derivedCodexAccountInstallationID(auth)
-	if expected != "" {
-		return installationID != expected
-	}
 	return installationID == ""
 }
 
@@ -274,13 +270,13 @@ func prepareCodexInstallationID(auth *cliproxyauth.Auth) (*cliproxyauth.Auth, bo
 }
 
 func expectedCodexInstallationID(auth *cliproxyauth.Auth) string {
-	if installationID := derivedCodexAccountInstallationID(auth); installationID != "" {
-		return installationID
-	}
 	if auth == nil {
 		return ""
 	}
-	return canonicalCodexInstallationID(codexMetadataString(auth.Metadata, "openai_device_id"))
+	if saved := canonicalCodexInstallationID(codexMetadataString(auth.Metadata, "openai_device_id")); saved != "" {
+		return saved
+	}
+	return derivedCodexAccountInstallationID(auth)
 }
 
 func derivedCodexAccountInstallationID(auth *cliproxyauth.Auth) string {

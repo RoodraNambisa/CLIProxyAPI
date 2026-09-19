@@ -565,7 +565,7 @@ func TestCodexConvergedFingerprintReplacesInvalidPersistedInstallationID(t *test
 	}
 }
 
-func TestCodexConvergedFingerprintMigratesPersistedInstallationIDToAccountRoot(t *testing.T) {
+func TestCodexConvergedFingerprintPrefersPersistedInstallationID(t *testing.T) {
 	persisted := uuid.NewString()
 	auth := &cliproxyauth.Auth{ID: "auth", Provider: "codex", Metadata: map[string]any{
 		"account_id": "account-1", "openai_device_id": persisted,
@@ -575,9 +575,20 @@ func TestCodexConvergedFingerprintMigratesPersistedInstallationIDToAccountRoot(t
 	if err != nil {
 		t.Fatalf("resolveCodexConvergedFingerprint() error = %v", err)
 	}
-	want := deriveStableCodexFingerprintUUID("installation", "account-1")
-	if got.installationID != want {
-		t.Fatalf("installation ID = %q, want account-derived %q", got.installationID, want)
+	if got.installationID != persisted {
+		t.Fatalf("installation ID = %q, want saved %q", got.installationID, persisted)
+	}
+	if codexInstallationIDNeedsPreparation(auth) {
+		t.Fatal("valid saved device ID triggered preparation")
+	}
+	updated, changed := prepareCodexInstallationID(auth)
+	if changed || updated != auth || expectedCodexInstallationID(updated) != persisted {
+		t.Fatal("preparation replaced a saved device ID")
+	}
+	updated = auth.Clone()
+	updated.Metadata["account_id"] = "refreshed-account-id"
+	if expectedCodexInstallationID(updated) != persisted || codexInstallationIDNeedsPreparation(updated) {
+		t.Fatal("account refresh replaced the saved device ID")
 	}
 }
 
