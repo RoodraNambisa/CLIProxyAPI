@@ -133,3 +133,59 @@ func TestManagedStateAdmissionAndFrozenRetry(t *testing.T) {
 		t.Fatal("retry reused a state frozen for the previous subscription")
 	}
 }
+
+func TestReviewManagedStateUsesRequestPolicyBeforeRuntimeSync(t *testing.T) {
+	a := &auth.Auth{ID: "review-state-policy", Provider: "codex"}
+	registry.GetGlobalRegistry().RegisterClient(a.ID, "codex", []*registry.ModelInfo{{ID: "model"}})
+	defer registry.GetGlobalRegistry().UnregisterClient(a.ID)
+	cfg := &config.Config{Codex: config.CodexConfig{StateOverride: config.CodexStateOverrideConfig{Enabled: true, Acquisition: "manual", MissingPolicy: "error", Lengths: []int{292}}}}
+	c := StateCredential(a, "model")
+	codexstate.Default.Sync(cfg.Codex.StateOverride, []codexstate.Credential{c})
+	defer codexstate.Default.Sync(config.CodexStateOverrideConfig{}, nil)
+	codexstate.Default.Action(a.ID, "model", "acquire")
+	codexstate.Default.Tick(t.Context(), time.Now(), func(context.Context, codexstate.Credential, config.CodexStateOverrideConfig) (codexstate.Result, error) {
+		return codexstate.Result{Completed: true, Model: "model", State: strings.Repeat("s", 292)}, nil
+	})
+	codexstate.Default.Wait()
+	cfg.Codex.StateOverride.Lengths = []int{332}
+	headers := http.Header{}
+	err := ApplyManagedState(core.WithCodexStateSnapshot(t.Context()), cfg, a, "model", headers)
+	var status interface{ StatusCode() int }
+	if !errors.As(err, &status) || status.StatusCode() != 429 || headers.Get("X-Codex-Turn-State") != "" {
+		t.Fatal("new request sent cached State validated against an obsolete policy", err)
+	}
+	cfg.Codex.StateOverride.MissingPolicy = "continue"
+	headers = http.Header{}
+	if err := ApplyManagedState(t.Context(), cfg, a, "model", headers); err != nil || headers.Get("X-Codex-Turn-State") != "" {
+		t.Fatal("continue policy was not honored while synchronization is pending", err)
+	}
+
+	codexstate.Default.Sync(config.CodexStateOverrideConfig{}, nil)
+	cfg.Codex.StateOverride.MissingPolicy = "error"
+	if err := ApplyManagedState(t.Context(), cfg, a, "model", http.Header{}); !errors.As(err, &status) || status.StatusCode() != 429 {
+		t.Fatal("missing runtime entry bypassed request policy", err)
+	}
+	cfg.Codex.StateOverride.Mode = "missing"
+	headers = http.Header{"X-Codex-Turn-State": {"client-value"}}
+	if err := ApplyManagedState(t.Context(), cfg, a, "model", headers); err != nil || headers.Get("X-Codex-Turn-State") != "client-value" {
+		t.Fatal("missing-only policy did not retain explicit client State", err)
+	}
+}
+
+func TestReviewLegacyStateScopeKeepsExactRegisteredAlias(t *testing.T) {
+	a := &auth.Auth{ID: "review-state-legacy-alias", Provider: "codex"}
+	registry.GetGlobalRegistry().RegisterClient(a.ID, "codex", []*registry.ModelInfo{{ID: "alias(high)", UpstreamID: "model"}})
+	defer registry.GetGlobalRegistry().UnregisterClient(a.ID)
+	cfg := &config.Config{Codex: config.CodexConfig{StateOverride: config.CodexStateOverrideConfig{Enabled: true, Models: []string{"alias(high)"}, Acquisition: "manual", MissingPolicy: "error"}}}
+	codexstate.Default.Sync(cfg.Codex.StateOverride, ManagedStateModels(cfg, a))
+	defer codexstate.Default.Sync(config.CodexStateOverrideConfig{}, nil)
+	codexstate.Default.Action(a.ID, "model", "acquire")
+	codexstate.Default.Tick(t.Context(), time.Now(), func(context.Context, codexstate.Credential, config.CodexStateOverrideConfig) (codexstate.Result, error) {
+		return codexstate.Result{Completed: true, Model: "model", State: strings.Repeat("s", 292)}, nil
+	})
+	codexstate.Default.Wait()
+	headers := http.Header{}
+	if err := ApplyManagedState(t.Context(), cfg, a, "model", headers); err != nil || len(headers.Get("X-Codex-Turn-State")) != 292 {
+		t.Fatal("legacy alias scope lost its validated State", err)
+	}
+}

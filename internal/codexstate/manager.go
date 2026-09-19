@@ -119,6 +119,9 @@ func (m *Manager) Sync(cfg config.CodexStateOverrideConfig, credentials []Creden
 		}
 		if c, ok := scopes[e.credential.ID+"\x00"+e.credential.Owner]; ok {
 			c.Model, c.Route, c.Aliases = e.Model, e.credential.Route, e.credential.Aliases
+			if cfg.Rules == nil && len(cfg.Models) > 0 && !slices.Contains(cfg.Models, c.Model) && !slices.Contains(cfg.Models, c.Route) {
+				continue
+			}
 			credentials = append(credentials, c)
 		}
 	}
@@ -226,6 +229,7 @@ func (m *Manager) QueueManual(c Credential) (bool, uint64) {
 	if !e.busy {
 		e.manual, e.paused = true, false
 		e.NextAttempt = time.Time{}
+		e.lastFailure = time.Time{}
 		e.failures, e.ConsecutiveFailures = 0, 0
 		e.Exhausted = false
 	}
@@ -248,21 +252,47 @@ func (m *Manager) Pick(c Credential, clientState string, now time.Time) (string,
 func (m *Manager) PickVersion(c Credential, clientState string, now time.Time) (string, string, uint64, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	return m.pickVersionLocked(c, clientState, now, nil)
+}
+
+// PickVersionForPolicy checks the request's resolved policy while background
+// synchronization catches up. A new request cannot reuse a value validated
+// against old rules or bypass its missing-State policy during that interval.
+func (m *Manager) PickVersionForPolicy(c Credential, clientState string, now time.Time, policy config.CodexStateOverrideConfig) (string, string, uint64, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.pickVersionLocked(c, clientState, now, &policy)
+}
+
+func (m *Manager) pickVersionLocked(c Credential, clientState string, now time.Time, requested *config.CodexStateOverrideConfig) (string, string, uint64, bool) {
 	e := m.entries[key(c)]
-	if !m.cfg.Enabled || e == nil || e.credential.Instance != c.Instance || e.credential.Plan != c.Plan || e.paused {
+	if e != nil && e.paused {
 		return "", "", 0, false
 	}
+	if !m.cfg.Enabled || e == nil || e.credential.Instance != c.Instance || e.credential.Plan != c.Plan {
+		if requested != nil && requested.Enabled {
+			if requested.Mode == "missing" && strings.TrimSpace(clientState) != "" {
+				return "", "", 0, true
+			}
+			return "", requested.MissingPolicy, 0, true
+		}
+		return "", "", 0, false
+	}
+	policy := e.policy
+	if requested != nil {
+		policy = *requested
+	}
 	e.LastUsed = now
-	if e.policy.Mode == "missing" && strings.TrimSpace(clientState) != "" {
+	if policy.Mode == "missing" && strings.TrimSpace(clientState) != "" {
 		return "", "", 0, true
 	}
-	if e.state != "" && now.Before(e.ExpiresAt) {
+	if e.state != "" && now.Before(e.ExpiresAt) && sameStateValidation(e.policy, policy) {
 		e.Uses++
 		e.CurrentUses++
 		return e.state, "", e.valueVersion, true
 	}
 	e.Misses++
-	return "", e.policy.MissingPolicy, 0, true
+	return "", policy.MissingPolicy, 0, true
 }
 
 // ObserveResponse invalidates only the value used by this request. Versions also

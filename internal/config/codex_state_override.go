@@ -112,7 +112,7 @@ func (c CodexStateOverrideConfig) ForModel(model string) CodexStateOverrideConfi
 	return c
 }
 
-func (c CodexStateOverrideConfig) Resolved() CodexStateOverrideConfig {
+func (c CodexStateOverrideConfig) clone() CodexStateOverrideConfig {
 	c.Rules = cloneCodexStateRules(c.Rules)
 	c.PlanLengths = slices.Clone(c.PlanLengths)
 	for i, v := range c.PlanLengths {
@@ -137,6 +137,15 @@ func (c CodexStateOverrideConfig) Resolved() CodexStateOverrideConfig {
 	c.IncludedCredentials = slices.Clone(c.IncludedCredentials)
 	c.ExcludedCredentials = slices.Clone(c.ExcludedCredentials)
 	c.Lengths = slices.Clone(c.Lengths)
+	if c.MatchModel != nil {
+		value := *c.MatchModel
+		c.MatchModel = &value
+	}
+	return c
+}
+
+func (c CodexStateOverrideConfig) Resolved() CodexStateOverrideConfig {
+	c = c.clone()
 	if c.Mode == "" {
 		c.Mode = "override"
 	}

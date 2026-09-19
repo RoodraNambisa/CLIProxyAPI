@@ -502,6 +502,9 @@ func Clone(input *Config) (*Config, error) {
 	if errDecode := yaml.Unmarshal(data, &snapshot); errDecode != nil {
 		return nil, fmt.Errorf("clone config: decode: %w", errDecode)
 	}
+	// State lengths use nil for inheritance and an empty list for no limit.
+	// YAML roundtrips collapse that distinction for non-pointer slices.
+	snapshot.Codex.StateOverride = input.Codex.StateOverride.clone()
 	snapshot.legacyMigrationPending = input.legacyMigrationPending
 	clonePayloadRawValues(snapshot.Payload.DefaultRaw, input.Payload.DefaultRaw)
 	clonePayloadRawValues(snapshot.Payload.OverrideRaw, input.Payload.OverrideRaw)
@@ -4320,6 +4323,12 @@ func mergeMappingPreserve(dst, src *yaml.Node, path ...[]string) {
 			dst.Content = append(dst.Content, deepCopyNode(sk), candidate)
 		}
 	}
+	if isCodexStateRuleYAMLPath(currentPath) {
+		// Clearing an override must restore inheritance while retaining unknown extensions.
+		pruneMissingCredentialYAMLKeys(dst, src, currentPath)
+	} else if len(currentPath) == 2 && currentPath[0] == "codex" && currentPath[1] == "state-override" && findMapKeyIndex(src, "rules") < 0 {
+		removeMapKey(dst, "rules")
+	}
 }
 
 // mergeNodePreserve merges src into dst for scalars, mappings and sequences while
@@ -4342,7 +4351,7 @@ func mergeNodePreserve(dst, src *yaml.Node, path ...[]string) {
 		mergeMappingPreserve(dst, src, currentPath)
 	case yaml.SequenceNode:
 		// Preserve explicit null style if dst was null and src is empty sequence
-		if dst.Kind == yaml.ScalarNode && dst.Tag == "!!null" && len(src.Content) == 0 {
+		if dst.Kind == yaml.ScalarNode && dst.Tag == "!!null" && len(src.Content) == 0 && !isCodexStateRuleYAMLPath(currentPath) {
 			// Keep as null to preserve original style
 			return
 		}
@@ -4419,6 +4428,9 @@ func appendPath(path []string, key string) []string {
 // represents a known default value that should not be written to the config file.
 // This prevents non-zero defaults from polluting the config.
 func isKnownDefaultValue(path []string, node *yaml.Node) bool {
+	if preservesCodexStateRuleYAMLValue(path, node) {
+		return false
+	}
 	fullPath := strings.Join(path, ".")
 	if fullPath == "usage-statistics-persistence-enabled" && node != nil && node.Kind == yaml.ScalarNode && node.Tag == "!!bool" {
 		return node.Value == "true"
@@ -4604,7 +4616,7 @@ func preservesExplicitChatGPTWebValue(fullPath string, node *yaml.Node) bool {
 // pruneKnownDefaultsInNewNode removes default-valued descendants from a new node
 // before it is appended into the destination YAML tree.
 func pruneKnownDefaultsInNewNode(path []string, node *yaml.Node) {
-	if node == nil {
+	if node == nil || isCodexStateRuleYAMLPath(path) {
 		return
 	}
 
@@ -4625,7 +4637,7 @@ func pruneKnownDefaultsInNewNode(path []string, node *yaml.Node) {
 
 			pruneKnownDefaultsInNewNode(childPath, valueNode)
 			if (valueNode.Kind == yaml.MappingNode || valueNode.Kind == yaml.SequenceNode) &&
-				len(valueNode.Content) == 0 {
+				len(valueNode.Content) == 0 && !preservesCodexStateRuleYAMLValue(childPath, valueNode) {
 				continue
 			}
 

@@ -280,12 +280,18 @@ func ApplyManagedState(ctx context.Context, cfg *config.Config, a *auth.Auth, mo
 		}
 		return nil
 	}
+	resolved, _, _ := cfg.Codex.StateOverride.PolicyFor(c.Scope())
+	if cfg.Codex.StateOverride.Rules == nil {
+		// Legacy scope was already checked against the exact registered alias.
+		// Do not recheck its spelling after resolving the upstream model.
+		resolved = cfg.Codex.StateOverride.ForCredential(c.Plan, c.Model)
+	}
 	choice := core.CodexStateForRequest(ctx, codexStateRequestKey(c), func() core.CodexStateChoice {
 		clientState := headers.Get("X-Codex-Turn-State")
 		if requireManaged {
 			clientState = ""
 		}
-		value, policy, version, eligible := codexstate.Default.PickVersion(c, clientState, time.Now())
+		value, policy, version, eligible := codexstate.Default.PickVersionForPolicy(c, clientState, time.Now(), resolved)
 		return core.CodexStateChoice{Value: value, Policy: policy, Version: version, Eligible: eligible}
 	})
 	state, policy, eligible := choice.Value, choice.Policy, choice.Eligible
@@ -311,7 +317,6 @@ func ApplyManagedState(ctx context.Context, cfg *config.Config, a *auth.Auth, mo
 		return nil
 	}
 	source = "unavailable"
-	resolved, _, _ := cfg.Codex.StateOverride.PolicyFor(c.Scope())
 	body, _ := json.Marshal(map[string]any{"error": map[string]string{"type": resolved.ErrorType, "code": resolved.ErrorCode, "message": resolved.ErrorMessage}})
 	return stateUnavailableError{body: string(body)}
 }
