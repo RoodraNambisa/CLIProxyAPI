@@ -403,6 +403,7 @@ type hookState struct {
 // Manager orchestrates auth lifecycle, selection, execution, and persistence.
 type Manager struct {
 	responseModelStats responseModelStats
+	errorHistory       map[string]*authErrorHistory
 	store              Store
 	executors          map[string]ProviderExecutor
 	selector           Selector
@@ -8238,6 +8239,11 @@ func (m *Manager) markResult(
 		return
 	}
 	acceptedResult := authInstanceID == ""
+	var errorRecord AuthErrorRecord
+	if !result.Success && result.Error != nil {
+		errorRecord = describeAuthError(result.Error)
+		errorRecord.LastModel = boundedAuthErrorText(canonicalModelKey(result.Model), 256)
+	}
 	now := time.Time{}
 	dynamicModelResult := false
 	staleDynamicModelResult := false
@@ -8259,6 +8265,7 @@ func (m *Manager) markResult(
 	if auth, ok := m.auths[result.AuthID]; ok && auth != nil && (authInstanceID == "" || authInstanceID == auth.instanceID) {
 		acceptedResult = true
 		now = time.Now()
+		m.recordAuthErrorLocked(result.AuthID, errorRecord, now)
 		dynamicFixedCooldown, hasDynamicFixedCooldown := m.fixedErrorCooldownForResult(result.Error, ctx)
 		resultStatusCode := statusCodeFromResult(result.Error)
 		if modelNotFound || resultStatusCode == http.StatusNotFound {

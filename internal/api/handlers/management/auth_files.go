@@ -706,6 +706,7 @@ func (h *Handler) buildAuthFileEntryAtWithRuntime(auth *coreauth.Auth, now time.
 	if manager := h.coreAuthRuntimeManager(); manager != nil {
 		entry["request_limit"] = manager.AuthRequestLimitSummary(auth)
 		entry["response_model_rewrite"] = manager.AuthResponseModelRewriteSummary(auth, false)
+		entry["error_history"] = manager.AuthErrorHistory(auth.ID, false)
 	}
 	if email := authEmail(auth); email != "" {
 		entry["email"] = email

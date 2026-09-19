@@ -972,6 +972,7 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.POST("/auth-files/codex/state/preview", s.mgmt.PreviewCodexState)
 		mgmt.POST("/auth-files/codex/state/proxy/check", s.mgmt.CheckCodexStateProxy)
 		mgmt.GET("/auth-files/response-model-rewrite", s.mgmt.GetAuthFileResponseModelRewrite)
+		mgmt.GET("/auth-files/errors", s.mgmt.GetAuthFileErrorHistory)
 		mgmt.GET("/model-definitions/:channel", s.mgmt.GetStaticModelDefinitions)
 		mgmt.GET("/auth-files/download", s.mgmt.DownloadAuthFile)
 		mgmt.POST("/auth-files/archive", s.mgmt.DownloadAuthFilesArchive)
