@@ -1,10 +1,12 @@
 package cliproxy
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -51,6 +53,92 @@ func TestCodexStateAcquisitionUsesNativeResultAndDoesNotForwardOldState(t *testi
 	}
 	if stored, _ := m.GetByID(a.ID); stored.Attributes["header:X-Codex-Turn-State"] != "old" {
 		t.Fatal("probe mutated credential headers")
+	}
+}
+
+func TestCodexStateDiagnosticOutsideScopeEndToEnd(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		policy config.CodexStateOverrideConfig
+	}{
+		{"credential", config.CodexStateOverrideConfig{Enabled: true, Priorities: []int{4}}},
+		{"model", config.CodexStateOverrideConfig{Enabled: true, Models: []string{"other"}}},
+		{"empty rules", config.CodexStateOverrideConfig{Enabled: true, Rules: &[]config.CodexStateRule{}}},
+		{"skip rule", config.CodexStateOverrideConfig{Enabled: true, Rules: &[]config.CodexStateRule{{Action: "skip"}}}},
+		{"disabled", config.CodexStateOverrideConfig{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const model = "gpt-5.6-luna"
+			state := strings.Repeat("d", 292)
+			var calls atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				var body struct {
+					Model string `json:"model"`
+				}
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Model != model || r.Header.Get("X-Codex-Turn-State") != "" {
+					t.Error("acquisition lost alias resolution or forwarded old State")
+				}
+				w.Header().Set("X-Codex-Turn-State", state)
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = fmt.Fprintf(w, "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"fixture\",\"model\":%q,\"status\":\"completed\",\"output\":[]}}\n\n", model)
+			}))
+			defer server.Close()
+			tc.policy.Acquisition, tc.policy.ProxyMode = "all", "direct"
+			cfg := &config.Config{Codex: config.CodexConfig{StateOverride: tc.policy}}
+			m := auth.NewManager(nil, nil, nil)
+			m.SetConfig(cfg)
+			m.SetOAuthModelAlias(map[string][]config.OAuthModelAlias{"codex": {{Name: model, Alias: "friendly-luna"}}})
+			a, err := m.Register(auth.WithSkipPersist(t.Context()), &auth.Auth{ID: "diagnostic-outside", Provider: "codex", Attributes: map[string]string{"base_url": server.URL, "header:X-Codex-Turn-State": "old"}, Metadata: map[string]any{"access_token": "fixture"}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			r := registry.GetGlobalRegistry()
+			r.RegisterClient(a.ID, "codex", []*registry.ModelInfo{{ID: "friendly-luna", UpstreamID: model}})
+			defer r.UnregisterClient(a.ID)
+			s := &Service{cfg: cfg, coreManager: m}
+			s.syncCodexState(cfg)
+			defer func() {
+				codexstate.Default.Sync(config.CodexStateOverrideConfig{}, nil)
+				codexstate.Diagnostic.Sync(config.CodexStateOverrideConfig{}, nil)
+				codexstate.Default.Wait()
+				codexstate.Diagnostic.Wait()
+			}()
+			c := helps.StateCredential(a, model)
+			c.Route = "friendly-luna"
+			if ok, _ := codexstate.Diagnostic.QueueManual(c); !ok {
+				t.Fatal("outside-scope manual test rejected")
+			}
+			s.syncCodexState(cfg)
+			codexstate.Diagnostic.Tick(t.Context(), time.Now(), s.acquireCodexState)
+			codexstate.Diagnostic.Wait()
+			s.syncCodexState(cfg)
+			if snapshots := codexstate.Diagnostic.Snapshots(a.ID, time.Now()); len(snapshots) != 1 || snapshots[0].Status != "valid" {
+				t.Fatalf("scope synchronization removed or rejected diagnostic: %+v", snapshots)
+			}
+			ctx := helps.WithCodexStateDiagnostic(core.WithCodexStateSnapshot(t.Context()), "acquired", "", nil)
+			headers := http.Header{}
+			if err := helps.ApplyManagedState(ctx, cfg, a, model, headers); err != nil || headers.Get("X-Codex-Turn-State") != state {
+				t.Fatalf("outside-scope reuse failed: %v", err)
+			}
+			headers = http.Header{}
+			if err := helps.ApplyManagedState(t.Context(), cfg, a, model, headers); err != nil || headers.Get("X-Codex-Turn-State") != "" || len(codexstate.Default.Snapshots(a.ID, time.Now())) != 0 {
+				t.Fatal("diagnostic State leaked into normal request scope")
+			}
+			codexstate.Diagnostic.Tick(t.Context(), time.Now().Add(24*time.Hour), s.acquireCodexState)
+			codexstate.Diagnostic.Wait()
+			if calls.Load() != 1 {
+				t.Fatal("one-shot acquisition automatically renewed")
+			}
+			a.Disabled = true
+			if _, err := m.Update(auth.WithSkipPersist(t.Context()), a); err != nil {
+				t.Fatal(err)
+			}
+			s.syncCodexState(cfg)
+			if len(codexstate.Diagnostic.Snapshots(a.ID, time.Now())) != 0 {
+				t.Fatal("disabled credential retained diagnostic")
+			}
+		})
 	}
 }
 

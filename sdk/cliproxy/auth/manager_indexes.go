@@ -642,6 +642,7 @@ func (m *Manager) removeAuthLocked(id string) {
 	}
 	removed := m.auths[id]
 	delete(m.auths, id)
+	delete(m.errorHistory, id)
 	m.responseModelStats.mu.Lock()
 	delete(m.responseModelStats.auths, id)
 	m.responseModelStats.mu.Unlock()
@@ -868,6 +869,11 @@ func (m *Manager) replaceAuthsLocked(auths map[string]*Auth, persisted []*Auth, 
 		auths = make(map[string]*Auth)
 	}
 	m.auths = auths
+	for id := range m.errorHistory {
+		if auths[id] == nil {
+			delete(m.errorHistory, id)
+		}
+	}
 	m.rebuildAuthIndexesLocked(persisted, complete)
 }
 

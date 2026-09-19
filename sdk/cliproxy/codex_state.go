@@ -40,13 +40,20 @@ func (s *Service) runCodexState(ctx context.Context) {
 	defer ticker.Stop()
 	defer func() {
 		codexstate.Default.Sync(internalconfig.CodexStateOverrideConfig{}, nil)
+		codexstate.Diagnostic.Sync(internalconfig.CodexStateOverrideConfig{}, nil)
 		codexstate.Default.Wait()
+		codexstate.Diagnostic.Wait()
 	}()
 	for {
 		s.cfgMu.RLock()
 		s.syncCodexState(s.cfg)
+		capacity := 1
+		if s.cfg != nil {
+			capacity = s.cfg.Codex.StateOverride.Resolved().Concurrency
+		}
 		s.cfgMu.RUnlock()
-		codexstate.Default.Tick(ctx, time.Now(), s.acquireCodexState)
+		codexstate.Diagnostic.TickWithCapacity(ctx, time.Now(), s.acquireCodexState, capacity-codexstate.Default.Running())
+		codexstate.Default.TickWithCapacity(ctx, time.Now(), s.acquireCodexState, capacity-codexstate.Diagnostic.Running())
 		select {
 		case <-ctx.Done():
 			return
@@ -61,8 +68,12 @@ func (s *Service) syncCodexState(cfg *internalconfig.Config) {
 	}
 	var credentials []codexstate.Credential
 	var manualScopes []codexstate.Credential
-	if cfg.Codex.StateOverride.Enabled {
-		for _, a := range s.coreManager.List() {
+	var diagnosticScopes []codexstate.Credential
+	for _, a := range s.coreManager.List() {
+		if helps.StateCredentialAvailable(a) {
+			diagnosticScopes = append(diagnosticScopes, helps.StateCredential(a, ""))
+		}
+		if cfg.Codex.StateOverride.Enabled {
 			credentials = append(credentials, helps.ManagedStateModels(cfg, a)...)
 			if helps.ManagedStateCredentialEligible(cfg, a) {
 				manualScopes = append(manualScopes, helps.StateCredential(a, ""))
@@ -70,6 +81,7 @@ func (s *Service) syncCodexState(cfg *internalconfig.Config) {
 		}
 	}
 	codexstate.Default.Sync(cfg.Codex.StateOverride, credentials, manualScopes...)
+	codexstate.Diagnostic.Sync(cfg.Codex.StateOverride, nil, diagnosticScopes...)
 }
 
 func (s *Service) acquireCodexState(ctx context.Context, credential codexstate.Credential, policy internalconfig.CodexStateOverrideConfig) (result codexstate.Result, err error) {

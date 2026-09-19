@@ -19,15 +19,24 @@ func (h *Handler) GetCodexState(c *gin.Context) {
 		c.JSON(404, gin.H{"error": "credential not found"})
 		return
 	}
-	c.JSON(200, gin.H{"models": codexstate.Default.Snapshots(a.ID, time.Now())})
+	manager := codexstate.Default
+	if c.Query("diagnostic") == "true" {
+		if !helps.StateCredentialAvailable(a) {
+			c.JSON(400, gin.H{"error": "manual State acquisition requires an enabled Codex OAuth credential"})
+			return
+		}
+		manager = codexstate.Diagnostic
+	}
+	c.JSON(200, gin.H{"models": manager.Snapshots(a.ID, time.Now())})
 }
 
 func (h *Handler) CodexStateAction(c *gin.Context) {
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 4096)
 	var input struct {
-		Name   string `json:"name"`
-		Model  string `json:"model"`
-		Action string `json:"action"`
+		Name       string `json:"name"`
+		Model      string `json:"model"`
+		Action     string `json:"action"`
+		Diagnostic bool   `json:"diagnostic"`
 	}
 	if c.ShouldBindJSON(&input) != nil || !slices.Contains([]string{"acquire", "pause", "resume", "clear"}, input.Action) {
 		c.JSON(400, gin.H{"error": "invalid state action"})
@@ -39,6 +48,32 @@ func (h *Handler) CodexStateAction(c *gin.Context) {
 		return
 	}
 	cfg := h.currentConfig()
+	if input.Diagnostic {
+		if input.Action != "acquire" || !helps.StateCredentialAvailable(a) {
+			c.JSON(400, gin.H{"error": "manual State acquisition requires an enabled Codex OAuth credential and the acquire action"})
+			return
+		}
+		model := helps.ResolveStateModel(a.ID, input.Model)
+		if !helps.StateTextModel(model) || len(model) > 256 || strings.ContainsAny(model, "\r\n\x00") {
+			c.JSON(400, gin.H{"error": "manual State acquisition requires a text model"})
+			return
+		}
+		for _, info := range registry.GetGlobalRegistry().GetModelsForClient(a.ID) {
+			if info != nil && helps.ResolveStateModel(a.ID, info.ID) == model && len(info.SupportedOutputModalities) > 0 && !slices.ContainsFunc(info.SupportedOutputModalities, func(value string) bool { return strings.EqualFold(value, "text") }) {
+				c.JSON(400, gin.H{"error": "manual State acquisition requires a text model"})
+				return
+			}
+		}
+		credential := helps.StateCredential(a, model)
+		credential.Route = strings.TrimSpace(input.Model)
+		matched, previous := codexstate.Diagnostic.QueueManual(credential)
+		if !matched {
+			c.JSON(409, gin.H{"error": "State runtime is not ready or the manual model limit was reached"})
+			return
+		}
+		c.JSON(200, gin.H{"diagnostic": true, "model": model, "previous_acquired": previous, "models": codexstate.Diagnostic.Snapshots(a.ID, time.Now())})
+		return
+	}
 	if !helps.ManagedStateCredentialEligible(cfg, a) {
 		c.JSON(400, gin.H{"error": "State is disabled or this credential is outside the configured priority/credential scope"})
 		return

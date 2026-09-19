@@ -83,3 +83,38 @@ func TestRulesHotReloadRejectsStaleWorkerWithoutCancelingOtherPair(t *testing.T)
 		t.Fatal("stale acquisition overwrote new rule or valid worker was discarded")
 	}
 }
+
+func TestReviewLegacyManualScopeRemoval(t *testing.T) {
+	m := New()
+	c := Credential{ID: "a", Owner: "a", Instance: "a", Model: "old", Route: "old"}
+	cfg := config.CodexStateOverrideConfig{Enabled: true, Models: []string{"old"}, Acquisition: "manual"}
+	m.Sync(cfg, nil, c)
+	if ok, _ := m.QueueManual(c); !ok {
+		t.Fatal("manual acquisition was not queued")
+	}
+	cfg.Models = []string{"new"}
+	m.Sync(cfg, nil, c)
+	if len(m.Snapshots(c.ID, time.Now())) != 0 {
+		t.Fatal("out-of-scope manual entry survived model scope removal")
+	}
+}
+
+func TestReviewManualRetryClearsFailureDeadlineOnPolicyEdit(t *testing.T) {
+	m := New()
+	c := Credential{ID: "a", Owner: "a", Instance: "a", Model: "model"}
+	cfg := config.CodexStateOverrideConfig{Enabled: true, Acquisition: "manual", RetrySeconds: 60}
+	m.Sync(cfg, nil, c)
+	if ok, _ := m.QueueManual(c); !ok {
+		t.Fatal("manual acquisition was not queued")
+	}
+	now := time.Now()
+	finishFixture(m, c, Result{}, errors.New("fixture"), now)
+	if ok, _ := m.QueueManual(c); !ok {
+		t.Fatal("manual retry was not queued")
+	}
+	cfg.ProxyMode = "direct"
+	m.Sync(cfg, nil, c)
+	if s := m.Snapshots(c.ID, now)[0]; !s.NextAttempt.IsZero() || s.ConsecutiveFailures != 0 {
+		t.Fatal("manual retry inherited an obsolete failure deadline")
+	}
+}

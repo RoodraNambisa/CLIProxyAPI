@@ -14,6 +14,7 @@ type CodexManagedStateUse struct {
 	Credential codexstate.Credential
 	Version    uint64
 	Value      string
+	manager    *codexstate.Manager
 }
 
 func codexStateRequestKey(c codexstate.Credential) string {
@@ -27,17 +28,25 @@ func ManagedStateUse(ctx context.Context, a *auth.Auth, model string, headers ht
 		return CodexManagedStateUse{}
 	}
 	c := StateCredential(a, model)
-	choice, ok := core.CodexStateChoiceForRequest(ctx, codexStateRequestKey(c))
+	manager, requestKey := codexstate.Default, codexStateRequestKey(c)
+	if diagnostic, _ := ctx.Value(codexStateDiagnosticKey{}).(*codexStateDiagnostic); diagnostic != nil && diagnostic.mode == "acquired" {
+		manager, requestKey = codexstate.Diagnostic, "diagnostic:"+requestKey
+	}
+	choice, ok := core.CodexStateChoiceForRequest(ctx, requestKey)
 	if !ok || choice.Version == 0 || choice.Value == "" || choice.Value != headers.Get("X-Codex-Turn-State") {
 		return CodexManagedStateUse{}
 	}
-	return CodexManagedStateUse{Credential: c, Version: choice.Version, Value: choice.Value}
+	return CodexManagedStateUse{Credential: c, Version: choice.Version, Value: choice.Value, manager: manager}
 }
 
 // Observe accepts original upstream metadata before any response-model rewrite.
 // It does not alter the business response or cause the business request to replay.
 func (u CodexManagedStateUse) Observe(headers http.Header, payload []byte) bool {
-	if u.Version == 0 || !codexstate.Default.WatchesResponses() {
+	manager := u.manager
+	if manager == nil {
+		manager = codexstate.Default
+	}
+	if u.Version == 0 || !manager.WatchesResponses() {
 		return false
 	}
 	model := ""
@@ -48,5 +57,5 @@ func (u CodexManagedStateUse) Observe(headers http.Header, payload []byte) bool 
 		}
 		model = root.Get("model").String()
 	}
-	return codexstate.Default.ObserveResponse(u.Credential, u.Version, u.Value, model, len(headers.Get("X-Codex-Turn-State"))) != ""
+	return manager.ObserveResponse(u.Credential, u.Version, u.Value, model, len(headers.Get("X-Codex-Turn-State"))) != ""
 }
