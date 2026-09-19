@@ -28,6 +28,7 @@ type credentialTargetExecutor struct {
 	failStatus int
 	chunkError bool
 	refreshes  int
+	wantModel  string
 }
 
 func (e *credentialTargetExecutor) Identifier() string { return e.provider }
@@ -50,7 +51,10 @@ func (e *credentialTargetExecutor) execute(ctx context.Context, auth *coreauth.A
 	}
 	return nil
 }
-func (e *credentialTargetExecutor) Execute(ctx context.Context, auth *coreauth.Auth, _ core.Request, opts core.Options) (core.Response, error) {
+func (e *credentialTargetExecutor) Execute(ctx context.Context, auth *coreauth.Auth, req core.Request, opts core.Options) (core.Response, error) {
+	if e.wantModel != "" && req.Model != e.wantModel {
+		return core.Response{}, fmt.Errorf("target model changed: %s", req.Model)
+	}
 	if err := e.execute(ctx, auth, opts); err != nil {
 		return core.Response{}, err
 	}
@@ -62,7 +66,10 @@ func (e *credentialTargetExecutor) Refresh(_ context.Context, auth *coreauth.Aut
 	e.refreshes++
 	return auth, nil
 }
-func (e *credentialTargetExecutor) ExecuteStream(ctx context.Context, auth *coreauth.Auth, _ core.Request, opts core.Options) (*core.StreamResult, error) {
+func (e *credentialTargetExecutor) ExecuteStream(ctx context.Context, auth *coreauth.Auth, req core.Request, opts core.Options) (*core.StreamResult, error) {
+	if e.wantModel != "" && req.Model != e.wantModel {
+		return nil, fmt.Errorf("target model changed: %s", req.Model)
+	}
 	if err := e.execute(ctx, auth, opts); err != nil {
 		if e.chunkError {
 			chunks := make(chan core.StreamChunk, 1)
@@ -222,7 +229,7 @@ func TestCredentialTargetFailuresReturnFirstOutcome(t *testing.T) {
 }
 
 func TestCredentialTargetStillEnforcesAccess(t *testing.T) {
-	for _, scenario := range []string{"provider", "priority", "disabled", "model", "live"} {
+	for _, scenario := range []string{"provider", "priority", "disabled", "live"} {
 		t.Run(scenario, func(t *testing.T) {
 			s := newTestServerWithConfig(t, func(cfg *config.Config) {
 				group := config.APIKeyGroup{APIKey: "test-key", AllowCredentialTargeting: true}
@@ -243,9 +250,6 @@ func TestCredentialTargetStillEnforcesAccess(t *testing.T) {
 			registry.GetGlobalRegistry().RegisterClient(a.ID, "xai", []*registry.ModelInfo{{ID: "target-model", Object: "model", OwnedBy: "xai"}})
 			t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(a.ID) })
 			model := "target-model"
-			if scenario == "model" {
-				model = "missing-model"
-			}
 			path := "/v1/responses"
 			if scenario == "live" {
 				path = "/v1/realtime/calls"
@@ -256,6 +260,52 @@ func TestCredentialTargetStillEnforcesAccess(t *testing.T) {
 			s.engine.ServeHTTP(w, req)
 			if w.Code < 400 || len(exec.calls) != 0 {
 				t.Fatalf("restriction bypassed: %d %s", w.Code, w.Body.String())
+			}
+		})
+	}
+}
+
+func TestCredentialTargetAllowsUnregisteredModels(t *testing.T) {
+	for _, provider := range []string{"codex", "xai"} {
+		t.Run(provider, func(t *testing.T) {
+			s := newTestServerWithConfig(t, func(cfg *config.Config) {
+				cfg.APIKeyGroups = []config.APIKeyGroup{{APIKey: "test-key", Providers: []string{provider}, AllowCredentialTargeting: true}}
+			})
+			exec := &credentialTargetExecutor{provider: provider}
+			s.handlers.AuthManager.RegisterExecutor(exec)
+			id := "unregistered-target-" + provider
+			_, err := s.handlers.AuthManager.Register(t.Context(), &coreauth.Auth{ID: id, Provider: provider, Metadata: map[string]any{coreauth.RoutingAliasMetadataKey: "target"}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			reg := registry.GetGlobalRegistry()
+			reg.RegisterClient(id, provider, []*registry.ModelInfo{{ID: "only-enabled-model"}})
+			reg.RegisterClient(id+"-other", "other-provider", []*registry.ModelInfo{{ID: "registered-elsewhere"}})
+			t.Cleanup(func() { reg.UnregisterClient(id); reg.UnregisterClient(id + "-other") })
+			for _, model := range []string{"not-registered-anywhere", "registered-elsewhere"} {
+				exec.wantModel = model
+				for _, path := range []string{"/v1/chat/completions", "/v1/responses"} {
+					for _, stream := range []bool{false, true} {
+						body := fmt.Sprintf(`{"model":%q,"messages":[{"role":"user","content":"test"}],"input":"test","stream":%t}`, model, stream)
+						req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+						req.Header.Set("Authorization", "Bearer test-key-auth-target")
+						req.Header.Set("Content-Type", "application/json")
+						before := len(exec.calls)
+						w := httptest.NewRecorder()
+						s.engine.ServeHTTP(w, req)
+						if w.Code != http.StatusOK || len(exec.calls) != before+1 || exec.calls[before] != id {
+							t.Fatalf("%s %s stream=%v: status=%d calls=%v body=%s", provider, model, stream, w.Code, exec.calls, w.Body.String())
+						}
+					}
+				}
+			}
+			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"not-registered-anywhere","messages":[]}`))
+			req.Header.Set("Authorization", "Bearer test-key")
+			before := len(exec.calls)
+			w := httptest.NewRecorder()
+			s.engine.ServeHTTP(w, req)
+			if w.Code == http.StatusOK || len(exec.calls) != before {
+				t.Fatal("ordinary request bypassed catalog")
 			}
 		})
 	}

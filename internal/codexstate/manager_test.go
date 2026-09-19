@@ -134,7 +134,7 @@ func TestStateResponseInvalidationPreservesFailureBudget(t *testing.T) {
 			t.Fatalf("failure budget reset: %+v", after)
 		}
 		m.Tick(t.Context(), now, func(context.Context, Credential, config.CodexStateOverrideConfig) (Result, error) {
-			t.Error("ignored backoff or exhausted failure budget")
+			t.Error("ignored retry interval or exhausted failure budget")
 			return good(), nil
 		})
 		m.Wait()
@@ -380,5 +380,35 @@ func TestStatePlanChangesInvalidateOldLengths(t *testing.T) {
 	finishFixture(m, changed, result, nil, now)
 	if value, _, ok := m.Pick(changed, "", now); !ok || len(value) != 332 {
 		t.Fatal("new plan length was not accepted")
+	}
+}
+
+func TestStateFailuresUseFixedRetryInterval(t *testing.T) {
+	m, c, cfg := fixture()
+	cfg.RetrySeconds = 60
+	cfg.MaxAttempts = 10
+	m.Sync(cfg, []Credential{c})
+	now := time.Now()
+	for failure := 1; failure <= 10; failure++ {
+		finishFixture(m, c, Result{}, errors.New("retry fixture"), now)
+		snapshot := m.Snapshots(c.ID, now)[0]
+		if snapshot.ConsecutiveFailures != failure {
+			t.Fatalf("failures=%d", snapshot.ConsecutiveFailures)
+		}
+		if failure == 10 {
+			if !snapshot.Exhausted || !snapshot.NextAttempt.IsZero() {
+				t.Fatal("failure limit no longer pauses acquisition")
+			}
+			break
+		}
+		if delay := snapshot.NextAttempt.Sub(now); delay != 60*time.Second {
+			t.Fatalf("failure %d: delay=%v, want 60s", failure, delay)
+		}
+		m.Tick(t.Context(), snapshot.NextAttempt.Add(-time.Nanosecond), func(context.Context, Credential, config.CodexStateOverrideConfig) (Result, error) {
+			t.Error("retried before the fixed interval elapsed")
+			return good(), nil
+		})
+		m.Wait()
+		now = snapshot.NextAttempt
 	}
 }

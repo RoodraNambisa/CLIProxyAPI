@@ -269,7 +269,7 @@ func (m *Manager) ObserveResponse(c Credential, version uint64, value, returnedM
 	e.ExpiresAt = time.Time{}
 	e.Invalidations++
 	e.LastInvalidation = reason
-	// Keep failure limits and backoff. An already-running renewal supplies the replacement.
+	// Keep failure limits and retry interval. An already-running renewal supplies the replacement.
 	if !e.busy && !e.Exhausted && !e.ManualOnly {
 		e.manual = true
 	}
@@ -464,7 +464,7 @@ func (m *Manager) finish(k string, expected *entry, version uint64, canceled err
 		e.LastError = reason
 		e.failures++
 		e.ConsecutiveFailures = e.failures
-		delay := time.Duration(m.cfg.RetrySeconds) * time.Second * time.Duration(1<<min(e.failures-1, 6))
+		delay := time.Duration(m.cfg.RetrySeconds) * time.Second
 		if e.failures >= m.cfg.MaxAttempts {
 			e.Exhausted = true
 			e.NextAttempt = time.Time{}

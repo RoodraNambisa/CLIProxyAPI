@@ -1,10 +1,12 @@
 package auth
 
 import (
+	"context"
 	"net/http"
 	"strings"
 
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v6/sdk/access"
+	core "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 )
 
 const RoutingAliasMetadataKey = "routing_alias"
@@ -59,4 +61,14 @@ func NormalizeCredentialRoutingAlias(raw string) (string, error) {
 		return "", nil
 	}
 	return sdkaccess.NormalizeCredentialTarget(raw)
+}
+
+// authenticatedModelTarget allows only the authenticated fixed-credential test
+// to bypass catalog membership. Ordinary SDK pinning must retain that check.
+func authenticatedModelTarget(ctx context.Context, opts core.Options) string {
+	target := sdkaccess.CredentialTargetAuthID(ctx)
+	if target != "" && target == pinnedAuthIDFromMetadata(opts.Metadata) {
+		return target
+	}
+	return ""
 }

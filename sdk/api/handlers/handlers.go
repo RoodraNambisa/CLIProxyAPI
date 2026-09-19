@@ -418,7 +418,7 @@ func (h *BaseAPIHandler) ValidateModelProviderAccess(ctx context.Context, handle
 	if _, restricted := allowedProviderSetFromContext(ctx); !restricted {
 		return nil
 	}
-	providers, _, errDetails := h.getRequestDetails(modelName)
+	providers, _, errDetails := h.getRequestDetails(modelName, ctx)
 	if errDetails != nil {
 		return errDetails
 	}
@@ -1107,7 +1107,7 @@ func appendAPIResponse(c *gin.Context, data []byte) {
 // This path is the only supported execution route.
 func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType, modelName string, rawJSON []byte, alt string) ([]byte, http.Header, *interfaces.ErrorMessage) {
 	ctx, _ = ensureErrorResponseSourceTracker(ctx, nil)
-	providers, normalizedModel, errMsg := h.getRequestDetails(modelName)
+	providers, normalizedModel, errMsg := h.getRequestDetails(modelName, ctx)
 	if errMsg != nil {
 		return nil, nil, errMsg
 	}
@@ -1241,7 +1241,7 @@ func (h *BaseAPIHandler) ExecuteStreamWithProvidersAndExecutionModel(ctx context
 // This path is the only supported execution route.
 func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handlerType, modelName string, rawJSON []byte, alt string) ([]byte, http.Header, *interfaces.ErrorMessage) {
 	ctx, _ = ensureErrorResponseSourceTracker(ctx, nil)
-	providers, normalizedModel, errMsg := h.getRequestDetails(modelName)
+	providers, normalizedModel, errMsg := h.getRequestDetails(modelName, ctx)
 	if errMsg != nil {
 		return nil, nil, errMsg
 	}
@@ -1287,7 +1287,7 @@ func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handle
 // This path is the only supported execution route.
 // The returned http.Header carries upstream response headers captured before streaming begins.
 func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handlerType, modelName string, rawJSON []byte, alt string) (<-chan []byte, http.Header, <-chan *interfaces.ErrorMessage) {
-	providers, normalizedModel, errMsg := h.getRequestDetails(modelName)
+	providers, normalizedModel, errMsg := h.getRequestDetails(modelName, ctx)
 	if errMsg != nil {
 		errChan := make(chan *interfaces.ErrorMessage, 1)
 		errChan <- errMsg
@@ -1655,7 +1655,7 @@ func executionErrorMessage(err error, providers []string, model string) *interfa
 	return &interfaces.ErrorMessage{StatusCode: status, Error: err, Addon: addon}
 }
 
-func (h *BaseAPIHandler) getRequestDetails(modelName string) (providers []string, normalizedModel string, err *interfaces.ErrorMessage) {
+func (h *BaseAPIHandler) getRequestDetails(modelName string, contexts ...context.Context) (providers []string, normalizedModel string, err *interfaces.ErrorMessage) {
 	resolvedModelName := modelName
 	initialSuffix := thinking.ParseSuffix(modelName)
 	if initialSuffix.ModelName == "auto" {
@@ -1676,6 +1676,18 @@ func (h *BaseAPIHandler) getRequestDetails(modelName string) (providers []string
 		return nil, "", &interfaces.ErrorMessage{
 			StatusCode: http.StatusServiceUnavailable,
 			Error:      fmt.Errorf("model %s is only supported on /v1/images/generations and /v1/images/edits", baseModel),
+		}
+	}
+
+	// Authenticated diagnostic targeting resolves the provider from the credential,
+	// even when the requested model is absent from every local catalog.
+	if len(contexts) > 0 && h != nil && h.AuthManager != nil {
+		if target := sdkaccess.CredentialTargetAuthID(contexts[0]); target != "" {
+			credential, exists := h.AuthManager.GetByID(target)
+			if !exists {
+				return nil, "", &interfaces.ErrorMessage{StatusCode: http.StatusNotFound, Error: errors.New("target credential not found")}
+			}
+			return []string{credential.ExecutionProvider()}, modelName, nil
 		}
 	}
 
