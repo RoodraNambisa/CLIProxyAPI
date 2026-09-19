@@ -152,7 +152,7 @@ func (e *CodexExecutor) executeOpenAIImage(ctx context.Context, auth *cliproxyau
 		helps.RecordAPIResponseError(ctx, e.cfg, readErr)
 		return resp, readErr
 	}
-	upstreamData := applyCodexIdentityConfuseResponsePayload(data, identityState)
+	upstreamData := data
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		upstreamData = codexauth.SanitizeAgentIdentityErrorBody(authMetadata(auth), upstreamData)
 		helps.AppendAPIResponseChunk(ctx, e.cfg, upstreamData)
@@ -228,8 +228,7 @@ func (e *CodexExecutor) executeOpenAIImageStream(ctx context.Context, auth *clip
 			helps.RecordAPIResponseError(ctx, e.cfg, readErr)
 			return nil, readErr
 		}
-		upstreamBody := applyCodexIdentityConfuseResponsePayload(data, identityState)
-		upstreamBody = codexauth.SanitizeAgentIdentityErrorBody(authMetadata(auth), upstreamBody)
+		upstreamBody := codexauth.SanitizeAgentIdentityErrorBody(authMetadata(auth), data)
 		helps.AppendAPIResponseChunk(ctx, e.cfg, upstreamBody)
 		helps.DebugCodexResponseError(ctx, httpResp.StatusCode, httpResp.Header.Get("Content-Type"), upstreamBody)
 		clientBody := applyCodexIdentityExposeResponsePayload(upstreamBody, identityState)
@@ -249,8 +248,7 @@ func (e *CodexExecutor) executeOpenAIImageStream(ctx context.Context, auth *clip
 				helps.RecordAPIResponseError(ctx, e.cfg, errProbe)
 				return nil, errProbe
 			}
-			upstreamError := applyCodexIdentityConfuseResponsePayload(failure.Payload, identityState)
-			upstreamError = codexauth.SanitizeAgentIdentityErrorBody(authMetadata(auth), upstreamError)
+			upstreamError := codexauth.SanitizeAgentIdentityErrorBody(authMetadata(auth), failure.Payload)
 			helps.AppendAPIResponseChunk(ctx, e.cfg, upstreamError)
 			clientError := applyCodexIdentityExposeResponsePayload(upstreamError, identityState)
 			return nil, statusErrWithHeaders{statusErr: newCodexStatusErr(failure.Status, helps.CodexBootstrapErrorBody(clientError)), headers: httpResp.Header.Clone()}
@@ -299,7 +297,7 @@ func (e *CodexExecutor) executeOpenAIImageStream(ctx context.Context, auth *clip
 				return
 			}
 			for _, frame := range frames {
-				upstreamFrame := applyCodexIdentityConfuseResponsePayload(frame, identityState)
+				upstreamFrame := frame
 				clientFrame := applyCodexIdentityExposeResponsePayload(upstreamFrame, identityState)
 				events := helps.ParseOpenAIStreamFrame(clientFrame)
 				frameErr := classifyFrame(events)

@@ -5,10 +5,16 @@ import (
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	core "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	"github.com/tidwall/gjson"
 )
+
+// Build a simulated upstream response from the request's original identities.
+func codexMappedResponseForTest(payload []byte, state codexIdentityConfuseState) []byte {
+	return helps.ReplaceCodexResponseIdentities(payload, state.responseIdentityReplacements(false))
+}
 
 func TestCodexIdentityResponseShortKeysPreserveBusinessContent(t *testing.T) {
 	for _, protected := range []bool{false, true} {
@@ -22,7 +28,7 @@ func TestCodexIdentityResponseShortKeysPreserveBusinessContent(t *testing.T) {
 			if framed {
 				payload = append(append([]byte("event: response.completed\r\ndata: "), body...), []byte("\r\n\r\ndata: [DONE]\r\n\r\n")...)
 			}
-			mapped := applyCodexIdentityConfuseResponsePayload(payload, state)
+			mapped := codexMappedResponseForTest(payload, state)
 			jsonBody := mapped
 			if framed {
 				jsonBody = bytes.Split(bytes.SplitN(mapped, []byte("data: "), 2)[1], []byte("\r\n"))[0]
@@ -70,7 +76,7 @@ func TestCodexIdentityPolicyFrozenAcrossConfigReplacement(t *testing.T) {
 func TestCodexIdentityResponseReplacementsDoNotCascade(t *testing.T) {
 	state := codexIdentityConfuseState{turnIDs: []codexIdentityReplacement{{original: "a", confused: "b"}, {original: "b", confused: "c"}}}
 	payload := []byte(`{"turn_id":"a","response":{"turn_id":"b"}}`)
-	mapped := applyCodexIdentityConfuseResponsePayload(payload, state)
+	mapped := codexMappedResponseForTest(payload, state)
 	if string(mapped) != `{"turn_id":"b","response":{"turn_id":"c"}}` {
 		t.Fatalf("cascading replacement: %s", mapped)
 	}

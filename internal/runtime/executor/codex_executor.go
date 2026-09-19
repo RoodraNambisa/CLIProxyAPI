@@ -1018,8 +1018,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	managedStateUse.Observe(httpResp.Header, nil)
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		b, _ := io.ReadAll(httpResp.Body)
-		upstreamBody := applyCodexIdentityConfuseResponsePayload(b, identityState)
-		upstreamBody = codexauth.SanitizeAgentIdentityErrorBody(authMetadata(auth), upstreamBody)
+		upstreamBody := codexauth.SanitizeAgentIdentityErrorBody(authMetadata(auth), b)
 		helps.AppendAPIResponseChunk(ctx, e.cfg, upstreamBody)
 		helps.DebugCodexResponseError(ctx, httpResp.StatusCode, httpResp.Header.Get("Content-Type"), upstreamBody)
 		clientBody := applyCodexIdentityExposeResponsePayload(upstreamBody, identityState)
@@ -1034,7 +1033,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	var terminalErr *statusErr
 	var terminalEvent []byte
 	processEvent := func(rawLine []byte) bool {
-		line := applyCodexIdentityConfuseResponsePayload(rawLine, identityState)
+		line := rawLine
 		if terminalErr != nil || len(completedEvent) > 0 {
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
 			return true
@@ -1234,8 +1233,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	managedStateUse.Observe(httpResp.Header, nil)
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		b, _ := io.ReadAll(httpResp.Body)
-		upstreamBody := applyCodexIdentityConfuseResponsePayload(b, identityState)
-		upstreamBody = codexauth.SanitizeAgentIdentityErrorBody(authMetadata(auth), upstreamBody)
+		upstreamBody := codexauth.SanitizeAgentIdentityErrorBody(authMetadata(auth), b)
 		helps.AppendAPIResponseChunk(ctx, e.cfg, upstreamBody)
 		helps.DebugCodexResponseError(ctx, httpResp.StatusCode, httpResp.Header.Get("Content-Type"), upstreamBody)
 		clientBody := applyCodexIdentityExposeResponsePayload(upstreamBody, identityState)
@@ -1248,7 +1246,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 		return resp, err
 	}
 	managedStateUse.Observe(nil, data)
-	upstreamData := applyCodexIdentityConfuseResponsePayload(data, identityState)
+	upstreamData := data
 	helps.AppendAPIResponseChunk(ctx, e.cfg, upstreamData)
 	reporter.Publish(ctx, helps.ParseOpenAIUsage(upstreamData))
 	reporter.EnsurePublished(ctx)
@@ -1410,8 +1408,7 @@ func (e *CodexExecutor) executeStream(ctx context.Context, auth *cliproxyauth.Au
 			helps.RecordAPIResponseError(ctx, e.cfg, readErr)
 			return nil, readErr
 		}
-		upstreamBody := applyCodexIdentityConfuseResponsePayload(data, identityState)
-		upstreamBody = codexauth.SanitizeAgentIdentityErrorBody(authMetadata(auth), upstreamBody)
+		upstreamBody := codexauth.SanitizeAgentIdentityErrorBody(authMetadata(auth), data)
 		helps.AppendAPIResponseChunk(ctx, e.cfg, upstreamBody)
 		helps.DebugCodexResponseError(ctx, httpResp.StatusCode, httpResp.Header.Get("Content-Type"), upstreamBody)
 		clientBody := applyCodexIdentityExposeResponsePayload(upstreamBody, identityState)
@@ -1435,8 +1432,7 @@ func (e *CodexExecutor) executeStream(ctx context.Context, auth *cliproxyauth.Au
 				helps.RecordAPIResponseError(ctx, e.cfg, errProbe)
 				return nil, errProbe
 			}
-			upstreamError := applyCodexIdentityConfuseResponsePayload(failure.Payload, identityState)
-			upstreamError = codexauth.SanitizeAgentIdentityErrorBody(authMetadata(auth), upstreamError)
+			upstreamError := codexauth.SanitizeAgentIdentityErrorBody(authMetadata(auth), failure.Payload)
 			helps.AppendAPIResponseChunk(ctx, e.cfg, upstreamError)
 			clientError := applyCodexIdentityExposeResponsePayload(upstreamError, identityState)
 			return nil, statusErrWithHeaders{statusErr: newCodexStatusErr(failure.Status, helps.CodexBootstrapErrorBody(clientError)), headers: httpResp.Header.Clone()}
@@ -1531,7 +1527,6 @@ func (e *CodexExecutor) executeStream(ctx context.Context, auth *cliproxyauth.Au
 						managedStateUse.Observe(nil, data)
 					}
 				}
-				line = applyCodexIdentityConfuseResponsePayload(line, identityState)
 				line = multiAgentResponse.RewriteSSEFrame(line)
 			}
 			clientLine := line
@@ -2498,11 +2493,9 @@ func applyCodexTurnMetadataIdentityConfuse(rawTurnMetadata string, state *codexI
 	return updatedTurnMetadata
 }
 
-func applyCodexIdentityConfuseResponsePayload(payload []byte, state codexIdentityConfuseState) []byte {
-	return helps.ReplaceCodexResponseIdentities(payload, state.responseIdentityReplacements(false))
-}
-
 func applyCodexIdentityExposeResponsePayload(payload []byte, state codexIdentityConfuseState) []byte {
+	// Upstream identities are already mapped. Restore directly from that snapshot;
+	// mapping them forward again can mistake a mapped ID for another original ID.
 	return helps.ReplaceCodexResponseIdentities(payload, state.responseIdentityReplacements(true))
 }
 

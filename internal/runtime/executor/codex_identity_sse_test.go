@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/gorilla/websocket"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	core "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
@@ -68,39 +69,88 @@ func TestCodexIdentityMultilineSSEAcrossNetworkChunks(t *testing.T) {
 	}
 }
 
-func TestCodexTrustedSSERestoresIdentityOnlyOnce(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, _ := io.ReadAll(r.Body)
-		nested := gjson.GetBytes(body, "client_metadata.x-codex-turn-metadata").Str
-		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = fmt.Fprintf(w, "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[],\"turn_id\":%q}}\n\n", gjson.Get(nested, "turn_id").Str)
-	}))
-	defer server.Close()
-	exec := NewCodexExecutor(&config.Config{Routing: config.RoutingConfig{SessionAffinity: true}, Codex: config.CodexConfig{IdentityConfuse: true}})
-	auth := &coreauth.Auth{ID: "restore-once", Provider: "codex", ProxyURL: "direct", Metadata: map[string]any{"access_token": "test-token", "codex_fingerprint_mode": "off"}, Attributes: map[string]string{"base_url": server.URL}}
-	opts := core.Options{SourceFormat: translator.FormatOpenAIResponse, Stream: true, Metadata: map[string]any{core.TrustUpstreamSSEMetadataKey: true}}
-	opaque, err := exec.PrepareProviderRequest(t.Context(), core.Request{}, opts, core.RequestOperationStream)
-	if err != nil {
-		t.Fatal(err)
-	}
-	prepared := opaque.(codexPreparedSessionIdentity)
-	first := "first-turn"
-	second := codexIdentityConfuseTurnUUID(auth.ID, first, prepared.TurnID)
-	payload, _ := json.Marshal(map[string]any{"model": "gpt-5.4", "input": "hello", "client_metadata": map[string]string{"turn_id": first, "x-codex-turn-metadata": fmt.Sprintf(`{"turn_id":%q}`, second)}})
-	opts = core.WithProviderPreparedRequest(opts, exec.Identifier(), prepared)
-	result, err := exec.ExecuteStream(t.Context(), auth, core.Request{Model: "gpt-5.4", Payload: payload}, opts)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var output []byte
-	for chunk := range result.Chunks {
-		if chunk.Err != nil {
-			t.Fatal(chunk.Err)
+func TestCodexResponseRestoresIdentityOnlyOnce(t *testing.T) {
+	for _, transport := range []string{"http", "ws"} {
+		for _, stream := range []bool{false, true} {
+			for _, trusted := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/stream=%t/trusted=%t", transport, stream, trusted), func(t *testing.T) {
+					echo := func(body []byte) []byte {
+						nested := gjson.GetBytes(body, "client_metadata.x-codex-turn-metadata").Str
+						return fmt.Appendf(nil, `{"type":"response.completed","response":{"status":"completed","output":[],"turn_id":%q,"client_metadata":{"turn_id":%q}}}`, gjson.GetBytes(body, "client_metadata.turn_id").Str, gjson.Get(nested, "turn_id").Str)
+					}
+					server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						if transport == "ws" {
+							upgrader := websocket.Upgrader{}
+							conn, err := upgrader.Upgrade(w, r, nil)
+							if err != nil {
+								t.Error(err)
+								return
+							}
+							defer func() { _ = conn.Close() }()
+							_, body, err := conn.ReadMessage()
+							if err != nil {
+								t.Error(err)
+								return
+							}
+							if err := conn.WriteMessage(websocket.TextMessage, echo(body)); err != nil {
+								t.Error(err)
+							}
+							return
+						}
+						body, _ := io.ReadAll(r.Body)
+						w.Header().Set("Content-Type", "text/event-stream")
+						_, _ = fmt.Fprintf(w, "data: %s\n\n", echo(body))
+					}))
+					defer server.Close()
+					cfg := &config.Config{Routing: config.RoutingConfig{SessionAffinity: true}, Codex: config.CodexConfig{IdentityConfuse: true}}
+					exec := NewCodexExecutor(cfg)
+					execute, executeStream := exec.Execute, exec.ExecuteStream
+					if transport == "ws" {
+						wsExec := NewCodexWebsocketsExecutor(cfg)
+						execute, executeStream = wsExec.Execute, wsExec.ExecuteStream
+					}
+					auth := &coreauth.Auth{ID: "restore-once", Provider: "codex", ProxyURL: "direct", Metadata: map[string]any{"access_token": "test-token", "codex_fingerprint_mode": "off"}, Attributes: map[string]string{"base_url": server.URL}}
+					opts := core.Options{SourceFormat: translator.FormatOpenAIResponse, Stream: stream, Metadata: map[string]any{core.TrustUpstreamSSEMetadataKey: trusted}}
+					opaque, err := exec.PrepareProviderRequest(t.Context(), core.Request{}, opts, core.RequestOperationStream)
+					if err != nil {
+						t.Fatal(err)
+					}
+					prepared := opaque.(codexPreparedSessionIdentity)
+					first := "first-turn"
+					second := codexIdentityConfuseTurnUUID(auth.ID, first, prepared.TurnID)
+					payload, _ := json.Marshal(map[string]any{"model": "gpt-5.4", "input": "hello", "client_metadata": map[string]string{"turn_id": first, "x-codex-turn-metadata": fmt.Sprintf(`{"turn_id":%q}`, second)}})
+					opts = core.WithProviderPreparedRequest(opts, exec.Identifier(), prepared)
+					req := core.Request{Model: "gpt-5.4", Payload: payload}
+					var response []byte
+					if stream {
+						result, err := executeStream(t.Context(), auth, req, opts)
+						if err != nil {
+							t.Fatal(err)
+						}
+						var output []byte
+						for chunk := range result.Chunks {
+							if chunk.Err != nil {
+								t.Fatal(chunk.Err)
+							}
+							output = append(output, chunk.Payload...)
+						}
+						data, ok := codexSSEFrameDataPayload(output)
+						if !ok {
+							t.Fatalf("invalid SSE: %s", output)
+						}
+						response = []byte(gjson.GetBytes(data, "response").Raw)
+					} else {
+						result, err := execute(t.Context(), auth, req, opts)
+						if err != nil {
+							t.Fatal(err)
+						}
+						response = result.Payload
+					}
+					if gjson.GetBytes(response, "turn_id").Str != first || gjson.GetBytes(response, "client_metadata.turn_id").Str != second {
+						t.Fatalf("response identity was mapped more than once: %s", response)
+					}
+				})
+			}
 		}
-		output = append(output, chunk.Payload...)
-	}
-	data, ok := codexSSEFrameDataPayload(output)
-	if !ok || gjson.GetBytes(data, "response.turn_id").Str != second {
-		t.Fatalf("trusted response was restored twice: %s", output)
 	}
 }

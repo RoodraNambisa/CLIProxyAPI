@@ -575,7 +575,6 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 			e.observeManagedWebsocketState(ctx, auth, sess, conn, req.Model, wsHeaders, nil, payload)
 		}
 		helps.ObserveResponsesTokenEvent(reporter, payload)
-		payload = applyCodexIdentityConfuseResponsePayload(payload, identityState)
 		normalizedPayload := normalizeCodexCompletion(payload)
 		clientPayload := applyCodexIdentityExposeResponsePayload(normalizedPayload, identityState)
 		if originalWSErr, ok := parseCodexWebsocketError(clientPayload); ok {
@@ -969,8 +968,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			}
 			hold, overloadStatus := probe.Observe(payload)
 			if overloadStatus != 0 {
-				upstreamError := applyCodexIdentityConfuseResponsePayload(payload, identityState)
-				upstreamError = codexauth.SanitizeAgentIdentityErrorBody(authMetadata(auth), upstreamError)
+				upstreamError := codexauth.SanitizeAgentIdentityErrorBody(authMetadata(auth), payload)
 				helps.AppendAPIWebsocketResponse(ctx, e.cfg, upstreamError)
 				clientError := applyCodexIdentityExposeResponsePayload(upstreamError, identityState)
 				bootstrapErr := statusErrWithHeaders{statusErr: newCodexStatusErr(overloadStatus, helps.CodexBootstrapErrorBody(clientError)), headers: parseCodexWebsocketErrorHeaders(payload)}
@@ -1092,7 +1090,6 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				continue
 			}
 			helps.ObserveResponsesTokenEvent(reporter, payload)
-			payload = applyCodexIdentityConfuseResponsePayload(payload, identityState)
 			normalizedPayload := normalizeCodexCompletion(payload)
 			clientPayload := applyCodexIdentityExposeResponsePayload(normalizedPayload, identityState)
 			if originalWSErr, ok := parseCodexWebsocketError(clientPayload); ok {

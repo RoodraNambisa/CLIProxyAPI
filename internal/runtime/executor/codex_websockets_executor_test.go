@@ -1213,7 +1213,7 @@ func TestCodexIdentityConfuseResponsePayloadHidesUpstreamAndRestoresClient(t *te
 	expectedTurnID := state.confuseTurnID("turn-ws-1")
 	rawPayload := []byte(`{"type":"response.completed","response":{"prompt_cache_key":"cache-ws-1","turn_id":"turn-ws-1"},"prompt_cache_key":"cache-ws-1","turn_id":"turn-ws-1"}`)
 
-	upstreamPayload := applyCodexIdentityConfuseResponsePayload(rawPayload, state)
+	upstreamPayload := codexMappedResponseForTest(rawPayload, state)
 	if bytes.Contains(upstreamPayload, []byte(`cache-ws-1`)) {
 		t.Fatalf("upstream payload still contains original prompt_cache_key: %s", string(upstreamPayload))
 	}
@@ -1242,7 +1242,7 @@ func TestCodexIdentityConfuseResponsePayloadHidesUpstreamAndRestoresClient(t *te
 	}
 
 	rawSSE := []byte(`data: {"type":"response.completed","response":{"prompt_cache_key":"cache-ws-1","turn_id":"turn-ws-1"}}`)
-	upstreamSSE := applyCodexIdentityConfuseResponsePayload(rawSSE, state)
+	upstreamSSE := codexMappedResponseForTest(rawSSE, state)
 	if bytes.Contains(upstreamSSE, []byte(`cache-ws-1`)) {
 		t.Fatalf("upstream SSE still contains original prompt_cache_key: %s", string(upstreamSSE))
 	}
@@ -1268,7 +1268,7 @@ func TestCodexIdentityConfuseStatusErrorRestoresClientPayload(t *testing.T) {
 	_ = state.confuseTurnID("turn-ws-1")
 	rawBody := []byte(`{"error":{"message":"cache-ws-1 turn-ws-1","type":"server_error","code":"server_error"}}`)
 
-	upstreamBody := applyCodexIdentityConfuseResponsePayload(rawBody, state)
+	upstreamBody := codexMappedResponseForTest(rawBody, state)
 	if !bytes.Equal(upstreamBody, rawBody) {
 		t.Fatalf("identity mapping changed an error message: %s", upstreamBody)
 	}
@@ -1291,7 +1291,7 @@ func TestCodexIdentityConfuseWebsocketErrorRestoresClientPayload(t *testing.T) {
 	_ = state.confuseTurnID("turn-ws-1")
 	rawPayload := []byte(`{"type":"error","status":429,"error":{"code":"server_error","message":"cache-ws-1 turn-ws-1"}}`)
 
-	upstreamPayload := applyCodexIdentityConfuseResponsePayload(rawPayload, state)
+	upstreamPayload := codexMappedResponseForTest(rawPayload, state)
 	if !bytes.Equal(upstreamPayload, rawPayload) {
 		t.Fatalf("identity mapping changed a websocket error message: %s", upstreamPayload)
 	}
