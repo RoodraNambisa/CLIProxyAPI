@@ -40,10 +40,13 @@ func Register(cfg *sdkconfig.SDKConfig) {
 }
 
 type provider struct {
-	name      string
-	keys      map[string][]string
-	lastUsed  map[string]*atomic.Int64
-	targeting map[string]bool
+	name                 string
+	keys                 map[string][]string
+	lastUsed             map[string]*atomic.Int64
+	targeting            map[string]bool
+	respectStatePolicy   map[string]bool
+	respectRequestLimit  map[string]bool
+	responseModelRewrite map[string]bool
 }
 
 func newProvider(name string, keys []string, groups []sdkconfig.APIKeyGroup) *provider {
@@ -53,12 +56,18 @@ func newProvider(name string, keys []string, groups []sdkconfig.APIKeyGroup) *pr
 	}
 	groupProviders := make(map[string][]string, len(groups))
 	targeting := make(map[string]bool, len(groups))
+	respectStatePolicy := make(map[string]bool, len(groups))
+	respectRequestLimit := make(map[string]bool, len(groups))
+	responseModelRewrite := make(map[string]bool, len(groups))
 	for _, group := range groups {
 		key := strings.TrimSpace(group.APIKey)
 		if key == "" {
 			continue
 		}
 		targeting[key] = group.AllowCredentialTargeting
+		respectStatePolicy[key] = group.CredentialTargetRespectStatePolicy
+		respectRequestLimit[key] = group.CredentialTargetRespectRequestLimit
+		responseModelRewrite[key] = group.CredentialTargetResponseModelRewrite
 		providers := normalizeProviders(group.Providers)
 		if len(providers) > 0 {
 			groupProviders[key] = providers
@@ -68,7 +77,7 @@ func newProvider(name string, keys []string, groups []sdkconfig.APIKeyGroup) *pr
 	for _, key := range keys {
 		keySet[key] = append([]string(nil), groupProviders[key]...)
 	}
-	return &provider{name: providerName, keys: keySet, targeting: targeting}
+	return &provider{name: providerName, keys: keySet, targeting: targeting, respectStatePolicy: respectStatePolicy, respectRequestLimit: respectRequestLimit, responseModelRewrite: responseModelRewrite}
 }
 
 func (p *provider) Identifier() string {
@@ -141,6 +150,15 @@ func (p *provider) Authenticate(_ context.Context, r *http.Request) (*sdkaccess.
 			metadata := map[string]string{"source": candidate.source}
 			if target != "" {
 				metadata[sdkaccess.MetadataCredentialTarget] = target
+				if p.respectStatePolicy[key] {
+					metadata[sdkaccess.MetadataCredentialTargetRespectStatePolicy] = "true"
+				}
+				if p.respectRequestLimit[key] {
+					metadata[sdkaccess.MetadataCredentialTargetRespectRequestLimit] = "true"
+				}
+				if p.responseModelRewrite[key] {
+					metadata[sdkaccess.MetadataCredentialTargetResponseModelRewrite] = "true"
+				}
 			}
 			if len(allowedProviders) > 0 {
 				metadata[sdkaccess.MetadataAllowedProviders] = strings.Join(allowedProviders, ",")

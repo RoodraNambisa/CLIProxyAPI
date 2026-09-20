@@ -26,6 +26,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
+	sdkaccess "github.com/router-for-me/CLIProxyAPI/v6/sdk/access"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	coreusage "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
@@ -9914,7 +9915,7 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 	if len(candidates) == 0 {
 		return nil, nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
-	if authenticatedModelTarget(ctx, opts) != "" {
+	if authenticatedModelTarget(ctx, opts) != "" && !sdkaccess.CredentialTargetRespectsRequestLimit(ctx) {
 		available, err := m.availableAuthsForRouteModelFiltered(candidates, provider, model, opts, time.Now(), nil)
 		if err != nil {
 			return nil, nil, err
@@ -10159,7 +10160,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 			selectorProvider = providerKey
 		}
 	}
-	if authenticatedModelTarget(ctx, opts) != "" {
+	if authenticatedModelTarget(ctx, opts) != "" && !sdkaccess.CredentialTargetRespectsRequestLimit(ctx) {
 		available, err := m.availableAuthsForRouteModelFiltered(candidates, selectorProvider, model, opts, time.Now(), pickAllowed)
 		if err != nil {
 			return nil, nil, "", err

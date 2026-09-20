@@ -8,13 +8,53 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/codexstate"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
+	sdkaccess "github.com/router-for-me/CLIProxyAPI/v6/sdk/access"
 	auth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	core "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	"github.com/tidwall/gjson"
 )
+
+func TestFixedCredentialStateOptionRespectsScopeAndPause(t *testing.T) {
+	a := &auth.Auth{ID: "target-state-option-scope", Provider: "codex"}
+	c := StateCredential(a, "model")
+	for _, scenario := range []string{"paused", "disabled", "excluded", "other-model", "skip"} {
+		t.Run(scenario, func(t *testing.T) {
+			cfg := &config.Config{Codex: config.CodexConfig{StateOverride: config.CodexStateOverrideConfig{Enabled: true, MissingPolicy: "hide", Acquisition: "manual"}}}
+			switch scenario {
+			case "disabled":
+				cfg.Codex.StateOverride.Enabled = false
+			case "excluded":
+				cfg.Codex.StateOverride.ExcludedCredentials = []string{a.ID}
+			case "other-model":
+				cfg.Codex.StateOverride.Models = []string{"other"}
+			case "skip":
+				cfg.Codex.StateOverride.Rules = &[]config.CodexStateRule{{Action: "skip"}}
+			}
+			codexstate.Default.Sync(cfg.Codex.StateOverride, []codexstate.Credential{c})
+			defer codexstate.Default.Sync(config.CodexStateOverrideConfig{}, nil)
+			if scenario == "paused" && !codexstate.Default.Action(c.ID, c.Model, "pause") {
+				t.Fatal("could not pause acquisition")
+			}
+			carrier := &gin.Context{}
+			carrier.Set(sdkaccess.CredentialTargetAuthIDContextKey, a.ID)
+			carrier.Set(sdkaccess.MetadataCredentialTargetRespectStatePolicy, "true")
+			ctx := context.WithValue(t.Context(), "gin", carrier)
+			err := ApplyManagedState(ctx, cfg, a, c.Model, http.Header{})
+			if scenario == "paused" {
+				var status interface{ StatusCode() int }
+				if !errors.As(err, &status) || status.StatusCode() != 503 {
+					t.Fatalf("paused missing State bypassed policy: %v", err)
+				}
+			} else if err != nil {
+				t.Fatalf("key option applied outside State scope: %v", err)
+			}
+		})
+	}
+}
 
 func TestManagedStateScopePriorityAndCatalogIntersection(t *testing.T) {
 	a := &auth.Auth{ID: "state-scope", Provider: "codex", Metadata: map[string]any{"account_id": "owner"}}

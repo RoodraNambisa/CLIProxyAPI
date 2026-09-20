@@ -186,7 +186,7 @@ func (h *Handler) GetAPIKeyGroups(c *gin.Context) {
 		priorities = append(priorities, group.ExcludedPriorities...)
 	}
 	slices.Sort(priorities)
-	c.JSON(http.StatusOK, gin.H{"api-key-groups": groups, "available-priorities": slices.Compact(priorities), "names-supported": true, "credential-targeting-supported": true})
+	c.JSON(http.StatusOK, gin.H{"api-key-groups": groups, "available-priorities": slices.Compact(priorities), "names-supported": true, "credential-targeting-supported": true, "credential-target-options-supported": true})
 }
 
 // PutAPIKeyGroups replaces all client API key access restrictions.
@@ -209,12 +209,15 @@ func (h *Handler) PutAPIKeyGroups(c *gin.Context) {
 // PatchAPIKeyGroups updates only the supplied access restriction fields.
 func (h *Handler) PatchAPIKeyGroups(c *gin.Context) {
 	var patch struct {
-		APIKey    string          `json:"api-key"`
-		Name      json.RawMessage `json:"name"`
-		Providers json.RawMessage `json:"providers"`
-		Allowed   json.RawMessage `json:"allowed-priorities"`
-		Excluded  json.RawMessage `json:"excluded-priorities"`
-		Targeting json.RawMessage `json:"allow-credential-targeting"`
+		APIKey       string          `json:"api-key"`
+		Name         json.RawMessage `json:"name"`
+		Providers    json.RawMessage `json:"providers"`
+		Allowed      json.RawMessage `json:"allowed-priorities"`
+		Excluded     json.RawMessage `json:"excluded-priorities"`
+		Targeting    json.RawMessage `json:"allow-credential-targeting"`
+		RespectState json.RawMessage `json:"credential-target-respect-state-policy"`
+		RespectLimit json.RawMessage `json:"credential-target-respect-request-limit"`
+		RewriteModel json.RawMessage `json:"credential-target-response-model-rewrite"`
 	}
 	if err := c.ShouldBindJSON(&patch); err != nil || strings.TrimSpace(patch.APIKey) == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
@@ -243,8 +246,18 @@ func (h *Handler) PatchAPIKeyGroups(c *gin.Context) {
 			return
 		}
 	}
-	if string(patch.Targeting) == "null" {
-		group.AllowCredentialTargeting = false
+	for _, field := range []struct {
+		raw    json.RawMessage
+		target *bool
+	}{
+		{patch.Targeting, &group.AllowCredentialTargeting},
+		{patch.RespectState, &group.CredentialTargetRespectStatePolicy},
+		{patch.RespectLimit, &group.CredentialTargetRespectRequestLimit},
+		{patch.RewriteModel, &group.CredentialTargetResponseModelRewrite},
+	} {
+		if string(field.raw) == "null" {
+			*field.target = false
+		}
 	}
 	for _, field := range []struct {
 		raw    json.RawMessage
@@ -252,6 +265,9 @@ func (h *Handler) PatchAPIKeyGroups(c *gin.Context) {
 	}{
 		{patch.Providers, &group.Providers}, {patch.Allowed, &group.AllowedPriorities}, {patch.Excluded, &group.ExcludedPriorities},
 		{patch.Targeting, &group.AllowCredentialTargeting},
+		{patch.RespectState, &group.CredentialTargetRespectStatePolicy},
+		{patch.RespectLimit, &group.CredentialTargetRespectRequestLimit},
+		{patch.RewriteModel, &group.CredentialTargetResponseModelRewrite},
 	} {
 		if field.raw != nil {
 			if err := json.Unmarshal(field.raw, field.target); err != nil {
@@ -363,7 +379,10 @@ func cloneAPIKeyGroups(groups []config.APIKeyGroup) []config.APIKeyGroup {
 	}
 	cloned := make([]config.APIKeyGroup, len(groups))
 	for index, group := range groups {
-		cloned[index] = config.APIKeyGroup{APIKey: group.APIKey, Name: group.Name, Providers: slices.Clone(group.Providers), AllowedPriorities: slices.Clone(group.AllowedPriorities), ExcludedPriorities: slices.Clone(group.ExcludedPriorities), AllowCredentialTargeting: group.AllowCredentialTargeting}
+		cloned[index] = group
+		cloned[index].Providers = slices.Clone(group.Providers)
+		cloned[index].AllowedPriorities = slices.Clone(group.AllowedPriorities)
+		cloned[index].ExcludedPriorities = slices.Clone(group.ExcludedPriorities)
 	}
 	return cloned
 }
@@ -416,14 +435,9 @@ func copyAPIKeyGroup(groups []config.APIKeyGroup, oldKey, newKey string) []confi
 	if oldIndex == -1 {
 		return groups
 	}
-	return append(groups, config.APIKeyGroup{
-		APIKey:                   newKey,
-		Name:                     groups[oldIndex].Name,
-		Providers:                append([]string(nil), groups[oldIndex].Providers...),
-		AllowedPriorities:        slices.Clone(groups[oldIndex].AllowedPriorities),
-		ExcludedPriorities:       slices.Clone(groups[oldIndex].ExcludedPriorities),
-		AllowCredentialTargeting: groups[oldIndex].AllowCredentialTargeting,
-	})
+	copied := cloneAPIKeyGroups(groups[oldIndex : oldIndex+1])[0]
+	copied.APIKey = newKey
+	return append(groups, copied)
 }
 
 func containsAPIKey(keys []string, target string) bool {

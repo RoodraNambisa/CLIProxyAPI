@@ -59,7 +59,7 @@ func TestCredentialTargetingConfigPersistsAndRenames(t *testing.T) {
 	}
 	cfg := &config.Config{SDKConfig: config.SDKConfig{APIKeys: []string{"key-a"}}}
 	h := NewHandler(cfg, path, nil)
-	for _, body := range []string{`{"api-key":"key-a","allow-credential-targeting":true}`, `{"api-key":"key-a","providers":["xai"]}`} {
+	for _, body := range []string{`{"api-key":"key-a","allow-credential-targeting":true}`, `{"api-key":"key-a","credential-target-respect-state-policy":true}`, `{"api-key":"key-a","credential-target-respect-request-limit":true}`, `{"api-key":"key-a","credential-target-response-model-rewrite":true}`, `{"api-key":"key-a","providers":["xai"]}`} {
 		r := performAPIKeyConfigRequest(t, h.PatchAPIKeyGroups, http.MethodPatch, "/api-key-groups", body)
 		if r.Code != 200 {
 			t.Fatalf("patch: %d %s", r.Code, r.Body.String())
@@ -72,12 +72,27 @@ func TestCredentialTargetingConfigPersistsAndRenames(t *testing.T) {
 	if len(cfg.APIKeyGroups) != 1 || !cfg.APIKeyGroups[0].AllowCredentialTargeting || cfg.APIKeyGroups[0].APIKey != "key-b" || cfg.APIKeyGroups[0].Providers[0] != "xai" {
 		t.Fatal("key rename lost targeting/permissions")
 	}
+	if !cfg.APIKeyGroups[0].CredentialTargetRespectStatePolicy || !cfg.APIKeyGroups[0].CredentialTargetRespectRequestLimit || !cfg.APIKeyGroups[0].CredentialTargetResponseModelRewrite {
+		t.Fatal("key rename or provider update dropped targeting options")
+	}
 	loaded, err := config.LoadConfig(path)
-	if err != nil || !loaded.APIKeyGroups[0].AllowCredentialTargeting {
+	if err != nil || !loaded.APIKeyGroups[0].AllowCredentialTargeting || !loaded.APIKeyGroups[0].CredentialTargetRespectStatePolicy || !loaded.APIKeyGroups[0].CredentialTargetRespectRequestLimit || !loaded.APIKeyGroups[0].CredentialTargetResponseModelRewrite {
 		t.Fatalf("config roundtrip: %v", err)
 	}
 	r = performAPIKeyConfigRequest(t, h.PatchAPIKeyGroups, http.MethodPatch, "/api-key-groups", `{"api-key":"key-b","allow-credential-targeting":null}`)
 	if r.Code != 200 || cfg.APIKeyGroups[0].AllowCredentialTargeting {
 		t.Fatal("clear did not disable targeting")
+	}
+	copyGroups := copyAPIKeyGroup(cfg.APIKeyGroups, "key-b", "key-c")
+	if len(copyGroups) != 2 || !copyGroups[1].CredentialTargetRespectStatePolicy || !copyGroups[1].CredentialTargetRespectRequestLimit || !copyGroups[1].CredentialTargetResponseModelRewrite {
+		t.Fatal("key copy dropped disabled targeting options")
+	}
+	r = performAPIKeyConfigRequest(t, h.PatchAPIKeyGroups, http.MethodPatch, "/api-key-groups", `{"api-key":"key-b","credential-target-respect-state-policy":null,"credential-target-respect-request-limit":null,"credential-target-response-model-rewrite":false}`)
+	if r.Code != 200 || cfg.APIKeyGroups[0].CredentialTargetRespectStatePolicy || cfg.APIKeyGroups[0].CredentialTargetRespectRequestLimit || cfg.APIKeyGroups[0].CredentialTargetResponseModelRewrite {
+		t.Fatal("explicit false/null did not clear options")
+	}
+	r = performAPIKeyConfigRequest(t, h.PatchAPIKeyGroups, http.MethodPatch, "/api-key-groups", `{"api-key":"key-b","credential-target-respect-state-policy":"true"}`)
+	if r.Code != 400 {
+		t.Fatal("non-boolean targeting option accepted")
 	}
 }

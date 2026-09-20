@@ -53,3 +53,35 @@ func TestCredentialTargetKeyKeepsIssuerAndRestrictions(t *testing.T) {
 		}
 	}
 }
+
+func TestCredentialTargetOptionsComeOnlyFromTheIssuingKey(t *testing.T) {
+	groups := []sdkconfig.APIKeyGroup{
+		{APIKey: "raw", AllowCredentialTargeting: true},
+		{APIKey: "state", AllowCredentialTargeting: true, CredentialTargetRespectStatePolicy: true},
+		{APIKey: "limit", AllowCredentialTargeting: true, CredentialTargetRespectRequestLimit: true},
+		{APIKey: "rewrite", AllowCredentialTargeting: true, CredentialTargetResponseModelRewrite: true},
+	}
+	p := newProvider("", []string{"raw", "state", "limit", "rewrite"}, groups)
+	for _, key := range []string{"raw", "state", "limit", "rewrite"} {
+		for _, targeted := range []bool{false, true} {
+			value := key
+			if targeted {
+				value += "-auth-test"
+			}
+			req := httptest.NewRequest("POST", "/v1/responses?credential_target_respect_state_policy=true", nil)
+			req.Header.Set("Authorization", "Bearer "+value)
+			req.Header.Set(sdkaccess.MetadataCredentialTargetRespectStatePolicy, "true")
+			req.Header.Set(sdkaccess.MetadataCredentialTargetRespectRequestLimit, "true")
+			req.Header.Set(sdkaccess.MetadataCredentialTargetResponseModelRewrite, "true")
+			result, err := p.Authenticate(t.Context(), req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if (result.Metadata[sdkaccess.MetadataCredentialTargetRespectStatePolicy] == "true") != (targeted && key == "state") ||
+				(result.Metadata[sdkaccess.MetadataCredentialTargetRespectRequestLimit] == "true") != (targeted && key == "limit") ||
+				(result.Metadata[sdkaccess.MetadataCredentialTargetResponseModelRewrite] == "true") != (targeted && key == "rewrite") {
+				t.Fatalf("key options leaked or accepted untrusted headers: %+v", result.Metadata)
+			}
+		}
+	}
+}

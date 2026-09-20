@@ -204,10 +204,18 @@ func StateCredentialPriority(a *auth.Auth) int {
 	return 0
 }
 
-type stateUnavailableError struct{ body string }
+type stateUnavailableError struct {
+	body   string
+	status int
+}
 
-func (e stateUnavailableError) Error() string             { return e.body }
-func (stateUnavailableError) StatusCode() int             { return 429 }
+func (e stateUnavailableError) Error() string { return e.body }
+func (e stateUnavailableError) StatusCode() int {
+	if e.status != 0 {
+		return e.status
+	}
+	return http.StatusTooManyRequests
+}
 func (stateUnavailableError) SkipAuthResult() bool        { return true }
 func (stateUnavailableError) RetryOtherAuth() bool        { return true }
 func (stateUnavailableError) PreserveErrorResponse() bool { return true }
@@ -218,7 +226,8 @@ func ApplyManagedState(ctx context.Context, cfg *config.Config, a *auth.Auth, mo
 	if ctx != nil {
 		diagnostic, _ = ctx.Value(codexStateDiagnosticKey{}).(*codexStateDiagnostic)
 	}
-	if diagnostic == nil && sdkaccess.CredentialTargetAuthID(ctx) != "" {
+	targetRespectsState := sdkaccess.CredentialTargetRespectsStatePolicy(ctx)
+	if diagnostic == nil && sdkaccess.CredentialTargetAuthID(ctx) != "" && !targetRespectsState {
 		diagnostic = &codexStateDiagnostic{mode: "auto"}
 	}
 	source := "none"
@@ -303,6 +312,11 @@ func ApplyManagedState(ctx context.Context, cfg *config.Config, a *auth.Auth, mo
 	if !inScope && requireManaged && ManagedStateCredentialEligible(cfg, a) && ManagedStatePairAllowed(cfg, c) && codexstate.Default.HasManual(c) {
 		inScope = true
 	}
+	// Fixed tests may request unregistered models. Opt-in State rules still
+	// apply to the matching credential/model without registering it for routing.
+	if !inScope && targetRespectsState && ManagedStateCredentialEligible(cfg, a) && ManagedStatePairAllowed(cfg, c) && StateTextModel(c.Model) {
+		inScope = true
+	}
 	if !inScope {
 		if requireManaged {
 			return unavailable()
@@ -324,6 +338,10 @@ func ApplyManagedState(ctx context.Context, cfg *config.Config, a *auth.Auth, mo
 		return core.CodexStateChoice{Value: value, Policy: policy, Version: version, Eligible: eligible}
 	})
 	state, policy, eligible := choice.Value, choice.Policy, choice.Eligible
+	if !eligible && targetRespectsState {
+		// Pausing acquisition must not bypass an explicitly requested admission check.
+		policy, eligible = resolved.MissingPolicy, true
+	}
 	if !eligible {
 		if requireManaged {
 			return unavailable()
@@ -349,6 +367,10 @@ func ApplyManagedState(ctx context.Context, cfg *config.Config, a *auth.Auth, mo
 		return nil
 	}
 	source = "unavailable"
+	if policy == "hide" && targetRespectsState {
+		body, _ := json.Marshal(map[string]any{"error": map[string]string{"type": "service_unavailable_error", "code": "auth_unavailable", "message": "Selected credential has no valid State for model " + c.Model}})
+		return stateUnavailableError{body: string(body), status: http.StatusServiceUnavailable}
+	}
 	body, _ := json.Marshal(map[string]any{"error": map[string]string{"type": resolved.ErrorType, "code": resolved.ErrorCode, "message": resolved.ErrorMessage}})
 	return stateUnavailableError{body: string(body)}
 }

@@ -4011,10 +4011,12 @@ func normalizeAPIKeyGroups(groups []APIKeyGroup, apiKeys []string, pruneUnknown 
 		if errExcluded != nil {
 			return nil, errExcluded
 		}
-		if name == "" && len(providers) == 0 && len(allowed) == 0 && len(excluded) == 0 && !group.AllowCredentialTargeting {
+		if name == "" && len(providers) == 0 && len(allowed) == 0 && len(excluded) == 0 && !group.AllowCredentialTargeting && !group.CredentialTargetRespectStatePolicy && !group.CredentialTargetRespectRequestLimit && !group.CredentialTargetResponseModelRewrite {
 			continue
 		}
-		normalized = append(normalized, APIKeyGroup{APIKey: key, Name: name, Providers: providers, AllowedPriorities: allowed, ExcludedPriorities: excluded, AllowCredentialTargeting: group.AllowCredentialTargeting})
+		group.APIKey, group.Name, group.Providers = key, name, providers
+		group.AllowedPriorities, group.ExcludedPriorities = allowed, excluded
+		normalized = append(normalized, group)
 	}
 	if len(normalized) == 0 {
 		return nil, nil

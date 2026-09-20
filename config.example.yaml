@@ -249,7 +249,10 @@ sentinel-solver:
 # api-key-groups:
 #   - api-key: "your-api-key-1"
 #     name: "Work" # Optional display name; empty means unnamed, up to 100 Unicode characters, no control characters.
-#     allow-credential-targeting: false # Opt in to <api-key>-auth-<auth_index or routing_alias> single-attempt tests (bypass local per-credential request limits).
+#     allow-credential-targeting: false # Opt in to <api-key>-auth-<auth_index or routing_alias> single-attempt tests (bypass local per-credential request limits by default).
+#     credential-target-respect-state-policy: false # Fixed tests obey matching missing-State policy: hide returns 503, error returns 429. Otherwise test without State when missing.
+#     credential-target-respect-request-limit: false # Apply per-credential request limits and share ordinary counters during fixed tests.
+#     credential-target-response-model-rewrite: false # Apply existing response-model-rewrite rules and count actual rewrites during fixed tests.
 #     providers: ["codex", "xai"]
 #     allowed-priorities: [1, 2]
 #     excluded-priorities: [2]

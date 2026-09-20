@@ -9,6 +9,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
+	sdkaccess "github.com/router-for-me/CLIProxyAPI/v6/sdk/access"
 	core "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
@@ -103,7 +104,7 @@ func ensureClientResponseModelMetadata(opts core.Options, fallback string) core.
 }
 
 func (m *Manager) responseModelRewriteOptions(ctx context.Context, auth *Auth, opts core.Options, stream bool) *StreamRewriteOptions {
-	if m == nil || auth == nil || core.SingleAttempt(ctx) {
+	if m == nil || auth == nil || (core.SingleAttempt(ctx) && !sdkaccess.CredentialTargetRewritesResponseModel(ctx)) {
 		return nil
 	}
 	policy := m.selectionPolicy(ctx)

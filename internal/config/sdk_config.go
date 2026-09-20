@@ -127,6 +127,10 @@ type APIKeyGroup struct {
 	Providers []string `yaml:"providers" json:"providers"`
 	// AllowCredentialTargeting enables explicit credential selection in client keys.
 	AllowCredentialTargeting bool `yaml:"allow-credential-targeting,omitempty" json:"allow-credential-targeting,omitempty"`
+	// Target test behavior is opt-in per issuing client key.
+	CredentialTargetRespectStatePolicy   bool `yaml:"credential-target-respect-state-policy,omitempty" json:"credential-target-respect-state-policy,omitempty"`
+	CredentialTargetRespectRequestLimit  bool `yaml:"credential-target-respect-request-limit,omitempty" json:"credential-target-respect-request-limit,omitempty"`
+	CredentialTargetResponseModelRewrite bool `yaml:"credential-target-response-model-rewrite,omitempty" json:"credential-target-response-model-rewrite,omitempty"`
 	// Empty allow lists impose no priority restriction; exclusions always win.
 	AllowedPriorities  APIKeyPriorityList `yaml:"allowed-priorities,omitempty" json:"allowed-priorities,omitempty"`
 	ExcludedPriorities APIKeyPriorityList `yaml:"excluded-priorities,omitempty" json:"excluded-priorities,omitempty"`
