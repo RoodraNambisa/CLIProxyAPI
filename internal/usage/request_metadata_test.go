@@ -2,8 +2,10 @@ package usage_test
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 
@@ -17,7 +19,7 @@ import (
 func usageRequestContext(t *testing.T) (context.Context, *gin.Context) {
 	t.Helper()
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
-	c.Request = httptest.NewRequest(http.MethodPost, "/v1/alpha/search", nil)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/alpha/search?key=private-query-fixture", nil)
 	c.Request.RemoteAddr = "203.0.113.10:1234"
 	ctx, cancel := handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, nil).GetContextWithCancel(nil, c, t.Context())
 	t.Cleanup(func() { cancel() })
@@ -42,6 +44,30 @@ func TestUsageRequestMetadataSurvivesGinReuse(t *testing.T) {
 		if detail.ClientIP != "203.0.113.10" {
 			t.Fatal("usage read a reused request's address")
 		}
+		if detail.RequestMethod != http.MethodPost || detail.RequestPath != "/v1/alpha/search" {
+			t.Fatalf("usage lost the original request route: %+v", detail)
+		}
+	}
+}
+
+func TestUsageRequestPathIsIndependentOfAPIKeyAndRouteTemplate(t *testing.T) {
+	stats := statistics.NewRequestStatistics()
+	engine := gin.New()
+	engine.POST("/v1beta/models/*action", func(c *gin.Context) {
+		ctx, cancel := handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, nil).GetContextWithCancel(nil, c, c.Request.Context())
+		defer cancel()
+		stats.Record(ctx, coreusage.Record{APIKey: "fixture-key", Provider: "gemini", Model: "fixture"})
+		c.Status(http.StatusOK)
+	})
+	engine.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1beta/models/fixture:generateContent?key=private-query-fixture", nil))
+	snapshot := stats.Snapshot()
+	detail := snapshot.APIs["fixture-key"].Models["fixture"].Details[0]
+	if detail.RequestMethod != "POST" || detail.RequestPath != "/v1beta/models/fixture:generateContent" {
+		t.Fatalf("request path was replaced by API key or route template: %+v", detail)
+	}
+	data, err := json.Marshal(snapshot)
+	if err != nil || strings.Contains(string(data), "private-query-fixture") {
+		t.Fatal("usage retained query parameters")
 	}
 }
 

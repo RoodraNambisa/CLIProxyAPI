@@ -351,6 +351,21 @@ func TestUsageDetailsHandlerFiltersAndPaginates(t *testing.T) {
 	}
 }
 
+func TestUsageDetailsHandlerFiltersRequestPath(t *testing.T) {
+	handler, stats, _ := newUsageHandlerForTest(t)
+	for _, path := range []string{"/v1/responses", "/v1/alpha/search", "/backend-api/codex/alpha/search", ""} {
+		ctx := coreusage.WithRequestMetadata(t.Context(), coreusage.RequestMetadata{Method: "POST", Path: path})
+		stats.Record(ctx, coreusage.Record{APIKey: "fixture-key", Model: "same-model"})
+	}
+	ctx, recorder := newUsageRequestContext("/v0/management/usage/details?request_path=%2Falpha%2Fsearch&limit=1")
+	handler.GetUsageDetails(ctx)
+	var page usage.DetailPage
+	decodeUsageResponse(t, recorder, &page)
+	if !page.RequestPathSupported || page.TotalMatched != 2 || !page.HasMore || len(page.Items) != 1 || page.Items[0].RequestMethod != "POST" || !strings.Contains(page.Items[0].RequestPath, "/alpha/search") {
+		t.Fatalf("invalid route-filtered response: %+v", page)
+	}
+}
+
 func TestClearUsageStatisticsHandler(t *testing.T) {
 	handler, stats, _ := newUsageHandlerForTest(t)
 	logDir := t.TempDir()

@@ -151,12 +151,14 @@ type DetailQuery struct {
 	AuthIndex string
 	Source    string
 	ClientIP  string
-	Failed    *bool
-	TimeRange TimeRange
-	SortBy    string
-	SortOrder string
-	Offset    int
-	Limit     int
+	// RequestPath matches a literal substring of the recorded downstream path.
+	RequestPath string
+	Failed      *bool
+	TimeRange   TimeRange
+	SortBy      string
+	SortOrder   string
+	Offset      int
+	Limit       int
 }
 
 // FailureSummaryQuery filters the safe failure aggregation view.
@@ -204,14 +206,15 @@ type DetailEntry struct {
 
 // DetailPage is a filtered and paginated detail response.
 type DetailPage struct {
-	Items        []DetailEntry `json:"items"`
-	Details      []DetailEntry `json:"details"`
-	Total        int           `json:"total"`
-	Offset       int           `json:"offset"`
-	Limit        int           `json:"limit"`
-	NextOffset   int           `json:"next_offset,omitempty"`
-	HasMore      bool          `json:"has_more"`
-	TotalMatched int           `json:"total_matched"`
+	RequestPathSupported bool          `json:"request_path_supported"`
+	Items                []DetailEntry `json:"items"`
+	Details              []DetailEntry `json:"details"`
+	Total                int           `json:"total"`
+	Offset               int           `json:"offset"`
+	Limit                int           `json:"limit"`
+	NextOffset           int           `json:"next_offset,omitempty"`
+	HasMore              bool          `json:"has_more"`
+	TotalMatched         int           `json:"total_matched"`
 }
 
 // SeriesQuery filters and groups time-series usage data.
@@ -834,6 +837,9 @@ func authUsageSnapshot(authIndex string, stats *authStats) AuthUsageSnapshot {
 }
 
 func detailMatchesQuery(detail RequestDetail, query DetailQuery) bool {
+	if query.RequestPath != "" && !strings.Contains(detail.RequestPath, query.RequestPath) {
+		return false
+	}
 	if !query.TimeRange.contains(detail.Timestamp) {
 		return false
 	}
@@ -1053,6 +1059,7 @@ func normalizeDetailQuery(query DetailQuery) DetailQuery {
 	query.AuthIndex = strings.TrimSpace(query.AuthIndex)
 	query.Source = strings.TrimSpace(query.Source)
 	query.ClientIP = strings.TrimSpace(query.ClientIP)
+	query.RequestPath = strings.TrimSpace(query.RequestPath)
 	query.SortBy = normalizeDetailsSortBy(query.SortBy)
 	query.SortOrder = normalizeDetailsSortOrder(query.SortOrder)
 	return query
@@ -1150,14 +1157,15 @@ func newDetailPage(items []DetailEntry, total, offset, limit int) DetailPage {
 		nextOffset = end
 	}
 	return DetailPage{
-		Items:        items,
-		Details:      items,
-		Total:        total,
-		Offset:       offset,
-		Limit:        limit,
-		NextOffset:   nextOffset,
-		HasMore:      hasMore,
-		TotalMatched: total,
+		RequestPathSupported: true,
+		Items:                items,
+		Details:              items,
+		Total:                total,
+		Offset:               offset,
+		Limit:                limit,
+		NextOffset:           nextOffset,
+		HasMore:              hasMore,
+		TotalMatched:         total,
 	}
 }
 

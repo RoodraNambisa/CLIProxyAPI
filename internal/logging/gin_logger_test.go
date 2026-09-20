@@ -70,6 +70,30 @@ func TestGinAccessLogCapturesRequestCredentialAndKeepsRequestsIsolated(t *testin
 	}
 }
 
+func TestSearchAccessLogsReceiveRequestIDs(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	hook := logtest.NewGlobal()
+	defer hook.Reset()
+	previousLevel := log.GetLevel()
+	log.SetLevel(log.InfoLevel)
+	defer log.SetLevel(previousLevel)
+	engine := gin.New()
+	engine.Use(GinLogrusLogger())
+	for _, path := range []string{"/v1/alpha/search", "/backend-api/codex/alpha/search"} {
+		engine.POST(path, func(c *gin.Context) {
+			if GetGinRequestID(c) == "" || GetRequestID(c.Request.Context()) == "" {
+				t.Error("search context has no request ID")
+			}
+			c.Status(http.StatusOK)
+		})
+		engine.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, path, nil))
+		entry := hook.LastEntry()
+		if entry == nil || entry.Data["path"] != path || entry.Data["method"] != "POST" || entry.Data["request_id"] == "--------" {
+			t.Fatalf("search access log cannot be traced: %+v", entry)
+		}
+	}
+}
+
 func TestGinLogrusLoggerSkipsRetiredGeminiCLICallbackQuery(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	hook := logtest.NewGlobal()

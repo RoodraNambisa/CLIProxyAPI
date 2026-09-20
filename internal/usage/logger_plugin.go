@@ -180,6 +180,8 @@ type RequestDetail struct {
 	FirstPacketMs           int64      `json:"first_packet_ms,omitempty"`
 	Source                  string     `json:"source"`
 	ClientIP                string     `json:"client_ip"`
+	RequestMethod           string     `json:"request_method,omitempty"`
+	RequestPath             string     `json:"request_path,omitempty"`
 	AuthIndex               string     `json:"auth_index"`
 	RequestServiceTier      string     `json:"request_service_tier,omitempty"`
 	ResponseServiceTier     string     `json:"response_service_tier,omitempty"`
@@ -308,6 +310,7 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 	if modelName == "" {
 		modelName = "unknown"
 	}
+	metadata, _ := coreusage.RequestMetadataFromContext(ctx)
 	requestDetail := RequestDetail{
 		Timestamp:               timestamp,
 		LatencyMs:               normaliseLatency(record.Latency),
@@ -315,6 +318,8 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 		FirstPacketMs:           normaliseLatency(record.FirstPacketLatency),
 		Source:                  record.Source,
 		ClientIP:                resolveClientIP(ctx),
+		RequestMethod:           metadata.Method,
+		RequestPath:             metadata.Path,
 		AuthIndex:               record.AuthIndex,
 		RequestServiceTier:      strings.TrimSpace(record.RequestServiceTier),
 		ResponseServiceTier:     strings.TrimSpace(record.ResponseServiceTier),
@@ -370,6 +375,8 @@ func (s *RequestStatistics) recordPreparedLocked(record preparedUsageRecord, now
 	requestDetail := record.detail
 	requestDetail.Source = s.internStringLocked(requestDetail.Source)
 	requestDetail.ClientIP = s.internStringLocked(requestDetail.ClientIP)
+	requestDetail.RequestMethod = s.internStringLocked(requestDetail.RequestMethod)
+	requestDetail.RequestPath = s.internStringLocked(requestDetail.RequestPath)
 	requestDetail.AuthIndex = s.internStringLocked(requestDetail.AuthIndex)
 	requestDetail.RequestServiceTier = s.internStringLocked(requestDetail.RequestServiceTier)
 	requestDetail.ResponseServiceTier = s.internStringLocked(requestDetail.ResponseServiceTier)
@@ -1416,6 +1423,8 @@ func (s *RequestStatistics) recordImported(apiName, modelName string, stats *api
 	modelName = s.internStringLocked(modelName)
 	detail.Source = s.internStringLocked(detail.Source)
 	detail.ClientIP = s.internStringLocked(detail.ClientIP)
+	detail.RequestMethod = s.internStringLocked(detail.RequestMethod)
+	detail.RequestPath = s.internStringLocked(detail.RequestPath)
 	detail.AuthIndex = s.internStringLocked(detail.AuthIndex)
 	detail.RequestServiceTier = s.internStringLocked(detail.RequestServiceTier)
 	detail.ResponseServiceTier = s.internStringLocked(detail.ResponseServiceTier)
@@ -1523,6 +1532,8 @@ func (s *RequestStatistics) rebuildLocked() {
 			for idx, detail := range modelStatsValue.Details {
 				detail.Source = s.internStringLocked(detail.Source)
 				detail.ClientIP = s.internStringLocked(detail.ClientIP)
+				detail.RequestMethod = s.internStringLocked(detail.RequestMethod)
+				detail.RequestPath = s.internStringLocked(detail.RequestPath)
 				detail.AuthIndex = s.internStringLocked(detail.AuthIndex)
 				detail.RequestServiceTier = s.internStringLocked(detail.RequestServiceTier)
 				detail.ResponseServiceTier = s.internStringLocked(detail.ResponseServiceTier)
@@ -1603,7 +1614,7 @@ func dedupKey(apiName, modelName string, detail RequestDetail) string {
 	timestamp := detail.Timestamp.UTC().Format(time.RFC3339Nano)
 	tokens := normaliseTokenStats(detail.Tokens)
 	return fmt.Sprintf(
-		"%s|%s|%s|%s|%s|%s|%s|%s|%t|%t|%d|%d|%d|%d|%d|%d",
+		"%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%t|%t|%d|%d|%d|%d|%d|%d",
 		apiName,
 		modelName,
 		timestamp,
@@ -1612,6 +1623,8 @@ func dedupKey(apiName, modelName string, detail RequestDetail) string {
 		detail.AuthIndex,
 		strings.TrimSpace(detail.RequestServiceTier),
 		strings.TrimSpace(detail.ResponseServiceTier),
+		detail.RequestMethod,
+		detail.RequestPath,
 		detail.Failed,
 		detail.Auxiliary,
 		tokens.InputTokens,

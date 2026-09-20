@@ -7,6 +7,8 @@ import "context"
 type RequestMetadata struct {
 	APIIdentifier string
 	ClientIP      string
+	Method        string
+	Path          string
 }
 
 type requestMetadataContextKey struct{}

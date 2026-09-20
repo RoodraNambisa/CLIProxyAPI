@@ -176,7 +176,7 @@ func (h *Handler) GetUsageDetails(c *gin.Context) {
 	if stats := h.usageStatisticsSnapshot(); stats != nil {
 		page = stats.Details(query)
 	} else {
-		page = usage.DetailPage{Items: []usage.DetailEntry{}, Details: []usage.DetailEntry{}, Limit: query.Limit}
+		page = usage.DetailPage{RequestPathSupported: true, Items: []usage.DetailEntry{}, Details: []usage.DetailEntry{}, Limit: query.Limit}
 	}
 	c.JSON(http.StatusOK, page)
 }
@@ -500,15 +500,16 @@ func parseUsageDetailQuery(c *gin.Context) (usage.DetailQuery, bool) {
 		return usage.DetailQuery{}, false
 	}
 	query := usage.DetailQuery{
-		API:       strings.TrimSpace(c.Query("api")),
-		Model:     strings.TrimSpace(c.Query("model")),
-		AuthIndex: strings.TrimSpace(c.Query("auth_index")),
-		Source:    strings.TrimSpace(c.Query("source")),
-		ClientIP:  strings.TrimSpace(c.Query("client_ip")),
-		TimeRange: timeRange,
-		SortBy:    sortBy,
-		SortOrder: sortOrder,
-		Limit:     usage.DefaultDetailsLimit,
+		API:         strings.TrimSpace(c.Query("api")),
+		Model:       strings.TrimSpace(c.Query("model")),
+		AuthIndex:   strings.TrimSpace(c.Query("auth_index")),
+		Source:      strings.TrimSpace(c.Query("source")),
+		ClientIP:    strings.TrimSpace(c.Query("client_ip")),
+		RequestPath: strings.TrimSpace(c.Query("request_path")),
+		TimeRange:   timeRange,
+		SortBy:      sortBy,
+		SortOrder:   sortOrder,
+		Limit:       usage.DefaultDetailsLimit,
 	}
 	if rawOffset := strings.TrimSpace(c.Query("offset")); rawOffset != "" {
 		offset, err := strconv.Atoi(rawOffset)

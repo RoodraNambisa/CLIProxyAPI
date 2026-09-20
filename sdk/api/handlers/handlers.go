@@ -971,7 +971,14 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
 		if path != "" && c.Request.Method != "" {
 			identifier = c.Request.Method + " " + path
 		}
-		newCtx = coreusage.WithRequestMetadata(newCtx, coreusage.RequestMetadata{APIIdentifier: identifier, ClientIP: logging.ResolveClientIP(c)})
+		requestPath := path
+		if c.Request.URL != nil {
+			requestPath = c.Request.URL.EscapedPath()
+		}
+		newCtx = coreusage.WithRequestMetadata(newCtx, coreusage.RequestMetadata{
+			APIIdentifier: identifier, ClientIP: logging.ResolveClientIP(c),
+			Method: c.Request.Method, Path: requestPath,
+		})
 	}
 	newCtx = executorhelps.CaptureCodexMultiAgentPolicyContext(newCtx)
 	newCtx = context.WithValue(newCtx, "handler", handler)
