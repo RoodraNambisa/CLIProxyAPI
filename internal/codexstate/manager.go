@@ -326,17 +326,29 @@ func (m *Manager) pickVersionLocked(c Credential, clientState string, now time.T
 // distinguish equal opaque values acquired at different times (the ABA case).
 // A nonempty reason still identifies a rejected old connection when a newer cache value exists.
 func (m *Manager) ObserveResponse(c Credential, version uint64, value, returnedModel string, returnedLength int) string {
+	return m.observeResponse(c, version, value, returnedModel, returnedLength, nil)
+}
+
+// ObserveResponseForPolicy uses the validation contract frozen when the State was sent.
+func (m *Manager) ObserveResponseForPolicy(c Credential, version uint64, value, returnedModel string, returnedLength int, policy config.CodexStateOverrideConfig) string {
+	return m.observeResponse(c, version, value, returnedModel, returnedLength, &policy)
+}
+func (m *Manager) observeResponse(c Credential, version uint64, value, returnedModel string, returnedLength int, requested *config.CodexStateOverrideConfig) string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	e := m.entries[key(c)]
-	if !m.cfg.Enabled || version == 0 || e == nil || e.paused || e.credential.Plan != c.Plan || (!e.policy.InvalidateOnModelMismatch && !e.policy.InvalidateOnStateLengthMismatch) {
+	if !m.cfg.Enabled || version == 0 || e == nil || e.paused || e.credential.Plan != c.Plan || e.credential.Instance != c.Instance {
 		return ""
 	}
+	policy := e.policy
+	if requested != nil {
+		policy = *requested
+	}
 	reason := ""
-	if e.policy.InvalidateOnModelMismatch && returnedModel != "" && returnedModel != c.Model {
+	if policy.InvalidateOnModelMismatch && returnedModel != "" && returnedModel != c.Model {
 		reason = "response_model_mismatch"
-	} else if e.policy.InvalidateOnStateLengthMismatch && returnedLength > 0 {
-		lengths := e.policy.Lengths
+	} else if policy.InvalidateOnStateLengthMismatch && returnedLength > 0 {
+		lengths := policy.Lengths
 		if len(lengths) > 0 && !slices.Contains(lengths, returnedLength) {
 			reason = "response_state_length_mismatch"
 		}
@@ -369,20 +381,6 @@ func (m *Manager) Complete(c Credential, state string) {
 	if e := m.entries[key(c)]; e != nil && e.credential.Instance == c.Instance && e.state == state {
 		e.Completed++
 	}
-}
-
-func (m *Manager) WatchesResponses() bool {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if !m.cfg.Enabled {
-		return false
-	}
-	for _, e := range m.entries {
-		if e.policy.InvalidateOnModelMismatch || e.policy.InvalidateOnStateLengthMismatch {
-			return true
-		}
-	}
-	return false
 }
 
 func (m *Manager) Snapshots(id string, now time.Time) []Snapshot {

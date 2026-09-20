@@ -83,3 +83,48 @@ func TestStateRulePreviewAndManualAcquisitionUseSamePolicy(t *testing.T) {
 		t.Fatal("manual action bypassed skip rule", w.Code)
 	}
 }
+
+func TestStateModelOverridePreviewMatchesAcquisition(t *testing.T) {
+	m := auth.NewManager(nil, nil, nil)
+	a, err := m.Register(auth.WithSkipPersist(t.Context()), &auth.Auth{ID: "nested-state", Provider: "codex", Attributes: map[string]string{"priority": "3"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry.GetGlobalRegistry().RegisterClient(a.ID, "codex", []*registry.ModelInfo{{ID: "alias", UpstreamID: "sol"}})
+	defer registry.GetGlobalRegistry().UnregisterClient(a.ID)
+	var cfg config.CodexStateOverrideConfig
+	if err := json.Unmarshal([]byte(`{"enabled":true,"rules":[{"id":"main","priorities":[3],"models":["sol"],"settings":{"acquisition":"manual"},"model-overrides":[{"id":"sol","models":["sol"],"settings":{"match-model":false,"invalidate-on-model-mismatch":false}}]}]}`), &cfg); err != nil {
+		t.Fatal(err)
+	}
+	h := &Handler{cfg: &config.Config{Codex: config.CodexConfig{StateOverride: cfg}}, authManager: m}
+	body, _ := json.Marshal(map[string]any{"name": a.ID, "model": "alias", "config": cfg})
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest("POST", "/auth-files/codex/state/preview", strings.NewReader(string(body)))
+	h.PreviewCodexState(c)
+	if w.Code != 200 || gjson.Get(w.Body.String(), "match.model_override_id").String() != "sol" || gjson.Get(w.Body.String(), "policy.match-model").Bool() || gjson.Get(w.Body.String(), "match.sources.match-model").String() != "model-override" {
+		t.Fatalf("preview lost nested policy: %s", w.Body.String())
+	}
+	codexstate.Diagnostic.Sync(cfg, nil, helps.StateCredential(a, ""))
+	defer codexstate.Diagnostic.Sync(config.CodexStateOverrideConfig{}, nil)
+	credential := helps.StateCredential(a, "sol")
+	credential.Route = "alias"
+	codexstate.Diagnostic.QueueManual(credential)
+	codexstate.Diagnostic.Tick(t.Context(), time.Now(), func(_ context.Context, _ codexstate.Credential, p config.CodexStateOverrideConfig) (codexstate.Result, error) {
+		if *p.MatchModel || p.InvalidateOnModelMismatch {
+			t.Error("manual acquisition ignored model override")
+		}
+		return codexstate.Result{Completed: true, Model: "other", State: strings.Repeat("s", 292)}, nil
+	})
+	codexstate.Diagnostic.Wait()
+	if codexstate.Diagnostic.Snapshots(a.ID, time.Now())[0].Status != "valid" {
+		t.Fatal("acquisition rejected explicitly allowed model mismatch")
+	}
+	w = httptest.NewRecorder()
+	c, _ = gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest("GET", "/auth-files/codex/state/options", nil)
+	h.GetCodexStateOptions(c)
+	if !gjson.Get(w.Body.String(), "features.rule_model_overrides").Bool() {
+		t.Fatal("capability missing")
+	}
+}

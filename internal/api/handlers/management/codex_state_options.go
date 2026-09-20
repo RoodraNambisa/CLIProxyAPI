@@ -120,5 +120,5 @@ func (h *Handler) GetCodexStateOptions(c *gin.Context) {
 	})
 	slices.Sort(priorities)
 	slices.Sort(plans)
-	c.JSON(200, gin.H{"credentials": credentials, "models": models, "priorities": priorities, "plans": plans})
+	c.JSON(200, gin.H{"credentials": credentials, "models": models, "priorities": priorities, "plans": plans, "features": gin.H{"rule_model_overrides": true}})
 }

@@ -5,16 +5,18 @@ import (
 	"net/http"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/codexstate"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	auth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	core "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	"github.com/tidwall/gjson"
 )
 
 type CodexManagedStateUse struct {
-	Credential codexstate.Credential
-	Version    uint64
-	Value      string
-	manager    *codexstate.Manager
+	Credential  codexstate.Credential
+	Version     uint64
+	Value       string
+	manager     *codexstate.Manager
+	observation *core.CodexStateObservationPolicy
 }
 
 func codexStateRequestKey(c codexstate.Credential) string {
@@ -36,7 +38,7 @@ func ManagedStateUse(ctx context.Context, a *auth.Auth, model string, headers ht
 	if !ok || choice.Version == 0 || choice.Value == "" || choice.Value != headers.Get("X-Codex-Turn-State") {
 		return CodexManagedStateUse{}
 	}
-	return CodexManagedStateUse{Credential: c, Version: choice.Version, Value: choice.Value, manager: manager}
+	return CodexManagedStateUse{Credential: c, Version: choice.Version, Value: choice.Value, manager: manager, observation: choice.Observation}
 }
 
 // Observe accepts original upstream metadata before any response-model rewrite.
@@ -46,7 +48,10 @@ func (u CodexManagedStateUse) Observe(headers http.Header, payload []byte) bool 
 	if manager == nil {
 		manager = codexstate.Default
 	}
-	if u.Version == 0 || !manager.WatchesResponses() {
+	if u.Version == 0 {
+		return false
+	}
+	if u.observation != nil && !u.observation.ModelMismatch && !u.observation.LengthMismatch {
 		return false
 	}
 	model := ""
@@ -56,6 +61,10 @@ func (u CodexManagedStateUse) Observe(headers http.Header, payload []byte) bool 
 			root = root.Get("response")
 		}
 		model = root.Get("model").String()
+	}
+	if u.observation != nil {
+		policy := config.CodexStateOverrideConfig{InvalidateOnModelMismatch: u.observation.ModelMismatch, InvalidateOnStateLengthMismatch: u.observation.LengthMismatch, Lengths: u.observation.Lengths}
+		return manager.ObserveResponseForPolicy(u.Credential, u.Version, u.Value, model, len(headers.Get("X-Codex-Turn-State")), policy) != ""
 	}
 	return manager.ObserveResponse(u.Credential, u.Version, u.Value, model, len(headers.Get("X-Codex-Turn-State"))) != ""
 }

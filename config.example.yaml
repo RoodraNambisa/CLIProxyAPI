@@ -1028,6 +1028,15 @@ xai:
 #         settings:
 #           lengths: [292]
 #           retry-seconds: 60
+#         # Parameters override this rule, then common defaults, per field.
+#         # Models do not expand the parent scope. Omit fields to inherit;
+#         # explicit false and [] are preserved. Exact models only, no overlaps.
+#         model-overrides:
+#           - id: sol-validation
+#             models: [gpt-5.6-sol]
+#             settings:
+#               match-model: false
+#               invalidate-on-model-mismatch: false
 #     proxy-mode: inherit           # inherit | direct | custom; inference route is unchanged.
 #     proxy-url: ""                 # {12} generates 12 digits, fixed within an acquisition attempt.
 #     lengths: [292]                # [] accepts any nonempty length.

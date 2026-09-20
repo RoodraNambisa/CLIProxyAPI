@@ -10,6 +10,13 @@ type CodexStateChoice struct {
 	Value, Policy string
 	Eligible      bool
 	Version       uint64
+	Observation   *CodexStateObservationPolicy
+}
+
+type CodexStateObservationPolicy struct {
+	ModelMismatch  bool
+	LengthMismatch bool
+	Lengths        []int
 }
 
 func CodexStateChoiceForRequest(ctx context.Context, key string) (CodexStateChoice, bool) {

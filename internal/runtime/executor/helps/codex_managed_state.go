@@ -280,7 +280,7 @@ func ApplyManagedState(ctx context.Context, cfg *config.Config, a *auth.Auth, mo
 			policy, _ := codexstate.DiagnosticPolicy(cfg.Codex.StateOverride, c)
 			choice := core.CodexStateForRequest(ctx, "diagnostic:"+codexStateRequestKey(c), func() core.CodexStateChoice {
 				value, missing, version, eligible := codexstate.Diagnostic.PickVersionForPolicy(c, "", time.Now(), policy)
-				return core.CodexStateChoice{Value: value, Policy: missing, Version: version, Eligible: eligible}
+				return core.CodexStateChoice{Value: value, Policy: missing, Version: version, Eligible: eligible, Observation: stateObservationPolicy(policy)}
 			})
 			if !choice.Eligible || choice.Value == "" {
 				return errors.New("no valid manually acquired State is available for this credential and upstream model")
@@ -335,7 +335,7 @@ func ApplyManagedState(ctx context.Context, cfg *config.Config, a *auth.Auth, mo
 			clientState = ""
 		}
 		value, policy, version, eligible := codexstate.Default.PickVersionForPolicy(c, clientState, time.Now(), resolved)
-		return core.CodexStateChoice{Value: value, Policy: policy, Version: version, Eligible: eligible}
+		return core.CodexStateChoice{Value: value, Policy: policy, Version: version, Eligible: eligible, Observation: stateObservationPolicy(resolved)}
 	})
 	state, policy, eligible := choice.Value, choice.Policy, choice.Eligible
 	if !eligible && targetRespectsState {
@@ -404,4 +404,8 @@ func ResolveStateModel(authID, requested string) string {
 		}
 	}
 	return model
+}
+
+func stateObservationPolicy(policy config.CodexStateOverrideConfig) *core.CodexStateObservationPolicy {
+	return &core.CodexStateObservationPolicy{ModelMismatch: policy.InvalidateOnModelMismatch, LengthMismatch: policy.InvalidateOnStateLengthMismatch, Lengths: slices.Clone(policy.Lengths)}
 }

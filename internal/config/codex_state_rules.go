@@ -9,16 +9,25 @@ import (
 // CodexStateRule is evaluated in list order for each credential/model pair.
 // An empty selector means "any" within that selector type.
 type CodexStateRule struct {
-	ID                  string                 `yaml:"id" json:"id"`
-	Name                string                 `yaml:"name" json:"name"`
-	Enabled             *bool                  `yaml:"enabled,omitempty" json:"enabled,omitempty"`
-	Action              string                 `yaml:"action" json:"action"`
-	Priorities          APIKeyPriorityList     `yaml:"priorities" json:"priorities"`
-	Credentials         []string               `yaml:"credentials" json:"credentials"`
-	ExcludedCredentials []string               `yaml:"excluded-credentials" json:"excluded-credentials"`
-	PlanTypes           []string               `yaml:"plan-types" json:"plan-types"`
-	Models              []string               `yaml:"models" json:"models"`
-	Settings            CodexStateRuleSettings `yaml:"settings" json:"settings"`
+	ID                  string                        `yaml:"id" json:"id"`
+	Name                string                        `yaml:"name" json:"name"`
+	Enabled             *bool                         `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+	Action              string                        `yaml:"action" json:"action"`
+	Priorities          APIKeyPriorityList            `yaml:"priorities" json:"priorities"`
+	Credentials         []string                      `yaml:"credentials" json:"credentials"`
+	ExcludedCredentials []string                      `yaml:"excluded-credentials" json:"excluded-credentials"`
+	PlanTypes           []string                      `yaml:"plan-types" json:"plan-types"`
+	Models              []string                      `yaml:"models" json:"models"`
+	Settings            CodexStateRuleSettings        `yaml:"settings" json:"settings"`
+	ModelOverrides      []CodexStateRuleModelOverride `yaml:"model-overrides,omitempty" json:"model-overrides,omitempty"`
+}
+
+// CodexStateRuleModelOverride changes parameters only inside its parent scope.
+type CodexStateRuleModelOverride struct {
+	ID       string                 `yaml:"id" json:"id"`
+	Enabled  *bool                  `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+	Models   []string               `yaml:"models" json:"models"`
+	Settings CodexStateRuleSettings `yaml:"settings" json:"settings"`
 }
 
 // Pointer fields distinguish inheritance from an explicitly configured zero or false value.
@@ -52,11 +61,13 @@ type CodexStateScope struct {
 }
 
 type CodexStateRuleMatch struct {
-	RuleID    string            `json:"rule_id,omitempty"`
-	RuleName  string            `json:"rule_name,omitempty"`
-	RuleIndex int               `json:"rule_index"`
-	Action    string            `json:"action"`
-	Sources   map[string]string `json:"sources,omitempty"`
+	RuleID          string            `json:"rule_id,omitempty"`
+	RuleName        string            `json:"rule_name,omitempty"`
+	RuleIndex       int               `json:"rule_index"`
+	Action          string            `json:"action"`
+	Sources         map[string]string `json:"sources,omitempty"`
+	ModelOverrideID string            `json:"model_override_id,omitempty"`
+	Conflicts       []string          `json:"conflicts,omitempty"`
 }
 
 func (r CodexStateRule) matches(scope CodexStateScope, includeModel bool) bool {
@@ -131,8 +142,28 @@ func (c CodexStateOverrideConfig) PolicyFor(scope CodexStateScope) (CodexStateOv
 		}
 		defaults := c
 		defaults.Rules = nil
-		policy := defaults.ForCredential(scope.Plan, scope.Model)
+		policy := defaults.stateDefaultsFor(scope, match.Sources)
 		applyCodexStateRuleSettings(&policy, rule.Settings, match.Sources)
+		for _, override := range rule.ModelOverrides {
+			if override.Enabled != nil && !*override.Enabled {
+				continue
+			}
+			if !slices.Contains(override.Models, scope.Model) && !slices.ContainsFunc(scope.Aliases, func(alias string) bool { return slices.Contains(override.Models, alias) }) {
+				continue
+			}
+			if match.ModelOverrideID != "" {
+				match.Conflicts = append(match.Conflicts, override.ID)
+				continue
+			}
+			match.ModelOverrideID = override.ID
+			match.Conflicts = []string{override.ID}
+			applyCodexStateRuleSettings(&policy, override.Settings, match.Sources, "model-override")
+		}
+		if len(match.Conflicts) > 1 {
+			match.Action = "conflict"
+			return CodexStateOverrideConfig{}, match, false
+		}
+		match.Conflicts = nil
 		policy.Enabled = true
 		policy.Rules = nil
 		policy.Priorities, policy.IncludedCredentials, policy.ExcludedCredentials, policy.Models = nil, nil, nil, nil
@@ -141,11 +172,15 @@ func (c CodexStateOverrideConfig) PolicyFor(scope CodexStateScope) (CodexStateOv
 	return CodexStateOverrideConfig{}, match, false
 }
 
-func applyCodexStateRuleSettings(policy *CodexStateOverrideConfig, settings CodexStateRuleSettings, sources map[string]string) {
+func applyCodexStateRuleSettings(policy *CodexStateOverrideConfig, settings CodexStateRuleSettings, sources map[string]string, layer ...string) {
+	source := "rule"
+	if len(layer) > 0 {
+		source = layer[0]
+	}
 	mark := func(name string, ok bool) {
 		if ok {
-			sources[name] = "rule"
-		} else {
+			sources[name] = source
+		} else if sources[name] == "" {
 			sources[name] = "default"
 		}
 	}
@@ -245,6 +280,16 @@ func cloneCodexStateRules(rules *[]CodexStateRule) *[]CodexStateRule {
 			rule.Enabled = &value
 		}
 		cloneCodexStateRuleSettings(&rule.Settings)
+		rule.ModelOverrides = slices.Clone(rule.ModelOverrides)
+		for j := range rule.ModelOverrides {
+			item := &rule.ModelOverrides[j]
+			item.Models = slices.Clone(item.Models)
+			if item.Enabled != nil {
+				value := *item.Enabled
+				item.Enabled = &value
+			}
+			cloneCodexStateRuleSettings(&item.Settings)
+		}
 	}
 	return &cloned
 }
@@ -364,6 +409,9 @@ func (cfg *Config) validateCodexStateRules() error {
 			}
 		}
 		if err := validateCodexStateRuleSettings(cfg, rule.Settings); err != nil {
+			return invalid(err.Error())
+		}
+		if err := validateCodexStateModelOverrides(cfg, rule); err != nil {
 			return invalid(err.Error())
 		}
 	}
