@@ -26,6 +26,8 @@ type CodexStateOverrideConfig struct {
 	Concurrency                     int                       `yaml:"concurrency" json:"concurrency"`
 	RetrySeconds                    int                       `yaml:"retry-seconds" json:"retry-seconds"`
 	MaxAttempts                     int                       `yaml:"max-attempts" json:"max-attempts"`
+	RetryRoundIntervalMinutes       int                       `yaml:"retry-round-interval-minutes" json:"retry-round-interval-minutes"`
+	MaxRetryRounds                  int                       `yaml:"max-retry-rounds" json:"max-retry-rounds"`
 	ProxyMode                       string                    `yaml:"proxy-mode" json:"proxy-mode"`
 	ProxyURL                        string                    `yaml:"proxy-url" json:"proxy-url"`
 	Lengths                         []int                     `yaml:"lengths" json:"lengths"`
@@ -170,6 +172,9 @@ func (c CodexStateOverrideConfig) Resolved() CodexStateOverrideConfig {
 	if c.RetrySeconds == 0 {
 		c.RetrySeconds = 60
 	}
+	if c.RetryRoundIntervalMinutes == 0 {
+		c.RetryRoundIntervalMinutes = 30
+	}
 	if c.MaxAttempts == 0 {
 		c.MaxAttempts = 3
 	}
@@ -252,6 +257,9 @@ func (cfg *Config) ValidateCodexStateOverride() error {
 	}
 	if !slices.Contains([]string{"override", "missing"}, c.Mode) || !slices.Contains([]string{"continue", "error", "hide"}, c.MissingPolicy) || !slices.Contains([]string{"active", "all", "manual"}, c.Acquisition) || !slices.Contains([]string{"inherit", "direct", "custom"}, c.ProxyMode) {
 		return invalid("invalid mode or policy")
+	}
+	if c.RetryRoundIntervalMinutes < 1 || c.RetryRoundIntervalMinutes > 1440 || c.MaxRetryRounds < 0 || c.MaxRetryRounds > 10 {
+		return invalid("retry round interval must be 1–1440 minutes and extra rounds 0–10")
 	}
 	if c.TTLMinutes < 1 || c.TTLMinutes > 1440 || c.RefreshBeforeMinutes < 1 || c.RefreshBeforeMinutes >= c.TTLMinutes || c.ActiveMinutes < 1 || c.ActiveMinutes > 10080 || c.Concurrency < 1 || c.Concurrency > 16 || c.RetrySeconds < 1 || c.RetrySeconds > 3600 || c.MaxAttempts < 1 || c.MaxAttempts > 10 {
 		return invalid("invalid lifetime, refresh, activity or acquisition limits")

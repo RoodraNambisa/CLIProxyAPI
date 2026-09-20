@@ -43,37 +43,41 @@ type Result struct {
 }
 type Probe func(context.Context, Credential, config.CodexStateOverrideConfig) (Result, error)
 type Snapshot struct {
-	RuleID              string    `json:"rule_id,omitempty"`
-	RuleName            string    `json:"rule_name,omitempty"`
-	AllowedLengths      []int     `json:"allowed_lengths"`
-	RetrySeconds        int       `json:"retry_seconds"`
-	MaxAttempts         int       `json:"max_attempts"`
-	Model               string    `json:"model"`
-	Status              string    `json:"status"`
-	Length              int       `json:"length"`
-	Digest              string    `json:"digest,omitempty"`
-	ExpiresAt           time.Time `json:"expires_at,omitzero"`
-	NextAttempt         time.Time `json:"next_attempt,omitzero"`
-	LastUsed            time.Time `json:"last_used,omitzero"`
-	Attempts            uint64    `json:"attempts"`
-	Acquired            uint64    `json:"acquired"`
-	Uses                uint64    `json:"uses"`
-	CurrentUses         uint64    `json:"current_uses"`
-	Completed           uint64    `json:"completed"`
-	Misses              uint64    `json:"misses"`
-	Tokens              int64     `json:"acquisition_tokens"`
-	LastError           string    `json:"last_error,omitempty"`
-	LastStatus          int       `json:"last_status,omitempty"`
-	LastReturnedLength  *int      `json:"last_returned_length,omitempty"`
-	LastReturnedModel   string    `json:"last_returned_model,omitempty"`
-	ConsecutiveFailures int       `json:"consecutive_failures"`
-	Exhausted           bool      `json:"exhausted"`
-	Invalidations       uint64    `json:"invalidations"`
-	LastInvalidation    string    `json:"last_invalidation,omitempty"`
-	InvalidationLength  *int      `json:"invalidation_length,omitempty"`
-	InvalidationModel   string    `json:"invalidation_model,omitempty"`
-	RoutingHidden       bool      `json:"routing_hidden,omitempty"`
-	ManualOnly          bool      `json:"manual_only,omitempty"`
+	RuleID                    string    `json:"rule_id,omitempty"`
+	RuleName                  string    `json:"rule_name,omitempty"`
+	AllowedLengths            []int     `json:"allowed_lengths"`
+	RetrySeconds              int       `json:"retry_seconds"`
+	MaxAttempts               int       `json:"max_attempts"`
+	RetryRoundIntervalMinutes int       `json:"retry_round_interval_minutes"`
+	MaxRetryRounds            int       `json:"max_retry_rounds"`
+	RetryRoundsUsed           int       `json:"retry_rounds_used"`
+	RoundWaiting              bool      `json:"round_waiting"`
+	Model                     string    `json:"model"`
+	Status                    string    `json:"status"`
+	Length                    int       `json:"length"`
+	Digest                    string    `json:"digest,omitempty"`
+	ExpiresAt                 time.Time `json:"expires_at,omitzero"`
+	NextAttempt               time.Time `json:"next_attempt,omitzero"`
+	LastUsed                  time.Time `json:"last_used,omitzero"`
+	Attempts                  uint64    `json:"attempts"`
+	Acquired                  uint64    `json:"acquired"`
+	Uses                      uint64    `json:"uses"`
+	CurrentUses               uint64    `json:"current_uses"`
+	Completed                 uint64    `json:"completed"`
+	Misses                    uint64    `json:"misses"`
+	Tokens                    int64     `json:"acquisition_tokens"`
+	LastError                 string    `json:"last_error,omitempty"`
+	LastStatus                int       `json:"last_status,omitempty"`
+	LastReturnedLength        *int      `json:"last_returned_length,omitempty"`
+	LastReturnedModel         string    `json:"last_returned_model,omitempty"`
+	ConsecutiveFailures       int       `json:"consecutive_failures"`
+	Exhausted                 bool      `json:"exhausted"`
+	Invalidations             uint64    `json:"invalidations"`
+	LastInvalidation          string    `json:"last_invalidation,omitempty"`
+	InvalidationLength        *int      `json:"invalidation_length,omitempty"`
+	InvalidationModel         string    `json:"invalidation_model,omitempty"`
+	RoutingHidden             bool      `json:"routing_hidden,omitempty"`
+	ManualOnly                bool      `json:"manual_only,omitempty"`
 }
 type entry struct {
 	credential  Credential
@@ -167,28 +171,24 @@ func (m *Manager) Sync(cfg config.CodexStateOverrideConfig, credentials []Creden
 			if old.credential.Plan != c.Plan || !sameStateValidation(old.policy, policy) {
 				next.state, next.Digest = "", ""
 				next.Length, next.CurrentUses, next.valueVersion = 0, 0, 0
-				next.ExpiresAt, next.NextAttempt = time.Time{}, time.Time{}
-				next.failures, next.ConsecutiveFailures = 0, 0
-				next.Exhausted, next.LastError = false, ""
-				next.lastFailure = time.Time{}
+				next.ExpiresAt = time.Time{}
+				next.resetRetryCycle()
+				next.LastError = ""
 			} else {
-				next.Exhausted = next.failures >= policy.MaxAttempts
-				if next.Exhausted {
-					next.NextAttempt = time.Time{}
-				} else if !next.lastFailure.IsZero() {
-					next.NextAttempt = next.lastFailure.Add(time.Duration(policy.RetrySeconds) * time.Second)
-				}
+				next.scheduleRetry()
 			}
 			old = &next
 			m.entries[k] = old
 		}
 		old.credential = c
-		if registered[k] {
+		if registered[k] && old.ManualOnly {
 			old.ManualOnly = false
+			old.scheduleRetry()
 		}
 		old.RuleID, old.RuleName = match.RuleID, match.RuleName
 		old.AllowedLengths = slices.Clone(policy.Lengths)
 		old.RetrySeconds, old.MaxAttempts = policy.RetrySeconds, policy.MaxAttempts
+		old.RetryRoundIntervalMinutes, old.MaxRetryRounds = policy.RetryRoundIntervalMinutes, policy.MaxRetryRounds
 	}
 	for k, e := range m.entries {
 		if !wanted[k] {
@@ -245,7 +245,7 @@ func (m *Manager) QueueManual(c Credential) (bool, uint64) {
 		if count >= 256 {
 			return false, 0
 		}
-		e = &entry{credential: c, policy: policy, Snapshot: Snapshot{Model: c.Model, ManualOnly: true, RuleID: match.RuleID, RuleName: match.RuleName, AllowedLengths: slices.Clone(policy.Lengths), RetrySeconds: policy.RetrySeconds, MaxAttempts: policy.MaxAttempts}}
+		e = &entry{credential: c, policy: policy, Snapshot: Snapshot{Model: c.Model, ManualOnly: true, RuleID: match.RuleID, RuleName: match.RuleName, AllowedLengths: slices.Clone(policy.Lengths), RetrySeconds: policy.RetrySeconds, MaxAttempts: policy.MaxAttempts, RetryRoundIntervalMinutes: policy.RetryRoundIntervalMinutes, MaxRetryRounds: policy.MaxRetryRounds}}
 		m.entries[key(c)] = e
 	}
 	if e.credential.Instance != c.Instance || e.credential.Plan != c.Plan || !reflect.DeepEqual(e.policy, policy) {
@@ -255,10 +255,7 @@ func (m *Manager) QueueManual(c Credential) (bool, uint64) {
 	e.credential = c
 	if !e.busy {
 		e.manual, e.paused = true, false
-		e.NextAttempt = time.Time{}
-		e.lastFailure = time.Time{}
-		e.failures, e.ConsecutiveFailures = 0, 0
-		e.Exhausted = false
+		e.resetRetryCycle()
 	}
 	return true, e.Acquired
 }
@@ -367,7 +364,7 @@ func (m *Manager) observeResponse(c Credential, version uint64, value, returnedM
 	e.InvalidationLength = new(returnedLength)
 	e.InvalidationModel, _ = managementdiag.ProcessText(returnedModel, "safe", 256)
 	// Keep failure limits and retry interval. An already-running renewal supplies the replacement.
-	if !e.busy && !e.Exhausted && !e.ManualOnly {
+	if !e.busy && !e.Exhausted && !e.ManualOnly && !e.RoundWaiting {
 		e.manual = true
 	}
 	m.publishAvailabilityLocked()
@@ -409,6 +406,8 @@ func (m *Manager) Snapshots(id string, now time.Time) []Snapshot {
 			s.Status = "queued"
 		case e.state != "" && now.Before(e.ExpiresAt):
 			s.Status = "valid"
+		case e.RoundWaiting:
+			s.Status = "retry_wait"
 		case e.Exhausted:
 			s.Status = "exhausted"
 		case !e.ExpiresAt.IsZero():
@@ -451,11 +450,7 @@ func (m *Manager) ActionWithBaseline(id, model, action string) (bool, uint64) {
 			}
 			e.manual = true
 			e.paused = false
-			e.NextAttempt = time.Time{}
-			e.lastFailure = time.Time{}
-			e.failures = 0
-			e.Exhausted = false
-			e.ConsecutiveFailures = 0
+			e.resetRetryCycle()
 		case "pause":
 			e.paused = true
 			e.manual = false
@@ -525,8 +520,16 @@ func (m *Manager) tick(ctx context.Context, now time.Time, probe Probe, capacity
 		if !e.ManualOnly && e.policy.MissingPolicy == "hide" && e.policy.Acquisition == "active" && (e.state == "" || !now.Before(e.ExpiresAt)) {
 			active = true
 		}
-		if !e.manual && (!active || (e.state != "" && now.Before(e.ExpiresAt.Add(-time.Duration(e.policy.RefreshBeforeMinutes)*time.Minute)))) {
+		recoveringRound := e.automaticRounds() && (e.RoundWaiting || e.RetryRoundsUsed > 0)
+		active = active || recoveringRound
+		if !e.manual && (!active || (!recoveringRound && e.state != "" && now.Before(e.ExpiresAt.Add(-time.Duration(e.policy.RefreshBeforeMinutes)*time.Minute)))) {
 			continue
+		}
+		if e.RoundWaiting {
+			e.RetryRoundsUsed++
+			e.RoundWaiting = false
+			e.failures, e.ConsecutiveFailures = 0, 0
+			e.lastFailure, e.NextAttempt = time.Time{}, time.Time{}
 		}
 		taskCtx, cancel := context.WithCancel(ctx)
 		e.cancel = cancel
@@ -594,14 +597,8 @@ func (m *Manager) finish(k string, expected *entry, version uint64, canceled err
 		e.lastFailure = now
 		e.failures++
 		e.ConsecutiveFailures = e.failures
-		delay := time.Duration(e.policy.RetrySeconds) * time.Second
-		if e.failures >= e.policy.MaxAttempts {
-			e.Exhausted = true
-			e.NextAttempt = time.Time{}
-		} else {
-			e.NextAttempt = now.Add(delay)
-		}
-		log.WithFields(log.Fields{"auth_id": e.credential.ID, "model": e.Model, "reason": reason, "consecutive_failures": e.ConsecutiveFailures, "paused_after_failure_limit": e.Exhausted}).Warn("Codex managed state acquisition rejected")
+		e.scheduleRetry()
+		log.WithFields(log.Fields{"auth_id": e.credential.ID, "model": e.Model, "reason": reason, "consecutive_failures": e.ConsecutiveFailures, "paused_after_failure_limit": e.Exhausted, "retry_rounds_used": e.RetryRoundsUsed, "round_waiting": e.RoundWaiting}).Warn("Codex managed state acquisition rejected")
 		return
 	}
 	e.state = result.State
@@ -613,12 +610,8 @@ func (m *Manager) finish(k string, expected *entry, version uint64, canceled err
 	e.ExpiresAt = now.Add(time.Duration(e.policy.TTLMinutes) * time.Minute)
 	e.Acquired++
 	e.CurrentUses = 0
-	e.lastFailure = time.Time{}
-	e.failures = 0
-	e.ConsecutiveFailures = 0
-	e.Exhausted = false
+	e.resetRetryCycle()
 	e.LastError = ""
-	e.NextAttempt = time.Time{}
 }
 
 // ExpandProxy generates one fixed substitution per placeholder width in a task.

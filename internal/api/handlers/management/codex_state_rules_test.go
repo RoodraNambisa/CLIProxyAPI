@@ -93,7 +93,7 @@ func TestStateModelOverridePreviewMatchesAcquisition(t *testing.T) {
 	registry.GetGlobalRegistry().RegisterClient(a.ID, "codex", []*registry.ModelInfo{{ID: "alias", UpstreamID: "sol"}})
 	defer registry.GetGlobalRegistry().UnregisterClient(a.ID)
 	var cfg config.CodexStateOverrideConfig
-	if err := json.Unmarshal([]byte(`{"enabled":true,"rules":[{"id":"main","priorities":[3],"models":["sol"],"settings":{"acquisition":"manual"},"model-overrides":[{"id":"sol","models":["sol"],"settings":{"match-model":false,"invalidate-on-model-mismatch":false}}]}]}`), &cfg); err != nil {
+	if err := json.Unmarshal([]byte(`{"enabled":true,"max-retry-rounds":2,"rules":[{"id":"main","priorities":[3],"models":["sol"],"settings":{"acquisition":"manual","retry-round-interval-minutes":60},"model-overrides":[{"id":"sol","models":["sol"],"settings":{"match-model":false,"invalidate-on-model-mismatch":false,"max-retry-rounds":0}}]}]}`), &cfg); err != nil {
 		t.Fatal(err)
 	}
 	h := &Handler{cfg: &config.Config{Codex: config.CodexConfig{StateOverride: cfg}}, authManager: m}
@@ -105,13 +105,16 @@ func TestStateModelOverridePreviewMatchesAcquisition(t *testing.T) {
 	if w.Code != 200 || gjson.Get(w.Body.String(), "match.model_override_id").String() != "sol" || gjson.Get(w.Body.String(), "policy.match-model").Bool() || gjson.Get(w.Body.String(), "match.sources.match-model").String() != "model-override" {
 		t.Fatalf("preview lost nested policy: %s", w.Body.String())
 	}
+	if gjson.Get(w.Body.String(), "policy.max-retry-rounds").Int() != 0 || gjson.Get(w.Body.String(), "policy.retry-round-interval-minutes").Int() != 60 || gjson.Get(w.Body.String(), "match.sources.max-retry-rounds").String() != "model-override" {
+		t.Fatal("preview lost retry round inheritance")
+	}
 	codexstate.Diagnostic.Sync(cfg, nil, helps.StateCredential(a, ""))
 	defer codexstate.Diagnostic.Sync(config.CodexStateOverrideConfig{}, nil)
 	credential := helps.StateCredential(a, "sol")
 	credential.Route = "alias"
 	codexstate.Diagnostic.QueueManual(credential)
 	codexstate.Diagnostic.Tick(t.Context(), time.Now(), func(_ context.Context, _ codexstate.Credential, p config.CodexStateOverrideConfig) (codexstate.Result, error) {
-		if *p.MatchModel || p.InvalidateOnModelMismatch {
+		if *p.MatchModel || p.InvalidateOnModelMismatch || p.MaxRetryRounds != 0 || p.RetryRoundIntervalMinutes != 60 {
 			t.Error("manual acquisition ignored model override")
 		}
 		return codexstate.Result{Completed: true, Model: "other", State: strings.Repeat("s", 292)}, nil
@@ -124,7 +127,7 @@ func TestStateModelOverridePreviewMatchesAcquisition(t *testing.T) {
 	c, _ = gin.CreateTestContext(w)
 	c.Request = httptest.NewRequest("GET", "/auth-files/codex/state/options", nil)
 	h.GetCodexStateOptions(c)
-	if !gjson.Get(w.Body.String(), "features.rule_model_overrides").Bool() {
+	if !gjson.Get(w.Body.String(), "features.rule_model_overrides").Bool() || !gjson.Get(w.Body.String(), "features.state_retry_rounds").Bool() {
 		t.Fatal("capability missing")
 	}
 }

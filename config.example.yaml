@@ -1007,7 +1007,11 @@ xai:
 #     refresh-before-minutes: 5
 #     concurrency: 1
 #     retry-seconds: 60 # Fixed wait after each failed acquisition; does not increase.
-#     max-attempts: 3                # Stop automatic acquisition until manual retry.
+#     max-attempts: 3                # Consecutive failure limit per round.
+#     retry-round-interval-minutes: 30 # Wait after a round fails; measured from its last failure.
+#     max-retry-rounds: 0            # Extra automatic rounds after the first; 0 preserves stop-on-exhaustion.
+#                                   # 2 means up to 3 rounds total. Success/manual acquire resets the budget.
+#                                   # One-shot diagnostics and acquisition: manual never restart automatically.
 #     # Optional ordered rules. Omit for the legacy scope; [] manages no pairs.
 #     # Same-field values are OR; different selectors are AND. First match wins.
 #     # Unspecified settings inherit the shared defaults above. A rule does not

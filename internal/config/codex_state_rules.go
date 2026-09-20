@@ -40,6 +40,8 @@ type CodexStateRuleSettings struct {
 	RefreshBeforeMinutes            *int    `yaml:"refresh-before-minutes,omitempty" json:"refresh-before-minutes,omitempty"`
 	RetrySeconds                    *int    `yaml:"retry-seconds,omitempty" json:"retry-seconds,omitempty"`
 	MaxAttempts                     *int    `yaml:"max-attempts,omitempty" json:"max-attempts,omitempty"`
+	RetryRoundIntervalMinutes       *int    `yaml:"retry-round-interval-minutes,omitempty" json:"retry-round-interval-minutes,omitempty"`
+	MaxRetryRounds                  *int    `yaml:"max-retry-rounds,omitempty" json:"max-retry-rounds,omitempty"`
 	ProxyMode                       *string `yaml:"proxy-mode,omitempty" json:"proxy-mode,omitempty"`
 	ProxyURL                        *string `yaml:"proxy-url,omitempty" json:"proxy-url,omitempty"`
 	Lengths                         *[]int  `yaml:"lengths,omitempty" json:"lengths,omitempty"`
@@ -216,6 +218,14 @@ func applyCodexStateRuleSettings(policy *CodexStateOverrideConfig, settings Code
 		policy.MaxAttempts = *settings.MaxAttempts
 	}
 	mark("max-attempts", settings.MaxAttempts != nil)
+	if settings.RetryRoundIntervalMinutes != nil {
+		policy.RetryRoundIntervalMinutes = *settings.RetryRoundIntervalMinutes
+	}
+	mark("retry-round-interval-minutes", settings.RetryRoundIntervalMinutes != nil)
+	if settings.MaxRetryRounds != nil {
+		policy.MaxRetryRounds = *settings.MaxRetryRounds
+	}
+	mark("max-retry-rounds", settings.MaxRetryRounds != nil)
 	if settings.ProxyMode != nil {
 		policy.ProxyMode = *settings.ProxyMode
 	}
@@ -295,6 +305,14 @@ func cloneCodexStateRules(rules *[]CodexStateRule) *[]CodexStateRule {
 }
 
 func cloneCodexStateRuleSettings(settings *CodexStateRuleSettings) {
+	if settings.RetryRoundIntervalMinutes != nil {
+		value := *settings.RetryRoundIntervalMinutes
+		settings.RetryRoundIntervalMinutes = &value
+	}
+	if settings.MaxRetryRounds != nil {
+		value := *settings.MaxRetryRounds
+		settings.MaxRetryRounds = &value
+	}
 	if settings.Lengths != nil {
 		values := slices.Clone(*settings.Lengths)
 		settings.Lengths = &values
@@ -426,7 +444,7 @@ func dereferenceStateLengths(values *[]int) []int {
 }
 
 func validateCodexStateRuleSettings(cfg *Config, settings CodexStateRuleSettings) error {
-	for _, value := range []*int{settings.ActiveMinutes, settings.TTLMinutes, settings.RefreshBeforeMinutes, settings.RetrySeconds, settings.MaxAttempts} {
+	for _, value := range []*int{settings.ActiveMinutes, settings.TTLMinutes, settings.RefreshBeforeMinutes, settings.RetrySeconds, settings.MaxAttempts, settings.RetryRoundIntervalMinutes} {
 		if value != nil && *value <= 0 {
 			return fmt.Errorf("rule intervals and limits must be positive")
 		}

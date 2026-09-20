@@ -65,7 +65,7 @@ func (h *Handler) PreviewCodexState(c *gin.Context) {
 	c.JSON(200, gin.H{"managed": managed, "registered": registered, "upstream_model": upstream, "match": match, "policy": gin.H{
 		"lengths": policy.Lengths, "match-model": policy.MatchModel, "acquisition": policy.Acquisition,
 		"mode": policy.Mode, "missing-policy": policy.MissingPolicy, "retry-seconds": policy.RetrySeconds,
-		"max-attempts": policy.MaxAttempts, "ttl-minutes": policy.TTLMinutes, "refresh-before-minutes": policy.RefreshBeforeMinutes,
+		"max-attempts": policy.MaxAttempts, "retry-round-interval-minutes": policy.RetryRoundIntervalMinutes, "max-retry-rounds": policy.MaxRetryRounds, "ttl-minutes": policy.TTLMinutes, "refresh-before-minutes": policy.RefreshBeforeMinutes,
 		"proxy-mode": policy.ProxyMode, "invalidate-on-state-length-mismatch": policy.InvalidateOnStateLengthMismatch, "invalidate-on-model-mismatch": policy.InvalidateOnModelMismatch,
 	}})
 }
