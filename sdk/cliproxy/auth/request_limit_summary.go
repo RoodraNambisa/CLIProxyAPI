@@ -25,12 +25,15 @@ func (m *Manager) AuthRequestLimitSummary(auth *Auth) RequestLimitSummary {
 	if limitOverride || windowOverride {
 		result.Source = "priority"
 	}
-	for index, rule := range s.prioritySubscriptionRules[result.Priority] {
-		if routingSubscriptionOverrideMatches(rule, auth, routingAuthPlanType(auth)) {
+	for layer, index := range routingSubscriptionMatchIndexes(s.prioritySubscriptionRules[result.Priority], auth) {
+		if index >= 0 {
 			result.Source, result.Rule = "subscription", index+1
-			break
+			if layer == 1 {
+				result.Source = "credential"
+			}
 		}
 	}
+
 	if result.Limit == 0 && s.strategyForPriorityLocked(result.Priority) == schedulerStrategyFillFirst {
 		if rpm := s.fillFirstPerAuthRPMForPriorityLocked(result.Priority); rpm > 0 {
 			result.Limit, result.WindowMinutes, result.Source, result.Rule = rpm, 1, "fill_first", 0

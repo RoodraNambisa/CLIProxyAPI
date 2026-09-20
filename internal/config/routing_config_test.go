@@ -235,7 +235,7 @@ func TestNormalizeRoutingPriorityOverrides_RejectsInvalidSubscriptionRules(t *te
 		{
 			name: "missing plan",
 			rule: RoutingSubscriptionOverride{PerAuthRequestLimit: &limit},
-			want: "at least one provider or plan type",
+			want: "at least one provider, plan type or credential",
 		},
 		{
 			name: "missing fields",

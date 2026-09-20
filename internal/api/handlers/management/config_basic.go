@@ -755,7 +755,7 @@ func (h *Handler) GetRoutingPriorityOverrides(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
 		return
 	}
-	c.JSON(200, gin.H{"priority-overrides": cfg.Routing.PriorityOverrides})
+	c.JSON(200, gin.H{"priority-overrides": cfg.Routing.PriorityOverrides, "features": gin.H{"credential_request_limits": true}})
 }
 
 func (h *Handler) PutRoutingPriorityOverrides(c *gin.Context) {

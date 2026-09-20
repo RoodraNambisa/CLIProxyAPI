@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"math"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -67,7 +68,13 @@ func routingAuthPlanType(auth *Auth) string {
 }
 
 func routingSubscriptionOverrideMatches(override internalconfig.RoutingSubscriptionOverride, auth *Auth, planType string) bool {
-	if auth == nil || len(override.PlanTypes) == 0 && len(override.Providers) == 0 {
+	if auth == nil || len(override.PlanTypes) == 0 && len(override.Providers) == 0 && len(override.Credentials) == 0 {
+		return false
+	}
+	if len(override.Credentials) > 0 && !slices.ContainsFunc(override.Credentials, func(value string) bool {
+		value = strings.TrimSpace(value)
+		return value != "" && (value == auth.ID || value == auth.Index || value == auth.FileName)
+	}) {
 		return false
 	}
 	planMatched := len(override.PlanTypes) == 0
@@ -92,22 +99,41 @@ func routingSubscriptionOverrideMatches(override internalconfig.RoutingSubscript
 	return false
 }
 
-func applyRoutingSubscriptionRequestLimitPolicy(policy authRequestLimitPolicy, auth *Auth, overrides []internalconfig.RoutingSubscriptionOverride) authRequestLimitPolicy {
-	if len(overrides) == 0 {
-		return normalizeAuthRequestLimitPolicy(policy)
+// Select one rule per layer. Specific credentials override generic provider/plan
+// limits regardless of list order; omitted fields keep the inherited value.
+func routingSubscriptionMatchIndexes(overrides []internalconfig.RoutingSubscriptionOverride, auth *Auth) [2]int {
+	indexes := [2]int{-1, -1}
+	if len(overrides) == 0 || auth == nil {
+		return indexes
 	}
 	planType := routingAuthPlanType(auth)
-	for _, override := range overrides {
-		if !routingSubscriptionOverrideMatches(override, auth, planType) {
+	for index, rule := range overrides {
+		layer := 0
+		if len(rule.Credentials) > 0 {
+			layer = 1
+		}
+		if indexes[layer] < 0 && routingSubscriptionOverrideMatches(rule, auth, planType) {
+			indexes[layer] = index
+		}
+		if indexes[0] >= 0 && indexes[1] >= 0 {
+			break
+		}
+	}
+	return indexes
+}
+
+func applyRoutingSubscriptionRequestLimitPolicy(policy authRequestLimitPolicy, auth *Auth, overrides []internalconfig.RoutingSubscriptionOverride) authRequestLimitPolicy {
+	for _, index := range routingSubscriptionMatchIndexes(overrides, auth) {
+		if index < 0 {
 			continue
 		}
+		override := overrides[index]
 		if override.PerAuthRequestLimit != nil {
 			policy.limit = internalconfig.NormalizePerAuthRequestLimit(*override.PerAuthRequestLimit)
 		}
 		if override.PerAuthRequestWindowMinutes != nil {
 			policy.windowMinutes = internalconfig.NormalizePerAuthRequestWindowMinutes(*override.PerAuthRequestWindowMinutes)
 		}
-		break
 	}
 	return normalizeAuthRequestLimitPolicy(policy)
 }

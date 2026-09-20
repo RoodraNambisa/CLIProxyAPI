@@ -1732,15 +1732,17 @@ type RequestBodyAuditErrorConfig struct {
 	Code       string `yaml:"code,omitempty" json:"code,omitempty"`
 }
 
-// RoutingSubscriptionOverride overrides generic request limits for subscriptions
-// within one credential priority.
+// RoutingSubscriptionOverride overrides request limits by provider, plan or credential
+// within one credential priority. Credential rules override provider/plan rules.
 type RoutingSubscriptionOverride struct {
 	// Providers optionally limits this rule to exact runtime provider IDs.
 	// An empty list matches every provider.
 	Providers []string `yaml:"providers,omitempty" json:"providers,omitempty"`
 	// PlanTypes matches normalized credential plan_type values. Empty matches all plans,
-	// including credentials without plan metadata, when Providers is specified.
+	// including credentials without plan metadata, when Providers or Credentials is specified.
 	PlanTypes []string `yaml:"plan-types" json:"plan-types"`
+	// Credentials matches exact auth IDs, stable short IDs or filenames. Empty matches all.
+	Credentials []string `yaml:"credentials,omitempty" json:"credentials,omitempty"`
 	// PerAuthRequestLimit optionally overrides the inherited per-auth request limit.
 	// A non-nil zero value disables the generic request limit for matching credentials.
 	PerAuthRequestLimit *int `yaml:"per-auth-request-limit,omitempty" json:"per-auth-request-limit,omitempty"`
@@ -3568,7 +3570,7 @@ func normalizeRoutingPlanTypes(values []string) []string {
 	return out
 }
 
-func routingProviderScopesOverlap(left, right []string) bool {
+func routingStringScopesOverlap(left, right []string) bool {
 	if len(left) == 0 || len(right) == 0 {
 		return true
 	}
@@ -3592,8 +3594,12 @@ func normalizeRoutingSubscriptionOverrides(priorityIndex, priority int, override
 	for index, override := range overrides {
 		providers := normalizeStringListLower(override.Providers)
 		planTypes := normalizeRoutingPlanTypes(override.PlanTypes)
-		if len(planTypes) == 0 && len(providers) == 0 {
-			return nil, fmt.Errorf("routing.priority-overrides[%d] (priority %d).subscription-overrides[%d].plan-types: at least one provider or plan type is required", priorityIndex, priority, index)
+		credentials, err := normalizeRoutingCredentials(override.Credentials)
+		if err != nil {
+			return nil, fmt.Errorf("routing.priority-overrides[%d].subscription-overrides[%d].credentials: %w", priorityIndex, index, err)
+		}
+		if len(planTypes) == 0 && len(providers) == 0 && len(credentials) == 0 {
+			return nil, fmt.Errorf("routing.priority-overrides[%d] (priority %d).subscription-overrides[%d].plan-types: at least one provider, plan type or credential is required", priorityIndex, priority, index)
 		}
 		if override.PerAuthRequestLimit == nil && override.PerAuthRequestWindowMinutes == nil {
 			return nil, fmt.Errorf("routing.priority-overrides[%d] (priority %d).subscription-overrides[%d]: at least one request limit field is required", priorityIndex, priority, index)
@@ -3611,7 +3617,11 @@ func normalizeRoutingSubscriptionOverrides(priorityIndex, priority int, override
 		}
 
 		for previousIndex, previous := range out {
-			if !routingProviderScopesOverlap(previous.Providers, providers) {
+			// Generic and credential-specific rules are distinct inheritance layers.
+			if (len(previous.Credentials) == 0) != (len(credentials) == 0) || !routingStringScopesOverlap(previous.Credentials, credentials) {
+				continue
+			}
+			if !routingStringScopesOverlap(previous.Providers, providers) {
 				continue
 			}
 			if len(previous.PlanTypes) == 0 || len(planTypes) == 0 {
@@ -3631,6 +3641,7 @@ func normalizeRoutingSubscriptionOverrides(priorityIndex, priority int, override
 		out = append(out, RoutingSubscriptionOverride{
 			Providers:                   providers,
 			PlanTypes:                   planTypes,
+			Credentials:                 credentials,
 			PerAuthRequestLimit:         perAuthRequestLimit,
 			PerAuthRequestWindowMinutes: perAuthRequestWindowMinutes,
 		})

@@ -918,6 +918,7 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.PUT("/routing/per-auth-request-window-minutes", s.mgmt.PutRoutingPerAuthRequestWindowMinutes)
 		mgmt.PATCH("/routing/per-auth-request-window-minutes", s.mgmt.PutRoutingPerAuthRequestWindowMinutes)
 		mgmt.GET("/routing/priority-overrides", s.mgmt.GetRoutingPriorityOverrides)
+		mgmt.GET("/routing/credential-options", s.mgmt.GetRoutingCredentialOptions)
 		mgmt.PUT("/routing/priority-overrides", s.mgmt.PutRoutingPriorityOverrides)
 		mgmt.PATCH("/routing/priority-overrides", s.mgmt.PutRoutingPriorityOverrides)
 

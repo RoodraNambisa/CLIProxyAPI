@@ -339,6 +339,7 @@ func cloneRoutingSubscriptionOverrides(overrides []internalconfig.RoutingSubscri
 		cloned := override
 		cloned.Providers = append([]string(nil), override.Providers...)
 		cloned.PlanTypes = append([]string(nil), override.PlanTypes...)
+		cloned.Credentials = append([]string(nil), override.Credentials...)
 		if override.PerAuthRequestLimit != nil {
 			value := *override.PerAuthRequestLimit
 			cloned.PerAuthRequestLimit = &value

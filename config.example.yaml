@@ -561,9 +561,12 @@ routing:
   #     # fill-first-per-auth-rpm: 60 # alternatively, sequentially move to next auth after 60 selections/minute
   #     per-auth-request-limit: 120
   #     per-auth-request-window-minutes: 5
-  #     # Optional provider/plan refinements. Empty providers match every provider.
-  #     # Each field independently inherits from this priority, then from global routing.
+  #     # Optional provider/plan/credential refinements. Different selector fields are AND.
+  #     # Credential-specific fields override matching provider/plan rules, then this priority and global.
+  #     # First match per layer wins; same-layer overlapping scopes are rejected.
   #     subscription-overrides:
+  #       - credentials: [c55aa61544196730] # Stable short ID, full auth ID or filename; exact case-sensitive match.
+  #         per-auth-request-limit: 20 # Other fields inherit matching provider/plan rules.
   #       - providers: [xai] # Omit plan-types to match every Grok credential, including unknown plans.
   #         per-auth-request-limit: 10
   #         per-auth-request-window-minutes: 1
