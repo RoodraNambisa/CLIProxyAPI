@@ -268,3 +268,40 @@ func TestReviewLegacyStateScopeKeepsExactRegisteredAlias(t *testing.T) {
 		t.Fatal("legacy alias scope lost its validated State", err)
 	}
 }
+
+func TestFixedCredentialCookieRespectsMissingPolicyOption(t *testing.T) {
+	a := &auth.Auth{ID: t.Name(), Provider: "codex"}
+	registry.GetGlobalRegistry().RegisterClient(a.ID, "codex", []*registry.ModelInfo{{ID: "model"}})
+	defer registry.GetGlobalRegistry().UnregisterClient(a.ID)
+	for _, policy := range []string{"error", "hide"} {
+		for _, respect := range []bool{false, true} {
+			cfg := &config.Config{Codex: config.CodexConfig{StateOverride: config.CodexStateOverrideConfig{Enabled: true, Strategy: "cookie-only", MissingPolicy: policy, Acquisition: "manual"}}}
+			codexstate.Default.Sync(cfg.Codex.StateOverride, []codexstate.Credential{StateCredential(a, "model")})
+			defer codexstate.Default.Sync(config.CodexStateOverrideConfig{}, nil)
+			carrier := &gin.Context{}
+			carrier.Set(sdkaccess.CredentialTargetAuthIDContextKey, a.ID)
+			if respect {
+				carrier.Set(sdkaccess.MetadataCredentialTargetRespectStatePolicy, "true")
+			}
+			ctx := core.WithCodexStateSnapshot(context.WithValue(t.Context(), "gin", carrier))
+			headers := http.Header{"Cookie": {"__oailb=custom"}, "X-Codex-Turn-State": {"custom"}}
+			err := ApplyManagedState(ctx, cfg, a, "model", headers)
+			if !respect && err != nil {
+				t.Fatalf("disabled option rejected Cookie-free test: %v", err)
+			}
+			if respect {
+				var status interface{ StatusCode() int }
+				expected := 429
+				if policy == "hide" {
+					expected = 503
+				}
+				if !errors.As(err, &status) || status.StatusCode() != expected {
+					t.Fatalf("missing policy bypassed: %v", err)
+				}
+			}
+			if headers.Get("Cookie") != "" || headers.Get("X-Codex-Turn-State") != "" {
+				t.Fatal("missing managed cookie fell back to custom headers")
+			}
+		}
+	}
+}

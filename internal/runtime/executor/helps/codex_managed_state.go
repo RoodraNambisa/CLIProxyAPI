@@ -379,6 +379,9 @@ func ApplyManagedState(ctx context.Context, cfg *config.Config, a *auth.Auth, mo
 		if requireManaged {
 			return errors.New("no valid managed Cookie is available for this credential")
 		}
+		if diagnostic != nil && diagnostic.mode == "auto" {
+			return nil
+		}
 		if choice.Policy == "error" || choice.Policy == "hide" {
 			body, _ := json.Marshal(map[string]any{"error": map[string]string{"type": resolved.ErrorType, "code": resolved.ErrorCode, "message": resolved.ErrorMessage}})
 			if choice.Policy == "hide" && targetRespectsState {
