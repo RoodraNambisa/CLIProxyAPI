@@ -54,7 +54,11 @@ type codexStateModelOption struct {
 
 // GetCodexStateOptions reads only local routing metadata and the registered catalog.
 // Discovery works before enabling State and never starts acquisition or upstream traffic.
-func (h *Handler) GetCodexStateOptions(c *gin.Context) {
+func (h *Handler) GetCodexStateOptions(c *gin.Context) { h.getCodexStateOptions(c, false) }
+
+func (h *Handler) GetCodexResponseGuardOptions(c *gin.Context) { h.getCodexStateOptions(c, true) }
+
+func (h *Handler) getCodexStateOptions(c *gin.Context, guard bool) {
 	h.mu.Lock()
 	manager := h.authManager
 	h.mu.Unlock()
@@ -69,7 +73,7 @@ func (h *Handler) GetCodexStateOptions(c *gin.Context) {
 	seenModels := map[codexStateModelOption]bool{}
 	policy := &config.Config{Codex: config.CodexConfig{StateOverride: config.CodexStateOverrideConfig{Enabled: true}}}
 	for _, a := range manager.List() {
-		if a == nil || a.ExecutionProvider() != "codex" || a.RuntimeInstanceRetired() || a.Attributes["api_key"] != "" {
+		if a == nil || a.ExecutionProvider() != "codex" || a.RuntimeInstanceRetired() || !guard && a.Attributes["api_key"] != "" {
 			continue
 		}
 		id := strings.TrimSpace(a.Index)
@@ -102,7 +106,10 @@ func (h *Handler) GetCodexStateOptions(c *gin.Context) {
 				upstream = info.ID
 			}
 			upstream = thinking.ParseSuffix(upstream).ModelName
-			if !allowed[upstream] {
+			if !allowed[upstream] && !guard {
+				continue
+			}
+			if guard && len(info.SupportedOutputModalities) > 0 && !slices.ContainsFunc(info.SupportedOutputModalities, func(value string) bool { return strings.EqualFold(value, "text") }) {
 				continue
 			}
 			option := codexStateModelOption{ID: thinking.ParseSuffix(info.ID).ModelName, UpstreamID: upstream}
@@ -120,5 +127,5 @@ func (h *Handler) GetCodexStateOptions(c *gin.Context) {
 	})
 	slices.Sort(priorities)
 	slices.Sort(plans)
-	c.JSON(200, gin.H{"credentials": credentials, "models": models, "priorities": priorities, "plans": plans, "features": gin.H{"rule_model_overrides": true, "state_retry_rounds": true, "cookie_only": true, "state_seconds": true}})
+	c.JSON(200, gin.H{"credentials": credentials, "models": models, "priorities": priorities, "plans": plans, "features": gin.H{"rule_model_overrides": true, "state_retry_rounds": true, "cookie_only": true, "state_seconds": true, "response_guard": true}})
 }

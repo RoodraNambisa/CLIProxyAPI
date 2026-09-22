@@ -55,7 +55,7 @@ func (h *Handler) PreviewCodexState(c *gin.Context) {
 	}
 	upstream := helps.ResolveStateModel(a.ID, input.Model)
 	credential := helps.StateCredential(a, upstream)
-	policy, match, managed := cfg.Codex.StateOverride.PolicyFor(credential.Scope())
+	policy, match, managed := cfg.Codex.ManagedStateConfig().PolicyFor(credential.Scope())
 	if !helps.ManagedStateCredentialEligible(cfg, a) || !helps.StateTextModel(upstream) {
 		managed = false
 	}

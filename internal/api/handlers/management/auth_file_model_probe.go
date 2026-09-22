@@ -24,42 +24,44 @@ import (
 const modelProbeDefaultPrompt = "Reply with exactly OK."
 
 type modelProbeRequest struct {
-	CodexCookie     *modelProbeCookieInput `json:"codex_cookie,omitempty"`
-	Name            string                 `json:"name"`
-	Model           string                 `json:"model"`
-	Protocol        string                 `json:"protocol"`
-	Stream          bool                   `json:"stream"`
-	Upstream        string                 `json:"upstream"`
-	Prompt          string                 `json:"prompt,omitempty"`
-	MaxOutputTokens int                    `json:"max_output_tokens,omitempty"`
-	RequestBody     json.RawMessage        `json:"request_body,omitempty"`
-	CodexState      *modelProbeStateInput  `json:"codex_state,omitempty"`
+	CodexResponseGuard string                 `json:"codex_response_guard,omitempty"`
+	CodexCookie        *modelProbeCookieInput `json:"codex_cookie,omitempty"`
+	Name               string                 `json:"name"`
+	Model              string                 `json:"model"`
+	Protocol           string                 `json:"protocol"`
+	Stream             bool                   `json:"stream"`
+	Upstream           string                 `json:"upstream"`
+	Prompt             string                 `json:"prompt,omitempty"`
+	MaxOutputTokens    int                    `json:"max_output_tokens,omitempty"`
+	RequestBody        json.RawMessage        `json:"request_body,omitempty"`
+	CodexState         *modelProbeStateInput  `json:"codex_state,omitempty"`
 }
 
 type modelProbeResult struct {
-	CodexCookie         *modelProbeCookieResult `json:"codex_cookie,omitempty"`
-	Success             bool                    `json:"success"`
-	Name                string                  `json:"name"`
-	Provider            string                  `json:"provider,omitempty"`
-	Model               string                  `json:"model"`
-	UpstreamModel       string                  `json:"upstream_model,omitempty"`
-	ReturnedModel       string                  `json:"returned_model,omitempty"`
-	RequestPath         string                  `json:"request_path"`
-	UpstreamURL         string                  `json:"upstream_url,omitempty"`
-	Stream              bool                    `json:"stream"`
-	LatencyMS           int64                   `json:"latency_ms"`
-	StatusCode          int                     `json:"status_code,omitempty"`
-	RequestID           string                  `json:"request_id,omitempty"`
-	ResponseID          string                  `json:"response_id,omitempty"`
-	FinishReason        string                  `json:"finish_reason,omitempty"`
-	Response            string                  `json:"response,omitempty"`
-	Error               string                  `json:"error,omitempty"`
-	Usage               *modelProbeUsage        `json:"usage,omitempty"`
-	RequestBody         string                  `json:"request_body,omitempty"`
-	UpstreamRequestBody string                  `json:"upstream_request_body,omitempty"`
-	ResponseBody        string                  `json:"response_body,omitempty"`
-	DetailsTruncated    bool                    `json:"details_truncated,omitempty"`
-	CodexState          *modelProbeStateResult  `json:"codex_state,omitempty"`
+	CodexResponseGuard  *core.ResponseGuardRecord `json:"codex_response_guard,omitempty"`
+	CodexCookie         *modelProbeCookieResult   `json:"codex_cookie,omitempty"`
+	Success             bool                      `json:"success"`
+	Name                string                    `json:"name"`
+	Provider            string                    `json:"provider,omitempty"`
+	Model               string                    `json:"model"`
+	UpstreamModel       string                    `json:"upstream_model,omitempty"`
+	ReturnedModel       string                    `json:"returned_model,omitempty"`
+	RequestPath         string                    `json:"request_path"`
+	UpstreamURL         string                    `json:"upstream_url,omitempty"`
+	Stream              bool                      `json:"stream"`
+	LatencyMS           int64                     `json:"latency_ms"`
+	StatusCode          int                       `json:"status_code,omitempty"`
+	RequestID           string                    `json:"request_id,omitempty"`
+	ResponseID          string                    `json:"response_id,omitempty"`
+	FinishReason        string                    `json:"finish_reason,omitempty"`
+	Response            string                    `json:"response,omitempty"`
+	Error               string                    `json:"error,omitempty"`
+	Usage               *modelProbeUsage          `json:"usage,omitempty"`
+	RequestBody         string                    `json:"request_body,omitempty"`
+	UpstreamRequestBody string                    `json:"upstream_request_body,omitempty"`
+	ResponseBody        string                    `json:"response_body,omitempty"`
+	DetailsTruncated    bool                      `json:"details_truncated,omitempty"`
+	CodexState          *modelProbeStateResult    `json:"codex_state,omitempty"`
 }
 
 // ProbeAuthFileModel uses the credential's provider implementation with temporary
@@ -93,6 +95,10 @@ func (h *Handler) ProbeAuthFileModel(c *gin.Context) {
 		return
 	}
 	provider := auth.ExecutionProvider()
+	if input.CodexResponseGuard != "" && (provider != "codex" || (input.CodexResponseGuard != "off" && input.CodexResponseGuard != "observe" && input.CodexResponseGuard != "enforce")) {
+		c.JSON(400, gin.H{"error": "invalid Codex response guard mode"})
+		return
+	}
 	stateMode, stateValue, errState := validateModelProbeState(input.CodexState, provider)
 	if errState != nil {
 		c.JSON(400, gin.H{"error": errState.Error()})
@@ -183,7 +189,15 @@ func (h *Handler) ProbeAuthFileModel(c *gin.Context) {
 	started := time.Now()
 	ctx, cancel := context.WithCancel(c.Request.Context())
 	defer cancel()
+	if input.CodexResponseGuard != "" {
+		ctx = core.WithResponseGuardMode(ctx, input.CodexResponseGuard)
+	}
 	err = manager.ProbeCredential(ctx, auth, executor, core.Request{Model: input.Model, Payload: payload}, opts, func(execCtx context.Context, selected *coreauth.Auth, req core.Request, options core.Options) error {
+		defer func() {
+			if record, active := options.ResponseGuard.Snapshot(); active {
+				result.CodexResponseGuard = &record
+			}
+		}()
 		selected = selected.Clone()
 		if provider == "xai" && input.Upstream != "" && input.Upstream != "configured" {
 			if selected.Metadata == nil {

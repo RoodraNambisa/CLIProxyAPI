@@ -186,7 +186,7 @@ func (h *Handler) GetAPIKeyGroups(c *gin.Context) {
 		priorities = append(priorities, group.ExcludedPriorities...)
 	}
 	slices.Sort(priorities)
-	c.JSON(http.StatusOK, gin.H{"api-key-groups": groups, "available-priorities": slices.Compact(priorities), "names-supported": true, "credential-targeting-supported": true, "credential-target-options-supported": true})
+	c.JSON(http.StatusOK, gin.H{"api-key-groups": groups, "available-priorities": slices.Compact(priorities), "names-supported": true, "credential-targeting-supported": true, "credential-target-options-supported": true, "credential-response-guard-supported": true})
 }
 
 // PutAPIKeyGroups replaces all client API key access restrictions.
@@ -209,15 +209,16 @@ func (h *Handler) PutAPIKeyGroups(c *gin.Context) {
 // PatchAPIKeyGroups updates only the supplied access restriction fields.
 func (h *Handler) PatchAPIKeyGroups(c *gin.Context) {
 	var patch struct {
-		APIKey       string          `json:"api-key"`
-		Name         json.RawMessage `json:"name"`
-		Providers    json.RawMessage `json:"providers"`
-		Allowed      json.RawMessage `json:"allowed-priorities"`
-		Excluded     json.RawMessage `json:"excluded-priorities"`
-		Targeting    json.RawMessage `json:"allow-credential-targeting"`
-		RespectState json.RawMessage `json:"credential-target-respect-state-policy"`
-		RespectLimit json.RawMessage `json:"credential-target-respect-request-limit"`
-		RewriteModel json.RawMessage `json:"credential-target-response-model-rewrite"`
+		APIKey        string          `json:"api-key"`
+		Name          json.RawMessage `json:"name"`
+		Providers     json.RawMessage `json:"providers"`
+		Allowed       json.RawMessage `json:"allowed-priorities"`
+		Excluded      json.RawMessage `json:"excluded-priorities"`
+		Targeting     json.RawMessage `json:"allow-credential-targeting"`
+		RespectState  json.RawMessage `json:"credential-target-respect-state-policy"`
+		RespectLimit  json.RawMessage `json:"credential-target-respect-request-limit"`
+		ResponseGuard json.RawMessage `json:"credential-target-response-guard"`
+		RewriteModel  json.RawMessage `json:"credential-target-response-model-rewrite"`
 	}
 	if err := c.ShouldBindJSON(&patch); err != nil || strings.TrimSpace(patch.APIKey) == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
@@ -254,6 +255,7 @@ func (h *Handler) PatchAPIKeyGroups(c *gin.Context) {
 		{patch.RespectState, &group.CredentialTargetRespectStatePolicy},
 		{patch.RespectLimit, &group.CredentialTargetRespectRequestLimit},
 		{patch.RewriteModel, &group.CredentialTargetResponseModelRewrite},
+		{patch.ResponseGuard, &group.CredentialTargetResponseGuard},
 	} {
 		if string(field.raw) == "null" {
 			*field.target = false
@@ -268,6 +270,7 @@ func (h *Handler) PatchAPIKeyGroups(c *gin.Context) {
 		{patch.RespectState, &group.CredentialTargetRespectStatePolicy},
 		{patch.RespectLimit, &group.CredentialTargetRespectRequestLimit},
 		{patch.RewriteModel, &group.CredentialTargetResponseModelRewrite},
+		{patch.ResponseGuard, &group.CredentialTargetResponseGuard},
 	} {
 		if field.raw != nil {
 			if err := json.Unmarshal(field.raw, field.target); err != nil {
