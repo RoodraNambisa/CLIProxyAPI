@@ -698,6 +698,16 @@ func TestServiceAuthMaintenanceWorkerRetainsUncertainDeleteQuarantineWithoutRese
 	if calls := store.conditionalDeleteCalls.Load(); calls != 1 {
 		t.Fatalf("conditional delete calls = %d, want 1", calls)
 	}
+	// Entering the store call is not completion of the asynchronous worker.
+	// Wait for the runtime quarantine transition within the same test budget.
+	for time.Now().Before(deadline) {
+		_, primaryExists := service.coreManager.GetByID(dead.ID)
+		_, siblingExists := service.coreManager.GetByID(shadow.ID)
+		if !primaryExists && !siblingExists && authfileguard.IsQuarantined(candidate.Path) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 	if _, exists := service.coreManager.GetByID(dead.ID); exists {
 		t.Fatal("uncertain delete left the credential schedulable")
 	}
