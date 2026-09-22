@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
@@ -13,6 +14,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/codexstate"
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/managementdiag"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
@@ -104,6 +106,18 @@ func (s *Service) acquireCodexState(ctx context.Context, credential codexstate.C
 	s.cfgMu.RUnlock()
 	if err != nil {
 		return result, err
+	}
+	if policy.CookieOnly() {
+		if !helps.StateTextModel(credential.Model) {
+			result.FailureReason = "cookie_acquisition_requires_text_model"
+			return result, fmt.Errorf("Cookie acquisition requires a text model")
+		}
+		for _, info := range registry.GetGlobalRegistry().GetModelsForClient(a.ID) {
+			if info != nil && (info.ID == credential.Route || info.ID == credential.Model || info.UpstreamID == credential.Model) && len(info.SupportedOutputModalities) > 0 && !slices.ContainsFunc(info.SupportedOutputModalities, func(value string) bool { return strings.EqualFold(value, "text") }) {
+				result.FailureReason = "cookie_acquisition_requires_text_model"
+				return result, fmt.Errorf("Cookie acquisition requires a text model")
+			}
+		}
 	}
 	cfg.Codex.StateOverride.Enabled = false
 	// Probe traffic has separate usage attribution and cannot inherit payload overrides.

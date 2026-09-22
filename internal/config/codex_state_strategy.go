@@ -2,13 +2,18 @@ package config
 
 import (
 	"fmt"
+	"strings"
 	"time"
+	"unicode"
 )
 
 // CodexStateStrategySettings preserves explicit zero and false overrides.
 type CodexStateStrategySettings struct {
 	Strategy                   *string `yaml:"strategy,omitempty" json:"strategy,omitempty"`
 	CookieVerifyAfterAcquire   *bool   `yaml:"cookie-verify-after-acquire,omitempty" json:"cookie-verify-after-acquire,omitempty"`
+	CookiePoolMode             *string `yaml:"cookie-pool-mode,omitempty" json:"cookie-pool-mode,omitempty"`
+	CookiePoolGroup            *string `yaml:"cookie-pool-group,omitempty" json:"cookie-pool-group,omitempty"`
+	CookieAcquisitionModel     *string `yaml:"cookie-acquisition-model,omitempty" json:"cookie-acquisition-model,omitempty"`
 	CookieBackupCount          *int    `yaml:"cookie-backup-count,omitempty" json:"cookie-backup-count,omitempty"`
 	CookieMaxAgeSeconds        *int    `yaml:"cookie-max-age-seconds,omitempty" json:"cookie-max-age-seconds,omitempty"`
 	CookieRefreshBeforeSeconds *int    `yaml:"cookie-refresh-before-seconds,omitempty" json:"cookie-refresh-before-seconds,omitempty"`
@@ -28,6 +33,9 @@ func cloneStateValue[T any](p *T) *T {
 func (s CodexStateStrategySettings) clone() CodexStateStrategySettings {
 	s.Strategy = cloneStateValue(s.Strategy)
 	s.CookieVerifyAfterAcquire = cloneStateValue(s.CookieVerifyAfterAcquire)
+	s.CookiePoolMode = cloneStateValue(s.CookiePoolMode)
+	s.CookiePoolGroup = cloneStateValue(s.CookiePoolGroup)
+	s.CookieAcquisitionModel = cloneStateValue(s.CookieAcquisitionModel)
 	s.CookieBackupCount = cloneStateValue(s.CookieBackupCount)
 	s.CookieMaxAgeSeconds = cloneStateValue(s.CookieMaxAgeSeconds)
 	s.CookieRefreshBeforeSeconds = cloneStateValue(s.CookieRefreshBeforeSeconds)
@@ -40,6 +48,19 @@ func (s CodexStateStrategySettings) clone() CodexStateStrategySettings {
 func (s CodexStateStrategySettings) validateExplicit() error {
 	if s.Strategy != nil && *s.Strategy != "state" && *s.Strategy != "cookie-only" {
 		return fmt.Errorf("invalid strategy override")
+	}
+	if s.CookiePoolMode != nil && *s.CookiePoolMode != "auto" && *s.CookiePoolMode != "model" && *s.CookiePoolMode != "shared" && *s.CookiePoolMode != "credential" {
+		return fmt.Errorf("invalid Cookie pool mode")
+	}
+	if s.CookiePoolGroup != nil {
+		if err := validateCookiePoolGroup(*s.CookiePoolGroup); err != nil {
+			return err
+		}
+	}
+	if s.CookieAcquisitionModel != nil {
+		if err := validateCookieAcquisitionModel(*s.CookieAcquisitionModel); err != nil {
+			return err
+		}
 	}
 	if s.CookieBackupCount != nil && (*s.CookieBackupCount < 0 || *s.CookieBackupCount > 10) {
 		return fmt.Errorf("cookie-backup-count must be between 0 and 10")
@@ -68,6 +89,18 @@ func applyStateStrategySettings(c *CodexStateOverrideConfig, s CodexStateStrateg
 		c.CookieVerifyAfterAcquire = *s.CookieVerifyAfterAcquire
 	}
 	mark("cookie-verify-after-acquire", s.CookieVerifyAfterAcquire != nil)
+	if s.CookiePoolMode != nil {
+		c.CookiePoolMode = *s.CookiePoolMode
+	}
+	mark("cookie-pool-mode", s.CookiePoolMode != nil)
+	if s.CookiePoolGroup != nil {
+		c.CookiePoolGroup = *s.CookiePoolGroup
+	}
+	mark("cookie-pool-group", s.CookiePoolGroup != nil)
+	if s.CookieAcquisitionModel != nil {
+		c.CookieAcquisitionModel = *s.CookieAcquisitionModel
+	}
+	mark("cookie-acquisition-model", s.CookieAcquisitionModel != nil)
 	if s.CookieBackupCount != nil {
 		c.CookieBackupCount = *s.CookieBackupCount
 	}
@@ -122,6 +155,18 @@ func (c CodexStateOverrideConfig) validateStateStrategy() error {
 	}
 	if c.MissingReturnedState != "ignore" && c.MissingReturnedState != "reject" {
 		return fmt.Errorf("invalid missing-returned-state policy")
+	}
+	if c.CookiePoolMode != "auto" && c.CookiePoolMode != "model" && c.CookiePoolMode != "shared" && c.CookiePoolMode != "credential" {
+		return fmt.Errorf("invalid Cookie pool mode")
+	}
+	if err := validateCookiePoolGroup(c.CookiePoolGroup); err != nil {
+		return err
+	}
+	if c.CookieOnly() && c.CookiePoolMode == "shared" && c.CookiePoolGroup == "" {
+		return fmt.Errorf("shared Cookie pool requires cookie-pool-group")
+	}
+	if err := validateCookieAcquisitionModel(c.CookieAcquisitionModel); err != nil {
+		return err
 	}
 	if c.CookieBackupCount < 0 || c.CookieBackupCount > 10 {
 		return fmt.Errorf("cookie-backup-count must be between 0 and 10")
@@ -190,4 +235,18 @@ func (c CodexStateOverrideConfig) HasStateStrategy() bool {
 		}
 	}
 	return false
+}
+
+func validateCookieAcquisitionModel(model string) error {
+	if len(model) > 256 || strings.IndexFunc(model, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) }) >= 0 || strings.ContainsAny(model, "*?") {
+		return fmt.Errorf("cookie-acquisition-model must be empty or a single model ID of at most 256 bytes")
+	}
+	return nil
+}
+
+func validateCookiePoolGroup(group string) error {
+	if len(group) > 128 || group != strings.TrimSpace(group) || strings.IndexFunc(group, unicode.IsControl) >= 0 {
+		return fmt.Errorf("cookie-pool-group must be at most 128 bytes without surrounding whitespace or control characters")
+	}
+	return nil
 }

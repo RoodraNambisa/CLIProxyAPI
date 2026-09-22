@@ -27,17 +27,18 @@ func (h *Handler) GetCodexState(c *gin.Context) {
 		}
 		manager = codexstate.Diagnostic
 	}
-	c.JSON(200, gin.H{"models": manager.Snapshots(a.ID, time.Now()), "cookie": manager.CookieSnapshot(a.ID, time.Now())})
+	c.JSON(200, gin.H{"models": manager.Snapshots(a.ID, time.Now()), "cookie": manager.CookieSnapshot(a.ID, time.Now(), helps.ResolveStateModel(a.ID, c.Query("model"))), "cookies": manager.CookieSnapshots(a.ID, time.Now())})
 }
 
 func (h *Handler) CodexStateAction(c *gin.Context) {
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 4096)
 	var input struct {
-		Name       string `json:"name"`
-		Model      string `json:"model"`
-		Action     string `json:"action"`
-		Diagnostic bool   `json:"diagnostic"`
-		Strategy   string `json:"strategy"`
+		Name       string  `json:"name"`
+		Model      string  `json:"model"`
+		Action     string  `json:"action"`
+		Diagnostic bool    `json:"diagnostic"`
+		Strategy   string  `json:"strategy"`
+		CookiePool *string `json:"cookie_pool"`
 	}
 	if c.ShouldBindJSON(&input) != nil || input.Strategy != "" && input.Strategy != "state" && input.Strategy != "cookie-only" || !slices.Contains([]string{"acquire", "pause", "resume", "clear"}, input.Action) {
 		c.JSON(400, gin.H{"error": "invalid state action"})
@@ -75,7 +76,7 @@ func (h *Handler) CodexStateAction(c *gin.Context) {
 			c.JSON(409, gin.H{"error": "State runtime is not ready or the manual model limit was reached"})
 			return
 		}
-		c.JSON(200, gin.H{"diagnostic": true, "model": model, "previous_acquired": previous, "models": codexstate.Diagnostic.Snapshots(a.ID, time.Now()), "cookie": codexstate.Diagnostic.CookieSnapshot(a.ID, time.Now())})
+		c.JSON(200, gin.H{"diagnostic": true, "model": model, "previous_acquired": previous, "models": codexstate.Diagnostic.Snapshots(a.ID, time.Now()), "cookie": codexstate.Diagnostic.CookieSnapshot(a.ID, time.Now(), model), "cookies": codexstate.Diagnostic.CookieSnapshots(a.ID, time.Now())})
 		return
 	}
 	if !helps.ManagedStateCredentialEligible(cfg, a) {
@@ -87,12 +88,16 @@ func (h *Handler) CodexStateAction(c *gin.Context) {
 		if input.Model == "" {
 			model = ""
 		}
-		matched, previous := codexstate.Default.CookieAction(a.ID, model, input.Action)
+		var pools []string
+		if input.CookiePool != nil {
+			pools = append(pools, *input.CookiePool)
+		}
+		matched, previous := codexstate.Default.CookieAction(a.ID, model, input.Action, pools...)
 		if !matched {
 			c.JSON(409, gin.H{"error": "Cookie runtime is not ready or model is outside scope"})
 			return
 		}
-		c.JSON(200, gin.H{"strategy": "cookie-only", "previous_acquired": previous, "models": codexstate.Default.Snapshots(a.ID, time.Now()), "cookie": codexstate.Default.CookieSnapshot(a.ID, time.Now())})
+		c.JSON(200, gin.H{"strategy": "cookie-only", "previous_acquired": previous, "models": codexstate.Default.Snapshots(a.ID, time.Now()), "cookie": codexstate.Default.CookieSnapshot(a.ID, time.Now(), model), "cookies": codexstate.Default.CookieSnapshots(a.ID, time.Now())})
 		return
 	}
 	allowed := helps.ManagedStateModels(cfg, a)

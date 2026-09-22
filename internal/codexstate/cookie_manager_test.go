@@ -17,6 +17,7 @@ func cookieFixture(t *testing.T) (*Manager, Credential, config.CodexStateOverrid
 	t.Helper()
 	m, c, p := fixture()
 	p.Strategy = "cookie-only"
+	p.CookiePoolMode = "credential"
 	p.InvalidateOnStateLengthMismatch = true
 	p.InvalidateOnModelMismatch = true
 	p = p.Resolved()
@@ -29,12 +30,14 @@ func cookieResult(now time.Time, value string) Result {
 	return Result{State: strings.Repeat("s", 292), Model: "model", Completed: true, Status: 200, ReceivedAt: now, Cookies: CaptureCookies("https://chatgpt.com/backend-api/codex/responses", http.Header{"Set-Cookie": {"__oailb=" + value + "; Path=/; Secure; Max-Age=3600", "__cf_bm=aux; Path=/; Secure; Max-Age=1800"}}, now)}
 }
 func installCookie(m *Manager, c Credential, r Result, now time.Time) {
-	g := m.cookies[c.ID]
+	pool := m.cookieKeysLocked(c.ID, c.Model)[0]
+	g := m.cookies[pool]
 	g.work.Model = c.Model
 	g.work.credential = c
+	g.acquireCredential, g.acquirePolicy = CookieAcquisition(m.cfg, c, g.work.policy)
 	m.running++
 	g.work.busy = true
-	m.finishCookie(c.ID, g, g.work, nil, r, nil, now)
+	m.finishCookie(pool, g, g.work, nil, r, nil, now)
 }
 func TestCookieCredentialScopeExpiryAndInvalidation(t *testing.T) {
 	m, c, p := cookieFixture(t)

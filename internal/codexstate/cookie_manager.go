@@ -14,17 +14,21 @@ import (
 )
 
 type cookieGroup struct {
-	backups          []cookieBackup
-	backupTarget     int
-	filling          bool
-	promotions       uint64
-	owner            string
-	main, candidate  *CookieBundle
-	version          uint64
-	candidateVersion uint64
-	work             *entry
-	observation      string
-	pending          map[string]bool
+	ruleOrder         int
+	pool              string
+	acquireCredential Credential
+	acquirePolicy     config.CodexStateOverrideConfig
+	backups           []cookieBackup
+	backupTarget      int
+	filling           bool
+	promotions        uint64
+	owner             string
+	main, candidate   *CookieBundle
+	version           uint64
+	candidateVersion  uint64
+	work              *entry
+	observation       string
+	pending           map[string]bool
 }
 type cookieCandidateKey struct{}
 
@@ -69,7 +73,7 @@ func ValidateAcquisition(p config.CodexStateOverrideConfig, model string, r Resu
 func (m *Manager) cookieEntriesLocked(id string) []*entry {
 	var entries []*entry
 	for _, e := range m.entries {
-		if e.credential.ID == id && e.policy.CookieOnly() {
+		if e.policy.CookieOnly() && cookiePoolKey(e.credential.ID, CookiePool(e.credential, e.policy)) == id {
 			entries = append(entries, e)
 		}
 	}
@@ -91,12 +95,13 @@ func (m *Manager) syncCookiesLocked() {
 	wanted := map[string]bool{}
 	for _, e := range m.entries {
 		if e.policy.CookieOnly() {
-			wanted[e.credential.ID] = true
+			wanted[cookiePoolKey(e.credential.ID, CookiePool(e.credential, e.policy))] = true
 		}
 	}
 	for id := range wanted {
 		entries := m.cookieEntriesLocked(id)
 		selected := entries[0]
+		_, firstRule, _ := m.cfg.PolicyFor(selected.credential.Scope())
 		target := 0
 		for _, e := range entries {
 			target = max(target, e.policy.CookieBackupCount)
@@ -106,9 +111,11 @@ func (m *Manager) syncCookiesLocked() {
 			if g != nil && g.work.cancel != nil {
 				g.work.cancel()
 			}
-			m.cookies[id] = &cookieGroup{owner: selected.credential.Owner, backupTarget: target, work: &entry{credential: selected.credential, policy: selected.policy, Snapshot: Snapshot{Model: selected.Model, Status: "missing"}}}
+			acquireCredential, acquirePolicy := CookieAcquisition(m.cfg, selected.credential, selected.policy)
+			m.cookies[id] = &cookieGroup{ruleOrder: firstRule.RuleIndex, pool: CookiePool(selected.credential, selected.policy), acquireCredential: acquireCredential, acquirePolicy: acquirePolicy, owner: selected.credential.Owner, backupTarget: target, work: &entry{credential: selected.credential, policy: selected.policy, Snapshot: Snapshot{Model: selected.Model, Status: "missing"}}}
 			continue
 		}
+		g.ruleOrder = firstRule.RuleIndex
 		g.backupTarget = target
 		validModels := map[string]bool{}
 		for _, e := range entries {
@@ -126,7 +133,8 @@ func (m *Manager) syncCookiesLocked() {
 				break
 			}
 		}
-		if w.credential.Instance != selected.credential.Instance || w.Model != selected.Model || !reflect.DeepEqual(w.policy, selected.policy) {
+		acquireCredential, acquirePolicy := CookieAcquisition(m.cfg, selected.credential, selected.policy)
+		if w.credential.Instance != selected.credential.Instance || w.Model != selected.Model || !reflect.DeepEqual(w.policy, selected.policy) || g.acquireCredential.Model != acquireCredential.Model || !reflect.DeepEqual(g.acquirePolicy, acquirePolicy) {
 			if w.cancel != nil {
 				w.cancel()
 			}
@@ -138,7 +146,7 @@ func (m *Manager) syncCookiesLocked() {
 			next.manual = w.manual || w.busy
 			// Ordinary token or proxy updates retain the credential's cookies. A new
 			// validation contract cannot silently inherit an unverified acquisition.
-			if w.Model == selected.Model && (!sameCookieValidation(w.policy, selected.policy)) {
+			if w.Model == selected.Model && (!sameCookieValidation(w.policy, selected.policy) || g.acquireCredential.Model != acquireCredential.Model || !sameCookieValidation(g.acquirePolicy, acquirePolicy)) {
 				g.main = nil
 				g.backups = nil
 				g.version = 0
@@ -148,6 +156,7 @@ func (m *Manager) syncCookiesLocked() {
 			g.candidate = nil
 			g.work = &next
 		}
+		g.acquireCredential, g.acquirePolicy = acquireCredential, acquirePolicy
 		g.pruneBackups(time.Now())
 	}
 	for id, g := range m.cookies {
@@ -161,25 +170,26 @@ func (m *Manager) syncCookiesLocked() {
 }
 
 func sameCookieValidation(a, b config.CodexStateOverrideConfig) bool {
-	return a.ReturnedLengthMode == b.ReturnedLengthMode && reflect.DeepEqual(a.AcceptedReturnedModels, b.AcceptedReturnedModels) && reflect.DeepEqual(a.Lengths, b.Lengths) && reflect.DeepEqual(a.MatchModel, b.MatchModel) && a.Prompt == b.Prompt && a.ResponseContains == b.ResponseContains && a.CookieVerifyAfterAcquire == b.CookieVerifyAfterAcquire && a.MissingReturnedState == b.MissingReturnedState
+	return a.CookiePoolMode == b.CookiePoolMode && a.CookiePoolGroup == b.CookiePoolGroup && a.CookieAcquisitionModel == b.CookieAcquisitionModel && a.ReturnedLengthMode == b.ReturnedLengthMode && reflect.DeepEqual(a.AcceptedReturnedModels, b.AcceptedReturnedModels) && reflect.DeepEqual(a.Lengths, b.Lengths) && reflect.DeepEqual(a.MatchModel, b.MatchModel) && a.Prompt == b.Prompt && a.ResponseContains == b.ResponseContains && a.CookieVerifyAfterAcquire == b.CookieVerifyAfterAcquire && a.MissingReturnedState == b.MissingReturnedState
 }
 
-func (m *Manager) CookieSnapshot(id string, now time.Time) *CookieSnapshot {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+func (m *Manager) cookieSnapshotLocked(id string, now time.Time) *CookieSnapshot {
 	g := m.cookies[id]
 	if g == nil {
 		return nil
 	}
 	w := g.work
-	s := &CookieSnapshot{Snapshot: w.Snapshot, Main: g.main.snapshot(g.version, now, w.policy), Candidate: g.candidate.snapshot(g.candidateVersion, now, w.policy), Observation: g.observation, BackupTarget: g.backupTarget, Promotions: g.promotions, Backups: []*CookieBundleSnapshot{}}
+	s := &CookieSnapshot{Snapshot: w.Snapshot, Pool: g.pool, AcquisitionModel: g.acquireCredential.Model, SharedModels: []string{}, Main: g.main.snapshot(g.version, now, w.policy), Candidate: g.candidate.snapshot(g.candidateVersion, now, w.policy), Observation: g.observation, BackupTarget: g.backupTarget, Promotions: g.promotions, Backups: []*CookieBundleSnapshot{}}
 	for _, b := range g.backups {
 		if b.bundle.Select(b.bundle.Origin, now, w.policy).Header != "" {
 			s.Backups = append(s.Backups, b.bundle.snapshot(b.version, now, w.policy))
 		}
 	}
-	s.AllowedLengths = append([]int(nil), w.policy.Lengths...)
-	s.LengthMode = w.policy.ReturnedLengthMode
+	for _, e := range m.cookieEntriesLocked(id) {
+		s.SharedModels = append(s.SharedModels, e.Model)
+	}
+	s.AllowedLengths = append([]int(nil), g.acquirePolicy.Lengths...)
+	s.LengthMode = g.acquirePolicy.ReturnedLengthMode
 	s.LastReturnedLength = cloneCookieInt(w.LastReturnedLength)
 	s.InvalidationLength = cloneCookieInt(w.InvalidationLength)
 	switch {
@@ -219,7 +229,7 @@ func cloneCookieInt(p *int) *int {
 func (m *Manager) PickCookie(c Credential, rawURL string, now time.Time, p config.CodexStateOverrideConfig) (CookieSelection, string, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	g := m.cookies[c.ID]
+	g := m.cookies[cookiePoolKey(c.ID, CookiePool(c, p))]
 	if !m.cfg.Enabled || g == nil || g.owner != c.Owner {
 		return CookieSelection{}, p.MissingPolicy, true
 	}
@@ -238,7 +248,7 @@ func (m *Manager) PickCookie(c Credential, rawURL string, now time.Time, p confi
 		m.publishAvailabilityLocked()
 	}
 	if selection.Header != "" {
-		selection.Version = g.version
+		selection.Version, selection.Pool = g.version, g.pool
 		w.Uses++
 		w.CurrentUses++
 		return selection, "", true
@@ -247,10 +257,7 @@ func (m *Manager) PickCookie(c Credential, rawURL string, now time.Time, p confi
 	return selection, p.MissingPolicy, true
 }
 
-func (m *Manager) CookieAction(id, model, action string) (bool, uint64) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	defer m.publishAvailabilityLocked()
+func (m *Manager) cookieActionLocked(id, model, action string) (bool, uint64) {
 	g := m.cookies[id]
 	if g == nil {
 		return false, 0
@@ -259,12 +266,13 @@ func (m *Manager) CookieAction(id, model, action string) (bool, uint64) {
 	if model != "" && action == "acquire" {
 		found := false
 		for _, e := range m.entries {
-			if e.credential.ID == id && e.Model == model && e.policy.CookieOnly() {
+			if cookiePoolKey(e.credential.ID, CookiePool(e.credential, e.policy)) == id && e.Model == model && e.policy.CookieOnly() {
 				found = true
 				if !w.busy {
 					w.credential = e.credential
 					w.Model = model
 					w.policy = e.policy
+					g.acquireCredential, g.acquirePolicy = CookieAcquisition(m.cfg, e.credential, e.policy)
 				}
 				break
 			}
@@ -323,10 +331,23 @@ func (m *Manager) CookieAction(id, model, action string) (bool, uint64) {
 
 func (m *Manager) tickCookiesLocked(ctx context.Context, now time.Time, probe Probe, capacity int) {
 	ids := make([]string, 0, len(m.cookies))
-	for id := range m.cookies {
+	busyCredentials := map[string]bool{}
+	for id, g := range m.cookies {
 		ids = append(ids, id)
+		if g.work.busy {
+			busyCredentials[g.work.credential.ID] = true
+		}
 	}
-	sort.Strings(ids)
+	sort.Slice(ids, func(i, j int) bool {
+		a, b := m.cookies[ids[i]], m.cookies[ids[j]]
+		if a.work.credential.ID != b.work.credential.ID {
+			return a.work.credential.ID < b.work.credential.ID
+		}
+		if a.ruleOrder != b.ruleOrder {
+			return a.ruleOrder < b.ruleOrder
+		}
+		return ids[i] < ids[j]
+	})
 	for _, id := range ids {
 		if m.running >= min(m.cfg.Concurrency, capacity) {
 			return
@@ -337,7 +358,7 @@ func (m *Manager) tickCookiesLocked(ctx context.Context, now time.Time, probe Pr
 		if len(g.backups) > 0 && (g.main == nil || g.main.Select(g.main.Origin, now, w.policy).Header == "") {
 			m.promoteCookie(g, g.backups[0].bundle.Origin, now, w.policy)
 		}
-		if w.busy || w.paused || w.Exhausted || now.Before(w.NextAttempt) {
+		if w.busy || busyCredentials[w.credential.ID] || w.paused || w.Exhausted || now.Before(w.NextAttempt) {
 			continue
 		}
 		candidates := m.cookieEntriesLocked(id)
@@ -369,6 +390,7 @@ func (m *Manager) tickCookiesLocked(ctx context.Context, now time.Time, probe Pr
 		w.credential = selected.credential
 		w.Model = selected.Model
 		w.policy = selected.policy
+		g.acquireCredential, g.acquirePolicy = CookieAcquisition(m.cfg, selected.credential, selected.policy)
 		w.ManualOnly = selected.ManualOnly
 		w.RuleID = selected.RuleID
 		w.RuleName = selected.RuleName
@@ -387,11 +409,12 @@ func (m *Manager) tickCookiesLocked(ctx context.Context, now time.Time, probe Pr
 		task, cancel := context.WithCancel(ctx)
 		w.cancel = cancel
 		w.busy = true
+		busyCredentials[w.credential.ID] = true
 		w.manual = false
 		w.Attempts++
 		m.running++
 		m.wg.Add(1)
-		policy, credential := w.policy, w.credential
+		policy, credential := g.acquirePolicy, g.acquireCredential
 		task = context.WithValue(task, cookieCandidateKey{}, func(b *CookieBundle) {
 			m.mu.Lock()
 			defer m.mu.Unlock()
@@ -430,7 +453,7 @@ func (m *Manager) finishCookie(id string, expected *cookieGroup, work *entry, ca
 	w.LastStatus = r.Status
 	w.LastReturnedLength = new(len(r.State))
 	w.LastReturnedModel, _ = managementdiag.ProcessText(r.Model, "safe", 256)
-	reason := ValidateAcquisition(w.policy, w.Model, r, now)
+	reason := ValidateAcquisition(g.acquirePolicy, g.acquireCredential.Model, r, now)
 	if err != nil {
 		reason = r.FailureReason
 		if reason == "" {
@@ -478,7 +501,7 @@ func (m *Manager) ObserveCookieEvidence(c Credential, used CookieSelection, p co
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	defer m.publishAvailabilityLocked()
-	g := m.cookies[c.ID]
+	g := m.cookies[cookiePoolKey(c.ID, used.Pool)]
 	if g == nil || g.owner != c.Owner || used.Version == 0 {
 		return false
 	}
@@ -593,9 +616,9 @@ func (m *Manager) ObserveCookieEvidence(c Credential, used CookieSelection, p co
 func (m *Manager) CookieCandidate(c Credential, target string, now time.Time, p config.CodexStateOverrideConfig) CookieSelection {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if g := m.cookies[c.ID]; g != nil && g.owner == c.Owner && g.candidate != nil {
+	if g := m.cookies[cookiePoolKey(c.ID, CookiePool(c, p))]; g != nil && g.owner == c.Owner && g.candidate != nil {
 		selection := g.candidate.Select(target, now, p)
-		selection.Version = g.candidateVersion
+		selection.Version, selection.Pool = g.candidateVersion, g.pool
 		return selection
 	}
 	return CookieSelection{}
@@ -616,7 +639,7 @@ func (m *Manager) QueueManualStrategy(c Credential, strategy string) (bool, uint
 	e.manualStrategy = strategy
 	e.policy.Strategy = strategy
 	m.syncCookiesLocked()
-	g := m.cookies[c.ID]
+	g := m.cookies[cookiePoolKey(c.ID, CookiePool(c, e.policy))]
 	if g.work.busy {
 		if c.Model != g.work.Model {
 			if g.pending == nil {
@@ -629,6 +652,7 @@ func (m *Manager) QueueManualStrategy(c Credential, strategy string) (bool, uint
 	g.work.credential = c
 	g.work.Model = c.Model
 	g.work.policy = e.policy
+	g.acquireCredential, g.acquirePolicy = CookieAcquisition(m.cfg, c, e.policy)
 	g.work.ManualOnly = true
 	g.work.manual = true
 	g.work.paused = false

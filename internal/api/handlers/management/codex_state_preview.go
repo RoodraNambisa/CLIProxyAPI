@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/codexstate"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
 )
@@ -62,8 +63,9 @@ func (h *Handler) PreviewCodexState(c *gin.Context) {
 	registered := len(credential.Aliases) > 0
 	// Return only effective policy fields that are useful to the UI; no tokens,
 	// proxy passwords, test prompt text or raw State are included.
+	probeCredential, probePolicy := codexstate.CookieAcquisition(cfg.Codex.ManagedStateConfig(), credential, policy)
 	c.JSON(200, gin.H{"managed": managed, "registered": registered, "upstream_model": upstream, "match": match, "policy": gin.H{
-		"strategy": policy.Strategy, "cookie-verify-after-acquire": policy.CookieVerifyAfterAcquire, "cookie-backup-count": policy.CookieBackupCount, "cookie-max-age-seconds": policy.CookieMaxAgeSeconds, "cookie-refresh-before-seconds": policy.CookieRefreshBeforeSeconds, "ttl-seconds": int(policy.StateTTL().Seconds()), "refresh-before-seconds": int(policy.StateRefreshBefore().Seconds()), "missing-returned-state": policy.MissingReturnedState,
+		"cookie-acquisition-model": policy.CookieAcquisitionModel, "cookie-pool-mode": policy.CookiePoolMode, "cookie-pool-group": policy.CookiePoolGroup, "cookie-effective-pool": codexstate.CookiePool(credential, policy), "cookie-effective-acquisition-model": probeCredential.Model, "cookie-acquisition-lengths": probePolicy.Lengths, "cookie-acquisition-match-model": probePolicy.MatchModel, "strategy": policy.Strategy, "cookie-verify-after-acquire": policy.CookieVerifyAfterAcquire, "cookie-backup-count": policy.CookieBackupCount, "cookie-max-age-seconds": policy.CookieMaxAgeSeconds, "cookie-refresh-before-seconds": policy.CookieRefreshBeforeSeconds, "ttl-seconds": int(policy.StateTTL().Seconds()), "refresh-before-seconds": int(policy.StateRefreshBefore().Seconds()), "missing-returned-state": policy.MissingReturnedState,
 		"lengths": policy.Lengths, "match-model": policy.MatchModel, "acquisition": policy.Acquisition,
 		"mode": policy.Mode, "missing-policy": policy.MissingPolicy, "retry-seconds": policy.RetrySeconds,
 		"max-attempts": policy.MaxAttempts, "retry-round-interval-minutes": policy.RetryRoundIntervalMinutes, "max-retry-rounds": policy.MaxRetryRounds, "ttl-minutes": policy.TTLMinutes, "refresh-before-minutes": policy.RefreshBeforeMinutes,

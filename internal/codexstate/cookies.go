@@ -26,6 +26,7 @@ type CookieMember struct {
 	Version uint64      `json:"-"`
 }
 type CookieSelection struct {
+	Pool      string `json:"-"`
 	Header    string `json:"-"`
 	Version   uint64
 	Members   map[string]uint64 `json:"-"`
@@ -52,12 +53,15 @@ type CookieBundleSnapshot struct {
 }
 type CookieSnapshot struct {
 	Snapshot
-	Backups      []*CookieBundleSnapshot `json:"backups"`
-	BackupTarget int                     `json:"backup_target"`
-	Promotions   uint64                  `json:"promotions"`
-	Main         *CookieBundleSnapshot   `json:"main,omitempty"`
-	Candidate    *CookieBundleSnapshot   `json:"candidate,omitempty"`
-	Observation  string                  `json:"observation,omitempty"`
+	Pool             string                  `json:"pool"`
+	AcquisitionModel string                  `json:"acquisition_model"`
+	SharedModels     []string                `json:"shared_models"`
+	Backups          []*CookieBundleSnapshot `json:"backups"`
+	BackupTarget     int                     `json:"backup_target"`
+	Promotions       uint64                  `json:"promotions"`
+	Main             *CookieBundleSnapshot   `json:"main,omitempty"`
+	Candidate        *CookieBundleSnapshot   `json:"candidate,omitempty"`
+	Observation      string                  `json:"observation,omitempty"`
 }
 
 func RouteCookieName(name string) bool   { return name == "__oailb" || name == "__cflb" }

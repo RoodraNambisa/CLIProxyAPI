@@ -26,12 +26,12 @@ func (m *Manager) StateSelectionValid(c Credential, value string, version uint64
 func (m *Manager) CookieSelectionValid(c Credential, selected CookieSelection, now time.Time, p config.CodexStateOverrideConfig) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	g := m.cookies[c.ID]
+	g := m.cookies[cookiePoolKey(c.ID, selected.Pool)]
 	if !m.cfg.Enabled || g == nil || g.owner != c.Owner || g.work.paused || selected.Version == 0 || selected.Version != g.version || g.main == nil {
 		return false
 	}
 	configured, _, _ := m.resolvePolicy(m.cfg, c)
-	if !sameCookieValidation(configured, p) {
+	if CookiePool(c, configured) != selected.Pool || !sameCookieValidation(configured, p) {
 		return false
 	}
 	current := g.main.Select(selected.URL, now, p)
@@ -43,6 +43,7 @@ func (m *Manager) CookieSelectionValid(c Credential, selected CookieSelection, n
 func (m *Manager) CookieConnectionValid(c Credential, selected CookieSelection, now time.Time, p config.CodexStateOverrideConfig) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	g := m.cookies[c.ID]
-	return m.cfg.Enabled && g != nil && g.owner == c.Owner && !g.work.paused && selected.Version != 0 && selected.Version == g.version && g.main.Select(selected.URL, now, p).Header != ""
+	g := m.cookies[cookiePoolKey(c.ID, selected.Pool)]
+	configured, _, _ := m.resolvePolicy(m.cfg, c)
+	return CookiePool(c, configured) == selected.Pool && m.cfg.Enabled && g != nil && g.owner == c.Owner && !g.work.paused && selected.Version != 0 && selected.Version == g.version && g.main.Select(selected.URL, now, p).Header != ""
 }
