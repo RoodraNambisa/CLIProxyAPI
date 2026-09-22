@@ -189,3 +189,43 @@ func (m *HistoryMatcher) InvalidateAuth(authID string) {
 		}
 	}
 }
+
+// CaptureInvalidation removes only the matching revisions visible now. A late
+// response cannot remove a newer preference, even for the same credential.
+func (m *HistoryMatcher) CaptureInvalidation(namespace string, history *History, authID string) func() {
+	if m == nil {
+		return nil
+	}
+	m.mu.Lock()
+	entries := map[*historyEntry]uint64{}
+	if history == nil {
+		for _, e := range m.groups {
+			if e.authID == authID {
+				entries[e] = e.version
+			}
+		}
+	} else {
+		scope := sha256.Sum256([]byte(namespace))
+		for i := len(history.prefixes) - 1; i >= history.minimum-1; i-- {
+			for e := range m.prefixes[historyIndexKey{scope, history.prefixes[i]}] {
+				if e.authID == authID {
+					entries[e] = e.version
+				}
+			}
+			if len(entries) > 0 {
+				break
+			}
+		}
+	}
+	m.mu.Unlock()
+	return func() {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		for e, version := range entries {
+			if m.groups[e.key] == e && e.version == version {
+				m.invalidations++
+				m.removeLocked(e)
+			}
+		}
+	}
+}

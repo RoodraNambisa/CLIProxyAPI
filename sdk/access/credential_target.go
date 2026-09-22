@@ -41,7 +41,12 @@ func CredentialTargetRewritesResponseModel(ctx context.Context) bool {
 	return credentialTargetOption(ctx, MetadataCredentialTargetResponseModelRewrite)
 }
 
+func CredentialTargetAppliesResponseGuard(ctx context.Context) bool {
+	return credentialTargetOption(ctx, MetadataCredentialTargetResponseGuard)
+}
+
 const (
+	MetadataCredentialTargetResponseGuard        = "credential_target_response_guard"
 	CredentialTargetSuffix                       = "-auth-"
 	MetadataCredentialTarget                     = "credential_target"
 	MetadataCredentialTargetRespectStatePolicy   = "credential_target_respect_state_policy"

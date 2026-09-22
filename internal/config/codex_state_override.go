@@ -11,13 +11,16 @@ import (
 
 // CodexStateOverrideConfig manages short-lived state in memory only.
 type CodexStateOverrideConfig struct {
-	Strategy                   string `yaml:"strategy,omitempty" json:"strategy,omitempty"`
-	CookieVerifyAfterAcquire   bool   `yaml:"cookie-verify-after-acquire,omitempty" json:"cookie-verify-after-acquire,omitempty"`
-	CookieMaxAgeSeconds        int    `yaml:"cookie-max-age-seconds,omitempty" json:"cookie-max-age-seconds,omitempty"`
-	CookieRefreshBeforeSeconds int    `yaml:"cookie-refresh-before-seconds,omitempty" json:"cookie-refresh-before-seconds,omitempty"`
-	TTLSeconds                 *int   `yaml:"ttl-seconds,omitempty" json:"ttl-seconds,omitempty"`
-	RefreshBeforeSeconds       *int   `yaml:"refresh-before-seconds,omitempty" json:"refresh-before-seconds,omitempty"`
-	MissingReturnedState       string `yaml:"missing-returned-state,omitempty" json:"missing-returned-state,omitempty"`
+	ResponseGuard              *CodexResponseGuardConfig `yaml:"-" json:"-"`
+	AcceptedReturnedModels     []string                  `yaml:"-" json:"accepted_returned_models,omitempty"`
+	ReturnedLengthMode         string                    `yaml:"-" json:"returned_length_mode,omitempty"`
+	Strategy                   string                    `yaml:"strategy,omitempty" json:"strategy,omitempty"`
+	CookieVerifyAfterAcquire   bool                      `yaml:"cookie-verify-after-acquire,omitempty" json:"cookie-verify-after-acquire,omitempty"`
+	CookieMaxAgeSeconds        int                       `yaml:"cookie-max-age-seconds,omitempty" json:"cookie-max-age-seconds,omitempty"`
+	CookieRefreshBeforeSeconds int                       `yaml:"cookie-refresh-before-seconds,omitempty" json:"cookie-refresh-before-seconds,omitempty"`
+	TTLSeconds                 *int                      `yaml:"ttl-seconds,omitempty" json:"ttl-seconds,omitempty"`
+	RefreshBeforeSeconds       *int                      `yaml:"refresh-before-seconds,omitempty" json:"refresh-before-seconds,omitempty"`
+	MissingReturnedState       string                    `yaml:"missing-returned-state,omitempty" json:"missing-returned-state,omitempty"`
 
 	Rules                           *[]CodexStateRule         `yaml:"rules,omitempty" json:"rules,omitempty"`
 	Enabled                         bool                      `yaml:"enabled" json:"enabled"`
@@ -125,6 +128,11 @@ func (c CodexStateOverrideConfig) ForModel(model string) CodexStateOverrideConfi
 }
 
 func (c CodexStateOverrideConfig) clone() CodexStateOverrideConfig {
+	c.AcceptedReturnedModels = slices.Clone(c.AcceptedReturnedModels)
+	if c.ResponseGuard != nil {
+		value := c.ResponseGuard.Clone()
+		c.ResponseGuard = &value
+	}
 	c.Rules = cloneCodexStateRules(c.Rules)
 	c.TTLSeconds = cloneStateValue(c.TTLSeconds)
 	c.RefreshBeforeSeconds = cloneStateValue(c.RefreshBeforeSeconds)

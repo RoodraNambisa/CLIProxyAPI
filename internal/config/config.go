@@ -575,6 +575,7 @@ type CodexConfig struct {
 	SpoofSessionIdentity      bool                     `yaml:"spoof-session-identity" json:"spoof-session-identity"`
 	TurnStatePolicy           CodexTurnStatePolicy     `yaml:"turn-state-policy" json:"turn-state-policy"`
 	StateOverride             CodexStateOverrideConfig `yaml:"state-override" json:"state-override"`
+	ResponseGuard             CodexResponseGuardConfig `yaml:"response-guard,omitempty" json:"response-guard"`
 	EnforceSoftwareIdentity   *bool                    `yaml:"enforce-software-identity,omitempty" json:"enforce-software-identity,omitempty"`
 }
 
@@ -2378,6 +2379,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	if errState := cfg.ValidateCodexStateOverride(); errState != nil {
 		return nil, errState
 	}
+	if errGuard := cfg.ValidateCodexResponseGuard(); errGuard != nil {
+		return nil, errGuard
+	}
 	if errRewrite := cfg.ValidateResponseModelRewrite(); errRewrite != nil {
 		return nil, errRewrite
 	}
@@ -4022,7 +4026,7 @@ func normalizeAPIKeyGroups(groups []APIKeyGroup, apiKeys []string, pruneUnknown 
 		if errExcluded != nil {
 			return nil, errExcluded
 		}
-		if name == "" && len(providers) == 0 && len(allowed) == 0 && len(excluded) == 0 && !group.AllowCredentialTargeting && !group.CredentialTargetRespectStatePolicy && !group.CredentialTargetRespectRequestLimit && !group.CredentialTargetResponseModelRewrite {
+		if name == "" && len(providers) == 0 && len(allowed) == 0 && len(excluded) == 0 && !group.AllowCredentialTargeting && !group.CredentialTargetRespectStatePolicy && !group.CredentialTargetRespectRequestLimit && !group.CredentialTargetResponseModelRewrite && !group.CredentialTargetResponseGuard {
 			continue
 		}
 		group.APIKey, group.Name, group.Providers = key, name, providers
@@ -4080,6 +4084,9 @@ func SaveConfigPreserveComments(configFile string, cfg *Config) error {
 	}
 	if errState := cfg.ValidateCodexStateOverride(); errState != nil {
 		return errState
+	}
+	if errGuard := cfg.ValidateCodexResponseGuard(); errGuard != nil {
+		return errGuard
 	}
 	if errRewrite := cfg.ValidateResponseModelRewrite(); errRewrite != nil {
 		return errRewrite
@@ -4341,7 +4348,9 @@ func mergeMappingPreserve(dst, src *yaml.Node, path ...[]string) {
 			dst.Content = append(dst.Content, deepCopyNode(sk), candidate)
 		}
 	}
-	if isCodexStateRuleYAMLPath(currentPath) {
+	if isCodexResponseGuardYAMLPath(currentPath) {
+		pruneMissingResponseGuardKeys(dst, src)
+	} else if isCodexStateRuleYAMLPath(currentPath) {
 		// Clearing an override must restore inheritance while retaining unknown extensions.
 		pruneMissingCredentialYAMLKeys(dst, src, currentPath)
 	} else if len(currentPath) == 2 && currentPath[0] == "codex" && currentPath[1] == "state-override" {

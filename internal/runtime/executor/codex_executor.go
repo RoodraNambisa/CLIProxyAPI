@@ -999,6 +999,10 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		AuthType:  authType,
 		AuthValue: authValue,
 	})
+	guardModel := gjson.GetBytes(upstreamBody, "model").String()
+	if guardModel == "" {
+		guardModel = baseModel
+	}
 	upstreamBody = nil
 	httpClient := reporter.TrackHTTPClient(e.newCodexHTTPClient(ctx, auth, imageRequest))
 	httpResp, err := helps.DoUpstreamHTTPRequest(httpClient, httpReq)
@@ -1016,8 +1020,11 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	helps.CaptureStateHeaders(ctx, httpResp)
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	managedStateUse := helps.ManagedStateUse(ctx, auth, req.Model, httpReq.Header)
-	managedStateUse.Observe(httpResp.Header, nil)
+	guard := helps.NewCodexResponseGuard(ctx, e.cfg, auth, guardModel, opts, false, "http", httpResp.StatusCode, httpResp.Header, func(evidence config.CodexResponseEvidence) {
+		managedStateUse.RejectGuardEvidence(httpResp.Header, evidence)
+	})
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+		guard.UpstreamFailure(httpResp.StatusCode)
 		b, _ := io.ReadAll(httpResp.Body)
 		upstreamBody := codexauth.SanitizeAgentIdentityErrorBody(authMetadata(auth), b)
 		helps.AppendAPIResponseChunk(ctx, e.cfg, upstreamBody)
@@ -1027,7 +1034,13 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		err = newCodexStatusErr(httpResp.StatusCode, clientBody)
 		return resp, err
 	}
-	helps.ReleaseRequestBodyAfterStreamEstablished(ctx, opts)
+	managedStateUse.Observe(httpResp.Header, nil)
+
+	defer func() { guard.Finish(err) }()
+	var guardErr error
+	if !guard.Enforces() {
+		helps.ReleaseRequestBodyAfterStreamEstablished(ctx, opts)
+	}
 	outputItemsByIndex := make(map[int64][]byte)
 	var outputItemsFallback [][]byte
 	var completedEvent []byte
@@ -1046,6 +1059,9 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		}
 
 		eventData := bytes.TrimSpace(trimmedLine[len(dataTag):])
+		if guardErr = guard.Observe(eventData, false); guardErr != nil {
+			return false
+		}
 		helps.ObserveResponsesTokenEvent(reporter, eventData)
 		eventType := gjson.GetBytes(eventData, "type").String()
 		if eventType == "response.output_item.done" {
@@ -1091,6 +1107,9 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		if !processEvent(scanner.Bytes()) {
 			break
 		}
+	}
+	if guardErr != nil {
+		return resp, guardErr
 	}
 	if errRead := scanner.Err(); errRead != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, errRead)
@@ -1386,6 +1405,10 @@ func (e *CodexExecutor) executeStream(ctx context.Context, auth *cliproxyauth.Au
 		AuthType:  authType,
 		AuthValue: authValue,
 	})
+	guardModel := gjson.GetBytes(upstreamBody, "model").String()
+	if guardModel == "" {
+		guardModel = baseModel
+	}
 	upstreamBody = nil
 
 	httpClient := reporter.TrackHTTPClient(e.newCodexHTTPClient(ctx, auth, imageRequest))
@@ -1400,8 +1423,11 @@ func (e *CodexExecutor) executeStream(ctx context.Context, auth *cliproxyauth.Au
 	helps.CaptureStateHeaders(ctx, httpResp)
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	managedStateUse := helps.ManagedStateUse(ctx, auth, req.Model, httpReq.Header)
-	managedStateUse.Observe(httpResp.Header, nil)
+	guard := helps.NewCodexResponseGuard(ctx, e.cfg, auth, guardModel, opts, true, "sse", httpResp.StatusCode, httpResp.Header, func(evidence config.CodexResponseEvidence) {
+		managedStateUse.RejectGuardEvidence(httpResp.Header, evidence)
+	})
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+		guard.UpstreamFailure(httpResp.StatusCode)
 		defer cleanupBodies()
 		data, readErr := io.ReadAll(httpResp.Body)
 		if errClose := httpResp.Body.Close(); errClose != nil {
@@ -1419,22 +1445,27 @@ func (e *CodexExecutor) executeStream(ctx context.Context, auth *cliproxyauth.Au
 		err = newCodexStatusErr(httpResp.StatusCode, clientBody)
 		return nil, err
 	}
+	managedStateUse.Observe(httpResp.Header, nil)
+
 	if state, ok := opts.Metadata[cliproxyexecutor.ImageGenerationStreamPassthroughStateMetadataKey].(*cliproxyexecutor.ImageGenerationStreamPassthroughState); ok {
 		state.SetEnabled(imageStreamPassthrough)
 	}
-	if e.codexPreparedSessionIdentity(ctx, req, opts).StreamBootstrapBuffering && helps.RequestBodyReplayable(ctx, opts) {
+	bootstrapEnabled := e.codexPreparedSessionIdentity(ctx, req, opts).StreamBootstrapBuffering
+	if bootstrapEnabled && helps.RequestBodyReplayable(ctx, opts) || guard.Enforces() {
 		bodyReplay, failure, errProbe := helps.ProbeCodexSSEBootstrap(ctx, httpResp.Body, func() bool {
-			return helps.RequestBodyReplayable(ctx, opts)
-		})
+			return bootstrapEnabled && helps.RequestBodyReplayable(ctx, opts)
+		}, guard)
 		if errProbe != nil || failure != nil {
 			cleanupBodies()
 			if errClose := httpResp.Body.Close(); errClose != nil {
 				log.Errorf("codex executor: close bootstrap response body error: %v", errClose)
 			}
 			if errProbe != nil {
+				guard.Finish(errProbe)
 				helps.RecordAPIResponseError(ctx, e.cfg, errProbe)
 				return nil, errProbe
 			}
+			_ = guard.Observe(failure.Payload, false)
 			upstreamError := codexauth.SanitizeAgentIdentityErrorBody(authMetadata(auth), failure.Payload)
 			helps.AppendAPIResponseChunk(ctx, e.cfg, upstreamError)
 			clientError := applyCodexIdentityExposeResponsePayload(upstreamError, identityState)
@@ -1446,6 +1477,7 @@ func (e *CodexExecutor) executeStream(ctx context.Context, auth *cliproxyauth.Au
 	out := make(chan cliproxyexecutor.StreamChunk, cliproxyexecutor.StreamBufferSize)
 	go func() {
 		defer close(out)
+		defer func() { guard.Finish(ctx.Err()) }()
 		defer cleanupBodies()
 		defer func() {
 			if errClose := httpResp.Body.Close(); errClose != nil {
@@ -1467,14 +1499,21 @@ func (e *CodexExecutor) executeStream(ctx context.Context, auth *cliproxyauth.Au
 		var pendingImageCompletionEvent []byte
 		var pendingTranslatedCompletionEvent []byte
 		emit := func(chunk cliproxyexecutor.StreamChunk) bool {
+			guard.Finish(chunk.Err)
 			if ctx == nil {
 				out <- chunk
+				if chunk.Err == nil && len(chunk.Payload) > 0 {
+					guard.Commit()
+				}
 				return true
 			}
 			select {
 			case <-ctx.Done():
 				return false
 			case out <- chunk:
+				if chunk.Err == nil && len(chunk.Payload) > 0 {
+					guard.Commit()
+				}
 				return true
 			}
 		}
@@ -1492,6 +1531,13 @@ func (e *CodexExecutor) executeStream(ctx context.Context, auth *cliproxyauth.Au
 			}
 			frame := trustedFrame
 			trustedFrame = nil
+			if data, ok := codexSSEFrameDataPayload(frame); ok {
+				if errGuard := guard.Observe(data, false); errGuard != nil {
+					reporter.PublishFailure(ctx, errGuard)
+					_ = emit(cliproxyexecutor.StreamChunk{Err: errGuard})
+					return false, false
+				}
+			}
 			if managedStateUse.Version > 0 {
 				if data, ok := codexSSEFrameDataPayload(frame); ok && isCodexSuccessfulCompletion(normalizeCodexCompletion(data)) {
 					managedStateUse.Observe(nil, data)
@@ -1524,6 +1570,13 @@ func (e *CodexExecutor) executeStream(ctx context.Context, auth *cliproxyauth.Au
 		for scanner.Scan() {
 			line := scanner.Bytes()
 			if !trustUpstreamSSE {
+				if bytes.HasPrefix(line, dataTag) {
+					if errGuard := guard.Observe(bytes.TrimSpace(line[len(dataTag):]), false); errGuard != nil {
+						reporter.PublishFailure(ctx, errGuard)
+						_ = emit(cliproxyexecutor.StreamChunk{Err: errGuard})
+						return
+					}
+				}
 				if managedStateUse.Version > 0 && bytes.HasPrefix(line, dataTag) {
 					data := bytes.TrimSpace(line[len(dataTag):])
 					if isCodexSuccessfulCompletion(normalizeCodexCompletion(data)) {

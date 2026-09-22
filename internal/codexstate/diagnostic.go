@@ -21,6 +21,7 @@ func DiagnosticPolicy(cfg config.CodexStateOverrideConfig, c Credential) (config
 		policy = cfg.ForCredential(c.Plan, c.Model)
 		match = config.CodexStateRuleMatch{RuleIndex: -1, Action: "manual"}
 	}
+	policy = cfg.ApplyResponseAcceptance(c.Scope(), policy)
 	policy.Rules = nil
 	policy.Priorities, policy.IncludedCredentials, policy.ExcludedCredentials, policy.Models = nil, nil, nil, nil
 	policy.ModelOverrides, policy.PlanLengths = nil, nil

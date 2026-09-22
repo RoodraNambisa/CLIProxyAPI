@@ -19,13 +19,15 @@ type CodexStateChoice struct {
 }
 
 type CodexStateObservationPolicy struct {
-	MatchModel           bool
-	ModelMismatch        bool
-	LengthMismatch       bool
-	Lengths              []int
-	MissingReturnedState string
-	Strategy             string
-	CookieMaxAgeSeconds  int
+	AcceptedReturnedModels []string
+	ReturnedLengthMode     string
+	MatchModel             bool
+	ModelMismatch          bool
+	LengthMismatch         bool
+	Lengths                []int
+	MissingReturnedState   string
+	Strategy               string
+	CookieMaxAgeSeconds    int
 }
 
 func CodexStateChoiceForRequest(ctx context.Context, key string) (CodexStateChoice, bool) {

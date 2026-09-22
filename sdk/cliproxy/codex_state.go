@@ -80,8 +80,8 @@ func (s *Service) syncCodexState(cfg *internalconfig.Config) {
 			}
 		}
 	}
-	codexstate.Default.Sync(cfg.Codex.StateOverride, credentials, manualScopes...)
-	codexstate.Diagnostic.Sync(cfg.Codex.StateOverride, nil, diagnosticScopes...)
+	codexstate.Default.Sync(cfg.Codex.ManagedStateConfig(), credentials, manualScopes...)
+	codexstate.Diagnostic.Sync(cfg.Codex.ManagedStateConfig(), nil, diagnosticScopes...)
 }
 
 func (s *Service) acquireCodexState(ctx context.Context, credential codexstate.Credential, policy internalconfig.CodexStateOverrideConfig) (result codexstate.Result, err error) {

@@ -45,6 +45,7 @@ type Result struct {
 }
 type Probe func(context.Context, Credential, config.CodexStateOverrideConfig) (Result, error)
 type Snapshot struct {
+	LengthMode                string    `json:"length_mode,omitempty"`
 	RuleID                    string    `json:"rule_id,omitempty"`
 	RuleName                  string    `json:"rule_name,omitempty"`
 	AllowedLengths            []int     `json:"allowed_lengths"`
@@ -195,6 +196,7 @@ func (m *Manager) Sync(cfg config.CodexStateOverrideConfig, credentials []Creden
 		}
 		old.RuleID, old.RuleName = match.RuleID, match.RuleName
 		old.AllowedLengths = slices.Clone(policy.Lengths)
+		old.LengthMode = policy.ReturnedLengthMode
 		old.RetrySeconds, old.MaxAttempts = policy.RetrySeconds, policy.MaxAttempts
 		old.RetryRoundIntervalMinutes, old.MaxRetryRounds = policy.RetryRoundIntervalMinutes, policy.MaxRetryRounds
 	}
@@ -216,6 +218,7 @@ func resolveEntryPolicy(cfg config.CodexStateOverrideConfig, c Credential) (conf
 	if cfg.Rules == nil {
 		policy, ok = cfg.ForCredential(c.Plan, c.Model), cfg.Enabled
 	}
+	policy = cfg.ApplyResponseAcceptance(c.Scope(), policy)
 	policy.Rules = nil
 	policy.Priorities, policy.IncludedCredentials, policy.ExcludedCredentials, policy.Models = nil, nil, nil, nil
 	policy.ModelOverrides, policy.PlanLengths = nil, nil
@@ -231,7 +234,7 @@ func (m *Manager) resolvePolicy(cfg config.CodexStateOverrideConfig, c Credentia
 	return resolveEntryPolicy(cfg, c)
 }
 func sameStateValidation(a, b config.CodexStateOverrideConfig) bool {
-	return reflect.DeepEqual(a.Lengths, b.Lengths) && reflect.DeepEqual(a.MatchModel, b.MatchModel) && a.Prompt == b.Prompt && a.ResponseContains == b.ResponseContains && a.StateTTL() == b.StateTTL() && a.Strategy == b.Strategy && a.MissingReturnedState == b.MissingReturnedState
+	return a.ReturnedLengthMode == b.ReturnedLengthMode && reflect.DeepEqual(a.AcceptedReturnedModels, b.AcceptedReturnedModels) && reflect.DeepEqual(a.Lengths, b.Lengths) && reflect.DeepEqual(a.MatchModel, b.MatchModel) && a.Prompt == b.Prompt && a.ResponseContains == b.ResponseContains && a.StateTTL() == b.StateTTL() && a.Strategy == b.Strategy && a.MissingReturnedState == b.MissingReturnedState
 }
 
 // QueueManual creates a bounded diagnostic entry without registering a model.
@@ -263,7 +266,7 @@ func (m *Manager) QueueManual(c Credential, strategies ...string) (bool, uint64)
 		if count >= 256 {
 			return false, 0
 		}
-		e = &entry{credential: c, policy: policy, Snapshot: Snapshot{Model: c.Model, ManualOnly: true, RuleID: match.RuleID, RuleName: match.RuleName, AllowedLengths: slices.Clone(policy.Lengths), RetrySeconds: policy.RetrySeconds, MaxAttempts: policy.MaxAttempts, RetryRoundIntervalMinutes: policy.RetryRoundIntervalMinutes, MaxRetryRounds: policy.MaxRetryRounds}}
+		e = &entry{credential: c, policy: policy, Snapshot: Snapshot{Model: c.Model, ManualOnly: true, RuleID: match.RuleID, RuleName: match.RuleName, AllowedLengths: slices.Clone(policy.Lengths), LengthMode: policy.ReturnedLengthMode, RetrySeconds: policy.RetrySeconds, MaxAttempts: policy.MaxAttempts, RetryRoundIntervalMinutes: policy.RetryRoundIntervalMinutes, MaxRetryRounds: policy.MaxRetryRounds}}
 		m.entries[key(c)] = e
 	}
 	if e.credential.Instance != c.Instance || e.credential.Plan != c.Plan || !reflect.DeepEqual(e.policy, policy) {
@@ -363,13 +366,13 @@ func (m *Manager) observeResponse(c Credential, version uint64, value, returnedM
 		policy = *requested
 	}
 	reason := ""
-	if policy.InvalidateOnModelMismatch && returnedModel != "" && returnedModel != c.Model {
+	if policy.InvalidateOnModelMismatch && returnedModel != "" && !config.CodexReturnedModelAccepted(c.Model, returnedModel, policy.AcceptedReturnedModels) {
 		reason = "response_model_mismatch"
-	} else if policy.InvalidateOnStateLengthMismatch && returnedLength == 0 && len(policy.Lengths) > 0 && policy.MissingReturnedState == "reject" {
+	} else if policy.InvalidateOnStateLengthMismatch && returnedLength == 0 && policy.CheckReturnedLength() && policy.MissingReturnedState == "reject" {
 		reason = "missing_returned_state"
 	} else if policy.InvalidateOnStateLengthMismatch && returnedLength > 0 {
 		lengths := policy.Lengths
-		if len(lengths) > 0 && !slices.Contains(lengths, returnedLength) {
+		if policy.CheckReturnedLength() && !config.CodexReturnedLengthAccepted(returnedLength, policy.ReturnedLengthMode, lengths) {
 			reason = "response_state_length_mismatch"
 		}
 	}

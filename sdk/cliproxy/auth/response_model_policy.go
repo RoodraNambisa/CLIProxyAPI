@@ -19,13 +19,34 @@ import (
 const clientResponseModelKey = "client_response_model"
 const responseModelRecentLimit = 20
 
+// PreviewResponseModelName resolves configured public naming without recording a rewrite.
+func (m *Manager) PreviewResponseModelName(a *Auth, requested, original string) string {
+	opts := core.Options{Metadata: map[string]any{clientResponseModelKey: requested}}
+	if rewrite := m.responseModelRewriteOptions(context.Background(), a, opts, false); rewrite != nil && original != "" {
+		return rewrite.RewriteModel
+	}
+	if alias := m.resolveExecutionAliasResult(a, requested); original != "" && alias.ForceMapping && alias.OriginalAlias != "" {
+		return alias.OriginalAlias
+	}
+	return original
+}
+
+// PreviewUpstreamModel performs alias resolution without rotating a model pool.
+func (m *Manager) PreviewUpstreamModel(a *Auth, requested string) string {
+	if alias := m.resolveExecutionAliasResult(a, requested); alias.UpstreamModel != "" {
+		return thinking.ParseSuffix(alias.UpstreamModel).ModelName
+	}
+	return thinking.ParseSuffix(rewriteModelForAuth(requested, a)).ModelName
+}
+
 type ResponseModelRewriteRecord struct {
-	At             time.Time `json:"at"`
-	RequestedModel string    `json:"requested_model"`
-	OriginalModel  string    `json:"original_model"`
-	ResponseModel  string    `json:"response_model"`
-	Rule           int       `json:"rule"`
-	Stream         bool      `json:"stream"`
+	Validation     *core.ResponseGuardRecord `json:"validation,omitempty"`
+	At             time.Time                 `json:"at"`
+	RequestedModel string                    `json:"requested_model"`
+	OriginalModel  string                    `json:"original_model"`
+	ResponseModel  string                    `json:"response_model"`
+	Rule           int                       `json:"rule"`
+	Stream         bool                      `json:"stream"`
 }
 
 type ResponseModelRewriteScope struct {
@@ -34,18 +55,23 @@ type ResponseModelRewriteScope struct {
 }
 
 type ResponseModelRewriteSummary struct {
-	Enabled     bool                         `json:"enabled"`
-	Conditional bool                         `json:"conditional"`
-	Total       uint64                       `json:"total"`
-	Since       time.Time                    `json:"since"`
-	LastAt      *time.Time                   `json:"last_at,omitempty"`
-	Rules       []ResponseModelRewriteScope  `json:"rules"`
-	Recent      []ResponseModelRewriteRecord `json:"recent,omitempty"`
+	GuardEnabled bool                         `json:"guard_enabled"`
+	Blocked      uint64                       `json:"blocked"`
+	Observed     uint64                       `json:"observed"`
+	Enabled      bool                         `json:"enabled"`
+	Conditional  bool                         `json:"conditional"`
+	Total        uint64                       `json:"total"`
+	Since        time.Time                    `json:"since"`
+	LastAt       *time.Time                   `json:"last_at,omitempty"`
+	Rules        []ResponseModelRewriteScope  `json:"rules"`
+	Recent       []ResponseModelRewriteRecord `json:"recent,omitempty"`
 }
 
 type responseModelAuthStats struct {
-	total  uint64
-	recent []ResponseModelRewriteRecord
+	blocked  uint64
+	observed uint64
+	total    uint64
+	recent   []ResponseModelRewriteRecord
 }
 
 type responseModelStats struct {
@@ -133,6 +159,10 @@ func (m *Manager) responseModelRewriteOptions(ctx context.Context, auth *Auth, o
 		var once sync.Once
 		return &StreamRewriteOptions{RewriteModel: requested, StrictModelFields: true, OnRewrite: func(original string) {
 			once.Do(func() {
+				if _, active := opts.ResponseGuard.Snapshot(); active {
+					opts.ResponseGuard.SetClientModel(requested, true, i+1)
+					return
+				}
 				m.recordResponseModelRewrite(auth, ResponseModelRewriteRecord{
 					At: time.Now().UTC(), RequestedModel: strings.Clone(requested), OriginalModel: strings.Clone(original),
 					ResponseModel: strings.Clone(requested), Rule: i + 1, Stream: stream,
@@ -144,6 +174,11 @@ func (m *Manager) responseModelRewriteOptions(ctx context.Context, auth *Auth, o
 }
 
 func (m *Manager) rewriteClientResponseModel(ctx context.Context, auth *Auth, opts core.Options, response *core.Response, alias OAuthModelAliasResult) {
+	defer func() {
+		if model := gjson.GetBytes(response.Payload, "model").String(); model != "" {
+			opts.ResponseGuard.SetClientModel(model, false, 0)
+		}
+	}()
 	if options := m.responseModelRewriteOptions(ctx, auth, opts, false); options != nil {
 		response.Payload = rewriteModelWithOptions(response.Payload, *options)
 		return
@@ -190,6 +225,28 @@ func (m *Manager) AuthResponseModelRewriteSummary(auth *Auth, details bool) Resp
 		return result
 	}
 	policy := m.selectionPolicy()
+	if policy != nil && auth.ExecutionProvider() == "codex" {
+		guard := policy.codexResponseGuard
+		models := map[string]bool{"": true}
+		if guard.Rules != nil {
+			for _, rule := range *guard.Rules {
+				for _, model := range rule.Models {
+					models[model] = true
+				}
+				for _, o := range rule.ModelOverrides {
+					for _, model := range o.Models {
+						models[model] = true
+					}
+				}
+			}
+		}
+		for model := range models {
+			if guard.PolicyFor(ResponseGuardCredentialScope(auth, model)).Mode != "off" {
+				result.GuardEnabled = true
+				break
+			}
+		}
+	}
 	if policy != nil && policy.responseModelRewrite.Enabled {
 		result.Conditional = true
 		for i, rule := range policy.responseModelRewrite.Rules {
@@ -210,6 +267,7 @@ func (m *Manager) AuthResponseModelRewriteSummary(auth *Auth, details bool) Resp
 	result.Since = stats.since
 	if entry := stats.auths[auth.ID]; entry != nil {
 		result.Total = entry.total
+		result.Blocked, result.Observed = entry.blocked, entry.observed
 		if len(entry.recent) > 0 {
 			at := entry.recent[len(entry.recent)-1].At
 			result.LastAt = &at

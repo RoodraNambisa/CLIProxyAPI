@@ -119,6 +119,14 @@ func (c CodexStateOverrideConfig) MatchesCredential(scope CodexStateScope) bool 
 // PolicyFor resolves one effective policy. It is the only rule resolver used by
 // managed State runtime code and the management preview endpoint.
 func (c CodexStateOverrideConfig) PolicyFor(scope CodexStateScope) (CodexStateOverrideConfig, CodexStateRuleMatch, bool) {
+	p, match, ok := c.statePolicyFor(scope)
+	if ok {
+		p = c.ApplyResponseAcceptance(scope, p)
+	}
+	return p, match, ok
+}
+
+func (c CodexStateOverrideConfig) statePolicyFor(scope CodexStateScope) (CodexStateOverrideConfig, CodexStateRuleMatch, bool) {
 	match := CodexStateRuleMatch{RuleIndex: -1, Action: "unmatched", Sources: map[string]string{}}
 	if !c.Enabled {
 		match.Action = "disabled"

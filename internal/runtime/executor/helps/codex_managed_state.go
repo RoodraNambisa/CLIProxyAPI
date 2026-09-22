@@ -222,6 +222,11 @@ func (stateUnavailableError) PreserveErrorResponse() bool { return true }
 
 // ApplyManagedState runs after client headers and account guards. It never changes session IDs.
 func ApplyManagedState(ctx context.Context, cfg *config.Config, a *auth.Auth, model string, headers http.Header, targetURLs ...string) (err error) {
+	if guard := core.ResponseGuardConfigFromContext(ctx); cfg != nil && guard != nil {
+		copy := *cfg
+		copy.Codex.ResponseGuard = *guard
+		cfg = &copy
+	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -289,7 +294,7 @@ func ApplyManagedState(ctx context.Context, cfg *config.Config, a *auth.Auth, mo
 				return errors.New("no valid manually acquired State is available for this credential and upstream model")
 			}
 			c := StateCredential(a, model)
-			policy, _ := codexstate.DiagnosticPolicy(cfg.Codex.StateOverride, c)
+			policy, _ := codexstate.DiagnosticPolicy(cfg.Codex.ManagedStateConfig(), c)
 			choice := core.RefreshCodexStateForRequest(ctx, "diagnostic:"+codexStateRequestKey(c), func(previous core.CodexStateChoice) bool {
 				return codexstate.Diagnostic.StateSelectionValid(c, previous.Value, previous.Version, previous.ExpiresAt, time.Now(), policy)
 			}, func() core.CodexStateChoice {
@@ -337,11 +342,11 @@ func ApplyManagedState(ctx context.Context, cfg *config.Config, a *auth.Auth, mo
 		}
 		return nil
 	}
-	resolved, _, _ := cfg.Codex.StateOverride.PolicyFor(c.Scope())
+	resolved, _, _ := cfg.Codex.ManagedStateConfig().PolicyFor(c.Scope())
 	if cfg.Codex.StateOverride.Rules == nil {
 		// Legacy scope was already checked against the exact registered alias.
 		// Do not recheck its spelling after resolving the upstream model.
-		resolved = cfg.Codex.StateOverride.ForCredential(c.Plan, c.Model)
+		resolved = cfg.Codex.ManagedStateConfig().ApplyResponseAcceptance(c.Scope(), cfg.Codex.StateOverride.ForCredential(c.Plan, c.Model))
 	}
 	if diagnostic != nil && diagnostic.mode == "none" && !resolved.CookieOnly() {
 		return nil
@@ -460,7 +465,7 @@ func ObserveManagedStateCompletion(ctx context.Context, a *auth.Auth, model stri
 
 // ManagedStatePairAllowed checks the full scope for explicit diagnostic pairs.
 func ManagedStatePairAllowed(cfg *config.Config, c codexstate.Credential) bool {
-	_, _, ok := cfg.Codex.StateOverride.PolicyFor(c.Scope())
+	_, _, ok := cfg.Codex.ManagedStateConfig().PolicyFor(c.Scope())
 	return ok
 }
 func ResolveStateModel(authID, requested string) string {
@@ -477,5 +482,5 @@ func ResolveStateModel(authID, requested string) string {
 }
 
 func stateObservationPolicy(policy config.CodexStateOverrideConfig) *core.CodexStateObservationPolicy {
-	return &core.CodexStateObservationPolicy{MatchModel: policy.MatchModel == nil || *policy.MatchModel, ModelMismatch: policy.InvalidateOnModelMismatch, LengthMismatch: policy.InvalidateOnStateLengthMismatch, Lengths: slices.Clone(policy.Lengths), MissingReturnedState: policy.MissingReturnedState, Strategy: policy.Strategy, CookieMaxAgeSeconds: policy.CookieMaxAgeSeconds}
+	return &core.CodexStateObservationPolicy{AcceptedReturnedModels: slices.Clone(policy.AcceptedReturnedModels), ReturnedLengthMode: policy.ReturnedLengthMode, MatchModel: policy.MatchModel == nil || *policy.MatchModel, ModelMismatch: policy.InvalidateOnModelMismatch, LengthMismatch: policy.InvalidateOnStateLengthMismatch, Lengths: slices.Clone(policy.Lengths), MissingReturnedState: policy.MissingReturnedState, Strategy: policy.Strategy, CookieMaxAgeSeconds: policy.CookieMaxAgeSeconds}
 }

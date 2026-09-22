@@ -9,6 +9,9 @@ func isCodexStateRuleYAMLPath(path []string) bool {
 // Explicit false/empty values are policy choices, not removable defaults.
 // Preserve their ancestors too when the whole section is newly introduced.
 func preservesCodexStateRuleYAMLValue(path []string, node *yaml.Node) bool {
+	if isCodexResponseGuardYAMLPath(path) || len(path) == 1 && path[0] == "codex" && findMapKeyIndex(node, "response-guard") >= 0 {
+		return true
+	}
 	if isCodexStateRuleYAMLPath(path) || len(path) >= 3 && path[0] == "codex" && path[1] == "state-override" && path[2] == "model-overrides" {
 		return true
 	}

@@ -130,6 +130,7 @@ type APIKeyGroup struct {
 	// Target test behavior is opt-in per issuing client key.
 	CredentialTargetRespectStatePolicy   bool `yaml:"credential-target-respect-state-policy,omitempty" json:"credential-target-respect-state-policy,omitempty"`
 	CredentialTargetRespectRequestLimit  bool `yaml:"credential-target-respect-request-limit,omitempty" json:"credential-target-respect-request-limit,omitempty"`
+	CredentialTargetResponseGuard        bool `yaml:"credential-target-response-guard,omitempty" json:"credential-target-response-guard,omitempty"`
 	CredentialTargetResponseModelRewrite bool `yaml:"credential-target-response-model-rewrite,omitempty" json:"credential-target-response-model-rewrite,omitempty"`
 	// Empty allow lists impose no priority restriction; exclusions always win.
 	AllowedPriorities  APIKeyPriorityList `yaml:"allowed-priorities,omitempty" json:"allowed-priorities,omitempty"`

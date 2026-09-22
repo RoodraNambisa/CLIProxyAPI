@@ -41,7 +41,7 @@ func applyCredentialTarget(c *gin.Context, manager *coreauth.Manager, result *sd
 		return false
 	}
 	c.Set(sdkaccess.CredentialTargetAuthIDContextKey, selected.ID)
-	for _, option := range []string{sdkaccess.MetadataCredentialTargetRespectStatePolicy, sdkaccess.MetadataCredentialTargetRespectRequestLimit, sdkaccess.MetadataCredentialTargetResponseModelRewrite} {
+	for _, option := range []string{sdkaccess.MetadataCredentialTargetRespectStatePolicy, sdkaccess.MetadataCredentialTargetRespectRequestLimit, sdkaccess.MetadataCredentialTargetResponseModelRewrite, sdkaccess.MetadataCredentialTargetResponseGuard} {
 		c.Set(option, result.Metadata[option])
 	}
 	c.Header("X-CLIProxy-Auth-ID", selected.Index)

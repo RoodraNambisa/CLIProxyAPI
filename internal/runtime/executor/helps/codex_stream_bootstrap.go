@@ -161,7 +161,11 @@ func (g *CodexBootstrapDisconnectGate) Finish(discard bool) {
 // ProbeCodexSSEBootstrap returns an exact replay of all consumed bytes unless a
 // replayable overload is found. It neither translates nor logs/records usage.
 // The caller owns closing body on failure and closing the returned body otherwise.
-func ProbeCodexSSEBootstrap(ctx context.Context, body io.ReadCloser, replayable func() bool) (io.ReadCloser, *CodexBootstrapFailure, error) {
+func ProbeCodexSSEBootstrap(ctx context.Context, body io.ReadCloser, replayable func() bool, guards ...*CodexResponseGuard) (io.ReadCloser, *CodexBootstrapFailure, error) {
+	var guard *CodexResponseGuard
+	if len(guards) > 0 {
+		guard = guards[0]
+	}
 	reader := bufio.NewReader(body)
 	prefix := make([]byte, 0, 4096)
 	var probe CodexBootstrapProbe
@@ -182,7 +186,7 @@ func ProbeCodexSSEBootstrap(ctx context.Context, body io.ReadCloser, replayable 
 		if ctx != nil && ctx.Err() != nil {
 			return nil, nil, ctx.Err()
 		}
-		if !replayable() {
+		if !replayable() && guard == nil {
 			return replay(nil), nil, nil
 		}
 		start := len(prefix)
@@ -206,7 +210,10 @@ func ProbeCodexSSEBootstrap(ctx context.Context, body io.ReadCloser, replayable 
 		if ctx != nil && ctx.Err() != nil {
 			return nil, nil, ctx.Err()
 		}
-		if len(prefix) >= CodexBootstrapMaxBytes || !replayable() {
+		if len(prefix) >= CodexBootstrapMaxBytes || !replayable() && guard == nil {
+			if errGuard := guard.Observe(nil, true); errGuard != nil {
+				return nil, nil, errGuard
+			}
 			return replay(readErr), nil, nil
 		}
 		line := bytes.TrimSuffix(bytes.TrimSuffix(prefix[start:], []byte("\n")), []byte("\r"))
@@ -218,24 +225,39 @@ func ProbeCodexSSEBootstrap(ctx context.Context, body io.ReadCloser, replayable 
 			frameData = append(frameData, data...)
 			if gjson.ValidBytes(frameData) {
 				hold, status := probe.Observe(frameData)
-				if status != 0 {
+				if status != 0 && replayable() {
 					return nil, &CodexBootstrapFailure{Payload: frameData, Status: status}, nil
 				}
+				if errGuard := guard.Observe(frameData, !hold); errGuard != nil {
+					return nil, nil, errGuard
+				}
 				if !hold {
+					if errGuard := guard.Observe(nil, true); errGuard != nil {
+						return nil, nil, errGuard
+					}
 					return replay(readErr), nil, nil
 				}
 				frameData = frameData[:0]
 			}
 		} else if len(line) == 0 {
 			if len(frameData) != 0 {
+				if errGuard := guard.Observe(nil, true); errGuard != nil {
+					return nil, nil, errGuard
+				}
 				return replay(readErr), nil, nil
 			}
 		} else if !bytes.HasPrefix(line, []byte(":")) && !bytes.HasPrefix(line, []byte("event:")) && !bytes.HasPrefix(line, []byte("id:")) && !bytes.HasPrefix(line, []byte("retry:")) {
+			if errGuard := guard.Observe(nil, true); errGuard != nil {
+				return nil, nil, errGuard
+			}
 			return replay(readErr), nil, nil
 		}
 		if readErr != nil {
 			return replay(readErr), nil, nil
 		}
+	}
+	if errGuard := guard.Observe(nil, true); errGuard != nil {
+		return nil, nil, errGuard
 	}
 	return replay(nil), nil, nil
 }

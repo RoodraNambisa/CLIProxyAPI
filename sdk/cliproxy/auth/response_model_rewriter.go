@@ -18,7 +18,7 @@ func rewriteSSEPayloadLines(payload []byte, targetModel string) []byte {
 }
 
 func rewriteSSEPayloadLinesWithOptions(payload []byte, options StreamRewriteOptions) []byte {
-	if options.RewriteModel == "" || len(payload) == 0 {
+	if options.RewriteModel == "" && options.OnModel == nil || len(payload) == 0 {
 		return payload
 	}
 	lines := bytes.Split(payload, []byte("\n"))
@@ -44,7 +44,7 @@ func rewriteModelInResponse(data []byte, targetModel string) []byte {
 
 func rewriteModelWithOptions(data []byte, options StreamRewriteOptions) []byte {
 	targetModel := options.RewriteModel
-	if targetModel == "" || len(data) == 0 {
+	if targetModel == "" && options.OnModel == nil || len(data) == 0 {
 		return data
 	}
 	if options.StrictModelFields {
@@ -61,6 +61,12 @@ func rewriteModelWithOptions(data []byte, options StreamRewriteOptions) []byte {
 	for _, path := range modelFieldPaths {
 		value := gjson.GetBytes(data, path)
 		if options.StrictModelFields && (value.Type != gjson.String || value.String() == "" || value.String() == targetModel) {
+			continue
+		}
+		if targetModel == "" {
+			if options.OnModel != nil && value.Type == gjson.String && value.String() != "" {
+				options.OnModel(value.String())
+			}
 			continue
 		}
 		if value.Exists() {
@@ -82,6 +88,8 @@ type StreamRewriteOptions struct {
 	RewriteModel      string
 	StrictModelFields bool
 	OnRewrite         func(string)
+	// OnModel observes forwarded model fields without changing payloads when RewriteModel is empty.
+	OnModel func(string)
 }
 
 type StreamRewriter struct {
@@ -94,7 +102,7 @@ func NewStreamRewriter(options StreamRewriteOptions) *StreamRewriter {
 }
 
 func (r *StreamRewriter) RewriteChunk(chunk []byte) []byte {
-	if r.options.RewriteModel == "" {
+	if r.options.RewriteModel == "" && r.options.OnModel == nil {
 		return chunk
 	}
 	if len(r.pendingBuf) > 0 {

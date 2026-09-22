@@ -2,6 +2,7 @@ package helps
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"sync"
 	"time"
@@ -12,6 +13,11 @@ import (
 	core "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	"github.com/tidwall/gjson"
 )
+
+func (u CodexManagedStateUse) RejectGuardEvidence(headers http.Header, evidence config.CodexResponseEvidence) bool {
+	payload, _ := json.Marshal(map[string]string{"model": evidence.Model})
+	return u.RejectEvidence(headers, payload)
+}
 
 type CodexManagedStateUse struct {
 	Credential  codexstate.Credential
@@ -71,6 +77,16 @@ func ManagedStateUse(ctx context.Context, a *auth.Auth, model string, headers ht
 // Observe accepts original upstream metadata before any response-model rewrite.
 // It does not alter the business response or cause the business request to replay.
 func (u CodexManagedStateUse) Observe(headers http.Header, payload []byte) bool {
+	return u.observe(headers, payload, false)
+}
+
+// RejectEvidence permits invalidation after a positive guard mismatch, without
+// recording a cancelled acquisition or business request as a completion.
+func (u CodexManagedStateUse) RejectEvidence(headers http.Header, payload []byte) bool {
+	return u.observe(headers, payload, true)
+}
+
+func (u CodexManagedStateUse) observe(headers http.Header, payload []byte, evidence bool) bool {
 	manager := u.manager
 	if manager == nil {
 		manager = codexstate.Default
@@ -95,6 +111,8 @@ func (u CodexManagedStateUse) Observe(headers http.Header, payload []byte) bool 
 			policy.InvalidateOnModelMismatch = u.observation.ModelMismatch
 			policy.InvalidateOnStateLengthMismatch = u.observation.LengthMismatch
 			policy.Lengths = u.observation.Lengths
+			policy.AcceptedReturnedModels = u.observation.AcceptedReturnedModels
+			policy.ReturnedLengthMode = u.observation.ReturnedLengthMode
 			policy.MissingReturnedState = u.observation.MissingReturnedState
 			policy.MatchModel = new(u.observation.MatchModel)
 		}
@@ -110,16 +128,16 @@ func (u CodexManagedStateUse) Observe(headers http.Header, payload []byte) bool 
 					return true
 				}
 			}
-			if !completed {
+			if !completed && !evidence {
 				return false
 			}
 			headers = u.response.headers.Clone()
 			headers.Del("Set-Cookie")
 		}
-		return manager.ObserveCookie(u.Credential, *u.cookie, policy, headers, model, completed)
+		return manager.ObserveCookieEvidence(u.Credential, *u.cookie, policy, headers, model, completed, evidence)
 	}
 	if u.observation != nil {
-		policy := config.CodexStateOverrideConfig{InvalidateOnModelMismatch: u.observation.ModelMismatch, InvalidateOnStateLengthMismatch: u.observation.LengthMismatch, Lengths: u.observation.Lengths, MissingReturnedState: u.observation.MissingReturnedState}
+		policy := config.CodexStateOverrideConfig{AcceptedReturnedModels: u.observation.AcceptedReturnedModels, ReturnedLengthMode: u.observation.ReturnedLengthMode, InvalidateOnModelMismatch: u.observation.ModelMismatch, InvalidateOnStateLengthMismatch: u.observation.LengthMismatch, Lengths: u.observation.Lengths, MissingReturnedState: u.observation.MissingReturnedState}
 		if headers == nil {
 			policy.MissingReturnedState = "ignore"
 		}

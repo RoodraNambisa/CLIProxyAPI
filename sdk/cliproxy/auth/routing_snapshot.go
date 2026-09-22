@@ -27,6 +27,7 @@ type routingRequestPolicy struct {
 	oauthErrorRules       map[string]*config.CompiledRequestScopedErrors
 	clientKeyPriorities   map[[sha256.Size]byte]clientKeyPriorityPolicy
 	responseModelRewrite  config.ResponseModelRewriteConfig
+	codexResponseGuard    config.CodexResponseGuardConfig
 }
 
 type routingRequestPolicyKey struct{}

@@ -982,6 +982,9 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
 	}
 	newCtx = executorhelps.CaptureCodexMultiAgentPolicyContext(newCtx)
 	newCtx = context.WithValue(newCtx, "handler", handler)
+	if h != nil && h.AuthManager != nil {
+		newCtx = h.AuthManager.WithRoutingPolicySnapshot(newCtx)
+	}
 	newCtx, _ = ensureErrorResponseSourceTracker(newCtx, c)
 	if c != nil {
 		if value, exists := c.Get(coreexecutor.ImageBootstrapPolicyMetadataKey); exists {
@@ -1038,9 +1041,19 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
 
 // StartNonStreamingKeepAlive emits blank lines every 5 seconds while waiting for a non-streaming response.
 // It returns a stop function that must be called before writing the final response.
-func (h *BaseAPIHandler) StartNonStreamingKeepAlive(c *gin.Context, ctx context.Context) func() {
+func (h *BaseAPIHandler) StartNonStreamingKeepAlive(c *gin.Context, ctx context.Context, models ...string) func() {
 	if h == nil || c == nil {
 		return func() {}
+	}
+	if len(models) > 0 && h.AuthManager.ResponseGuardMayEnforce(ctx) {
+		providers, _, errDetails := h.getRequestDetails(ctx, models[0])
+		if errDetails == nil {
+			for _, provider := range providers {
+				if provider == "codex" {
+					return func() {}
+				}
+			}
+		}
 	}
 	interval := NonStreamingKeepAliveInterval(h.Cfg)
 	if interval <= 0 {
@@ -1543,7 +1556,7 @@ func (h *BaseAPIHandler) executeStreamWithResolvedProviders(ctx context.Context,
 					// Safe bootstrap recovery: if the upstream fails before any payload bytes are sent,
 					// retry a few times (to allow auth rotation / transient recovery) and then attempt model fallback.
 					if !sentPayload && pendingProtocolProjection == nil {
-						if bootstrapRetries < maxBootstrapRetries && allowRequestErrorRetry(streamErr) && bootstrapEligible(streamErr) && coreauth.ConsumeRequestRetryBudget(ctx) {
+						if !coreexecutor.IsResponseGuardError(streamErr) && bootstrapRetries < maxBootstrapRetries && allowRequestErrorRetry(streamErr) && bootstrapEligible(streamErr) && coreauth.ConsumeRequestRetryBudget(ctx) {
 							bootstrapRetries++
 							retryResult, retryErr := h.AuthManager.ExecuteStream(ctx, providers, req, opts)
 							if retryErr == nil {

@@ -67,21 +67,22 @@ type codexWebsocketSession struct {
 
 	reqMu sync.Mutex
 
-	connMu               sync.Mutex
-	conn                 *websocket.Conn
-	wsURL                string
-	authID               string
-	authInstanceID       string
-	proxyBindingID       string
-	proxyIdentity        string
-	softwareIdentity     codexauth.SoftwareIdentity
-	requestScopeDigest   [sha256.Size]byte
-	requestModel         string
-	cacheSessionDigest   [sha256.Size]byte
-	managedStateModel    string
-	managedStateUse      helps.CodexManagedStateUse
-	managedStateRejected bool
-	xaiHeaderDigest      string
+	connMu                 sync.Mutex
+	conn                   *websocket.Conn
+	wsURL                  string
+	authID                 string
+	authInstanceID         string
+	proxyBindingID         string
+	proxyIdentity          string
+	softwareIdentity       codexauth.SoftwareIdentity
+	requestScopeDigest     [sha256.Size]byte
+	requestModel           string
+	cacheSessionDigest     [sha256.Size]byte
+	managedStateModel      string
+	managedStateUse        helps.CodexManagedStateUse
+	responseGuardHandshake config.CodexResponseEvidence
+	managedStateRejected   bool
+	xaiHeaderDigest        string
 	// multiAgentResponse describes only the tools committed on the current conn.
 	// It is guarded by connMu and contains no request bodies or connection pointer.
 	multiAgentResponse helps.CodexMultiAgentResponsePolicy
@@ -541,6 +542,8 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	}
 	wsReqBody = nil
 
+	guard := e.newWebsocketResponseGuard(ctx, auth, sess, conn, req.Model, opts, false, wsHeaders, upstreamHeaders)
+	defer func() { guard.Finish(err) }()
 	streamEstablished := false
 	outputItemsByIndex := make(map[int64][]byte)
 	var outputItemsFallback [][]byte
@@ -569,6 +572,14 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		payload = bytes.TrimSpace(payload)
 		if len(payload) == 0 {
 			continue
+		}
+		if errGuard := guard.Observe(payload, false); errGuard != nil {
+			if sess != nil {
+				e.invalidateUpstreamConnWithoutDisconnectNotify(sess, conn, "response_guard", errGuard)
+			} else {
+				_ = conn.Close()
+			}
+			return resp, errGuard
 		}
 		helps.ObserveCodexWebsocketQuota(ctx, auth, payload)
 		if isCodexSuccessfulCompletion(normalizeCodexCompletion(payload)) {
@@ -614,7 +625,9 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 
 		eventType := gjson.GetBytes(payload, "type").String()
 		if !streamEstablished && eventType != "" && eventType != "error" {
-			helps.ReleaseRequestBodyAfterStreamEstablished(ctx, opts)
+			if !guard.Enforces() {
+				helps.ReleaseRequestBodyAfterStreamEstablished(ctx, opts)
+			}
 			streamEstablished = true
 		}
 		if eventType == "response.output_item.done" {
@@ -787,7 +800,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	}
 
 	var bootstrapDisconnect *helps.CodexBootstrapDisconnectGate
-	if sess != nil && preparedIdentity.StreamBootstrapBuffering && !cliproxyexecutor.RequiredUpstreamWebsocket(ctx) && helps.RequestBodyReplayable(ctx, opts) {
+	if sess != nil && (preparedIdentity.StreamBootstrapBuffering || opts.ResponseGuard != nil && opts.ResponseGuard.Config.Enabled) {
 		bootstrapDisconnect = helps.NewCodexBootstrapDisconnectGate(sess.notifyUpstreamDisconnect)
 		sess.connMu.Lock()
 		sess.bootstrapDisconnectGate = bootstrapDisconnect
@@ -945,11 +958,13 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	wsReqBody = nil
 
 	out := make(chan cliproxyexecutor.StreamChunk, cliproxyexecutor.StreamBufferSize)
+	guard := e.newWebsocketResponseGuard(ctx, auth, sess, conn, req.Model, opts, true, wsHeaders, upstreamHeaders)
 	var bootstrapFrames []codexWebsocketRead
-	if preparedIdentity.StreamBootstrapBuffering && !cliproxyexecutor.RequiredUpstreamWebsocket(ctx) && helps.RequestBodyReplayable(ctx, opts) {
+	bootstrapEnabled := preparedIdentity.StreamBootstrapBuffering && !cliproxyexecutor.RequiredUpstreamWebsocket(ctx)
+	if bootstrapEnabled && helps.RequestBodyReplayable(ctx, opts) || guard.Enforces() {
 		var probe helps.CodexBootstrapProbe
 		bufferedBytes := 0
-		for helps.RequestBodyReplayable(ctx, opts) {
+		for guard.Enforces() || helps.RequestBodyReplayable(ctx, opts) {
 			msgType, payload, errRead := readCodexWebsocketMessage(ctx, sess, conn, readCh)
 			if msgType == websocket.TextMessage && len(payload) > 0 {
 				helps.ObserveCodexWebsocketQuota(ctx, auth, payload)
@@ -963,11 +978,12 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			}
 			bootstrapFrames = append(bootstrapFrames, codexWebsocketRead{msgType: msgType, payload: payload, err: errRead})
 			bufferedBytes += len(payload)
-			if errRead != nil || msgType != websocket.TextMessage || bufferedBytes >= helps.CodexBootstrapMaxBytes || !helps.RequestBodyReplayable(ctx, opts) {
+			if errRead != nil || msgType != websocket.TextMessage {
 				break
 			}
 			hold, overloadStatus := probe.Observe(payload)
-			if overloadStatus != 0 {
+			if overloadStatus != 0 && bootstrapEnabled && helps.RequestBodyReplayable(ctx, opts) {
+				_ = guard.Observe(payload, false)
 				upstreamError := codexauth.SanitizeAgentIdentityErrorBody(authMetadata(auth), payload)
 				helps.AppendAPIWebsocketResponse(ctx, e.cfg, upstreamError)
 				clientError := applyCodexIdentityExposeResponsePayload(upstreamError, identityState)
@@ -987,7 +1003,22 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				cleanupBodies()
 				return nil, bootstrapErr
 			}
-			if !hold {
+			boundary := !hold || bufferedBytes >= helps.CodexBootstrapMaxBytes
+			if errGuard := guard.Observe(payload, boundary); errGuard != nil {
+				if bootstrapDisconnect != nil {
+					bootstrapDisconnect.Finish(true)
+				}
+				if sess != nil {
+					e.invalidateUpstreamConnWithoutDisconnectNotify(sess, conn, "response_guard", errGuard)
+					sess.clearActiveForConn(readCh, conn)
+					sess.reqMu.Unlock()
+				} else {
+					_ = conn.Close()
+				}
+				cleanupBodies()
+				return nil, errGuard
+			}
+			if boundary || !helps.RequestBodyReplayable(ctx, opts) {
 				break
 			}
 		}
@@ -997,6 +1028,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		var terminateErr error
 
 		defer close(out)
+		defer func() { guard.Finish(terminateErr) }()
 		defer cleanupBodies()
 		defer func() {
 			if sess != nil {
@@ -1011,12 +1043,19 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		}()
 
 		send := func(chunk cliproxyexecutor.StreamChunk) bool {
+			guard.Finish(chunk.Err)
 			if ctx == nil {
 				out <- chunk
+				if chunk.Err == nil && len(chunk.Payload) > 0 {
+					guard.Commit()
+				}
 				return true
 			}
 			select {
 			case out <- chunk:
+				if chunk.Err == nil && len(chunk.Payload) > 0 {
+					guard.Commit()
+				}
 				return true
 			case <-ctx.Done():
 				return false
@@ -1088,6 +1127,15 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			payload = bytes.TrimSpace(payload)
 			if len(payload) == 0 {
 				continue
+			}
+			if errGuard := guard.Observe(payload, false); errGuard != nil {
+				terminateReason, terminateErr = "response_guard", errGuard
+				if sess != nil {
+					e.invalidateUpstreamConnWithoutDisconnectNotify(sess, conn, "response_guard", errGuard)
+				}
+				reporter.PublishFailure(ctx, errGuard)
+				_ = send(cliproxyexecutor.StreamChunk{Err: errGuard})
+				return
 			}
 			helps.ObserveResponsesTokenEvent(reporter, payload)
 			normalizedPayload := normalizeCodexCompletion(payload)
@@ -2193,6 +2241,11 @@ func (e *CodexWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *
 	sess.proxyIdentity = requestedProxyIdentity
 	sess.managedStateModel = requestedStateModel
 	sess.managedStateUse = managedUse
+	sess.responseGuardHandshake = config.CodexResponseEvidence{}
+	if resp != nil {
+		state := resp.Header.Get("X-Codex-Turn-State")
+		sess.responseGuardHandshake = config.CodexResponseEvidence{StatePresent: state != "", StateLength: len(state)}
+	}
 	sess.managedStateRejected = rejected
 	sess.cacheSessionDigest = requestedCacheSessionDigest
 	sess.requestScopeDigest = requestedRequestScopeDigest
@@ -2341,6 +2394,7 @@ func (e *CodexWebsocketsExecutor) invalidateUpstreamConnWithNotify(sess *codexWe
 	sess.multiAgentResponse = helps.CodexMultiAgentResponsePolicy{}
 	sess.softwareIdentity = codexauth.SoftwareIdentity{}
 	sess.managedStateUse = helps.CodexManagedStateUse{}
+	sess.responseGuardHandshake = config.CodexResponseEvidence{}
 	sess.managedStateRejected = false
 	if sess.readerConn == conn {
 		sess.readerConn = nil
@@ -2742,4 +2796,22 @@ func codexWebsocketsEnabled(auth *cliproxyauth.Auth) bool {
 	default:
 	}
 	return false
+}
+
+func (e *CodexWebsocketsExecutor) newWebsocketResponseGuard(ctx context.Context, auth *cliproxyauth.Auth, sess *codexWebsocketSession, conn *websocket.Conn, model string, opts cliproxyexecutor.Options, stream bool, sent, headers http.Header) *helps.CodexResponseGuard {
+	use := helps.ManagedStateUse(ctx, auth, model, sent)
+	var evidence config.CodexResponseEvidence
+	if sess != nil {
+		sess.connMu.Lock()
+		if sess.conn == conn {
+			use = sess.managedStateUse
+			evidence = sess.responseGuardHandshake
+		}
+		sess.connMu.Unlock()
+	}
+	guard := helps.NewCodexResponseGuard(ctx, e.cfg, auth, model, opts, stream, "websocket", http.StatusSwitchingProtocols, headers, func(observed config.CodexResponseEvidence) { use.RejectGuardEvidence(headers, observed) })
+	if sess != nil {
+		guard.SetStateEvidence(evidence)
+	}
+	return guard
 }

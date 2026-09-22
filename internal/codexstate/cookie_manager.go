@@ -4,7 +4,6 @@ import (
 	"context"
 	"net/http"
 	"reflect"
-	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -43,22 +42,16 @@ func ValidateAcquisition(p config.CodexStateOverrideConfig, model string, r Resu
 	} else if r.State == "" || len(r.State) > 8192 || strings.ContainsAny(r.State, "\r\n\x00") {
 		return "invalid_or_missing_state"
 	}
-	if len(p.Lengths) > 0 {
+	if p.CheckReturnedLength() {
 		if r.State == "" {
 			if p.MissingReturnedState == "reject" {
 				return "missing_returned_state"
 			}
-		} else {
-			matched := false
-			for _, n := range p.Lengths {
-				matched = matched || n == len(r.State)
-			}
-			if !matched {
-				return "state_length_mismatch"
-			}
+		} else if !config.CodexReturnedLengthAccepted(len(r.State), p.ReturnedLengthMode, p.Lengths) {
+			return "state_length_mismatch"
 		}
 	}
-	if *p.MatchModel && r.Model != model {
+	if *p.MatchModel && !config.CodexReturnedModelAccepted(model, r.Model, p.AcceptedReturnedModels) {
 		return "response_model_mismatch"
 	}
 	if p.ResponseContains != "" && !strings.Contains(r.Answer, p.ResponseContains) {
@@ -156,7 +149,7 @@ func (m *Manager) syncCookiesLocked() {
 }
 
 func sameCookieValidation(a, b config.CodexStateOverrideConfig) bool {
-	return reflect.DeepEqual(a.Lengths, b.Lengths) && reflect.DeepEqual(a.MatchModel, b.MatchModel) && a.Prompt == b.Prompt && a.ResponseContains == b.ResponseContains && a.CookieVerifyAfterAcquire == b.CookieVerifyAfterAcquire && a.MissingReturnedState == b.MissingReturnedState
+	return a.ReturnedLengthMode == b.ReturnedLengthMode && reflect.DeepEqual(a.AcceptedReturnedModels, b.AcceptedReturnedModels) && reflect.DeepEqual(a.Lengths, b.Lengths) && reflect.DeepEqual(a.MatchModel, b.MatchModel) && a.Prompt == b.Prompt && a.ResponseContains == b.ResponseContains && a.CookieVerifyAfterAcquire == b.CookieVerifyAfterAcquire && a.MissingReturnedState == b.MissingReturnedState
 }
 
 func (m *Manager) CookieSnapshot(id string, now time.Time) *CookieSnapshot {
@@ -169,6 +162,7 @@ func (m *Manager) CookieSnapshot(id string, now time.Time) *CookieSnapshot {
 	w := g.work
 	s := &CookieSnapshot{Snapshot: w.Snapshot, Main: g.main.snapshot(g.version, now, w.policy), Candidate: g.candidate.snapshot(g.candidateVersion, now, w.policy), Observation: g.observation}
 	s.AllowedLengths = append([]int(nil), w.policy.Lengths...)
+	s.LengthMode = w.policy.ReturnedLengthMode
 	s.LastReturnedLength = cloneCookieInt(w.LastReturnedLength)
 	s.InvalidationLength = cloneCookieInt(w.InvalidationLength)
 	switch {
@@ -432,6 +426,10 @@ func (m *Manager) finishCookie(id string, expected *cookieGroup, work *entry, ca
 }
 
 func (m *Manager) ObserveCookie(c Credential, used CookieSelection, p config.CodexStateOverrideConfig, headers http.Header, model string, completed bool) bool {
+	return m.ObserveCookieEvidence(c, used, p, headers, model, completed, false)
+}
+
+func (m *Manager) ObserveCookieEvidence(c Credential, used CookieSelection, p config.CodexStateOverrideConfig, headers http.Header, model string, completed, evidence bool) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	defer m.publishAvailabilityLocked()
@@ -445,11 +443,11 @@ func (m *Manager) ObserveCookie(c Credential, used CookieSelection, p config.Cod
 	if headers != nil {
 		length := len(headers.Get("X-Codex-Turn-State"))
 		w.LastReturnedLength = new(length)
-		if completed && len(p.Lengths) > 0 {
+		if (completed || evidence) && p.CheckReturnedLength() {
 			if length == 0 && p.MissingReturnedState == "reject" {
 				mismatch = "missing_returned_state"
 			}
-			if length > 0 && !slices.Contains(p.Lengths, length) {
+			if length > 0 && !config.CodexReturnedLengthAccepted(length, p.ReturnedLengthMode, p.Lengths) {
 				mismatch = "response_state_length_mismatch"
 			}
 			if p.InvalidateOnStateLengthMismatch {
@@ -494,7 +492,9 @@ func (m *Manager) ObserveCookie(c Credential, used CookieSelection, p config.Cod
 	}
 	if completed {
 		w.Completed++
-		if model != "" && model != c.Model && (p.MatchModel == nil || *p.MatchModel || p.InvalidateOnModelMismatch) {
+	}
+	if completed || evidence {
+		if model != "" && !config.CodexReturnedModelAccepted(c.Model, model, p.AcceptedReturnedModels) && (p.MatchModel == nil || *p.MatchModel || p.InvalidateOnModelMismatch) {
 			mismatch = "response_model_mismatch"
 			if p.InvalidateOnModelMismatch {
 				reason = mismatch
@@ -502,7 +502,7 @@ func (m *Manager) ObserveCookie(c Credential, used CookieSelection, p config.Cod
 		}
 	}
 	if reason == "" {
-		if completed {
+		if completed || evidence {
 			g.observation = "matches_rules"
 			if mismatch != "" {
 				g.observation = mismatch

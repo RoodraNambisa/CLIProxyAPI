@@ -88,5 +88,6 @@ func (m *Manager) ProbeCredential(ctx context.Context, expected *Auth, executor 
 			err = runtimeAuthInstanceRetiredError()
 		}
 	}()
-	return probe(ctx, auth, req, opts)
+	opts = m.withResponseGuardAttempt(ctx, auth, req, opts)
+	return probe(core.WithResponseGuardAttempt(ctx, opts.ResponseGuard), auth, req, opts)
 }

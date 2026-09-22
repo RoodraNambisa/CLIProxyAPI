@@ -825,6 +825,7 @@ type Request struct {
 
 // Options controls execution behavior for both streaming and non-streaming calls.
 type Options struct {
+	ResponseGuard *ResponseGuardAttempt
 	// Stream toggles streaming mode.
 	Stream bool
 	// Alt carries optional alternate format hint (e.g. SSE JSON key).

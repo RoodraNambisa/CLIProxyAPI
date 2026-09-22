@@ -1184,6 +1184,7 @@ func (m *Manager) SetSelector(selector Selector) {
 		policy.oauthErrorRules = previous.oauthErrorRules
 		policy.clientKeyPriorities = previous.clientKeyPriorities
 		policy.responseModelRewrite = previous.responseModelRewrite
+		policy.codexResponseGuard = previous.codexResponseGuard
 		policy.codexQuotaAutoDisable = previous.codexQuotaAutoDisable
 	}
 	m.routingPolicy.Store(policy)
@@ -1402,6 +1403,7 @@ func (m *Manager) setConfigLocked(cfg *internalconfig.Config) {
 	policy.oauthErrorRules = oauthErrorRules
 	policy.clientKeyPriorities = compileClientKeyPriorities(cfg)
 	policy.responseModelRewrite = cloneResponseModelRewrite(cfg.ResponseModelRewrite)
+	policy.codexResponseGuard = cfg.Codex.ResponseGuard.Clone()
 	m.routingPolicy.Store(policy)
 	if m.backingPathAuthDir != strings.TrimSpace(cfg.AuthDir) {
 		m.rebuildBackingPathIndexLocked(cfg)
@@ -2480,10 +2482,14 @@ func (m *Manager) wrapStreamResult(ctx, resultCtx context.Context, auth *Auth, a
 		forward := true
 		var rewriter *StreamRewriter
 		if !cliproxyexecutor.SingleAttempt(ctx) && aliasResult.ForceMapping && strings.TrimSpace(aliasResult.OriginalAlias) != "" {
-			rewriter = NewStreamRewriter(StreamRewriteOptions{RewriteModel: aliasResult.OriginalAlias})
+			rewriter = NewStreamRewriter(StreamRewriteOptions{RewriteModel: aliasResult.OriginalAlias, OnRewrite: func(string) { opts.ResponseGuard.SetClientModel(aliasResult.OriginalAlias, false, 0) }})
 		}
 		if rewrite := m.responseModelRewriteOptions(ctx, auth, opts, true); rewrite != nil {
 			rewriter = NewStreamRewriter(*rewrite)
+		}
+		var guardModelObserver *StreamRewriter
+		if _, active := opts.ResponseGuard.Snapshot(); active {
+			guardModelObserver = NewStreamRewriter(StreamRewriteOptions{StrictModelFields: true, OnModel: func(model string) { opts.ResponseGuard.SetClientModel(model, false, 0) }})
 		}
 		send := func(chunk cliproxyexecutor.StreamChunk, retiredChunk bool) bool {
 			select {
@@ -2491,6 +2497,9 @@ func (m *Manager) wrapStreamResult(ctx, resultCtx context.Context, auth *Auth, a
 				forward = false
 				return false
 			case out <- chunk:
+				if guardModelObserver != nil && chunk.Err == nil {
+					_ = guardModelObserver.RewriteChunk(chunk.Payload)
+				}
 				if retiredChunk {
 					retiredErrorSent = true
 				}
@@ -2677,6 +2686,9 @@ func (m *Manager) executeStreamWithModelPool(ctx, resultCtx context.Context, exe
 		}
 		attemptCtx, usageAttempt := cliproxyexecutor.WithRequestUsageAttempt(ctx)
 		attemptCtx = cliproxyexecutor.WithUpstreamAttemptSlot(attemptCtx, execOpts.AuthRequestSlot)
+		execOpts = m.withResponseGuardAttempt(attemptCtx, auth, execReq, execOpts)
+		attemptCtx = cliproxyexecutor.WithResponseGuardAttempt(attemptCtx, execOpts.ResponseGuard)
+		opts.ResponseGuard = execOpts.ResponseGuard
 		streamResult, errStream := executeProviderStream(attemptCtx, executor, auth, execReq, execOpts)
 		streamResult, errStream = validateStreamResult(streamResult, errStream)
 		errStream = recordExecutionAttemptError(attemptCtx, auth, provider, errStream)
@@ -2709,6 +2721,9 @@ func (m *Manager) executeStreamWithModelPool(ctx, resultCtx context.Context, exe
 				return nil, errStream
 			}
 			lastErr = errStream
+			if cliproxyexecutor.IsResponseGuardError(errStream) {
+				return nil, errStream
+			}
 			if !requestBodyReplayable(ctx, replayOpts) {
 				return nil, errStream
 			}
@@ -4598,7 +4613,7 @@ func authFilePathQuarantined(auth *Auth, authDir string) bool {
 func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (response cliproxyexecutor.Response, err error) {
 	ctx = cliproxyexecutor.WithCodexStateSnapshot(coreusage.WithStreamDefault(ctx, false))
 	ctx = contextWithGenerateMetadata(ctx, opts)
-	ctx = m.WithRoutingPolicySnapshot(ctx)
+	ctx = cliproxyexecutor.WithResponseGuardRequest(m.WithRoutingPolicySnapshot(ctx))
 	ctx = m.withCodexQuotaObservation(ctx)
 	ctx, upstreamErrors := withUpstreamErrorHistory(ctx)
 	var releaseProducer func()
@@ -4698,7 +4713,7 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (response cliproxyexecutor.Response, err error) {
 	ctx = cliproxyexecutor.WithCodexStateSnapshot(coreusage.WithStreamDefault(ctx, false))
 	ctx = contextWithGenerateMetadata(ctx, opts)
-	ctx = m.WithRoutingPolicySnapshot(ctx)
+	ctx = cliproxyexecutor.WithResponseGuardRequest(m.WithRoutingPolicySnapshot(ctx))
 	ctx = cliproxyexecutor.WithCodexQuotaObserver(ctx, nil)
 	ctx, upstreamErrors := withUpstreamErrorHistory(ctx)
 	var releaseProducer func()
@@ -4788,7 +4803,7 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (result *cliproxyexecutor.StreamResult, err error) {
 	ctx = cliproxyexecutor.WithCodexStateSnapshot(coreusage.WithStreamDefault(ctx, true))
 	ctx = contextWithGenerateMetadata(ctx, opts)
-	ctx = m.WithRoutingPolicySnapshot(ctx)
+	ctx = cliproxyexecutor.WithResponseGuardRequest(m.WithRoutingPolicySnapshot(ctx))
 	ctx = m.withCodexQuotaObservation(ctx)
 	ctx, upstreamErrors := withUpstreamErrorHistory(ctx)
 	var producer *resultPersistenceProducer
@@ -5782,6 +5797,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			}
 			return cliproxyexecutor.Response{}, &Error{Code: "request_body_released", Message: "request body released; retry disabled"}
 		}
+		cliproxyexecutor.AddResponseGuardExclusions(ctx, roundState.tried)
 		selectionStarted := time.Now()
 		requestSlotBefore := opts.AuthRequestSlot.ReservationDurationNanos()
 		opts = m.withSessionAffinityResultSnapshot(ctx, providers, routeModel, opts)
@@ -5906,6 +5922,8 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			}
 			roundState.markAttempted(auth)
 			runtimeCtx = cliproxyexecutor.WithUpstreamAttemptSlot(runtimeCtx, opts.AuthRequestSlot)
+			opts = m.withResponseGuardAttempt(runtimeCtx, auth, execReq, opts)
+			runtimeCtx = cliproxyexecutor.WithResponseGuardAttempt(runtimeCtx, opts.ResponseGuard)
 			resp, errExec := executeProviderRequest(runtimeCtx, executor, auth, execReq, opts)
 			retiredDuringExecution := releaseExecution()
 			if !retiredDuringExecution {
@@ -5972,6 +5990,8 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 						break
 					}
 					retryCtx = cliproxyexecutor.WithUpstreamAttemptSlot(retryCtx, opts.AuthRequestSlot)
+					opts = m.withResponseGuardAttempt(retryCtx, auth, execReq, opts)
+					retryCtx = cliproxyexecutor.WithResponseGuardAttempt(retryCtx, opts.ResponseGuard)
 					resp, errExec = executeProviderRequest(retryCtx, executor, auth, execReq, opts)
 					retiredDuringRetry := releaseRetry()
 					if !retiredDuringRetry {
@@ -6027,6 +6047,9 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				return cliproxyexecutor.Response{}, withAuthErrorResponseSource(errExec, auth, provider)
 			}
 			authErr = errExec
+			if cliproxyexecutor.IsResponseGuardError(errExec) {
+				break
+			}
 			if !requestBodyReplayable(execCtx, opts) {
 				return cliproxyexecutor.Response{}, withAuthErrorResponseSource(errExec, auth, provider)
 			}
@@ -6303,6 +6326,9 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 				return cliproxyexecutor.Response{}, withAuthErrorResponseSource(errExec, auth, provider)
 			}
 			authErr = errExec
+			if cliproxyexecutor.IsResponseGuardError(errExec) {
+				break
+			}
 			if !requestBodyReplayable(execCtx, opts) {
 				return cliproxyexecutor.Response{}, withAuthErrorResponseSource(errExec, auth, provider)
 			}
@@ -6349,6 +6375,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			}
 			return nil, &Error{Code: "request_body_released", Message: "request body released; retry disabled"}
 		}
+		cliproxyexecutor.AddResponseGuardExclusions(ctx, roundState.tried)
 		selectionStarted := time.Now()
 		requestSlotBefore := opts.AuthRequestSlot.ReservationDurationNanos()
 		opts = m.withSessionAffinityResultSnapshot(ctx, providers, routeModel, opts)
@@ -9396,6 +9423,9 @@ func isRequestInvalidErrorWithRules(err error, rules []internalconfig.NonRetryab
 	if err == nil {
 		return false
 	}
+	if cliproxyexecutor.IsResponseGuardError(err) {
+		return !retryOtherAuthForError(err)
+	}
 	if isRequestScopedStopError(err) {
 		return true
 	}
@@ -10039,7 +10069,7 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 }
 
 func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, error) {
-	ctx = m.WithRoutingPolicySnapshot(ctx)
+	ctx = cliproxyexecutor.WithResponseGuardRequest(m.WithRoutingPolicySnapshot(ctx))
 	if ctx != nil && ctx.Err() != nil {
 		return nil, nil, ctx.Err()
 	}
@@ -10292,7 +10322,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 }
 
 func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}, pickAllowed ...func(*Auth) bool) (*Auth, ProviderExecutor, string, error) {
-	ctx = m.WithRoutingPolicySnapshot(ctx)
+	ctx = cliproxyexecutor.WithResponseGuardRequest(m.WithRoutingPolicySnapshot(ctx))
 	if ctx != nil && ctx.Err() != nil {
 		return nil, nil, "", ctx.Err()
 	}

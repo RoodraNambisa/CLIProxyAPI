@@ -253,6 +253,7 @@ sentinel-solver:
 #     credential-target-respect-state-policy: false # Fixed tests obey matching missing-State policy: hide returns 503, error returns 429. Otherwise test without State when missing.
 #     credential-target-respect-request-limit: false # Apply per-credential request limits and share ordinary counters during fixed tests.
 #     credential-target-response-model-rewrite: false # Apply existing response-model-rewrite rules and count actual rewrites during fixed tests.
+#     credential-target-response-guard: false # Apply independent Codex response checks during fixed tests; never retry or clear production affinity.
 #     providers: ["codex", "xai"]
 #     allowed-priorities: [1, 2]
 #     excluded-priorities: [2]
@@ -993,6 +994,26 @@ xai:
 #   optimize-multi-agent-v2: false
 #   spoof-session-identity: false
 #   turn-state-policy: "guard-cross-account"
+#   # Independent response checks; does not require or enable State/Cookie management.
+#   response-guard:
+#     enabled: false
+#     mode: observe                 # off | observe | enforce. Enforce rejects before output with HTTP 429.
+#     # allowed-returned-models: [alternative-model] # Exact additions; length checks still apply.
+#     # length-mode: allow          # off | allow | deny; no implicit length restriction.
+#     # lengths: [292]              # Explicit [] disables length checking; no model-specific constants.
+#     # Explicit accepted models/lengths also apply to active resource acquisition and invalidation.
+#     missing-model: allow          # allow | reject; missing requirements are independently configurable.
+#     missing-state: allow          # Never treat a missing State as a zero-length State.
+#     on-reject: error              # error | retry, using existing budgets and a different credential.
+#     clear-affinity: session       # none | session (current session/model) | credential.
+#     late-mismatch: observe        # observe | abort; after output starts, abort uses a protocol error.
+#     error-type: rate_limit_exceeded
+#     error-code: rate_limit_exceeded
+#     error-message: "Rate limit exceeded. Please try again later."
+#     # Omit rules to use defaults for all Codex credentials; [] matches none.
+#     # Ordered rules support id, name, enabled, credentials, excluded-credentials,
+#     # priorities, plan-types, models, settings and model-overrides [{id,models,settings}].
+#     # Empty selectors mean any, including unknown plans. Model overrides remain inside their parent scope.
 #   # Memory-only State per credential/model, or Cookie-only per credential. Disabled by default.
 #   state-override:
 #     enabled: false

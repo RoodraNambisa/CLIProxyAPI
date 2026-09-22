@@ -46,7 +46,7 @@ func applyCookieDiagnostic(ctx context.Context, cfg *config.Config, a *auth.Auth
 	codexstate.StripManagedCookies(headers)
 	p := config.CodexStateOverrideConfig{}.Resolved()
 	if cfg != nil {
-		p, _, _ = cfg.Codex.StateOverride.PolicyFor(StateCredential(a, model).Scope())
+		p, _, _ = cfg.Codex.ManagedStateConfig().PolicyFor(StateCredential(a, model).Scope())
 		p = p.Resolved()
 	}
 	c := StateCredential(a, model)
