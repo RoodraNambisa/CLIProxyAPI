@@ -214,15 +214,16 @@ func (o *modelProbeObserver) fill(result *modelProbeResult) {
 // A shared executor can report from its streaming goroutine. Retain bounded
 // diagnostic fields, including Codex State when requested, never authorization headers.
 type modelProbeTrace struct {
-	mu         sync.Mutex
-	url        string
-	body       string
-	model      string
-	requestID  string
-	status     int
-	truncated  bool
-	codexState *modelProbeStateResult
-	stateSent  string
+	mu          sync.Mutex
+	url         string
+	body        string
+	model       string
+	requestID   string
+	status      int
+	truncated   bool
+	codexState  *modelProbeStateResult
+	codexCookie *modelProbeCookieResult
+	stateSent   string
 }
 
 func (t *modelProbeTrace) request(url string, body []byte) {
@@ -263,6 +264,11 @@ func (t *modelProbeTrace) fill(result *modelProbeResult) {
 		result.RequestID = t.requestID
 	}
 	result.DetailsTruncated = result.DetailsTruncated || t.truncated
+	if t.codexCookie != nil {
+		cookie := *t.codexCookie
+		cookie.Names = append([]string(nil), cookie.Names...)
+		result.CodexCookie = &cookie
+	}
 	if t.codexState != nil {
 		state := *t.codexState
 		result.CodexState = &state

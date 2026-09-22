@@ -27,7 +27,7 @@ func (h *Handler) GetCodexState(c *gin.Context) {
 		}
 		manager = codexstate.Diagnostic
 	}
-	c.JSON(200, gin.H{"models": manager.Snapshots(a.ID, time.Now())})
+	c.JSON(200, gin.H{"models": manager.Snapshots(a.ID, time.Now()), "cookie": manager.CookieSnapshot(a.ID, time.Now())})
 }
 
 func (h *Handler) CodexStateAction(c *gin.Context) {
@@ -37,10 +37,14 @@ func (h *Handler) CodexStateAction(c *gin.Context) {
 		Model      string `json:"model"`
 		Action     string `json:"action"`
 		Diagnostic bool   `json:"diagnostic"`
+		Strategy   string `json:"strategy"`
 	}
-	if c.ShouldBindJSON(&input) != nil || !slices.Contains([]string{"acquire", "pause", "resume", "clear"}, input.Action) {
+	if c.ShouldBindJSON(&input) != nil || input.Strategy != "" && input.Strategy != "state" && input.Strategy != "cookie-only" || !slices.Contains([]string{"acquire", "pause", "resume", "clear"}, input.Action) {
 		c.JSON(400, gin.H{"error": "invalid state action"})
 		return
+	}
+	if input.Strategy == "" {
+		input.Strategy = "state"
 	}
 	a := h.findManagedAuthWithManager(input.Name, h.authManager)
 	if a == nil {
@@ -66,16 +70,29 @@ func (h *Handler) CodexStateAction(c *gin.Context) {
 		}
 		credential := helps.StateCredential(a, model)
 		credential.Route = strings.TrimSpace(input.Model)
-		matched, previous := codexstate.Diagnostic.QueueManual(credential)
+		matched, previous := codexstate.Diagnostic.QueueManualStrategy(credential, input.Strategy)
 		if !matched {
 			c.JSON(409, gin.H{"error": "State runtime is not ready or the manual model limit was reached"})
 			return
 		}
-		c.JSON(200, gin.H{"diagnostic": true, "model": model, "previous_acquired": previous, "models": codexstate.Diagnostic.Snapshots(a.ID, time.Now())})
+		c.JSON(200, gin.H{"diagnostic": true, "model": model, "previous_acquired": previous, "models": codexstate.Diagnostic.Snapshots(a.ID, time.Now()), "cookie": codexstate.Diagnostic.CookieSnapshot(a.ID, time.Now())})
 		return
 	}
 	if !helps.ManagedStateCredentialEligible(cfg, a) {
 		c.JSON(400, gin.H{"error": "State is disabled or this credential is outside the configured priority/credential scope"})
+		return
+	}
+	if input.Strategy == "cookie-only" {
+		model := helps.ResolveStateModel(a.ID, input.Model)
+		if input.Model == "" {
+			model = ""
+		}
+		matched, previous := codexstate.Default.CookieAction(a.ID, model, input.Action)
+		if !matched {
+			c.JSON(409, gin.H{"error": "Cookie runtime is not ready or model is outside scope"})
+			return
+		}
+		c.JSON(200, gin.H{"strategy": "cookie-only", "previous_acquired": previous, "models": codexstate.Default.Snapshots(a.ID, time.Now()), "cookie": codexstate.Default.CookieSnapshot(a.ID, time.Now())})
 		return
 	}
 	allowed := helps.ManagedStateModels(cfg, a)

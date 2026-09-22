@@ -24,40 +24,42 @@ import (
 const modelProbeDefaultPrompt = "Reply with exactly OK."
 
 type modelProbeRequest struct {
-	Name            string                `json:"name"`
-	Model           string                `json:"model"`
-	Protocol        string                `json:"protocol"`
-	Stream          bool                  `json:"stream"`
-	Upstream        string                `json:"upstream"`
-	Prompt          string                `json:"prompt,omitempty"`
-	MaxOutputTokens int                   `json:"max_output_tokens,omitempty"`
-	RequestBody     json.RawMessage       `json:"request_body,omitempty"`
-	CodexState      *modelProbeStateInput `json:"codex_state,omitempty"`
+	CodexCookie     *modelProbeCookieInput `json:"codex_cookie,omitempty"`
+	Name            string                 `json:"name"`
+	Model           string                 `json:"model"`
+	Protocol        string                 `json:"protocol"`
+	Stream          bool                   `json:"stream"`
+	Upstream        string                 `json:"upstream"`
+	Prompt          string                 `json:"prompt,omitempty"`
+	MaxOutputTokens int                    `json:"max_output_tokens,omitempty"`
+	RequestBody     json.RawMessage        `json:"request_body,omitempty"`
+	CodexState      *modelProbeStateInput  `json:"codex_state,omitempty"`
 }
 
 type modelProbeResult struct {
-	Success             bool                   `json:"success"`
-	Name                string                 `json:"name"`
-	Provider            string                 `json:"provider,omitempty"`
-	Model               string                 `json:"model"`
-	UpstreamModel       string                 `json:"upstream_model,omitempty"`
-	ReturnedModel       string                 `json:"returned_model,omitempty"`
-	RequestPath         string                 `json:"request_path"`
-	UpstreamURL         string                 `json:"upstream_url,omitempty"`
-	Stream              bool                   `json:"stream"`
-	LatencyMS           int64                  `json:"latency_ms"`
-	StatusCode          int                    `json:"status_code,omitempty"`
-	RequestID           string                 `json:"request_id,omitempty"`
-	ResponseID          string                 `json:"response_id,omitempty"`
-	FinishReason        string                 `json:"finish_reason,omitempty"`
-	Response            string                 `json:"response,omitempty"`
-	Error               string                 `json:"error,omitempty"`
-	Usage               *modelProbeUsage       `json:"usage,omitempty"`
-	RequestBody         string                 `json:"request_body,omitempty"`
-	UpstreamRequestBody string                 `json:"upstream_request_body,omitempty"`
-	ResponseBody        string                 `json:"response_body,omitempty"`
-	DetailsTruncated    bool                   `json:"details_truncated,omitempty"`
-	CodexState          *modelProbeStateResult `json:"codex_state,omitempty"`
+	CodexCookie         *modelProbeCookieResult `json:"codex_cookie,omitempty"`
+	Success             bool                    `json:"success"`
+	Name                string                  `json:"name"`
+	Provider            string                  `json:"provider,omitempty"`
+	Model               string                  `json:"model"`
+	UpstreamModel       string                  `json:"upstream_model,omitempty"`
+	ReturnedModel       string                  `json:"returned_model,omitempty"`
+	RequestPath         string                  `json:"request_path"`
+	UpstreamURL         string                  `json:"upstream_url,omitempty"`
+	Stream              bool                    `json:"stream"`
+	LatencyMS           int64                   `json:"latency_ms"`
+	StatusCode          int                     `json:"status_code,omitempty"`
+	RequestID           string                  `json:"request_id,omitempty"`
+	ResponseID          string                  `json:"response_id,omitempty"`
+	FinishReason        string                  `json:"finish_reason,omitempty"`
+	Response            string                  `json:"response,omitempty"`
+	Error               string                  `json:"error,omitempty"`
+	Usage               *modelProbeUsage        `json:"usage,omitempty"`
+	RequestBody         string                  `json:"request_body,omitempty"`
+	UpstreamRequestBody string                  `json:"upstream_request_body,omitempty"`
+	ResponseBody        string                  `json:"response_body,omitempty"`
+	DetailsTruncated    bool                    `json:"details_truncated,omitempty"`
+	CodexState          *modelProbeStateResult  `json:"codex_state,omitempty"`
 }
 
 // ProbeAuthFileModel uses the credential's provider implementation with temporary
@@ -94,6 +96,11 @@ func (h *Handler) ProbeAuthFileModel(c *gin.Context) {
 	stateMode, stateValue, errState := validateModelProbeState(input.CodexState, provider)
 	if errState != nil {
 		c.JSON(400, gin.H{"error": errState.Error()})
+		return
+	}
+	cookieMode, errCookie := validateModelProbeCookie(input.CodexCookie, provider, stateMode)
+	if errCookie != nil {
+		c.JSON(400, gin.H{"error": errCookie.Error()})
 		return
 	}
 	if coreauth.IsRetiredGeminiCLIAuth(auth) || provider == "qwen" || provider == "iflow" {
@@ -171,6 +178,7 @@ func (h *Handler) ProbeAuthFileModel(c *gin.Context) {
 	trace := modelProbeTrace{}
 	if provider == "codex" {
 		trace.codexState = &modelProbeStateResult{Mode: stateMode, Source: "none"}
+		trace.codexCookie = &modelProbeCookieResult{Mode: cookieMode, Source: "none", Names: []string{}}
 	}
 	started := time.Now()
 	ctx, cancel := context.WithCancel(c.Request.Context())
@@ -191,6 +199,7 @@ func (h *Handler) ProbeAuthFileModel(c *gin.Context) {
 		execCtx = helps.WithRequestTrace(execCtx, trace.request, trace.response)
 		if provider == "codex" {
 			execCtx = helps.WithCodexStateDiagnostic(execCtx, stateMode, stateValue, trace.stateApplied)
+			execCtx = helps.WithCodexCookieDiagnostic(execCtx, cookieMode, trace.cookieApplied)
 		}
 		if !input.Stream {
 			response, errExecute := executor.Execute(execCtx, selected, req, options)

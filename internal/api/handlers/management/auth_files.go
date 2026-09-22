@@ -701,7 +701,7 @@ func (h *Handler) buildAuthFileEntryAtWithRuntime(auth *coreauth.Auth, now time.
 	applyAuthCooldownStatus(entry, summarizeAuthCooldown(auth, now))
 	entry["proxy_route"] = h.authFileProxyRoute(auth, runtimeSummary)
 	if auth.ExecutionProvider() == "codex" {
-		entry["codex_state"] = gin.H{"enabled": h.currentConfig() != nil && h.currentConfig().Codex.StateOverride.Enabled, "models": codexstate.Default.Snapshots(auth.ID, now)}
+		entry["codex_state"] = gin.H{"enabled": h.currentConfig() != nil && h.currentConfig().Codex.StateOverride.Enabled, "models": codexstate.Default.Snapshots(auth.ID, now), "cookie": codexstate.Default.CookieSnapshot(auth.ID, now)}
 	}
 	if manager := h.coreAuthRuntimeManager(); manager != nil {
 		entry["request_limit"] = manager.AuthRequestLimitSummary(auth)

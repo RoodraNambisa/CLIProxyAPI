@@ -63,6 +63,7 @@ func (h *Handler) PreviewCodexState(c *gin.Context) {
 	// Return only effective policy fields that are useful to the UI; no tokens,
 	// proxy passwords, test prompt text or raw State are included.
 	c.JSON(200, gin.H{"managed": managed, "registered": registered, "upstream_model": upstream, "match": match, "policy": gin.H{
+		"strategy": policy.Strategy, "cookie-verify-after-acquire": policy.CookieVerifyAfterAcquire, "cookie-max-age-seconds": policy.CookieMaxAgeSeconds, "cookie-refresh-before-seconds": policy.CookieRefreshBeforeSeconds, "ttl-seconds": int(policy.StateTTL().Seconds()), "refresh-before-seconds": int(policy.StateRefreshBefore().Seconds()), "missing-returned-state": policy.MissingReturnedState,
 		"lengths": policy.Lengths, "match-model": policy.MatchModel, "acquisition": policy.Acquisition,
 		"mode": policy.Mode, "missing-policy": policy.MissingPolicy, "retry-seconds": policy.RetrySeconds,
 		"max-attempts": policy.MaxAttempts, "retry-round-interval-minutes": policy.RetryRoundIntervalMinutes, "max-retry-rounds": policy.MaxRetryRounds, "ttl-minutes": policy.TTLMinutes, "refresh-before-minutes": policy.RefreshBeforeMinutes,
