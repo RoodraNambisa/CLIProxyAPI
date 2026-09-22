@@ -32,6 +32,7 @@ type CodexStateRuleModelOverride struct {
 
 // Pointer fields distinguish inheritance from an explicitly configured zero or false value.
 type CodexStateRuleSettings struct {
+	CodexStateStrategySettings      `yaml:",inline"`
 	Mode                            *string `yaml:"mode,omitempty" json:"mode,omitempty"`
 	MissingPolicy                   *string `yaml:"missing-policy,omitempty" json:"missing-policy,omitempty"`
 	Acquisition                     *string `yaml:"acquisition,omitempty" json:"acquisition,omitempty"`
@@ -203,13 +204,18 @@ func applyCodexStateRuleSettings(policy *CodexStateOverrideConfig, settings Code
 	}
 	mark("active-minutes", settings.ActiveMinutes != nil)
 	if settings.TTLMinutes != nil {
+		policy.TTLSeconds = nil
+		sources["ttl-seconds"] = source
 		policy.TTLMinutes = *settings.TTLMinutes
 	}
 	mark("ttl-minutes", settings.TTLMinutes != nil)
 	if settings.RefreshBeforeMinutes != nil {
+		policy.RefreshBeforeSeconds = nil
+		sources["refresh-before-seconds"] = source
 		policy.RefreshBeforeMinutes = *settings.RefreshBeforeMinutes
 	}
 	mark("refresh-before-minutes", settings.RefreshBeforeMinutes != nil)
+	applyStateStrategySettings(policy, settings.CodexStateStrategySettings, sources, source)
 	if settings.RetrySeconds != nil {
 		policy.RetrySeconds = *settings.RetrySeconds
 	}
@@ -317,6 +323,7 @@ func cloneCodexStateRuleSettings(settings *CodexStateRuleSettings) {
 		values := slices.Clone(*settings.Lengths)
 		settings.Lengths = &values
 	}
+	settings.CodexStateStrategySettings = settings.CodexStateStrategySettings.clone()
 	if settings.Mode != nil {
 		value := *settings.Mode
 		settings.Mode = &value
@@ -444,6 +451,9 @@ func dereferenceStateLengths(values *[]int) []int {
 }
 
 func validateCodexStateRuleSettings(cfg *Config, settings CodexStateRuleSettings) error {
+	if err := settings.CodexStateStrategySettings.validateExplicit(); err != nil {
+		return err
+	}
 	for _, value := range []*int{settings.ActiveMinutes, settings.TTLMinutes, settings.RefreshBeforeMinutes, settings.RetrySeconds, settings.MaxAttempts, settings.RetryRoundIntervalMinutes} {
 		if value != nil && *value <= 0 {
 			return fmt.Errorf("rule intervals and limits must be positive")

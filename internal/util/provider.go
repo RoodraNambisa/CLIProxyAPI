@@ -209,7 +209,7 @@ func MaskAuthorizationHeader(value string) string {
 func MaskSensitiveHeaderValue(key, value string) string {
 	lowerKey := strings.ToLower(strings.TrimSpace(key))
 	switch {
-	case lowerKey == "x-codex-turn-state":
+	case lowerKey == "x-codex-turn-state", lowerKey == "cookie", lowerKey == "set-cookie":
 		return "[REDACTED]"
 	case lowerKey == "sec-websocket-protocol":
 		return maskRealtimeAuthSubprotocols(value)

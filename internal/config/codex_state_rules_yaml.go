@@ -9,8 +9,15 @@ func isCodexStateRuleYAMLPath(path []string) bool {
 // Explicit false/empty values are policy choices, not removable defaults.
 // Preserve their ancestors too when the whole section is newly introduced.
 func preservesCodexStateRuleYAMLValue(path []string, node *yaml.Node) bool {
-	if isCodexStateRuleYAMLPath(path) {
+	if isCodexStateRuleYAMLPath(path) || len(path) >= 3 && path[0] == "codex" && path[1] == "state-override" && path[2] == "model-overrides" {
 		return true
+	}
+	if len(path) == 3 && path[0] == "codex" && path[1] == "state-override" {
+		for _, key := range codexStateStrategyYAMLKeys {
+			if path[2] == key {
+				return true
+			}
+		}
 	}
 	if node == nil || len(path) == 0 || path[0] != "codex" {
 		return false
@@ -24,5 +31,23 @@ func preservesCodexStateRuleYAMLValue(path []string, node *yaml.Node) bool {
 	} else if len(path) != 2 || path[1] != "state-override" {
 		return false
 	}
-	return findMapKeyIndex(node, "rules") >= 0
+	if findMapKeyIndex(node, "rules") >= 0 {
+		return true
+	}
+	for _, key := range codexStateStrategyYAMLKeys {
+		if findMapKeyIndex(node, key) >= 0 {
+			return true
+		}
+	}
+	return false
+}
+
+var codexStateStrategyYAMLKeys = []string{"strategy", "cookie-verify-after-acquire", "cookie-max-age-seconds", "cookie-refresh-before-seconds", "ttl-seconds", "refresh-before-seconds", "missing-returned-state"}
+
+func pruneMissingCodexStateStrategy(dst, src *yaml.Node) {
+	for _, key := range codexStateStrategyYAMLKeys {
+		if findMapKeyIndex(src, key) < 0 {
+			removeMapKey(dst, key)
+		}
+	}
 }

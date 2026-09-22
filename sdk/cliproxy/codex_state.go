@@ -132,7 +132,7 @@ func (s *Service) acquireCodexState(ctx context.Context, credential codexstate.C
 		selected = selected.Clone()
 		// Credential headers are copied before removing state; tokens remain unchanged.
 		for name := range selected.Attributes {
-			if strings.EqualFold(strings.TrimPrefix(name, "header:"), "x-codex-turn-state") {
+			if strings.EqualFold(strings.TrimPrefix(name, "header:"), "x-codex-turn-state") || strings.EqualFold(strings.TrimPrefix(name, "header:"), "cookie") {
 				delete(selected.Attributes, name)
 			}
 		}
@@ -149,7 +149,24 @@ func (s *Service) acquireCodexState(ctx context.Context, credential codexstate.C
 		_ = response
 		return nil
 	})
-	if err != nil {
+	if err == nil && policy.CookieOnly() && policy.CookieVerifyAfterAcquire && codexstate.ValidateAcquisition(policy, credential.Model, result, time.Now()) == "" {
+		codexstate.PublishCookieCandidate(ctx, result.Cookies)
+		verifyPolicy := policy
+		verifyPolicy.CookieVerifyAfterAcquire = false
+		verified, verifyErr := s.acquireCodexState(helps.WithCookieVerification(ctx, result.Cookies, policy), credential, verifyPolicy)
+		result.Tokens += verified.Tokens
+		if verifyErr != nil {
+			err = verifyErr
+		} else {
+			// Verify the sent sample, not new Cookie values returned by the verification.
+			verified.Cookies = result.Cookies
+			if reason := codexstate.ValidateAcquisition(policy, credential.Model, verified, time.Now()); reason != "" {
+				result.FailureReason = "cookie_verification_" + reason
+				err = fmt.Errorf("%s", result.FailureReason)
+			}
+		}
+	}
+	if err != nil && result.FailureReason == "" {
 		result.FailureReason = safeStateError(err)
 	}
 	return result, err

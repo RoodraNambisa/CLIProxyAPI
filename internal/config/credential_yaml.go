@@ -247,9 +247,24 @@ func pruneMissingCredentialYAMLKeys(dst, src *yaml.Node, path []string) {
 		return
 	}
 	known := make(map[string]bool, typ.NumField())
-	for index := 0; index < typ.NumField(); index++ {
-		known[yamlFieldName(typ.Field(index))] = true
+	var collect func(reflect.Type)
+	collect = func(t reflect.Type) {
+		for i := 0; i < t.NumField(); i++ {
+			field := t.Field(i)
+			if slices.Contains(strings.Split(field.Tag.Get("yaml"), ","), "inline") {
+				nested := field.Type
+				if nested.Kind() == reflect.Pointer {
+					nested = nested.Elem()
+				}
+				if nested.Kind() == reflect.Struct {
+					collect(nested)
+				}
+			} else {
+				known[yamlFieldName(field)] = true
+			}
+		}
 	}
+	collect(typ)
 	retained := *src
 	retained.Content = append([]*yaml.Node(nil), src.Content...)
 	for index := 0; index+1 < len(dst.Content); index += 2 {

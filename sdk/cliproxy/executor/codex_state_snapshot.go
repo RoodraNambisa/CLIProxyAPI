@@ -3,6 +3,9 @@ package executor
 import (
 	"context"
 	"sync"
+	"time"
+
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/codexstate"
 )
 
 type codexStateSnapshotKey struct{}
@@ -11,12 +14,18 @@ type CodexStateChoice struct {
 	Eligible      bool
 	Version       uint64
 	Observation   *CodexStateObservationPolicy
+	ExpiresAt     time.Time
+	Cookie        *codexstate.CookieSelection
 }
 
 type CodexStateObservationPolicy struct {
-	ModelMismatch  bool
-	LengthMismatch bool
-	Lengths        []int
+	MatchModel           bool
+	ModelMismatch        bool
+	LengthMismatch       bool
+	Lengths              []int
+	MissingReturnedState string
+	Strategy             string
+	CookieMaxAgeSeconds  int
 }
 
 func CodexStateChoiceForRequest(ctx context.Context, key string) (CodexStateChoice, bool) {
@@ -72,6 +81,28 @@ func CodexStateForRequest(ctx context.Context, key string, choose func() CodexSt
 	snapshot.mu.Lock()
 	defer snapshot.mu.Unlock()
 	if choice, ok := snapshot.choices[key]; ok {
+		return choice
+	}
+	choice := choose()
+	if snapshot.choices == nil {
+		snapshot.choices = make(map[string]CodexStateChoice)
+	}
+	snapshot.choices[key] = choice
+	return choice
+}
+
+// RefreshCodexStateForRequest reselects only when the previous resource is no longer usable.
+func RefreshCodexStateForRequest(ctx context.Context, key string, valid func(CodexStateChoice) bool, choose func() CodexStateChoice) CodexStateChoice {
+	if ctx == nil {
+		return choose()
+	}
+	snapshot, _ := ctx.Value(codexStateSnapshotKey{}).(*codexStateChoices)
+	if snapshot == nil {
+		return choose()
+	}
+	snapshot.mu.Lock()
+	defer snapshot.mu.Unlock()
+	if choice, ok := snapshot.choices[key]; ok && valid(choice) {
 		return choice
 	}
 	choice := choose()

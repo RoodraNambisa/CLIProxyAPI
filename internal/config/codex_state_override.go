@@ -11,6 +11,14 @@ import (
 
 // CodexStateOverrideConfig manages short-lived state in memory only.
 type CodexStateOverrideConfig struct {
+	Strategy                   string `yaml:"strategy,omitempty" json:"strategy,omitempty"`
+	CookieVerifyAfterAcquire   bool   `yaml:"cookie-verify-after-acquire,omitempty" json:"cookie-verify-after-acquire,omitempty"`
+	CookieMaxAgeSeconds        int    `yaml:"cookie-max-age-seconds,omitempty" json:"cookie-max-age-seconds,omitempty"`
+	CookieRefreshBeforeSeconds int    `yaml:"cookie-refresh-before-seconds,omitempty" json:"cookie-refresh-before-seconds,omitempty"`
+	TTLSeconds                 *int   `yaml:"ttl-seconds,omitempty" json:"ttl-seconds,omitempty"`
+	RefreshBeforeSeconds       *int   `yaml:"refresh-before-seconds,omitempty" json:"refresh-before-seconds,omitempty"`
+	MissingReturnedState       string `yaml:"missing-returned-state,omitempty" json:"missing-returned-state,omitempty"`
+
 	Rules                           *[]CodexStateRule         `yaml:"rules,omitempty" json:"rules,omitempty"`
 	Enabled                         bool                      `yaml:"enabled" json:"enabled"`
 	Priorities                      APIKeyPriorityList        `yaml:"priorities" json:"priorities"`
@@ -83,11 +91,12 @@ func (c CodexStateOverrideConfig) ForCredential(plan, model string) CodexStateOv
 }
 
 type CodexStateModelOverride struct {
-	Model            string  `yaml:"model" json:"model"`
-	Lengths          []int   `yaml:"lengths" json:"lengths"`
-	MatchModel       *bool   `yaml:"match-model,omitempty" json:"match-model,omitempty"`
-	Prompt           string  `yaml:"prompt" json:"prompt"`
-	ResponseContains *string `yaml:"response-contains,omitempty" json:"response-contains,omitempty"`
+	CodexStateStrategySettings `yaml:",inline"`
+	Model                      string  `yaml:"model" json:"model"`
+	Lengths                    []int   `yaml:"lengths" json:"lengths"`
+	MatchModel                 *bool   `yaml:"match-model,omitempty" json:"match-model,omitempty"`
+	Prompt                     string  `yaml:"prompt" json:"prompt"`
+	ResponseContains           *string `yaml:"response-contains,omitempty" json:"response-contains,omitempty"`
 }
 
 // ForModel applies only validation/probe overrides; selection is still catalog-scoped.
@@ -95,6 +104,7 @@ func (c CodexStateOverrideConfig) ForModel(model string) CodexStateOverrideConfi
 	c = c.Resolved()
 	for _, v := range c.ModelOverrides {
 		if v.Model == model {
+			applyStateStrategySettings(&c, v.CodexStateStrategySettings, nil, "model-override")
 			if v.Lengths != nil {
 				c.Lengths = slices.Clone(v.Lengths)
 			}
@@ -116,6 +126,8 @@ func (c CodexStateOverrideConfig) ForModel(model string) CodexStateOverrideConfi
 
 func (c CodexStateOverrideConfig) clone() CodexStateOverrideConfig {
 	c.Rules = cloneCodexStateRules(c.Rules)
+	c.TTLSeconds = cloneStateValue(c.TTLSeconds)
+	c.RefreshBeforeSeconds = cloneStateValue(c.RefreshBeforeSeconds)
 	c.PlanLengths = slices.Clone(c.PlanLengths)
 	for i, v := range c.PlanLengths {
 		c.PlanLengths[i].PlanTypes = slices.Clone(v.PlanTypes)
@@ -125,6 +137,7 @@ func (c CodexStateOverrideConfig) clone() CodexStateOverrideConfig {
 	c.ModelOverrides = slices.Clone(c.ModelOverrides)
 	for i, v := range c.ModelOverrides {
 		c.ModelOverrides[i].Lengths = slices.Clone(v.Lengths)
+		c.ModelOverrides[i].CodexStateStrategySettings = v.CodexStateStrategySettings.clone()
 		if v.MatchModel != nil {
 			b := *v.MatchModel
 			c.ModelOverrides[i].MatchModel = &b
@@ -148,6 +161,12 @@ func (c CodexStateOverrideConfig) clone() CodexStateOverrideConfig {
 
 func (c CodexStateOverrideConfig) Resolved() CodexStateOverrideConfig {
 	c = c.clone()
+	if c.Strategy == "" {
+		c.Strategy = "state"
+	}
+	if c.MissingReturnedState == "" {
+		c.MissingReturnedState = "ignore"
+	}
 	if c.Mode == "" {
 		c.Mode = "override"
 	}
@@ -239,6 +258,14 @@ func (cfg *Config) ValidateCodexStateOverride() error {
 	}
 	seen := map[string]bool{}
 	for _, v := range c.ModelOverrides {
+		if err := v.CodexStateStrategySettings.validateExplicit(); err != nil {
+			return invalid(err.Error())
+		}
+		candidate := c
+		applyStateStrategySettings(&candidate, v.CodexStateStrategySettings, nil, "")
+		if err := candidate.validateStateStrategy(); err != nil {
+			return invalid(err.Error())
+		}
 		if strings.TrimSpace(v.Model) == "" || seen[v.Model] || len(v.Model) > 256 || strings.ContainsAny(v.Model, "\r\n\x00") {
 			return invalid("invalid or duplicate model override")
 		}
@@ -252,7 +279,7 @@ func (cfg *Config) ValidateCodexStateOverride() error {
 			}
 		}
 	}
-	if c.Enabled && cfg.Codex.ResolvedTurnStatePolicy() == CodexTurnStatePolicyStrip {
+	if c.Enabled && c.HasStateStrategy() && cfg.Codex.ResolvedTurnStatePolicy() == CodexTurnStatePolicyStrip {
 		return invalid("cannot enable while turn-state-policy is strip")
 	}
 	if !slices.Contains([]string{"override", "missing"}, c.Mode) || !slices.Contains([]string{"continue", "error", "hide"}, c.MissingPolicy) || !slices.Contains([]string{"active", "all", "manual"}, c.Acquisition) || !slices.Contains([]string{"inherit", "direct", "custom"}, c.ProxyMode) {
@@ -261,7 +288,10 @@ func (cfg *Config) ValidateCodexStateOverride() error {
 	if c.RetryRoundIntervalMinutes < 1 || c.RetryRoundIntervalMinutes > 1440 || c.MaxRetryRounds < 0 || c.MaxRetryRounds > 10 {
 		return invalid("retry round interval must be 1–1440 minutes and extra rounds 0–10")
 	}
-	if c.TTLMinutes < 1 || c.TTLMinutes > 1440 || c.RefreshBeforeMinutes < 1 || c.RefreshBeforeMinutes >= c.TTLMinutes || c.ActiveMinutes < 1 || c.ActiveMinutes > 10080 || c.Concurrency < 1 || c.Concurrency > 16 || c.RetrySeconds < 1 || c.RetrySeconds > 3600 || c.MaxAttempts < 1 || c.MaxAttempts > 10 {
+	if err := c.validateStateStrategy(); err != nil {
+		return invalid(err.Error())
+	}
+	if c.TTLMinutes < 1 || c.TTLMinutes > 1440 || c.RefreshBeforeMinutes < 1 || c.ActiveMinutes < 1 || c.ActiveMinutes > 10080 || c.Concurrency < 1 || c.Concurrency > 16 || c.RetrySeconds < 1 || c.RetrySeconds > 3600 || c.MaxAttempts < 1 || c.MaxAttempts > 10 {
 		return invalid("invalid lifetime, refresh, activity or acquisition limits")
 	}
 	if len(c.Prompt) > 4096 || len(c.ResponseContains) > 1024 || len(c.Models) > 256 || len(c.IncludedCredentials) > 1024 || len(c.ExcludedCredentials) > 1024 || len(c.Priorities) > 128 || len(c.Lengths) > 32 {

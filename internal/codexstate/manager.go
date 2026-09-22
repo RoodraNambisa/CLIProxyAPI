@@ -36,6 +36,8 @@ func (c Credential) Scope() config.CodexStateScope {
 
 type Result struct {
 	State, Model, Answer string
+	Cookies              *CookieBundle
+	ReceivedAt           time.Time
 	Completed            bool
 	Status               int
 	Tokens               int64
@@ -86,6 +88,8 @@ type entry struct {
 	Snapshot
 	state                string
 	valueVersion         uint64
+	invalidStateVersion  uint64
+	manualStrategy       string
 	busy, paused, manual bool
 	failures             int
 	cancel               context.CancelFunc
@@ -96,6 +100,7 @@ type Manager struct {
 	wg               sync.WaitGroup
 	cfg              config.CodexStateOverrideConfig
 	entries          map[string]*entry
+	cookies          map[string]*cookieGroup
 	version          uint64
 	running          int
 	nextValueVersion uint64
@@ -155,6 +160,9 @@ func (m *Manager) Sync(cfg config.CodexStateOverrideConfig, credentials []Creden
 			continue
 		}
 		k := key(c)
+		if old := m.entries[k]; old != nil && old.ManualOnly && old.manualStrategy != "" {
+			policy.Strategy = old.manualStrategy
+		}
 		wanted[k] = true
 		old := m.entries[k]
 		if old == nil {
@@ -198,6 +206,7 @@ func (m *Manager) Sync(cfg config.CodexStateOverrideConfig, credentials []Creden
 			delete(m.entries, k)
 		}
 	}
+	m.syncCookiesLocked()
 }
 
 // Resolve legacy scopes exactly as before; their eligibility has already been
@@ -222,19 +231,28 @@ func (m *Manager) resolvePolicy(cfg config.CodexStateOverrideConfig, c Credentia
 	return resolveEntryPolicy(cfg, c)
 }
 func sameStateValidation(a, b config.CodexStateOverrideConfig) bool {
-	return reflect.DeepEqual(a.Lengths, b.Lengths) && reflect.DeepEqual(a.MatchModel, b.MatchModel) && a.Prompt == b.Prompt && a.ResponseContains == b.ResponseContains && a.TTLMinutes == b.TTLMinutes
+	return reflect.DeepEqual(a.Lengths, b.Lengths) && reflect.DeepEqual(a.MatchModel, b.MatchModel) && a.Prompt == b.Prompt && a.ResponseContains == b.ResponseContains && a.StateTTL() == b.StateTTL() && a.Strategy == b.Strategy && a.MissingReturnedState == b.MissingReturnedState
 }
 
 // QueueManual creates a bounded diagnostic entry without registering a model.
 // Callers must validate the credential; regular managers also require configured scope.
-func (m *Manager) QueueManual(c Credential) (bool, uint64) {
+func (m *Manager) QueueManual(c Credential, strategies ...string) (bool, uint64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	policy, match, managed := m.resolvePolicy(m.cfg, c)
+	if len(strategies) > 0 && strategies[0] != "" {
+		policy.Strategy = strategies[0]
+	}
 	if !managed {
 		return false, 0
 	}
 	e := m.entries[key(c)]
+	if m.diagnostic && e != nil && len(strategies) > 0 && e.policy.Strategy != policy.Strategy {
+		if e.cancel != nil {
+			e.cancel()
+		}
+		e = nil
+	}
 	if e == nil {
 		count := 0
 		for _, existing := range m.entries {
@@ -252,6 +270,9 @@ func (m *Manager) QueueManual(c Credential) (bool, uint64) {
 		return false, e.Acquired
 	}
 	e.ManualOnly = true
+	if len(strategies) > 0 {
+		e.manualStrategy = policy.Strategy
+	}
 	e.credential = c
 	if !e.busy {
 		e.manual, e.paused = true, false
@@ -344,6 +365,8 @@ func (m *Manager) observeResponse(c Credential, version uint64, value, returnedM
 	reason := ""
 	if policy.InvalidateOnModelMismatch && returnedModel != "" && returnedModel != c.Model {
 		reason = "response_model_mismatch"
+	} else if policy.InvalidateOnStateLengthMismatch && returnedLength == 0 && len(policy.Lengths) > 0 && policy.MissingReturnedState == "reject" {
+		reason = "missing_returned_state"
 	} else if policy.InvalidateOnStateLengthMismatch && returnedLength > 0 {
 		lengths := policy.Lengths
 		if len(lengths) > 0 && !slices.Contains(lengths, returnedLength) {
@@ -356,6 +379,7 @@ func (m *Manager) observeResponse(c Credential, version uint64, value, returnedM
 	if e.valueVersion != version || e.state != value || e.state == "" {
 		return reason
 	}
+	e.invalidStateVersion = max(e.invalidStateVersion, version)
 	e.state, e.Digest = "", ""
 	e.valueVersion, e.CurrentUses, e.Length = 0, 0, 0
 	e.ExpiresAt = time.Time{}
@@ -385,7 +409,7 @@ func (m *Manager) Snapshots(id string, now time.Time) []Snapshot {
 	defer m.mu.Unlock()
 	result := []Snapshot{}
 	for _, e := range m.entries {
-		if e.credential.ID != id {
+		if e.credential.ID != id || e.policy.CookieOnly() {
 			continue
 		}
 		s := e.Snapshot
@@ -438,7 +462,7 @@ func (m *Manager) ActionWithBaseline(id, model, action string) (bool, uint64) {
 	matched := false
 	var previousAcquired uint64
 	for _, e := range m.entries {
-		if e.credential.ID != id || (model != "" && model != e.Model) {
+		if e.policy.CookieOnly() || e.credential.ID != id || (model != "" && model != e.Model) {
 			continue
 		}
 		matched = true
@@ -469,6 +493,7 @@ func (m *Manager) ActionWithBaseline(id, model, action string) (bool, uint64) {
 			copyEntry.manual = false
 			m.entries[key(e.credential)] = &copyEntry
 			e = &copyEntry
+			e.invalidStateVersion = max(e.invalidStateVersion, e.valueVersion)
 			e.state = ""
 			e.Length = 0
 			e.Digest = ""
@@ -511,6 +536,9 @@ func (m *Manager) tick(ctx context.Context, now time.Time, probe Probe, capacity
 			break
 		}
 		e := m.entries[k]
+		if e.policy.CookieOnly() {
+			continue
+		}
 		if e.busy || e.paused || e.Exhausted || now.Before(e.NextAttempt) {
 			continue
 		}
@@ -522,7 +550,7 @@ func (m *Manager) tick(ctx context.Context, now time.Time, probe Probe, capacity
 		}
 		recoveringRound := e.automaticRounds() && (e.RoundWaiting || e.RetryRoundsUsed > 0)
 		active = active || recoveringRound
-		if !e.manual && (!active || (!recoveringRound && e.state != "" && now.Before(e.ExpiresAt.Add(-time.Duration(e.policy.RefreshBeforeMinutes)*time.Minute)))) {
+		if !e.manual && (!active || (!recoveringRound && e.state != "" && now.Before(e.ExpiresAt.Add(-e.policy.StateRefreshBefore())))) {
 			continue
 		}
 		if e.RoundWaiting {
@@ -546,6 +574,7 @@ func (m *Manager) tick(ctx context.Context, now time.Time, probe Probe, capacity
 			m.finish(k, e, version, taskCtx.Err(), result, err, time.Now())
 		}()
 	}
+	m.tickCookiesLocked(ctx, now, probe, capacity)
 }
 
 // Wait joins canceled workers after disabling acquisition.
@@ -573,25 +602,21 @@ func (m *Manager) finish(k string, expected *entry, version uint64, canceled err
 		e.LastReturnedLength = new(len(result.State))
 		e.LastReturnedModel, _ = managementdiag.ProcessText(result.Model, "safe", 256)
 	}
-	reason := ""
-	validation := e.policy
-	switch {
-	case err != nil:
+	reason := ValidateAcquisition(e.policy, e.Model, result, now)
+	if err != nil {
 		reason = result.FailureReason
 		if reason == "" {
 			reason = "acquisition_request_failed"
 		}
-	case !result.Completed:
-		reason = "response_not_completed"
-	case result.State == "" || len(result.State) > 8192 || strings.ContainsAny(result.State, "\r\n\x00"):
-		reason = "invalid_or_missing_state"
-	case len(validation.Lengths) > 0 && !slices.Contains(validation.Lengths, len(result.State)):
-		reason = "state_length_mismatch"
-	case *validation.MatchModel && result.Model != e.Model:
-		reason = "response_model_mismatch"
-	case validation.ResponseContains != "" && !strings.Contains(result.Answer, validation.ResponseContains):
-		reason = "response_text_mismatch"
 	}
+	received := result.ReceivedAt
+	if received.IsZero() {
+		received = now
+	}
+	if reason == "" && !now.Before(received.Add(e.policy.StateTTL())) {
+		reason = "acquired_state_expired"
+	}
+
 	if reason != "" {
 		e.LastError = reason
 		e.lastFailure = now
@@ -607,7 +632,7 @@ func (m *Manager) finish(k string, expected *entry, version uint64, canceled err
 	e.Length = len(result.State)
 	d := sha256.Sum256([]byte(result.State))
 	e.Digest = hex.EncodeToString(d[:8])
-	e.ExpiresAt = now.Add(time.Duration(e.policy.TTLMinutes) * time.Minute)
+	e.ExpiresAt = received.Add(e.policy.StateTTL())
 	e.Acquired++
 	e.CurrentUses = 0
 	e.resetRetryCycle()

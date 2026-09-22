@@ -4344,8 +4344,13 @@ func mergeMappingPreserve(dst, src *yaml.Node, path ...[]string) {
 	if isCodexStateRuleYAMLPath(currentPath) {
 		// Clearing an override must restore inheritance while retaining unknown extensions.
 		pruneMissingCredentialYAMLKeys(dst, src, currentPath)
-	} else if len(currentPath) == 2 && currentPath[0] == "codex" && currentPath[1] == "state-override" && findMapKeyIndex(src, "rules") < 0 {
-		removeMapKey(dst, "rules")
+	} else if len(currentPath) == 2 && currentPath[0] == "codex" && currentPath[1] == "state-override" {
+		if findMapKeyIndex(src, "rules") < 0 {
+			removeMapKey(dst, "rules")
+		}
+		pruneMissingCodexStateStrategy(dst, src)
+	} else if len(currentPath) >= 3 && currentPath[0] == "codex" && currentPath[1] == "state-override" && currentPath[2] == "model-overrides" {
+		pruneMissingCredentialYAMLKeys(dst, src, currentPath)
 	}
 }
 

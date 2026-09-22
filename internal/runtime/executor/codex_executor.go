@@ -1013,6 +1013,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	}()
 	helps.ObserveCodexHTTPQuota(ctx, auth, httpResp.Header)
 	reporter.ObserveHTTPResponse(httpResp.StatusCode, httpResp.Header)
+	helps.CaptureStateHeaders(ctx, httpResp)
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	managedStateUse := helps.ManagedStateUse(ctx, auth, req.Model, httpReq.Header)
 	managedStateUse.Observe(httpResp.Header, nil)
@@ -1228,6 +1229,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	}()
 	helps.ObserveCodexHTTPQuota(ctx, auth, httpResp.Header)
 	reporter.ObserveHTTPResponse(httpResp.StatusCode, httpResp.Header)
+	helps.CaptureStateHeaders(ctx, httpResp)
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	managedStateUse := helps.ManagedStateUse(ctx, auth, req.Model, httpReq.Header)
 	managedStateUse.Observe(httpResp.Header, nil)
@@ -1395,6 +1397,7 @@ func (e *CodexExecutor) executeStream(ctx context.Context, auth *cliproxyauth.Au
 	}
 	helps.ObserveCodexHTTPQuota(ctx, auth, httpResp.Header)
 	reporter.ObserveHTTPResponse(httpResp.StatusCode, httpResp.Header)
+	helps.CaptureStateHeaders(ctx, httpResp)
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	managedStateUse := helps.ManagedStateUse(ctx, auth, req.Model, httpReq.Header)
 	managedStateUse.Observe(httpResp.Header, nil)
@@ -2060,7 +2063,7 @@ func (e *CodexExecutor) applyCodexHTTPSessionIdentity(
 		httpReq.ContentLength = int64(bodyReader.Len())
 	}
 	guardCodexTurnStateHeader(e.cfg, auth, httpReq.Header)
-	if errState := helps.ApplyManagedState(ctx, e.cfg, auth, req.Model, httpReq.Header); errState != nil {
+	if errState := helps.ApplyManagedState(ctx, e.cfg, auth, req.Model, httpReq.Header, httpReq.URL.String()); errState != nil {
 		return nil, errState
 	}
 	return projected, nil
@@ -2801,13 +2804,13 @@ func (e *CodexExecutor) newCodexHTTPClient(ctx context.Context, auth *cliproxyau
 		cfg = e.cfg
 	}
 	if codexFingerprintJA3Enabled(cfg) {
-		return helps.NewCodexNativeTLSHTTP1Client(ctx, cfg, auth, 0)
+		return helps.StateProbeHTTPClient(ctx, helps.NewCodexNativeTLSHTTP1Client(ctx, cfg, auth, 0))
 	}
 	forceHTTP1 := codexFingerprintShouldForceHTTP1(cfg, imageRequest)
 	if forceHTTP1 {
-		return helps.NewProxyAwareHTTP1Client(ctx, cfg, auth, 0)
+		return helps.StateProbeHTTPClient(ctx, helps.NewProxyAwareHTTP1Client(ctx, cfg, auth, 0))
 	}
-	return helps.NewProxyAwareHTTPClient(ctx, cfg, auth, 0)
+	return helps.StateProbeHTTPClient(ctx, helps.NewProxyAwareHTTPClient(ctx, cfg, auth, 0))
 }
 
 func newCodexStatusErr(statusCode int, body []byte) statusErr {

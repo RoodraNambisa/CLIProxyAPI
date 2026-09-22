@@ -993,9 +993,19 @@ xai:
 #   optimize-multi-agent-v2: false
 #   spoof-session-identity: false
 #   turn-state-policy: "guard-cross-account"
-#   # Memory-only state per credential account and upstream model. Disabled by default.
+#   # Memory-only State per credential/model, or Cookie-only per credential. Disabled by default.
 #   state-override:
 #     enabled: false
+#     strategy: state               # state | cookie-only; existing rules keep State behavior.
+#     cookie-verify-after-acquire: false # Optional extra Cookie-only probe before activation.
+#     cookie-max-age-seconds: 0      # 0 uses declared expiry; session cookies remain in memory only.
+#     cookie-refresh-before-seconds: 0 # 0 disables early refresh. Independent of State lifetime.
+#     missing-returned-state: ignore # ignore | reject, only when State length checks are enabled.
+#     # ttl-seconds: 120            # Optional; seconds win within a layer, then rule precedence applies.
+#     # refresh-before-seconds: 0   # Explicit 0 disables early State refresh.
+#     # Cookie acquisition sends no Cookie or State. Cookie-only inference sends no State.
+#     # Route cookies are shared by all Cookie-only models of this credential.
+#     # New strategy fields can also be set in rule settings and model overrides.
 #     priorities: []                # OR with included-credentials; both empty matches all. Missing priority is 0.
 #     included-credentials: []       # Credential IDs, short IDs or filenames; can extend priority scope.
 #     excluded-credentials: []       # Credential IDs, short IDs or filenames. Exclusions always win.

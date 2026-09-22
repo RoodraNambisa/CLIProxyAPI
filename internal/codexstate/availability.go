@@ -35,7 +35,14 @@ func (m *Manager) publishAvailabilityLocked() {
 				result[e.credential.ID] = routes
 			}
 			var expires time.Time
-			if !e.paused && e.state != "" {
+			if e.policy.CookieOnly() {
+				if g := m.cookies[e.credential.ID]; g != nil && !g.work.paused && g.main != nil {
+					expires = g.main.expiry(e.policy)
+					if expires.IsZero() {
+						expires = time.Date(9999, 1, 1, 0, 0, 0, 0, time.UTC)
+					}
+				}
+			} else if !e.paused && e.state != "" {
 				expires = e.ExpiresAt
 			}
 			for _, route := range append([]string{e.Model, e.credential.Route}, e.credential.Aliases...) {

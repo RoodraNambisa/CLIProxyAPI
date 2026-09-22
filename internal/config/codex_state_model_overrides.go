@@ -12,6 +12,7 @@ func (c CodexStateOverrideConfig) stateDefaultsFor(scope CodexStateScope, source
 		if override.Model != scope.Model {
 			continue
 		}
+		applyStateStrategySettings(&policy, override.CodexStateStrategySettings, sources, "global-model")
 		if override.Lengths != nil {
 			sources["lengths"] = "global-model"
 		}

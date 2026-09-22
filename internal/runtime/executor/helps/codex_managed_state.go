@@ -102,7 +102,7 @@ func StateCredentialAvailable(a *auth.Auth) bool {
 
 // ManagedStateCredentialEligible checks credential scope without requiring a registered model.
 func ManagedStateCredentialEligible(cfg *config.Config, a *auth.Auth) bool {
-	if cfg == nil || !cfg.Codex.StateOverride.Enabled || cfg.Codex.ResolvedTurnStatePolicy() == config.CodexTurnStatePolicyStrip || !StateCredentialAvailable(a) {
+	if cfg == nil || !cfg.Codex.StateOverride.Enabled || !StateCredentialAvailable(a) {
 		return false
 	}
 	c := cfg.Codex.StateOverride
@@ -221,7 +221,10 @@ func (stateUnavailableError) RetryOtherAuth() bool        { return true }
 func (stateUnavailableError) PreserveErrorResponse() bool { return true }
 
 // ApplyManagedState runs after client headers and account guards. It never changes session IDs.
-func ApplyManagedState(ctx context.Context, cfg *config.Config, a *auth.Auth, model string, headers http.Header) (err error) {
+func ApplyManagedState(ctx context.Context, cfg *config.Config, a *auth.Auth, model string, headers http.Header, targetURLs ...string) (err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	var diagnostic *codexStateDiagnostic
 	if ctx != nil {
 		diagnostic, _ = ctx.Value(codexStateDiagnosticKey{}).(*codexStateDiagnostic)
@@ -253,10 +256,20 @@ func ApplyManagedState(ctx context.Context, cfg *config.Config, a *auth.Auth, mo
 			headers.Set("X-Codex-Turn-State", value)
 		}
 	}
+	targetURL := "https://chatgpt.com/backend-api/codex/responses"
+	if a != nil && a.Attributes["base_url"] != "" {
+		targetURL = strings.TrimRight(a.Attributes["base_url"], "/") + "/responses"
+	}
+	if len(targetURLs) > 0 {
+		targetURL = targetURLs[0]
+	}
 	if IsStateProbe(ctx) {
-		setState("")
 		source = "none"
-		return nil
+		return applyStateProbeHeaders(ctx, headers, targetURL)
+	}
+	if handled, errCookie := applyCookieDiagnostic(ctx, cfg, a, model, headers, targetURL); handled {
+		source = "cookie"
+		return errCookie
 	}
 	if diagnostic != nil {
 		switch diagnostic.mode {
@@ -266,7 +279,6 @@ func ApplyManagedState(ctx context.Context, cfg *config.Config, a *auth.Auth, mo
 		case "none":
 			setState("")
 			source = "none"
-			return nil
 		case "custom":
 			setState(diagnostic.value)
 			source = "custom"
@@ -278,9 +290,11 @@ func ApplyManagedState(ctx context.Context, cfg *config.Config, a *auth.Auth, mo
 			}
 			c := StateCredential(a, model)
 			policy, _ := codexstate.DiagnosticPolicy(cfg.Codex.StateOverride, c)
-			choice := core.CodexStateForRequest(ctx, "diagnostic:"+codexStateRequestKey(c), func() core.CodexStateChoice {
+			choice := core.RefreshCodexStateForRequest(ctx, "diagnostic:"+codexStateRequestKey(c), func(previous core.CodexStateChoice) bool {
+				return codexstate.Diagnostic.StateSelectionValid(c, previous.Value, previous.Version, previous.ExpiresAt, time.Now(), policy)
+			}, func() core.CodexStateChoice {
 				value, missing, version, eligible := codexstate.Diagnostic.PickVersionForPolicy(c, "", time.Now(), policy)
-				return core.CodexStateChoice{Value: value, Policy: missing, Version: version, Eligible: eligible, Observation: stateObservationPolicy(policy)}
+				return core.CodexStateChoice{Value: value, Policy: missing, Version: version, Eligible: eligible, ExpiresAt: codexstate.Diagnostic.StateExpiry(c, version), Observation: stateObservationPolicy(policy)}
 			})
 			if !choice.Eligible || choice.Value == "" {
 				return errors.New("no valid manually acquired State is available for this credential and upstream model")
@@ -295,7 +309,7 @@ func ApplyManagedState(ctx context.Context, cfg *config.Config, a *auth.Auth, mo
 		source = "unavailable"
 		return errors.New("no valid managed State is available for this credential and upstream model")
 	}
-	if cfg == nil || !cfg.Codex.StateOverride.Enabled || cfg.Codex.ResolvedTurnStatePolicy() == config.CodexTurnStatePolicyStrip {
+	if cfg == nil || !cfg.Codex.StateOverride.Enabled {
 		if requireManaged {
 			return unavailable()
 		}
@@ -329,13 +343,66 @@ func ApplyManagedState(ctx context.Context, cfg *config.Config, a *auth.Auth, mo
 		// Do not recheck its spelling after resolving the upstream model.
 		resolved = cfg.Codex.StateOverride.ForCredential(c.Plan, c.Model)
 	}
-	choice := core.CodexStateForRequest(ctx, codexStateRequestKey(c), func() core.CodexStateChoice {
+	if diagnostic != nil && diagnostic.mode == "none" && !resolved.CookieOnly() {
+		return nil
+	}
+	if cfg.Codex.ResolvedTurnStatePolicy() == config.CodexTurnStatePolicyStrip && !resolved.CookieOnly() {
+		if requireManaged {
+			return unavailable()
+		}
+		return nil
+	}
+	if resolved.CookieOnly() {
+		setState("")
+		if d, ok := ctx.Value(cookieDiagnosticKey{}).(cookieDiagnostic); ok && d.mode == "none" {
+			source = "none"
+			return nil
+		}
+		codexstate.StripManagedCookies(headers)
+		choice := core.RefreshCodexStateForRequest(ctx, codexStateRequestKey(c), func(previous core.CodexStateChoice) bool {
+			return previous.Cookie != nil && previous.Cookie.URL == targetURL && codexstate.Default.CookieSelectionValid(c, *previous.Cookie, time.Now(), resolved)
+		}, func() core.CodexStateChoice {
+			selection, missing, eligible := codexstate.Default.PickCookie(c, targetURL, time.Now(), resolved)
+			return core.CodexStateChoice{Policy: missing, Eligible: eligible, Version: selection.Version, Cookie: &selection, Observation: stateObservationPolicy(resolved)}
+		})
+		if choice.Cookie != nil && choice.Cookie.Header != "" {
+			existing := headers.Get("Cookie")
+			if existing != "" {
+				existing += "; "
+			}
+			headers.Set("Cookie", existing+choice.Cookie.Header)
+			source = "cookie"
+			observeCookieSelection(ctx, "managed", *choice.Cookie)
+			return nil
+		}
+		source = "unavailable"
+		if requireManaged {
+			return errors.New("no valid managed Cookie is available for this credential")
+		}
+		if choice.Policy == "error" || choice.Policy == "hide" {
+			body, _ := json.Marshal(map[string]any{"error": map[string]string{"type": resolved.ErrorType, "code": resolved.ErrorCode, "message": resolved.ErrorMessage}})
+			if choice.Policy == "hide" && targetRespectsState {
+				body = []byte(`{"error":{"type":"service_unavailable_error","code":"auth_unavailable","message":"Selected credential has no valid Cookie"}}`)
+				return stateUnavailableError{body: string(body), status: 503}
+			}
+			return stateUnavailableError{body: string(body)}
+		}
+		return nil
+	}
+	// A retry may reuse its mutable header map. Remove a retired managed value
+	// before the missing-only mode considers it an explicit client value.
+	if previous, ok := core.CodexStateChoiceForRequest(ctx, codexStateRequestKey(c)); ok && previous.Version != 0 && previous.Value != "" && headers.Get("X-Codex-Turn-State") == previous.Value && !codexstate.Default.StateSelectionValid(c, previous.Value, previous.Version, previous.ExpiresAt, time.Now(), resolved) {
+		setState("")
+	}
+	choice := core.RefreshCodexStateForRequest(ctx, codexStateRequestKey(c), func(previous core.CodexStateChoice) bool {
+		return codexstate.Default.StateSelectionValid(c, previous.Value, previous.Version, previous.ExpiresAt, time.Now(), resolved)
+	}, func() core.CodexStateChoice {
 		clientState := headers.Get("X-Codex-Turn-State")
 		if requireManaged {
 			clientState = ""
 		}
 		value, policy, version, eligible := codexstate.Default.PickVersionForPolicy(c, clientState, time.Now(), resolved)
-		return core.CodexStateChoice{Value: value, Policy: policy, Version: version, Eligible: eligible, Observation: stateObservationPolicy(resolved)}
+		return core.CodexStateChoice{Value: value, Policy: policy, Version: version, Eligible: eligible, ExpiresAt: codexstate.Default.StateExpiry(c, version), Observation: stateObservationPolicy(resolved)}
 	})
 	state, policy, eligible := choice.Value, choice.Policy, choice.Eligible
 	if !eligible && targetRespectsState {
@@ -407,5 +474,5 @@ func ResolveStateModel(authID, requested string) string {
 }
 
 func stateObservationPolicy(policy config.CodexStateOverrideConfig) *core.CodexStateObservationPolicy {
-	return &core.CodexStateObservationPolicy{ModelMismatch: policy.InvalidateOnModelMismatch, LengthMismatch: policy.InvalidateOnStateLengthMismatch, Lengths: slices.Clone(policy.Lengths)}
+	return &core.CodexStateObservationPolicy{MatchModel: policy.MatchModel == nil || *policy.MatchModel, ModelMismatch: policy.InvalidateOnModelMismatch, LengthMismatch: policy.InvalidateOnStateLengthMismatch, Lengths: slices.Clone(policy.Lengths), MissingReturnedState: policy.MissingReturnedState, Strategy: policy.Strategy, CookieMaxAgeSeconds: policy.CookieMaxAgeSeconds}
 }

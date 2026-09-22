@@ -96,3 +96,11 @@ func TestOpenAICompatibilityAliasSkipsDisabledProviders(t *testing.T) {
 		t.Fatalf("active provider config did not resolve: %#v %#v", compat, model)
 	}
 }
+
+func TestManagedSessionHeadersAreNeverPersistedInLogs(t *testing.T) {
+	for _, key := range []string{"Cookie", "Set-Cookie", "cookie", "X-Codex-Turn-State"} {
+		if got := MaskSensitiveHeaderValue(key, "secret-value"); got != "[REDACTED]" {
+			t.Fatalf("%s leaked: %s", key, got)
+		}
+	}
+}

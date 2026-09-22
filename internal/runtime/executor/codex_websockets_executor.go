@@ -572,7 +572,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		}
 		helps.ObserveCodexWebsocketQuota(ctx, auth, payload)
 		if isCodexSuccessfulCompletion(normalizeCodexCompletion(payload)) {
-			e.observeManagedWebsocketState(ctx, auth, sess, conn, req.Model, wsHeaders, nil, payload)
+			e.observeManagedWebsocketState(ctx, auth, sess, conn, req.Model, wsHeaders, upstreamHeaders, payload)
 		}
 		helps.ObserveResponsesTokenEvent(reporter, payload)
 		normalizedPayload := normalizeCodexCompletion(payload)
@@ -954,7 +954,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			if msgType == websocket.TextMessage && len(payload) > 0 {
 				helps.ObserveCodexWebsocketQuota(ctx, auth, payload)
 				if isCodexSuccessfulCompletion(normalizeCodexCompletion(payload)) {
-					e.observeManagedWebsocketState(ctx, auth, sess, conn, req.Model, wsHeaders, nil, payload)
+					e.observeManagedWebsocketState(ctx, auth, sess, conn, req.Model, wsHeaders, upstreamHeaders, payload)
 				}
 				helps.ObserveResponsesTokenEvent(reporter, payload)
 			}
@@ -1049,7 +1049,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				if errRead == nil && msgType == websocket.TextMessage {
 					helps.ObserveCodexWebsocketQuota(ctx, auth, payload)
 					if isCodexSuccessfulCompletion(normalizeCodexCompletion(payload)) {
-						e.observeManagedWebsocketState(ctx, auth, sess, conn, req.Model, wsHeaders, nil, payload)
+						e.observeManagedWebsocketState(ctx, auth, sess, conn, req.Model, wsHeaders, upstreamHeaders, payload)
 					}
 				}
 			}
@@ -1998,7 +1998,7 @@ func (e *CodexWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *
 			return nil, nil, cliproxyexecutor.NewUpstreamWebsocketReplayRequiredError()
 		}
 		if len(models) > 0 {
-			if errState := helps.ApplyManagedState(ctx, e.cfg, auth, models[0], headers); errState != nil {
+			if errState := helps.ApplyManagedState(ctx, e.cfg, auth, models[0], headers, wsURL); errState != nil {
 				return nil, nil, errState
 			}
 		}
@@ -2043,6 +2043,7 @@ func (e *CodexWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *
 	currentWSURL := strings.TrimSpace(sess.wsURL)
 	currentSoftwareIdentity := sess.softwareIdentity
 	currentManagedStateModel := sess.managedStateModel
+	currentManagedStateUse := sess.managedStateUse
 	stateRejected := sess.managedStateRejected
 	currentCacheSessionDigest := sess.cacheSessionDigest
 	currentRequestScopeDigest := sess.requestScopeDigest
@@ -2071,7 +2072,7 @@ func (e *CodexWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *
 			}
 		}
 	}
-	stateModelChanged := conn != nil && (currentManagedStateModel != requestedStateModel || stateRejected)
+	stateModelChanged := conn != nil && (currentManagedStateModel != requestedStateModel || stateRejected || currentManagedStateUse.CookieNeedsReconnect())
 
 	softwareChanged := conn != nil && len(models) > 0 && codexEnforceSoftwareIdentity(e.cfg) && !codexAuthUsesAPIKey(auth) &&
 		!codexauth.SoftwareIdentitySupportsModel(currentSoftwareIdentity, thinking.ParseSuffix(models[0]).ModelName)
@@ -2131,7 +2132,7 @@ func (e *CodexWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *
 	sess.connMu.Unlock()
 
 	if len(models) > 0 {
-		if errState := helps.ApplyManagedState(ctx, e.cfg, auth, models[0], headers); errState != nil {
+		if errState := helps.ApplyManagedState(ctx, e.cfg, auth, models[0], headers, wsURL); errState != nil {
 			clearCodexPendingWebsocketDial(sess, dialGeneration)
 			return nil, nil, errState
 		}
@@ -2247,6 +2248,7 @@ func (e *CodexWebsocketsExecutor) observeManagedWebsocketState(ctx context.Conte
 			return
 		}
 		use = sess.managedStateUse
+		response = nil // The stored observation already owns the original handshake headers.
 		sess.connMu.Unlock()
 	}
 	if use.Observe(response, payload) && sess != nil {
