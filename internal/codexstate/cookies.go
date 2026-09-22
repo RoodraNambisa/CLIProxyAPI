@@ -52,9 +52,12 @@ type CookieBundleSnapshot struct {
 }
 type CookieSnapshot struct {
 	Snapshot
-	Main        *CookieBundleSnapshot `json:"main,omitempty"`
-	Candidate   *CookieBundleSnapshot `json:"candidate,omitempty"`
-	Observation string                `json:"observation,omitempty"`
+	Backups      []*CookieBundleSnapshot `json:"backups"`
+	BackupTarget int                     `json:"backup_target"`
+	Promotions   uint64                  `json:"promotions"`
+	Main         *CookieBundleSnapshot   `json:"main,omitempty"`
+	Candidate    *CookieBundleSnapshot   `json:"candidate,omitempty"`
+	Observation  string                  `json:"observation,omitempty"`
 }
 
 func RouteCookieName(name string) bool   { return name == "__oailb" || name == "__cflb" }

@@ -1019,6 +1019,7 @@ xai:
 #     enabled: false
 #     strategy: state               # state | cookie-only; existing rules keep State behavior.
 #     cookie-verify-after-acquire: false # Optional extra Cookie-only probe before activation.
+#     cookie-backup-count: 0 # Validated standby bundles per credential, excluding the active bundle; 0-10. Acquisition uses the configured scope and retry budget.
 #     cookie-max-age-seconds: 0      # 0 uses declared expiry; session cookies remain in memory only.
 #     cookie-refresh-before-seconds: 0 # 0 disables early refresh. Independent of State lifetime.
 #     missing-returned-state: ignore # ignore | reject, only when State length checks are enabled.

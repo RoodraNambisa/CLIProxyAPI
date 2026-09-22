@@ -45,7 +45,7 @@ func preservesCodexStateRuleYAMLValue(path []string, node *yaml.Node) bool {
 	return false
 }
 
-var codexStateStrategyYAMLKeys = []string{"strategy", "cookie-verify-after-acquire", "cookie-max-age-seconds", "cookie-refresh-before-seconds", "ttl-seconds", "refresh-before-seconds", "missing-returned-state"}
+var codexStateStrategyYAMLKeys = []string{"strategy", "cookie-verify-after-acquire", "cookie-backup-count", "cookie-max-age-seconds", "cookie-refresh-before-seconds", "ttl-seconds", "refresh-before-seconds", "missing-returned-state"}
 
 func pruneMissingCodexStateStrategy(dst, src *yaml.Node) {
 	for _, key := range codexStateStrategyYAMLKeys {

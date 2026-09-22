@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"reflect"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -13,6 +14,10 @@ import (
 )
 
 type cookieGroup struct {
+	backups          []cookieBackup
+	backupTarget     int
+	filling          bool
+	promotions       uint64
 	owner            string
 	main, candidate  *CookieBundle
 	version          uint64
@@ -92,14 +97,19 @@ func (m *Manager) syncCookiesLocked() {
 	for id := range wanted {
 		entries := m.cookieEntriesLocked(id)
 		selected := entries[0]
+		target := 0
+		for _, e := range entries {
+			target = max(target, e.policy.CookieBackupCount)
+		}
 		g := m.cookies[id]
 		if g == nil || g.owner != selected.credential.Owner {
 			if g != nil && g.work.cancel != nil {
 				g.work.cancel()
 			}
-			m.cookies[id] = &cookieGroup{owner: selected.credential.Owner, work: &entry{credential: selected.credential, policy: selected.policy, Snapshot: Snapshot{Model: selected.Model, Status: "missing"}}}
+			m.cookies[id] = &cookieGroup{owner: selected.credential.Owner, backupTarget: target, work: &entry{credential: selected.credential, policy: selected.policy, Snapshot: Snapshot{Model: selected.Model, Status: "missing"}}}
 			continue
 		}
+		g.backupTarget = target
 		validModels := map[string]bool{}
 		for _, e := range entries {
 			validModels[e.Model] = true
@@ -130,6 +140,7 @@ func (m *Manager) syncCookiesLocked() {
 			// validation contract cannot silently inherit an unverified acquisition.
 			if w.Model == selected.Model && (!sameCookieValidation(w.policy, selected.policy)) {
 				g.main = nil
+				g.backups = nil
 				g.version = 0
 				g.observation = "rules_changed"
 				next.resetRetryCycle()
@@ -137,6 +148,7 @@ func (m *Manager) syncCookiesLocked() {
 			g.candidate = nil
 			g.work = &next
 		}
+		g.pruneBackups(time.Now())
 	}
 	for id, g := range m.cookies {
 		if !wanted[id] {
@@ -160,7 +172,12 @@ func (m *Manager) CookieSnapshot(id string, now time.Time) *CookieSnapshot {
 		return nil
 	}
 	w := g.work
-	s := &CookieSnapshot{Snapshot: w.Snapshot, Main: g.main.snapshot(g.version, now, w.policy), Candidate: g.candidate.snapshot(g.candidateVersion, now, w.policy), Observation: g.observation}
+	s := &CookieSnapshot{Snapshot: w.Snapshot, Main: g.main.snapshot(g.version, now, w.policy), Candidate: g.candidate.snapshot(g.candidateVersion, now, w.policy), Observation: g.observation, BackupTarget: g.backupTarget, Promotions: g.promotions, Backups: []*CookieBundleSnapshot{}}
+	for _, b := range g.backups {
+		if b.bundle.Select(b.bundle.Origin, now, w.policy).Header != "" {
+			s.Backups = append(s.Backups, b.bundle.snapshot(b.version, now, w.policy))
+		}
+	}
 	s.AllowedLengths = append([]int(nil), w.policy.Lengths...)
 	s.LengthMode = w.policy.ReturnedLengthMode
 	s.LastReturnedLength = cloneCookieInt(w.LastReturnedLength)
@@ -172,7 +189,7 @@ func (m *Manager) CookieSnapshot(id string, now time.Time) *CookieSnapshot {
 		s.Status = "acquiring"
 	case w.manual || len(g.pending) > 0 && !w.Exhausted && !w.RoundWaiting && !now.Before(w.NextAttempt):
 		s.Status = "queued"
-	case g.main != nil && g.main.Select(g.main.Origin, now, w.policy).Header != "":
+	case g.main != nil && g.main.Select(g.main.Origin, now, w.policy).Header != "" || len(s.Backups) > 0:
 		s.Status = "valid"
 	case w.RoundWaiting:
 		s.Status = "retry_wait"
@@ -216,6 +233,10 @@ func (m *Manager) PickCookie(c Credential, rawURL string, now time.Time, p confi
 	}
 	w.LastUsed = now
 	selection := g.main.Select(rawURL, now, p)
+	if selection.Header == "" && m.promoteCookie(g, rawURL, now, p) {
+		selection = g.main.Select(rawURL, now, p)
+		m.publishAvailabilityLocked()
+	}
 	if selection.Header != "" {
 		selection.Version = g.version
 		w.Uses++
@@ -290,6 +311,7 @@ func (m *Manager) CookieAction(id, model, action string) (bool, uint64) {
 		copy.resetRetryCycle()
 		g.work = &copy
 		g.main = nil
+		g.backups = nil
 		g.candidate = nil
 		g.version = 0
 		g.observation = "cleared"
@@ -311,11 +333,16 @@ func (m *Manager) tickCookiesLocked(ctx context.Context, now time.Time, probe Pr
 		}
 		g := m.cookies[id]
 		w := g.work
+		g.pruneBackups(now)
+		if len(g.backups) > 0 && (g.main == nil || g.main.Select(g.main.Origin, now, w.policy).Header == "") {
+			m.promoteCookie(g, g.backups[0].bundle.Origin, now, w.policy)
+		}
 		if w.busy || w.paused || w.Exhausted || now.Before(w.NextAttempt) {
 			continue
 		}
 		candidates := m.cookieEntriesLocked(id)
 		var selected *entry
+		filling := false
 		for _, e := range candidates {
 			manual := w.manual && w.Model == e.Model || g.pending[e.Model]
 			valid := g.main != nil && g.main.Select(g.main.Origin, now, e.policy).Header != ""
@@ -325,9 +352,12 @@ func (m *Manager) tickCookiesLocked(ctx context.Context, now time.Time, probe Pr
 				continue
 			}
 			end := g.main.refreshDeadline(e.policy, now)
-			if !manual && !recovering && valid && (end.IsZero() || now.Before(end)) {
+			needsRefresh := !valid || !end.IsZero() && !now.Before(end)
+			needsBackups := g.readyBackups(now, e.policy) < g.backupTarget
+			if !manual && !recovering && !needsRefresh && !needsBackups {
 				continue
 			}
+			filling = !manual && !needsRefresh && needsBackups
 			selected = e
 			break
 		}
@@ -335,6 +365,7 @@ func (m *Manager) tickCookiesLocked(ctx context.Context, now time.Time, probe Pr
 			continue
 		}
 		delete(g.pending, selected.Model)
+		g.filling = filling
 		w.credential = selected.credential
 		w.Model = selected.Model
 		w.policy = selected.policy
@@ -406,6 +437,10 @@ func (m *Manager) finishCookie(id string, expected *cookieGroup, work *entry, ca
 			reason = "acquisition_request_failed"
 		}
 	}
+	g.pruneBackups(now)
+	if reason == "" && g.backupTarget > 0 && g.duplicate(r.Cookies, now) {
+		reason = "duplicate_cookie"
+	}
 	if reason != "" {
 		w.LastError = reason
 		w.lastFailure = now
@@ -414,14 +449,24 @@ func (m *Manager) finishCookie(id string, expected *cookieGroup, work *entry, ca
 		w.scheduleRetry()
 		return
 	}
-	m.nextValueVersion++
-	g.version = m.nextValueVersion
-	g.main = cloneCookieBundle(r.Cookies)
+	bundle := cloneCookieBundle(r.Cookies)
+	mainValid := g.main != nil && g.main.Select(g.main.Origin, now, w.policy).Header != ""
+	if g.filling && mainValid && g.backupTarget > 0 {
+		m.nextValueVersion++
+		g.backups = append(g.backups, cookieBackup{bundle, m.nextValueVersion})
+	} else {
+		if mainValid && g.backupTarget > 0 {
+			end := g.main.refreshDeadline(w.policy, now)
+			if end.IsZero() || now.Before(end) {
+				g.backups = append(g.backups, cookieBackup{g.main, g.version})
+			}
+		}
+		m.activateCookie(g, bundle)
+	}
+	g.pruneBackups(now)
 	g.observation = "matches_rules"
 	w.Acquired++
-	w.CurrentUses = 0
 	w.LastError = ""
-	w.ExpiresAt = g.main.expiry(w.policy)
 	w.resetRetryCycle()
 }
 
@@ -434,7 +479,20 @@ func (m *Manager) ObserveCookieEvidence(c Credential, used CookieSelection, p co
 	defer m.mu.Unlock()
 	defer m.publishAvailabilityLocked()
 	g := m.cookies[c.ID]
-	if g == nil || g.owner != c.Owner || g.version != used.Version || used.Version == 0 || g.main == nil {
+	if g == nil || g.owner != c.Owner || used.Version == 0 {
+		return false
+	}
+	bundle, backupIndex := g.main, -1
+	if g.version != used.Version {
+		bundle = nil
+		for i, spare := range g.backups {
+			if spare.version == used.Version {
+				bundle, backupIndex = spare.bundle, i
+				break
+			}
+		}
+	}
+	if bundle == nil {
 		return false
 	}
 	w := g.work
@@ -459,7 +517,7 @@ func (m *Manager) ObserveCookieEvidence(c Credential, used CookieSelection, p co
 			for _, update := range updates.Members {
 				key := update.key()
 				found := false
-				for i, current := range g.main.Members {
+				for i, current := range bundle.Members {
 					if current.key() != key {
 						continue
 					}
@@ -471,18 +529,18 @@ func (m *Manager) ObserveCookieEvidence(c Credential, used CookieSelection, p co
 						if RouteCookieName(update.Cookie.Name) {
 							reason = "cookie_deleted"
 						}
-						g.main.Members[i] = update
-						g.main.Members[i].Version = current.Version + 1
+						bundle.Members[i] = update
+						bundle.Members[i].Version = current.Version + 1
 					} else if update.Cookie.Name == "__cf_bm" {
-						g.main.Members[i] = update
-						g.main.Members[i].Version = current.Version + 1
+						bundle.Members[i] = update
+						bundle.Members[i].Version = current.Version + 1
 					}
 					break
 				}
 				// Missing members may be added only once. A later response from the same
 				// old request has no matching member version and cannot overwrite them.
 				if !found && update.Cookie.Name == "__cf_bm" && used.Members[key] == 0 {
-					g.main.Members = append(g.main.Members, update)
+					bundle.Members = append(bundle.Members, update)
 				}
 			}
 		}
@@ -512,14 +570,21 @@ func (m *Manager) ObserveCookieEvidence(c Credential, used CookieSelection, p co
 		}
 		return false
 	}
-	g.main = nil
-	g.version = 0
+	if backupIndex >= 0 {
+		g.backups = slices.Delete(g.backups, backupIndex, backupIndex+1)
+	} else {
+		g.main = nil
+		g.version = 0
+	}
 	g.observation = reason
 	w.Invalidations++
 	w.LastInvalidation = reason
 	w.InvalidationModel = w.LastReturnedModel
 	w.InvalidationLength = cloneCookieInt(w.LastReturnedLength)
-	if !w.busy && !w.Exhausted && !w.ManualOnly && !w.RoundWaiting {
+	if backupIndex < 0 {
+		m.promoteCookie(g, used.URL, now, p)
+	}
+	if g.main == nil && !w.busy && !w.Exhausted && !w.ManualOnly && !w.RoundWaiting {
 		w.manual = true
 	}
 	return true

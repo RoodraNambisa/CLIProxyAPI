@@ -9,6 +9,7 @@ import (
 type CodexStateStrategySettings struct {
 	Strategy                   *string `yaml:"strategy,omitempty" json:"strategy,omitempty"`
 	CookieVerifyAfterAcquire   *bool   `yaml:"cookie-verify-after-acquire,omitempty" json:"cookie-verify-after-acquire,omitempty"`
+	CookieBackupCount          *int    `yaml:"cookie-backup-count,omitempty" json:"cookie-backup-count,omitempty"`
 	CookieMaxAgeSeconds        *int    `yaml:"cookie-max-age-seconds,omitempty" json:"cookie-max-age-seconds,omitempty"`
 	CookieRefreshBeforeSeconds *int    `yaml:"cookie-refresh-before-seconds,omitempty" json:"cookie-refresh-before-seconds,omitempty"`
 	TTLSeconds                 *int    `yaml:"ttl-seconds,omitempty" json:"ttl-seconds,omitempty"`
@@ -27,6 +28,7 @@ func cloneStateValue[T any](p *T) *T {
 func (s CodexStateStrategySettings) clone() CodexStateStrategySettings {
 	s.Strategy = cloneStateValue(s.Strategy)
 	s.CookieVerifyAfterAcquire = cloneStateValue(s.CookieVerifyAfterAcquire)
+	s.CookieBackupCount = cloneStateValue(s.CookieBackupCount)
 	s.CookieMaxAgeSeconds = cloneStateValue(s.CookieMaxAgeSeconds)
 	s.CookieRefreshBeforeSeconds = cloneStateValue(s.CookieRefreshBeforeSeconds)
 	s.TTLSeconds = cloneStateValue(s.TTLSeconds)
@@ -38,6 +40,9 @@ func (s CodexStateStrategySettings) clone() CodexStateStrategySettings {
 func (s CodexStateStrategySettings) validateExplicit() error {
 	if s.Strategy != nil && *s.Strategy != "state" && *s.Strategy != "cookie-only" {
 		return fmt.Errorf("invalid strategy override")
+	}
+	if s.CookieBackupCount != nil && (*s.CookieBackupCount < 0 || *s.CookieBackupCount > 10) {
+		return fmt.Errorf("cookie-backup-count must be between 0 and 10")
 	}
 	if s.MissingReturnedState != nil && *s.MissingReturnedState != "ignore" && *s.MissingReturnedState != "reject" {
 		return fmt.Errorf("invalid missing-returned-state override")
@@ -63,6 +68,10 @@ func applyStateStrategySettings(c *CodexStateOverrideConfig, s CodexStateStrateg
 		c.CookieVerifyAfterAcquire = *s.CookieVerifyAfterAcquire
 	}
 	mark("cookie-verify-after-acquire", s.CookieVerifyAfterAcquire != nil)
+	if s.CookieBackupCount != nil {
+		c.CookieBackupCount = *s.CookieBackupCount
+	}
+	mark("cookie-backup-count", s.CookieBackupCount != nil)
 	if s.CookieMaxAgeSeconds != nil {
 		c.CookieMaxAgeSeconds = *s.CookieMaxAgeSeconds
 	}
@@ -113,6 +122,9 @@ func (c CodexStateOverrideConfig) validateStateStrategy() error {
 	}
 	if c.MissingReturnedState != "ignore" && c.MissingReturnedState != "reject" {
 		return fmt.Errorf("invalid missing-returned-state policy")
+	}
+	if c.CookieBackupCount < 0 || c.CookieBackupCount > 10 {
+		return fmt.Errorf("cookie-backup-count must be between 0 and 10")
 	}
 	if c.CookieMaxAgeSeconds < 0 || c.CookieMaxAgeSeconds > 86400 || c.CookieRefreshBeforeSeconds < 0 || c.CookieRefreshBeforeSeconds > 86400 || c.CookieMaxAgeSeconds > 0 && c.CookieRefreshBeforeSeconds >= c.CookieMaxAgeSeconds {
 		return fmt.Errorf("invalid Cookie lifetime or refresh interval")

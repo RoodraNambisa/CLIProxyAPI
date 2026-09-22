@@ -16,6 +16,7 @@ type CodexStateOverrideConfig struct {
 	ReturnedLengthMode         string                    `yaml:"-" json:"returned_length_mode,omitempty"`
 	Strategy                   string                    `yaml:"strategy,omitempty" json:"strategy,omitempty"`
 	CookieVerifyAfterAcquire   bool                      `yaml:"cookie-verify-after-acquire,omitempty" json:"cookie-verify-after-acquire,omitempty"`
+	CookieBackupCount          int                       `yaml:"cookie-backup-count,omitempty" json:"cookie-backup-count,omitempty"`
 	CookieMaxAgeSeconds        int                       `yaml:"cookie-max-age-seconds,omitempty" json:"cookie-max-age-seconds,omitempty"`
 	CookieRefreshBeforeSeconds int                       `yaml:"cookie-refresh-before-seconds,omitempty" json:"cookie-refresh-before-seconds,omitempty"`
 	TTLSeconds                 *int                      `yaml:"ttl-seconds,omitempty" json:"ttl-seconds,omitempty"`

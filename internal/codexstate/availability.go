@@ -36,11 +36,8 @@ func (m *Manager) publishAvailabilityLocked() {
 			}
 			var expires time.Time
 			if e.policy.CookieOnly() {
-				if g := m.cookies[e.credential.ID]; g != nil && !g.work.paused && g.main != nil {
-					expires = g.main.expiry(e.policy)
-					if expires.IsZero() {
-						expires = time.Date(9999, 1, 1, 0, 0, 0, 0, time.UTC)
-					}
+				if g := m.cookies[e.credential.ID]; g != nil && !g.work.paused {
+					expires = g.availabilityExpiry(e.policy)
 				}
 			} else if !e.paused && e.state != "" {
 				expires = e.ExpiresAt
