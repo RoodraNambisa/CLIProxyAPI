@@ -27,6 +27,7 @@ import (
 	chatgptwebauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/chatgptweb"
 	internalcodex "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/authfileguard"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/codexcookie"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/proxypool"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor"
@@ -391,6 +392,15 @@ func (h authMaintenanceHook) OnAuthUpdated(ctx context.Context, auth *coreauth.A
 func (h authMaintenanceHook) handleAuthChange(ctx context.Context, auth *coreauth.Auth) {
 	if h.service == nil || auth == nil || strings.TrimSpace(auth.ID) == "" {
 		return
+	}
+	if h.service.coreManager != nil {
+		if current, ok := h.service.coreManager.CurrentAuthInstallation(auth); ok {
+			if current.ExecutionProvider() == "codex" && current.Attributes["api_key"] == "" {
+				codexcookie.Default.IdentityChanged(current.ID, executorhelps.StateCredential(current, "").Owner)
+			} else {
+				codexcookie.Default.Forget(current.ID)
+			}
+		}
 	}
 	h.service.markAuthMaintenanceChange(auth.ID)
 	if ctx != nil && ctx.Value(modelSyncHookSuppressedContextKey{}) != nil {
@@ -1189,6 +1199,7 @@ func (s *Service) handleManagementAuthDelete(ctx context.Context, auths []*corea
 			unlockMutation()
 			continue
 		}
+		codexcookie.Default.Forget(deleted.ID)
 		s.cancelModelSyncTask(deleted.ID)
 		executorhelps.CloseProxyTransportCachesForAuth(deleted.ID)
 		s.antigravityModelCapabilities.Delete(deleted.ID)
@@ -3634,6 +3645,7 @@ func (s *Service) deleteCoreAuth(ctx context.Context, id string) error {
 		log.Errorf("failed to delete auth %s: %v", id, errDelete)
 		return errDelete
 	}
+	codexcookie.Default.Forget(id)
 	s.cancelModelSyncTaskIfEpoch(id, modelSyncEpoch)
 	executorhelps.CloseProxyTransportCachesForAuth(id)
 	s.antigravityModelCapabilities.Delete(id)

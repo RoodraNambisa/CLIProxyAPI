@@ -38,6 +38,9 @@ func applyCookieDiagnostic(ctx context.Context, cfg *config.Config, a *auth.Auth
 	if d.mode != "managed" && d.mode != "candidate" {
 		return false, nil
 	}
+	if cfg != nil && cfg.Codex.AutoCookie {
+		return true, errors.New("Cookie-only diagnostics conflict with codex.auto-cookie")
+	}
 	for name := range headers {
 		if strings.EqualFold(name, "X-Codex-Turn-State") {
 			delete(headers, name)

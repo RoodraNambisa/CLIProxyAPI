@@ -993,6 +993,10 @@ xai:
 #   # Existing encrypted history remains opaque; other protocols cannot consume it.
 #   optimize-multi-agent-v2: false
 #   spoof-session-identity: false
+#   # Passive infrastructure cookies, isolated by credential; incompatible with Cookie-only management.
+#   auto-cookie: false
+#   # Replace request Cookie headers by default; an empty store sends no cookies.
+#   auto-cookie-override: true
 #   turn-state-policy: "guard-cross-account"
 #   # Independent response checks; does not require or enable State/Cookie management.
 #   response-guard:

@@ -1256,7 +1256,12 @@ func (e *CodexWebsocketsExecutor) dialCodexWebsocket(ctx context.Context, auth *
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	headers, storeCookies, errCookies := helps.PrepareAutoCookieHandshake(ctx, e.cfg, auth, wsURL, headers)
+	if errCookies != nil {
+		return nil, nil, errCookies
+	}
 	conn, resp, err := dialer.DialContext(ctx, wsURL, headers)
+	storeCookies(resp)
 	if resp != nil {
 		helps.ObserveCodexHTTPQuota(ctx, auth, resp.Header)
 	}
@@ -1305,7 +1310,12 @@ func (e *CodexExecutor) DialCodexLiveWebsocket(ctx context.Context, auth *clipro
 			break
 		}
 	}
-	conn, resp, errDial := helps.DialWebsocketHandshake(ctx, dialer, target, req.Header)
+	cookieHeaders, storeCookies, errCookies := helps.PrepareAutoCookieHandshake(ctx, e.cfg, auth, target, req.Header)
+	if errCookies != nil {
+		return nil, nil, errCookies
+	}
+	conn, resp, errDial := helps.DialWebsocketHandshake(ctx, dialer, target, cookieHeaders)
+	storeCookies(resp)
 	helps.ObserveUpstreamWebsocketDial(ctx, resp, errDial)
 	if conn != nil {
 		conn.EnableWriteCompression(false)

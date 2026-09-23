@@ -237,6 +237,22 @@ func sameStateValidation(a, b config.CodexStateOverrideConfig) bool {
 	return a.ReturnedLengthMode == b.ReturnedLengthMode && reflect.DeepEqual(a.AcceptedReturnedModels, b.AcceptedReturnedModels) && reflect.DeepEqual(a.Lengths, b.Lengths) && reflect.DeepEqual(a.MatchModel, b.MatchModel) && a.Prompt == b.Prompt && a.ResponseContains == b.ResponseContains && a.StateTTL() == b.StateTTL() && a.Strategy == b.Strategy && a.MissingReturnedState == b.MissingReturnedState
 }
 
+// DiscardCookieOnly stops obsolete manual Cookie jobs when passive cookies take ownership.
+func (m *Manager) DiscardCookieOnly() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	defer m.publishAvailabilityLocked()
+	for key, e := range m.entries {
+		if e.policy.CookieOnly() {
+			if e.cancel != nil {
+				e.cancel()
+			}
+			delete(m.entries, key)
+		}
+	}
+	m.syncCookiesLocked()
+}
+
 // QueueManual creates a bounded diagnostic entry without registering a model.
 // Callers must validate the credential; regular managers also require configured scope.
 func (m *Manager) QueueManual(c Credential, strategies ...string) (bool, uint64) {

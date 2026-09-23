@@ -358,6 +358,9 @@ func ApplyManagedState(ctx context.Context, cfg *config.Config, a *auth.Auth, mo
 		return nil
 	}
 	if resolved.CookieOnly() {
+		if cfg.Codex.AutoCookie {
+			return errors.New("Cookie-only management conflicts with codex.auto-cookie")
+		}
 		setState("")
 		if d, ok := ctx.Value(cookieDiagnosticKey{}).(cookieDiagnostic); ok && d.mode == "none" {
 			source = "none"

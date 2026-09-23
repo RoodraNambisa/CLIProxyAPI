@@ -122,3 +122,37 @@ func TestDiagnosticRetirementCancelsWithoutRequeueAndSharesCapacity(t *testing.T
 		t.Fatal("retired credential kept an acquisition or result")
 	}
 }
+
+func TestAutoCookieDiscardKeepsStateAndCancelsCookieJobs(t *testing.T) {
+	m := NewDiagnostic()
+	c := Credential{ID: "test", Owner: "owner", Instance: "one", Model: "model"}
+	cookie := c
+	cookie.Model = "cookie-model"
+	m.Sync(config.CodexStateOverrideConfig{Concurrency: 2}, nil, c)
+	m.QueueManual(c, "state")
+	m.Tick(t.Context(), time.Now(), func(context.Context, Credential, config.CodexStateOverrideConfig) (Result, error) {
+		return good(), nil
+	})
+	m.Wait()
+	if ok, _ := m.QueueManualStrategy(cookie, "cookie-only"); !ok {
+		t.Fatal("could not queue Cookie diagnostic")
+	}
+	started := make(chan struct{})
+	m.Tick(t.Context(), time.Now(), func(ctx context.Context, _ Credential, _ config.CodexStateOverrideConfig) (Result, error) {
+		close(started)
+		<-ctx.Done()
+		return good(), nil
+	})
+	if m.Running() != 1 {
+		t.Fatal("Cookie diagnostic did not start")
+	}
+	<-started
+	m.DiscardCookieOnly()
+	m.Wait()
+	if snapshots := m.Snapshots(c.ID, time.Now()); len(snapshots) != 1 || snapshots[0].Model != c.Model {
+		t.Fatal("discard removed State or allowed a late Cookie result", snapshots)
+	}
+	if value, _, _ := m.Pick(c, "", time.Now()); value != good().State {
+		t.Fatal("State resource lost during passive Cookie activation")
+	}
+}

@@ -243,6 +243,9 @@ func (c CodexStateOverrideConfig) Resolved() CodexStateOverrideConfig {
 var CodexStateProxyPlaceholder = regexp.MustCompile(`\{([0-9]+)\}`)
 
 func (cfg *Config) ValidateCodexStateOverride() error {
+	if err := cfg.ValidateCodexAutoCookie(); err != nil {
+		return err
+	}
 	if cfg == nil {
 		return nil
 	}

@@ -11,6 +11,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/codexcookie"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/codexstate"
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/managementdiag"
@@ -41,6 +42,7 @@ func (s *Service) runCodexState(ctx context.Context) {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	defer func() {
+		codexcookie.Default.Sync(false, nil)
 		codexstate.Default.Sync(internalconfig.CodexStateOverrideConfig{}, nil)
 		codexstate.Diagnostic.Sync(internalconfig.CodexStateOverrideConfig{}, nil)
 		codexstate.Default.Wait()
@@ -68,10 +70,14 @@ func (s *Service) syncCodexState(cfg *internalconfig.Config) {
 	if cfg == nil || s.coreManager == nil {
 		return
 	}
+	owners := map[string]string{}
 	var credentials []codexstate.Credential
 	var manualScopes []codexstate.Credential
 	var diagnosticScopes []codexstate.Credential
 	for _, a := range s.coreManager.List() {
+		if a != nil && a.ExecutionProvider() == "codex" && !a.RuntimeInstanceRetired() && a.Attributes["api_key"] == "" {
+			owners[a.ID] = helps.StateCredential(a, "").Owner
+		}
 		if helps.StateCredentialAvailable(a) {
 			diagnosticScopes = append(diagnosticScopes, helps.StateCredential(a, ""))
 		}
@@ -82,8 +88,13 @@ func (s *Service) syncCodexState(cfg *internalconfig.Config) {
 			}
 		}
 	}
+	codexcookie.Default.Sync(cfg.Codex.AutoCookie, owners)
 	codexstate.Default.Sync(cfg.Codex.ManagedStateConfig(), credentials, manualScopes...)
 	codexstate.Diagnostic.Sync(cfg.Codex.ManagedStateConfig(), nil, diagnosticScopes...)
+	if cfg.Codex.AutoCookie {
+		codexstate.Default.DiscardCookieOnly()
+		codexstate.Diagnostic.DiscardCookieOnly()
+	}
 }
 
 func (s *Service) acquireCodexState(ctx context.Context, credential codexstate.Credential, policy internalconfig.CodexStateOverrideConfig) (result codexstate.Result, err error) {
@@ -106,6 +117,9 @@ func (s *Service) acquireCodexState(ctx context.Context, credential codexstate.C
 	s.cfgMu.RUnlock()
 	if err != nil {
 		return result, err
+	}
+	if policy.CookieOnly() && cfg.Codex.AutoCookie {
+		return result, fmt.Errorf("Cookie-only acquisition conflicts with codex.auto-cookie")
 	}
 	if policy.CookieOnly() {
 		if !helps.StateTextModel(credential.Model) {

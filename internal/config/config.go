@@ -554,6 +554,10 @@ type CodexHeaderDefaults struct {
 
 // CodexConfig configures provider-wide Codex request behavior.
 type CodexConfig struct {
+	// AutoCookie passively stores allowlisted upstream cookies per credential.
+	AutoCookie bool `yaml:"auto-cookie" json:"auto-cookie"`
+	// AutoCookieOverride defaults to taking ownership of the outbound Cookie header.
+	AutoCookieOverride *bool `yaml:"auto-cookie-override,omitempty" json:"auto-cookie-override,omitempty"`
 	// LiveEnabled admits new realtime sessions, credentials and connections.
 	LiveEnabled bool `yaml:"live-enabled" json:"live-enabled"`
 	// LiveMediaRelay controls in-process WebRTC media forwarding independently of admission.

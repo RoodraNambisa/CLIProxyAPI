@@ -2857,13 +2857,13 @@ func (e *CodexExecutor) newCodexHTTPClient(ctx context.Context, auth *cliproxyau
 		cfg = e.cfg
 	}
 	if codexFingerprintJA3Enabled(cfg) {
-		return helps.StateProbeHTTPClient(ctx, helps.NewCodexNativeTLSHTTP1Client(ctx, cfg, auth, 0))
+		return helps.StateProbeHTTPClient(ctx, helps.AutoCookieHTTPClient(ctx, cfg, auth, helps.NewCodexNativeTLSHTTP1Client(ctx, cfg, auth, 0)))
 	}
 	forceHTTP1 := codexFingerprintShouldForceHTTP1(cfg, imageRequest)
 	if forceHTTP1 {
-		return helps.StateProbeHTTPClient(ctx, helps.NewProxyAwareHTTP1Client(ctx, cfg, auth, 0))
+		return helps.StateProbeHTTPClient(ctx, helps.AutoCookieHTTPClient(ctx, cfg, auth, helps.NewProxyAwareHTTP1Client(ctx, cfg, auth, 0)))
 	}
-	return helps.StateProbeHTTPClient(ctx, helps.NewProxyAwareHTTPClient(ctx, cfg, auth, 0))
+	return helps.StateProbeHTTPClient(ctx, helps.AutoCookieHTTPClient(ctx, cfg, auth, helps.NewProxyAwareHTTPClient(ctx, cfg, auth, 0)))
 }
 
 func newCodexStatusErr(statusCode int, body []byte) statusErr {
