@@ -104,6 +104,10 @@ func (h *Handler) ProbeAuthFileModel(c *gin.Context) {
 		c.JSON(400, gin.H{"error": errState.Error()})
 		return
 	}
+	if cfg := h.currentConfig(); cfg != nil && cfg.Codex.AutoCookie && input.CodexCookie != nil && (input.CodexCookie.Mode == "managed" || input.CodexCookie.Mode == "candidate") {
+		c.JSON(http.StatusConflict, gin.H{"error": "Cookie-only diagnostics conflict with codex.auto-cookie"})
+		return
+	}
 	cookieMode, errCookie := validateModelProbeCookie(input.CodexCookie, provider, stateMode)
 	if errCookie != nil {
 		c.JSON(400, gin.H{"error": errCookie.Error()})

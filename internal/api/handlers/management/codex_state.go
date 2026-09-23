@@ -53,6 +53,10 @@ func (h *Handler) CodexStateAction(c *gin.Context) {
 		return
 	}
 	cfg := h.currentConfig()
+	if cfg != nil && cfg.Codex.AutoCookie && input.Strategy == "cookie-only" && (input.Action == "acquire" || input.Action == "resume") {
+		c.JSON(http.StatusConflict, gin.H{"error": "Cookie-only acquisition conflicts with codex.auto-cookie"})
+		return
+	}
 	if input.Diagnostic {
 		if input.Action != "acquire" || !helps.StateCredentialAvailable(a) {
 			c.JSON(400, gin.H{"error": "manual State acquisition requires an enabled Codex OAuth credential and the acquire action"})

@@ -45,6 +45,7 @@ func (t *modelProbeTrace) cookieApplied(source string, selection codexstate.Cook
 	t.codexCookie.Source = source
 	t.codexCookie.Sent = selection.Header != ""
 	t.codexCookie.Version = selection.Version
+	t.codexCookie.Digest = ""
 	if selection.Header != "" {
 		t.codexCookie.Digest = modelProbeStateDigest(selection.Header)
 	}
