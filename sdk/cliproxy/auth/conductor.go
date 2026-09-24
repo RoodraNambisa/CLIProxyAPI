@@ -2721,7 +2721,7 @@ func (m *Manager) executeStreamWithModelPool(ctx, resultCtx context.Context, exe
 				return nil, errStream
 			}
 			lastErr = errStream
-			if cliproxyexecutor.IsResponseGuardError(errStream) {
+			if cliproxyexecutor.IsResponseGuardError(errStream) || (provider == "chatgpt-web" && isUnauthorizedError(errStream)) {
 				return nil, errStream
 			}
 			if !requestBodyReplayable(ctx, replayOpts) {
@@ -2764,7 +2764,7 @@ func (m *Manager) executeStreamWithModelPool(ctx, resultCtx context.Context, exe
 				}
 				return nil, bootstrapErr
 			}
-			if idx < len(execModels)-1 && requestBodyReplayable(ctx, replayOpts) {
+			if idx < len(execModels)-1 && requestBodyReplayable(ctx, replayOpts) && !(provider == "chatgpt-web" && isUnauthorizedError(bootstrapErr)) {
 				rerr := &Error{Message: bootstrapErr.Error()}
 				if se, ok := errors.AsType[cliproxyexecutor.StatusError](bootstrapErr); ok && se != nil {
 					rerr.HTTPStatus = se.StatusCode()
@@ -5862,9 +5862,11 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			if !skipAuthResultForError(errPrepare) {
 				m.markExecutionResult(execCtx, result)
 			}
-			if isChatGPTWebUnauthorizedRequestError(errPrepare) {
+			if isChatGPTWebUnauthorizedRequestError(errPrepare) || (provider == "chatgpt-web" && isUnauthorizedError(errPrepare)) {
 				triggerChatGPTWebUnauthorizedRequestRefresh(errPrepare)
-				return cliproxyexecutor.Response{}, withAuthErrorResponseSource(errPrepare, auth, provider)
+				if cliproxyexecutor.SingleAttempt(execCtx) || m.isRequestInvalidError(errPrepare, ctx) {
+					return cliproxyexecutor.Response{}, withAuthErrorResponseSource(errPrepare, auth, provider)
+				}
 			}
 			if strictSessionAffinity {
 				return cliproxyexecutor.Response{}, withAuthErrorResponseSource(errPrepare, auth, provider)
@@ -6047,7 +6049,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				return cliproxyexecutor.Response{}, withAuthErrorResponseSource(errExec, auth, provider)
 			}
 			authErr = errExec
-			if cliproxyexecutor.IsResponseGuardError(errExec) {
+			if cliproxyexecutor.IsResponseGuardError(errExec) || isChatGPTWebUnauthorizedRequestError(errExec) {
 				break
 			}
 			if !requestBodyReplayable(execCtx, opts) {
@@ -6156,9 +6158,11 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			if !skipAuthResultForError(errPrepare) {
 				m.markExecutionResult(execCtx, result)
 			}
-			if isChatGPTWebUnauthorizedRequestError(errPrepare) {
+			if isChatGPTWebUnauthorizedRequestError(errPrepare) || (provider == "chatgpt-web" && isUnauthorizedError(errPrepare)) {
 				triggerChatGPTWebUnauthorizedRequestRefresh(errPrepare)
-				return cliproxyexecutor.Response{}, withAuthErrorResponseSource(errPrepare, auth, provider)
+				if cliproxyexecutor.SingleAttempt(execCtx) || m.isRequestInvalidError(errPrepare, ctx) {
+					return cliproxyexecutor.Response{}, withAuthErrorResponseSource(errPrepare, auth, provider)
+				}
 			}
 			if strictSessionAffinity {
 				return cliproxyexecutor.Response{}, withAuthErrorResponseSource(errPrepare, auth, provider)
@@ -6326,7 +6330,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 				return cliproxyexecutor.Response{}, withAuthErrorResponseSource(errExec, auth, provider)
 			}
 			authErr = errExec
-			if cliproxyexecutor.IsResponseGuardError(errExec) {
+			if cliproxyexecutor.IsResponseGuardError(errExec) || isChatGPTWebUnauthorizedRequestError(errExec) {
 				break
 			}
 			if !requestBodyReplayable(execCtx, opts) {
@@ -6440,9 +6444,11 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			if !skipAuthResultForError(errPrepare) {
 				m.markExecutionResult(execCtx, result)
 			}
-			if isChatGPTWebUnauthorizedRequestError(errPrepare) {
+			if isChatGPTWebUnauthorizedRequestError(errPrepare) || (provider == "chatgpt-web" && isUnauthorizedError(errPrepare)) {
 				triggerChatGPTWebUnauthorizedRequestRefresh(errPrepare)
-				return nil, withAuthErrorResponseSource(errPrepare, auth, provider)
+				if cliproxyexecutor.SingleAttempt(execCtx) || m.isRequestInvalidError(errPrepare, ctx) {
+					return nil, withAuthErrorResponseSource(errPrepare, auth, provider)
+				}
 			}
 			if strictSessionAffinity {
 				return nil, withAuthErrorResponseSource(errPrepare, auth, provider)
@@ -9028,9 +9034,8 @@ func isChatGPTWebAuthenticationRecoveryError(err error) bool {
 	return errors.As(err, &lifecycleProvider) && lifecycleProvider != nil && lifecycleProvider.ChatGPTWebLifecycleError() != nil
 }
 
-// chatGPTWebUnauthorizedRequestError keeps the original upstream error while
-// preventing the rejected request from waiting for credential recovery or
-// falling through to another credential.
+// chatGPTWebUnauthorizedRequestError starts credential recovery without making
+// the request wait. The original error still determines whether replay is safe.
 type chatGPTWebUnauthorizedRequestError struct {
 	cause        error
 	startRefresh func()
@@ -9141,9 +9146,8 @@ func (m *Manager) wrapChatGPTWebUnauthorizedRequestError(ctx context.Context, au
 		if m != nil {
 			m.chatGPTWebRequestRefreshMetrics.noStart.Add(1)
 		}
-		// There is no safe refresh flight for this credential. Preserve the
-		// request-invalid contract while allowing the normal result mutation to
-		// persist a cooldown instead of leaving the credential ready.
+		// There is no safe refresh flight for this credential. Let normal result
+		// mutation persist a cooldown instead of leaving the credential ready.
 		return wrapChatGPTWebUnauthorizedRequestErrorWithResultPolicy(err, nil, false)
 	}
 	refreshAuth := auth.Clone()
@@ -9429,14 +9433,21 @@ func isRequestInvalidErrorWithRules(err error, rules []internalconfig.NonRetryab
 	if isRequestScopedStopError(err) {
 		return true
 	}
-	if isChatGPTWebUnauthorizedRequestError(err) {
-		return true
+	authResultErr := err
+	var unauthorized *chatGPTWebUnauthorizedRequestError
+	if errors.As(err, &unauthorized) && unauthorized != nil {
+		if unauthorized.StatusCode() != http.StatusUnauthorized {
+			return true
+		}
+		// SkipAuthResult on the recovery wrapper only defers credential state
+		// mutation. It must not turn a replayable 401 into a request-wide stop.
+		authResultErr = unauthorized.cause
 	}
 	var committed interface{ RequestCommitted() bool }
 	if errors.As(err, &committed) && committed.RequestCommitted() {
 		return true
 	}
-	if skipAuthResultForError(err) && !retryOtherAuthForError(err) {
+	if skipAuthResultForError(authResultErr) && !retryOtherAuthForError(authResultErr) {
 		return true
 	}
 	if isInvalidGrantError(err) {

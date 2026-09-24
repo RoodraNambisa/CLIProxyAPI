@@ -375,11 +375,12 @@ func TestFileTokenStoreSuccessfulResponseDoesNotWaitForResultSave(t *testing.T) 
 	})
 }
 
-func TestFileTokenStoreUnauthorizedResponseDoesNotWaitForRefreshSave(t *testing.T) {
+func TestFileTokenStoreUnauthorizedFailoverDoesNotWaitForRefreshSave(t *testing.T) {
 	const model = "file-result-401-model"
 	store := NewFileTokenStore()
 	store.SetBaseDir(t.TempDir())
 	manager := cliproxyauth.NewManager(store, &cliproxyauth.FillFirstSelector{}, nil)
+	manager.SetRetryConfig(0, 0, 2)
 	executor := &fileTokenStorePersistenceExecutor{}
 	manager.RegisterExecutor(executor)
 	primary := registerFileTokenStorePersistenceAuth(t, manager, "aa-file-result-401.json", "file-result-401@example.com", "stale-access-token")
@@ -387,7 +388,12 @@ func TestFileTokenStoreUnauthorizedResponseDoesNotWaitForRefreshSave(t *testing.
 	registerFileTokenStoreModel(t, primary, model)
 	registerFileTokenStoreModel(t, backup, model)
 	gate := newFileTokenStoreSaveGate()
-	store.lockTarget = gate.lockTarget
+	store.lockTarget = func(ctx context.Context, root *os.Root, path string) (func() error, error) {
+		if path == primary.ID {
+			return gate.lockTarget(ctx, root, path)
+		}
+		return lockRootAuthTarget(ctx, root, path)
+	}
 	t.Cleanup(func() {
 		gate.releaseSaves()
 		if errClose := manager.CloseExecutors(); errClose != nil {
@@ -395,10 +401,14 @@ func TestFileTokenStoreUnauthorizedResponseDoesNotWaitForRefreshSave(t *testing.
 		}
 	})
 
-	requestDone := make(chan error, 1)
+	type requestResult struct {
+		response cliproxyexecutor.Response
+		err      error
+	}
+	requestDone := make(chan requestResult, 1)
 	go func() {
-		_, errExecute := manager.Execute(t.Context(), []string{"chatgpt-web"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
-		requestDone <- errExecute
+		response, errExecute := manager.Execute(t.Context(), []string{"chatgpt-web"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+		requestDone <- requestResult{response: response, err: errExecute}
 	}()
 	select {
 	case startedID := <-gate.started:
@@ -409,15 +419,15 @@ func TestFileTokenStoreUnauthorizedResponseDoesNotWaitForRefreshSave(t *testing.
 		t.Fatal("background FileTokenStore refresh save did not start")
 	}
 	select {
-	case errExecute := <-requestDone:
-		if fileTokenStoreErrorStatus(errExecute) != http.StatusUnauthorized || errExecute.Error() != "invalid access token" {
-			t.Fatalf("Execute() error = %T %v, want original 401", errExecute, errExecute)
+	case result := <-requestDone:
+		if result.err != nil || string(result.response.Payload) != "successful-image-response" {
+			t.Fatalf("Execute() = %q, %v, want successful failover", result.response.Payload, result.err)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("401 response waited for FileTokenStore refresh Save")
+		t.Fatal("401 failover waited for FileTokenStore refresh Save")
 	}
-	if calls := executor.executeCalls.Load(); calls != 1 {
-		t.Fatalf("Execute() calls = %d, want one request without retry or fallback", calls)
+	if calls := executor.executeCalls.Load(); calls != 2 {
+		t.Fatalf("Execute() calls = %d, want rejected primary then successful backup", calls)
 	}
 	if calls := executor.refreshCalls.Load(); calls != 1 {
 		t.Fatalf("Refresh() calls = %d, want one background refresh", calls)

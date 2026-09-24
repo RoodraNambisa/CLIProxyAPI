@@ -51,6 +51,7 @@ func (chatGPTWebSettledUnauthorizedError) ChatGPTWebFailureStage() string {
 	return "settle"
 }
 func (chatGPTWebSettledUnauthorizedError) RetryOtherAuth() bool { return false }
+func (chatGPTWebSettledUnauthorizedError) SkipAuthResult() bool { return true }
 
 type chatGPTWebDeadRequestError struct {
 	lifecycle *chatgptwebauth.AuthError
@@ -216,6 +217,9 @@ func (executor *chatGPTWebUnauthorizedRefreshExecutor) Execute(_ context.Context
 func (executor *chatGPTWebUnauthorizedRefreshExecutor) ExecuteStream(_ context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
 	executor.streamCalls = append(executor.streamCalls, auth.ID)
 	if authAccessToken(auth) == "stale" {
+		if executor.executeErr != nil {
+			return nil, executor.executeErr
+		}
 		return nil, &Error{HTTPStatus: http.StatusUnauthorized, Message: "invalid access token"}
 	}
 	chunks := make(chan cliproxyexecutor.StreamChunk, 1)
@@ -241,6 +245,9 @@ func (executor *chatGPTWebUnauthorizedChunkExecutor) ExecuteStream(_ context.Con
 func (executor *chatGPTWebUnauthorizedRefreshExecutor) CountTokens(_ context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
 	executor.countCalls = append(executor.countCalls, auth.ID)
 	if authAccessToken(auth) == "stale" {
+		if executor.executeErr != nil {
+			return cliproxyexecutor.Response{}, executor.executeErr
+		}
 		return cliproxyexecutor.Response{}, &Error{HTTPStatus: http.StatusUnauthorized, Message: "invalid access token"}
 	}
 	return cliproxyexecutor.Response{Payload: []byte(auth.ID + ":" + authAccessToken(auth))}, nil
@@ -295,7 +302,7 @@ func (executor *chatGPTWebUnauthorizedRefreshExecutor) ShouldPrepareRequestAuth(
 
 func (executor *chatGPTWebUnauthorizedRefreshExecutor) PrepareRequestAuth(_ context.Context, auth *Auth) (*Auth, error) {
 	executor.prepareCalls++
-	if executor.prepareErr != nil {
+	if executor.prepareErr != nil && authAccessToken(auth) == "stale" {
 		return auth, executor.prepareErr
 	}
 	return auth, nil
@@ -310,6 +317,8 @@ func newChatGPTWebUnauthorizedRefreshFixture(t *testing.T) (*Manager, *chatGPTWe
 	const model = "chatgpt-web-refresh-model"
 	executor := &chatGPTWebUnauthorizedRefreshExecutor{}
 	manager := NewManager(nil, &FillFirstSelector{}, nil)
+	// Recovery-only tests deliberately exhaust the request's credential budget.
+	manager.SetRetryConfig(0, 0, 1)
 	manager.RegisterExecutor(executor)
 	auths := []*Auth{
 		{
@@ -508,7 +517,7 @@ func TestChatGPTWebUnauthorizedRecoveryStartsAfterRequestCancellation(t *testing
 	}
 }
 
-func TestChatGPTWebUnauthorizedWithoutRefreshFlightPersistsCooldownAndDoesNotFallback(t *testing.T) {
+func TestChatGPTWebUnauthorizedWithoutRefreshFlightPersistsCooldownAndHonorsCredentialLimit(t *testing.T) {
 	manager, executor, primary, backup, model := newChatGPTWebUnauthorizedRefreshFixture(t)
 	current, ok := manager.GetByID(primary.ID)
 	if !ok || current == nil {
@@ -789,6 +798,7 @@ func TestChatGPTWebUnauthorizedRefreshBackpressureTemporarilyExcludesOnlyFailedC
 	backupAuth.Metadata["access_token"] = "backup"
 	store := newResultPersistenceTestStore(1, 1, primaryAuth, backupAuth)
 	manager := NewManager(store, &FillFirstSelector{}, nil)
+	manager.SetRetryConfig(0, 0, 1)
 	executor := &chatGPTWebUnauthorizedRefreshExecutor{}
 	manager.RegisterExecutor(executor)
 	primary := registerResultPersistenceTestAuth(t, manager, store, primaryAuth.ID)

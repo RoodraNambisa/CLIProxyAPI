@@ -2,11 +2,15 @@ package cliproxy
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"strings"
 	"sync"
 
 	chatgptwebauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/chatgptweb"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/managementdiag"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
 )
@@ -284,10 +288,82 @@ func (s *Service) fetchChatGPTWebModelCatalog(ctx context.Context, auth *coreaut
 	}
 	models, err := providerExecutor.FetchModels(ctx, auth)
 	if err != nil {
-		log.Warnf("chatgpt web model catalog refresh failed for %s: %v", auth.ID, err)
+		fields, summary := chatGPTWebModelCatalogFailureLog(auth, err)
+		log.WithFields(fields).Warn(summary)
 		return nil, false
 	}
 	return chatGPTWebCatalogModelInfos(models, configuredChatGPTWebImageModels(s.currentConfig())...), true
+}
+
+func chatGPTWebModelCatalogFailureLog(auth *coreauth.Auth, err error) (log.Fields, string) {
+	var diagnostic *coreauth.ErrorDiagnostic
+	stage, code, status, responseType := "models", "model_catalog_refresh_failed", 0, "unknown"
+	if failure := coreauth.NewProviderError(auth, err); failure != nil {
+		diagnostic = failure.Diagnostic
+		status = failure.HTTPStatus
+		if failure.Code != "" {
+			code = failure.Code
+		}
+	}
+	var authErr *coreauth.Error
+	if errors.As(err, &authErr) && authErr != nil && authErr.Code != "" {
+		code, _ = managementdiag.ProcessText(authErr.Code, managementdiag.DetailLevelSafe, 128)
+	}
+	fields := log.Fields(helps.ChatGPTWebDiagnosticLogFields(diagnostic))
+	if fields == nil {
+		fields = log.Fields{}
+	}
+	fields["provider"] = chatgptwebauth.Provider
+	if auth != nil {
+		fields["auth_index"] = auth.EnsureIndex()
+	}
+	responseBody, truncated := "", false
+	if diagnostic != nil {
+		if strings.TrimSpace(diagnostic.Stage) != "" {
+			stage = strings.TrimSpace(diagnostic.Stage)
+		}
+		if strings.TrimSpace(diagnostic.Code) != "" {
+			code = strings.TrimSpace(diagnostic.Code)
+		}
+		if diagnostic.HTTPStatus != 0 {
+			status = diagnostic.HTTPStatus
+		}
+		if diagnostic.ResponseType != "" {
+			responseType = strings.TrimSpace(diagnostic.ResponseType)
+		}
+		responseBody, truncated = managementdiag.ProcessResponseBody(diagnostic.ResponseBody, managementdiag.DetailLevelFull, 768)
+		if responseBody != "" {
+			fields["response_body"] = managementdiag.NewManagementOnlyValueWithFallback(diagnostic.ResponseBody, responseBody)
+			truncated = truncated || diagnostic.ResponseBodyTruncated
+			fields["response_body_truncated"] = truncated
+		}
+	}
+	fields["stage"] = stage
+	fields["code"] = code
+	fields["status"] = status
+	fields["response_type"] = responseType
+	summary := fmt.Sprintf(
+		"chatgpt web model catalog refresh failed for %s: status=%d stage=%s response_type=%s code=%s",
+		authIDForModelCatalogLog(auth), status, stage, responseType, code,
+	)
+	if responseBody != "" {
+		summary += fmt.Sprintf(" response=%q", responseBody)
+		if truncated {
+			summary += " response_truncated=true"
+		}
+	} else if err != nil {
+		reason, _ := managementdiag.ProcessText(err.Error(), managementdiag.DetailLevelFull, 768)
+		fields["error"] = reason
+		summary += fmt.Sprintf(" error=%q", reason)
+	}
+	return fields, summary
+}
+
+func authIDForModelCatalogLog(auth *coreauth.Auth) string {
+	if auth == nil || strings.TrimSpace(auth.ID) == "" {
+		return "<unknown>"
+	}
+	return auth.ID
 }
 
 func (s *Service) currentAuthForChatGPTWebCatalog(source *coreauth.Auth) (*coreauth.Auth, bool) {

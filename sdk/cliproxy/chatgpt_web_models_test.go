@@ -5,10 +5,13 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	chatgptwebauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/chatgptweb"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
@@ -31,6 +34,78 @@ type chatGPTWebCatalogTestExecutor struct {
 	release  chan struct{}
 	executed chan string
 	once     sync.Once
+}
+
+type chatGPTWebCatalogDiagnosticError struct {
+	diagnostic *coreauth.ErrorDiagnostic
+}
+
+func (err chatGPTWebCatalogDiagnosticError) Error() string { return "catalog request failed" }
+
+func (err chatGPTWebCatalogDiagnosticError) AuthErrorDiagnostic() *coreauth.ErrorDiagnostic {
+	return err.diagnostic
+}
+
+func TestChatGPTWebModelCatalogFailureLogIncludesBoundedDiagnostic(t *testing.T) {
+	auth := &coreauth.Auth{ID: "chatgpt-web-log-fixture", Provider: chatgptwebauth.Provider}
+	err := chatGPTWebCatalogDiagnosticError{diagnostic: &coreauth.ErrorDiagnostic{
+		Provider:     chatgptwebauth.Provider,
+		Stage:        "models",
+		Code:         "token_revoked",
+		HTTPStatus:   http.StatusUnauthorized,
+		ResponseType: "json",
+		ResponseBody: `{"error":{"message":"token=secret-value","url":"https://example.test/file?sig=secret-signature"}}`,
+	}}
+	fields, summary := chatGPTWebModelCatalogFailureLog(auth, err)
+	for _, want := range []string{"status=401", "stage=models", "response_type=json", "code=token_revoked"} {
+		if !strings.Contains(summary, want) {
+			t.Fatalf("summary %q does not contain %q", summary, want)
+		}
+	}
+	if strings.Contains(summary, "secret-value") || strings.Contains(summary, "secret-signature") {
+		t.Fatalf("summary leaked sensitive response content: %q", summary)
+	}
+	if fields["status"] != http.StatusUnauthorized || fields["stage"] != "models" || fields["response_type"] != "json" {
+		t.Fatalf("diagnostic fields = %#v", fields)
+	}
+}
+
+func TestChatGPTWebModelCatalogFailureLogPreservesNonJSONPreview(t *testing.T) {
+	err := chatGPTWebCatalogDiagnosticError{diagnostic: &coreauth.ErrorDiagnostic{
+		Stage: "bootstrap", HTTPStatus: 403, Code: "cloudflare_challenge",
+		ResponseType: "html", ContentType: "text/html", CFRay: "fixture-ray",
+		ResponseBody: "<html>Just a moment. " + strings.Repeat("\u754c", 900) + "</html>",
+	}}
+	fields, summary := chatGPTWebModelCatalogFailureLog(nil, err)
+	body := fmt.Sprint(fields["response_body"])
+	if !strings.Contains(summary, "Just a moment") || !strings.Contains(summary, "stage=bootstrap") ||
+		!strings.Contains(summary, "response_truncated=true") || !utf8.ValidString(body) || len(body) > 768 {
+		t.Fatalf("invalid HTML preview: %q", summary)
+	}
+	if fields["content_type"] != "text/html" || fields["cf_ray"] != "fixture-ray" || fields["response_body_truncated"] != true {
+		t.Fatalf("missing HTTP details: %v", fields)
+	}
+}
+
+func TestChatGPTWebModelCatalogFailureLogPreservesErrorsWithoutBody(t *testing.T) {
+	for _, err := range []error{
+		errors.New("decode chatgpt web model catalog: invalid character '<'"),
+		fmt.Errorf("read catalog: %w", &coreauth.Error{HTTPStatus: 502, Code: "upstream_read_failed", Message: "unexpected EOF"}),
+		errors.New("Get https://proxy-user:proxy-secret@example.test/?access_token=token-secret: connection reset"),
+		nil,
+	} {
+		fields, summary := chatGPTWebModelCatalogFailureLog(nil, err)
+		if err != nil && !strings.Contains(summary, "error=") {
+			t.Fatalf("lost original error: %q", summary)
+		}
+		if strings.Contains(summary, "proxy-secret") || strings.Contains(summary, "token-secret") {
+			t.Fatalf("error summary exposed credentials: %q", summary)
+		}
+		var status *coreauth.Error
+		if errors.As(err, &status) && (fields["status"] != 502 || fields["code"] != "upstream_read_failed") {
+			t.Fatalf("lost wrapped status/code: %v", fields)
+		}
+	}
 }
 
 func (*chatGPTWebCatalogTestExecutor) Identifier() string { return chatgptwebauth.Provider }
