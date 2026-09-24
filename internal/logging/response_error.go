@@ -2,6 +2,7 @@ package logging
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -20,6 +21,7 @@ type responseErrorDiagnostic struct {
 	code, message, body string
 	truncated           bool
 	localPolicy         string
+	original            *responseErrorDiagnostic
 }
 
 // errorResponseWriter observes only failed HTTP responses and preserves all transport methods.
@@ -162,6 +164,28 @@ func RecordResponseError(c *gin.Context, status int, body []byte, causes ...erro
 	diagnostic := buildResponseErrorDiagnostic(c, status, body)
 	if len(causes) > 0 {
 		diagnostic.localPolicy = LocalPolicyReason(causes[0])
+		var rewritten interface {
+			OriginalStatusCode() int
+			OriginalErrorText() string
+			ErrorResponseRewritten() bool
+		}
+		if errors.As(causes[0], &rewritten) && rewritten.ErrorResponseRewritten() {
+			if originalStatus := rewritten.OriginalStatusCode(); originalStatus >= 100 && originalStatus <= 599 {
+				text := rewritten.OriginalErrorText()
+				truncated := len(text) > responseErrorCaptureLimit
+				if truncated {
+					text = text[:responseErrorCaptureLimit]
+				}
+				original := buildResponseErrorDiagnostic(c, originalStatus, []byte(text))
+				var coded interface{ ExecutionResultErrorCode() string }
+				if errors.As(causes[0], &coded) && coded.ExecutionResultErrorCode() != "" {
+					original.code, _ = safeResponseErrorText(c, coded.ExecutionResultErrorCode(), 128)
+				}
+				original.body = ""
+				original.truncated = original.truncated || truncated
+				diagnostic.original = &original
+			}
+		}
 	}
 	c.Set(responseErrorContextKey, diagnostic)
 }

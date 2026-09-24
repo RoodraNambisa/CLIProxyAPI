@@ -80,6 +80,22 @@ func populateUsageFailure(ctx context.Context, record *usage.Record, cause error
 				}
 			}
 		}
+		var diagnosticProvider interface {
+			AuthErrorDiagnostic() *cliproxyauth.ErrorDiagnostic
+		}
+		if errors.As(cause, &diagnosticProvider) {
+			if diagnostic := diagnosticProvider.AuthErrorDiagnostic(); diagnostic != nil && diagnostic.Provider == "chatgpt-web" {
+				if diagnostic.HTTPStatus >= 100 && diagnostic.HTTPStatus <= 599 {
+					record.UpstreamStatusCode = diagnostic.HTTPStatus
+				}
+				if code == "" {
+					code = diagnostic.Code
+				}
+				if raw == "<redacted-non-json-response-body>" && diagnostic.ResponseText != "" {
+					raw = diagnostic.ResponseText
+				}
+			}
+		}
 		var headers interface{ Headers() http.Header }
 		if errors.As(cause, &headers) {
 			for _, name := range []string{"X-Request-Id", "Request-Id", "Openai-Request-Id"} {

@@ -3890,6 +3890,7 @@ func TestChatGPTWebAssetStatusRetriesOnlyRecoverableFailures(t *testing.T) {
 		http.StatusTooEarly,
 		http.StatusTooManyRequests,
 		http.StatusBadGateway,
+		http.StatusServiceUnavailable,
 	} {
 		err := newChatGPTWebAssetStatusError(statusCode, "https://storage.example/image?sig=secret", nil, nil, "image_download")
 		assertChatGPTWebAssetRetryError(t, err)
@@ -3904,6 +3905,20 @@ func TestChatGPTWebAssetStatusRetriesOnlyRecoverableFailures(t *testing.T) {
 		err := newChatGPTWebAssetStatusError(statusCode, "https://storage.example/image?sig=secret", nil, nil, "image_download")
 		assertChatGPTWebNonAuthNonRetryError(t, err)
 	}
+}
+
+func TestChatGPTWebUploadStorageBusyIsNotCredentialFailure(t *testing.T) {
+	err := newChatGPTWebAssetStatusError(503, "https://storage.oaiusercontent.com/files/fixture/raw?sig=secret",
+		[]byte("\ufeff<?xml version=\"1.0\"?><Error><Code>ServerBusy</Code><Message>Ingress is over the account limit.</Message></Error>"),
+		fhttp.Header{"Content-Type": {"application/xml"}}, "file_upload")
+	assertChatGPTWebAssetRetryError(t, err)
+	if err.ChatGPTWebLifecycleError() != nil || err.diagnostic.Stage != "file_upload" || err.diagnostic.Code != "storage_server_busy" {
+		t.Fatal("storage overload was mistaken for an account lifecycle failure")
+	}
+	if strings.Contains(err.Error(), "secret") || strings.Contains(err.Error(), "Ingress") {
+		t.Fatal("internal storage details leaked to the public error")
+	}
+	assertChatGPTWebNonAuthNonRetryError(t, chatGPTWebCommittedRequestError(t.Context(), err))
 }
 
 func assertChatGPTWebAssetRetryError(t *testing.T, err error) {

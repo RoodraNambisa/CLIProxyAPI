@@ -94,8 +94,8 @@ func TestAccessErrorLoggingPreservesCancellationAndPublicRewrite(t *testing.T) {
 				t.Fatal("logging changed stream behavior")
 			}
 			if testCase.rewrite {
-				if entry.Level != log.WarnLevel || !strings.Contains(entry.Message, "error_status=429") || !strings.Contains(entry.Message, "public explanation") || strings.Contains(entry.Message, "original explanation") {
-					t.Fatal("access log did not use the public rewritten error")
+				if entry.Level != log.WarnLevel || !strings.Contains(entry.Message, "error_status=429") || !strings.Contains(entry.Message, "public explanation") || !strings.Contains(entry.Message, "original explanation") {
+					t.Fatal("access log did not preserve both original and rewritten errors")
 				}
 			} else if entry.Level != log.InfoLevel || strings.Contains(entry.Message, "error_status=") {
 				t.Fatal("client cancellation was logged as an upstream failure")
@@ -153,8 +153,9 @@ func TestAccessErrorLoggingDistinguishesLocalPolicyAfterRewrite(t *testing.T) {
 					if transportStatus == 429 {
 						wantStatus = 503
 					}
-					if entry == nil || !strings.Contains(entry.Message, "public explanation") || strings.Contains(entry.Message, "Rate limit exceeded") {
-						t.Fatalf("access log did not retain public rewrite: %+v", entry)
+					if entry == nil || !strings.Contains(entry.Message, "public explanation") || !strings.Contains(entry.Message, "Rate limit exceeded") ||
+						entry.Data["original_code"] != "rate_limit_exceeded" || entry.Data["code"] != "public_failure" {
+						t.Fatalf("access log did not distinguish original and public errors: %+v", entry)
 					}
 				}
 				if writer.Code != wantStatus || entry == nil || entry.Data["status"] != wantStatus {

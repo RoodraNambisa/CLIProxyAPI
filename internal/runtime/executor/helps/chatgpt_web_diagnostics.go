@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"encoding/xml"
 	"errors"
 	"mime"
 	"net"
@@ -96,6 +97,15 @@ func ClassifyChatGPTWebHTTPDiagnostic(status int, path string, body []byte, head
 	}
 	cloudflare := chatGPTWebDiagnosticCloudflare(status, cfMitigated, server, responseType, body)
 	code := chatGPTWebDiagnosticErrorCode(status, responseType, cloudflare, body)
+	if status >= http.StatusBadRequest && responseType == "xml" && !cloudflare {
+		if xmlCode, xmlText := chatGPTWebXMLDiagnostic(body); xmlCode != "" {
+			code = "upstream_xml_error"
+			if status == http.StatusServiceUnavailable && xmlCode == "ServerBusy" {
+				code = "storage_server_busy"
+			}
+			responseText = xmlText
+		}
+	}
 	retryable := cloudflare || status == http.StatusRequestTimeout || status == http.StatusTooEarly ||
 		status == http.StatusTooManyRequests || status >= http.StatusInternalServerError
 	return &cliproxyauth.ErrorDiagnostic{
@@ -115,6 +125,23 @@ func ClassifyChatGPTWebHTTPDiagnostic(status int, path string, body []byte, head
 		Cloudflare:            cloudflare,
 		Retryable:             retryable,
 	}
+}
+
+func chatGPTWebXMLDiagnostic(body []byte) (string, string) {
+	if len(body) > 64<<10 {
+		return "", ""
+	}
+	var payload struct {
+		XMLName xml.Name `xml:"Error"`
+		Code    string   `xml:"Code"`
+		Message string   `xml:"Message"`
+	}
+	body = bytes.TrimSpace(bytes.TrimPrefix(bytes.TrimSpace(body), []byte("\xef\xbb\xbf")))
+	if xml.Unmarshal(body, &payload) != nil || !chatGPTWebDiagnosticCodePattern.MatchString(payload.Code) {
+		return "", ""
+	}
+	text, _ := managementdiag.ProcessText(strings.Join(strings.Fields(payload.Code+": "+payload.Message), " "), managementdiag.DetailLevelSafe, 1024)
+	return payload.Code, text
 }
 
 // Error-page text must not disappear behind a long inline logo or stylesheet.
@@ -248,9 +275,13 @@ func chatGPTWebDiagnosticResponseType(contentType string, body []byte) string {
 	if json.Valid(body) {
 		return "json"
 	}
-	lower := bytes.ToLower(bytes.TrimSpace(body))
+	lower := bytes.ToLower(bytes.TrimSpace(bytes.TrimPrefix(bytes.TrimSpace(body), []byte("\xef\xbb\xbf"))))
 	if contentType == "text/html" || bytes.HasPrefix(lower, []byte("<!doctype html")) || bytes.HasPrefix(lower, []byte("<html")) {
 		return "html"
+	}
+	if contentType == "application/xml" || contentType == "text/xml" || strings.HasSuffix(contentType, "+xml") ||
+		bytes.HasPrefix(lower, []byte("<?xml")) || bytes.HasPrefix(lower, []byte("<error>")) {
+		return "xml"
 	}
 	if strings.HasPrefix(contentType, "text/") || utf8.Valid(body) {
 		return "text"

@@ -1,6 +1,8 @@
 package logging
 
 import (
+	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -12,6 +14,85 @@ import (
 	log "github.com/sirupsen/logrus"
 	logtest "github.com/sirupsen/logrus/hooks/test"
 )
+
+type rewrittenResponseFixture struct{ originalText string }
+
+func (rewrittenResponseFixture) Error() string                { return "private original body" }
+func (rewrittenResponseFixture) OriginalStatusCode() int      { return 502 }
+func (rewrittenResponseFixture) ErrorResponseRewritten() bool { return true }
+func (e rewrittenResponseFixture) OriginalErrorText() string {
+	if e.originalText != "" {
+		return e.originalText
+	}
+	return `{"error":{"code":"generation_failed","message":"original explanation token=fixture-secret"},"input":"private original body"}`
+}
+
+func TestAccessLogDistinguishesRewrittenStatusFromUpstream(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	hook := logtest.NewGlobal()
+	defer hook.Reset()
+	for _, tc := range []struct {
+		stream bool
+		status int
+	}{{false, 429}, {true, 429}, {false, 502}, {true, 502}} {
+		t.Run(fmt.Sprintf("stream=%v/status=%d", tc.stream, tc.status), func(t *testing.T) {
+			router := gin.New()
+			router.Use(GinLogrusLogger())
+			body := []byte(`{"error":{"code":"rate_limit_exceeded","message":"public rewritten response"}}`)
+			router.GET("/fixture", func(c *gin.Context) {
+				RecordResponseError(c, tc.status, body, fmt.Errorf("wrapped: %w", rewrittenResponseFixture{}))
+				if tc.stream {
+					c.Data(200, "text/event-stream", append([]byte("data: "), body...))
+				} else {
+					c.Data(tc.status, "application/json", body)
+				}
+			})
+			writer := httptest.NewRecorder()
+			router.ServeHTTP(writer, httptest.NewRequest(http.MethodGet, "/fixture", nil))
+			entry := hook.LastEntry()
+			if entry.Data["original_status"] != 502 || entry.Data["response_rewritten"] != true {
+				t.Fatalf("original status lost: %+v", entry.Data)
+			}
+			formatted, errFormat := (&LogFormatter{}).Format(entry)
+			if errFormat != nil || !strings.Contains(string(formatted), "original_status=502") || !strings.Contains(string(formatted), "response_rewritten=true") ||
+				!strings.Contains(managementLiveLogEvent(entry, managementdiag.DetailLevelSafe).Message, "original explanation") {
+				t.Fatal("file or live log lost the status rewrite marker")
+			}
+			if entry.Data["original_code"] != "generation_failed" || !strings.Contains(entry.Message, "original explanation") ||
+				!strings.Contains(entry.Message, "public rewritten response") || strings.Contains(entry.Message, "fixture-secret") {
+				t.Fatal("before/after error summaries were lost or retained a secret")
+			}
+			if entry.Data["upstream_status"] != nil || strings.Contains(writer.Body.String()+entry.Message, "private original body") {
+				t.Fatal("rewrite log leaked private text or invented an upstream HTTP status")
+			}
+			wantStatus := tc.status
+			if tc.stream {
+				wantStatus = 200
+			}
+			if writer.Code != wantStatus || entry.Data["status"] != wantStatus || entry.Data["code"] != "rate_limit_exceeded" {
+				t.Fatal("logging changed the public status or body classification")
+			}
+		})
+	}
+}
+
+type codedRewrittenResponseFixture struct{ rewrittenResponseFixture }
+
+func (codedRewrittenResponseFixture) ExecutionResultErrorCode() string {
+	return "chatgpt_web_image_upstream_failed"
+}
+
+func TestOriginalResponseErrorSummaryIsBoundedAndKeepsTypedCode(t *testing.T) {
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	cause := codedRewrittenResponseFixture{rewrittenResponseFixture{originalText: strings.Repeat("x", 2*responseErrorCaptureLimit)}}
+	RecordResponseError(c, 429, []byte(`{"error":{"message":"public response","code":"rate_limit_exceeded"}}`), cause)
+	value, _ := c.Get(responseErrorContextKey)
+	diagnostic := value.(responseErrorDiagnostic)
+	if diagnostic.original == nil || diagnostic.original.code != "chatgpt_web_image_upstream_failed" ||
+		!diagnostic.original.truncated || len(diagnostic.original.message) > 1024 || diagnostic.original.body != "" {
+		t.Fatal("original error summary lost its type or retained an unbounded body")
+	}
+}
 
 func TestGinAccessLogIncludesSanitizedFinalErrorWithoutRequestLogger(t *testing.T) {
 	gin.SetMode(gin.TestMode)
@@ -108,6 +189,18 @@ func TestGinAccessLogKeepsUpstreamEvidencePrivateAndClearsRetries(t *testing.T) 
 			t.Fatal("internal evidence entered API response")
 		}
 		if mode == "failure" {
+			var payload struct {
+				Error struct {
+					Message string `json:"message"`
+				} `json:"error"`
+			}
+			if errDecode := json.Unmarshal(writer.Body.Bytes(), &payload); errDecode != nil {
+				t.Fatal(errDecode)
+			}
+			if strings.Contains(entry.Message, "<redacted-non-json-response-body>") || !strings.Contains(entry.Message, "client_error_redacted=true") ||
+				payload.Error.Message != "<redacted-non-json-response-body>" {
+				t.Fatal("access log retained a meaningless placeholder or changed the public error")
+			}
 			raw, _ := (&LogFormatter{}).Format(entry)
 			if !strings.Contains(string(raw), "upstream detail") {
 				t.Fatal("file log lost upstream evidence")

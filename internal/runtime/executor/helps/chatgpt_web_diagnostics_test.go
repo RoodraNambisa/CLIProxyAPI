@@ -10,8 +10,45 @@ import (
 	"testing"
 	"unicode/utf8"
 
+	chatgptwebauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/chatgptweb"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 )
+
+func TestChatGPTWebXMLStorageDiagnostic(t *testing.T) {
+	const body = "\ufeff<?xml version=\"1.0\" encoding=\"utf-8\"?><Error><Code>ServerBusy</Code><Message>Ingress is over the account limit.\nRequestId:fixture</Message></Error>"
+	for _, contentType := range []string{"application/xml", "text/xml; charset=utf-8", "application/problem+xml", ""} {
+		diagnostic := ClassifyChatGPTWebHTTPDiagnostic(503, "https://storage.oaiusercontent.com/files/fixture/raw?sig=secret", []byte(body), http.Header{
+			"Content-Type": {contentType}, "Cf-Ray": {"fixture-YUL"}, "Server": {"cloudflare"},
+		})
+		if diagnostic.ResponseType != "xml" || diagnostic.Code != "storage_server_busy" || diagnostic.Cloudflare || !diagnostic.Retryable {
+			t.Fatalf("wrong XML classification: %+v", diagnostic)
+		}
+		if !strings.HasPrefix(diagnostic.ResponseText, "ServerBusy: Ingress is over the account limit.") || diagnostic.ResponseBody != body {
+			t.Fatalf("XML details missing: %+v", diagnostic)
+		}
+		if chatgptwebauth.SafeDiagnosticCode(diagnostic.Code) != diagnostic.Code {
+			t.Fatal("management diagnostic normalization would discard the storage code")
+		}
+	}
+}
+
+func TestChatGPTWebXMLDiagnosticIsBoundedAndRejectsInvalidEnvelopes(t *testing.T) {
+	for _, body := range []string{
+		`<Error><Code>ServerBusy</Code>`,
+		`<Other><Code>ServerBusy</Code><Message>not an error</Message></Other>`,
+		`<!DOCTYPE Error [<!ENTITY leak SYSTEM "file:///fixture-private">]><Error><Code>ServerBusy</Code><Message>&leak;</Message></Error>`,
+		`<Error><Code>ServerBusy</Code><Message>` + strings.Repeat("x", 64<<10) + `</Message></Error>`,
+	} {
+		diagnostic := ClassifyChatGPTWebHTTPDiagnostic(503, "/fixture", []byte(body), http.Header{"Content-Type": {"application/xml"}})
+		if diagnostic.Code != "upstream_non_json" || diagnostic.ResponseText != "" || len(diagnostic.ResponseBody) > 4096 {
+			t.Fatal("invalid or oversized XML was interpreted as a storage error")
+		}
+	}
+	diagnostic := ClassifyChatGPTWebHTTPDiagnostic(403, "/fixture", []byte(`<Error><Code>AuthenticationFailed</Code><Message>failed https://storage.example/raw?sig=secret-material token=private-token</Message></Error>`), http.Header{"Content-Type": {"application/xml"}})
+	if diagnostic.Code != "upstream_xml_error" || strings.Contains(diagnostic.ResponseText, "secret-material") || strings.Contains(diagnostic.ResponseText, "private-token") {
+		t.Fatal("XML diagnostic leaked signed credentials or misclassified storage authentication")
+	}
+}
 
 func TestClassifyChatGPTWebHTTPDiagnostic(t *testing.T) {
 	tests := []struct {

@@ -22,6 +22,34 @@ type diagnosticStatusError struct {
 	body   string
 }
 
+type diagnosticWebHTTPError struct {
+	diagnosticStatusError
+	diagnostic *cliproxyauth.ErrorDiagnostic
+}
+
+func (e diagnosticWebHTTPError) AuthErrorDiagnostic() *cliproxyauth.ErrorDiagnostic {
+	return e.diagnostic.Clone()
+}
+
+func TestUsageFailureKeepsWebStorageDiagnosticInsteadOfPlaceholder(t *testing.T) {
+	diagnostic := ClassifyChatGPTWebHTTPDiagnostic(503, "/fixture", []byte(`<Error><Code>ServerBusy</Code><Message>Ingress is over the account limit.</Message></Error>`), http.Header{"Content-Type": {"application/xml"}})
+	diagnostic.Stage = "file_upload"
+	cause := fmt.Errorf("upload: %w", diagnosticWebHTTPError{
+		diagnosticStatusError{503, "<redacted-non-json-response-body>"}, diagnostic,
+	})
+	record := usage.Record{Provider: "chatgpt-web", UpstreamCommitted: true, AuthRequestSlotConsumed: true}
+	populateUsageFailure(t.Context(), &record, cause)
+	if record.StatusCode != 503 || record.UpstreamStatusCode != 503 || record.FailureStage != "upstream" || record.ErrorCode != "storage_server_busy" {
+		t.Fatalf("diagnostic discarded: %+v", record)
+	}
+	if record.ErrorMessage != "ServerBusy: Ingress is over the account limit." || !record.UpstreamCommitted || !record.AuthRequestSlotConsumed {
+		t.Fatalf("wrong summary or changed accounting: %+v", record)
+	}
+	if !strings.Contains(cause.Error(), "<redacted-non-json-response-body>") {
+		t.Fatal("diagnostic changed the public error")
+	}
+}
+
 type diagnosticLocalPolicyError struct{ diagnosticStatusError }
 
 func (diagnosticLocalPolicyError) LocalPolicyReason() string { return "disabled_image_generation_tool" }

@@ -100,14 +100,41 @@ func GinLogrusLogger() gin.HandlerFunc {
 		}
 		if statusCode >= http.StatusBadRequest && (len(response.body) > 0 || diagnostic.status == 0) {
 			localPolicy := diagnostic.localPolicy
+			original := diagnostic.original
 			diagnostic = buildResponseErrorDiagnostic(c, statusCode, response.body)
 			diagnostic.localPolicy = localPolicy
+			diagnostic.original = original
 			diagnostic.truncated = diagnostic.truncated || response.truncated
 		}
 		if diagnostic.status != 0 {
-			logLine += fmt.Sprintf(" | error_status=%d code=%q error=%q", diagnostic.status, diagnostic.code, diagnostic.message)
+			var upstream log.Fields
+			if diagnostic.localPolicy == "" {
+				upstream = requestUpstreamDiagnostic(c.Request.Context())
+			}
+			logLine += fmt.Sprintf(" | error_status=%d code=%q", diagnostic.status, diagnostic.code)
+			if diagnostic.message == "<redacted-non-json-response-body>" && (upstream["response_text"] != nil || upstream["response_body"] != nil) {
+				logLine += " client_error_redacted=true"
+			} else {
+				logLine += fmt.Sprintf(" error=%q", diagnostic.message)
+			}
 			fields["code"] = diagnostic.code
 			fields["stage"] = "response"
+			if original := diagnostic.original; original != nil {
+				fields["original_status"] = original.status
+				fields["original_code"] = original.code
+				fields["original_error"] = original.message
+				fields["response_rewritten"] = true
+				logLine += fmt.Sprintf(" original_status=%d original_code=%q", original.status, original.code)
+				if original.message == "<redacted-non-json-response-body>" && (upstream["response_text"] != nil || upstream["response_body"] != nil) {
+					logLine += " original_error_redacted=true"
+				} else {
+					logLine += fmt.Sprintf(" original_error=%q", original.message)
+				}
+				logLine += " response_rewritten=true"
+				if original.truncated {
+					logLine += " original_error_truncated=true"
+				}
+			}
 			if diagnostic.localPolicy != "" {
 				fields["stage"] = "local_policy"
 				fields["error_origin"] = "local"
@@ -119,14 +146,12 @@ func GinLogrusLogger() gin.HandlerFunc {
 			if diagnostic.status > levelStatus {
 				levelStatus = diagnostic.status
 			}
-			if diagnostic.localPolicy == "" {
-				for key, value := range requestUpstreamDiagnostic(c.Request.Context()) {
-					switch key {
-					case "stage", "code", "status":
-						fields["upstream_"+key] = value
-					default:
-						fields[key] = value
-					}
+			for key, value := range upstream {
+				switch key {
+				case "stage", "code", "status":
+					fields["upstream_"+key] = value
+				default:
+					fields[key] = value
 				}
 			}
 		}

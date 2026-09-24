@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -19,6 +20,41 @@ import (
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
 )
+
+func TestChatGPTWebGenerationFailureIs502UnlessConfiguredOtherwise(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	for _, rewrite := range []bool{false, true} {
+		t.Run(fmt.Sprint(rewrite), func(t *testing.T) {
+			errImage := chatGPTWebCommittedRequestError(t.Context(), chatGPTWebImageFailureError("We experienced an error when generating images."))
+			assertChatGPTWebNonAuthNonRetryError(t, errImage)
+			manager, _ := newChatGPTWebImageHandlerManager(t, errImage, "gpt-image-2", "gpt-5.4-mini")
+			cfg := &sdkconfig.SDKConfig{Images: sdkconfig.ImagesConfig{
+				CodexModel: "gpt-5.4-mini", ChatGPTWeb: sdkconfig.ChatGPTWebImageConfig{SanitizeErrorResponses: true},
+			}}
+			if rewrite {
+				body := map[string]any{"error": map[string]any{"code": "rate_limit_exceeded", "type": "rate_limit_error", "message": "Rate limit reached for requests. Please try again later."}}
+				cfg.ErrorResponseRewrites = []sdkconfig.ErrorResponseRewriteRule{{MessageContains: "chatgpt web", ResponseStatusCode: 429, ResponseBody: &body}}
+			}
+			handler := openaihandlers.NewOpenAIImagesAPIHandler(handlers.NewBaseAPIHandlers(cfg, manager))
+			router := gin.New()
+			router.POST("/v1/images/generations", handler.Generations)
+			request := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(`{"model":"gpt-image-2","prompt":"fixture"}`))
+			request.Header.Set("Content-Type", "application/json")
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, request)
+			want := http.StatusBadGateway
+			if rewrite {
+				want = http.StatusTooManyRequests
+			}
+			if response.Code != want {
+				t.Fatalf("status = %d, want %d: %s", response.Code, want, response.Body.String())
+			}
+			if strings.Contains(response.Body.String(), "rate_limit_exceeded") != rewrite {
+				t.Fatalf("wrong response classification: %s", response.Body.String())
+			}
+		})
+	}
+}
 
 type chatGPTWebHandlerRateLimitExecutor struct {
 	err error

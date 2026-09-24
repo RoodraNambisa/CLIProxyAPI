@@ -287,6 +287,7 @@ func SafeDiagnosticCode(value string) string {
 		"request_canceled",
 		"server_error",
 		"service_unavailable",
+		"storage_server_busy",
 		"temporarily_unavailable",
 		"tls_error",
 		"token_expired",
@@ -295,7 +296,8 @@ func SafeDiagnosticCode(value string) string {
 		"upstream_non_json",
 		"upstream_request_error",
 		"upstream_server_error",
-		"upstream_unavailable":
+		"upstream_unavailable",
+		"upstream_xml_error":
 		return normalized
 	}
 	safe := SafeLifecycleReason(normalized)
