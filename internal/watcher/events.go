@@ -157,7 +157,7 @@ func (w *Watcher) processEvents(ctx context.Context) {
 			if !ok {
 				return
 			}
-			w.handleEvent(event)
+			w.handleEventContext(ctx, event)
 		case errWatch, ok := <-w.watcher.Errors:
 			if !ok {
 				return
@@ -176,7 +176,7 @@ func (w *Watcher) drainPendingEvents(ctx context.Context) {
 			if !ok {
 				return
 			}
-			w.handleEvent(event)
+			w.handleEventContext(ctx, event)
 		case errWatch, ok := <-w.watcher.Errors:
 			if !ok {
 				return
@@ -189,6 +189,13 @@ func (w *Watcher) drainPendingEvents(ctx context.Context) {
 }
 
 func (w *Watcher) handleEvent(event fsnotify.Event) {
+	w.handleEventContext(context.Background(), event)
+}
+
+func (w *Watcher) handleEventContext(ctx context.Context, event fsnotify.Event) {
+	if ctx.Err() != nil {
+		return
+	}
 	// Filter only relevant events: config file or auth-dir JSON files.
 	configOps := fsnotify.Write | fsnotify.Create | fsnotify.Rename
 	normalizedName := w.normalizeAuthPath(event.Name)
@@ -223,14 +230,27 @@ func (w *Watcher) handleEvent(event fsnotify.Event) {
 		// Give external, non-atomic replacements a short grace period without
 		// holding the save lock. Existing atomic replacements need no delay.
 		if _, errInfo := os.Lstat(event.Name); os.IsNotExist(errInfo) {
-			time.Sleep(replaceCheckDelay)
+			timer := time.NewTimer(replaceCheckDelay)
+			select {
+			case <-timer.C:
+			case <-ctx.Done():
+				timer.Stop()
+				w.clearRemoveDebounce(normalizedName)
+				return
+			}
 		}
 	}
 
 	// Events describe past changes, not the current filesystem state. Inspect
 	// and apply under the same path lock as saves; never delete based on a
 	// missing-path observation made before waiting for an in-flight save.
-	unlockPath := authfileguard.Lock(event.Name)
+	unlockPath, errLock := authfileguard.LockContext(ctx, event.Name)
+	if errLock != nil {
+		if removal {
+			w.clearRemoveDebounce(normalizedName)
+		}
+		return
+	}
 	defer unlockPath()
 	info, errInfo := os.Lstat(event.Name)
 	if errInfo != nil {
@@ -304,7 +324,7 @@ func (w *Watcher) replayInitialSyncEvents(ctx context.Context) int {
 	}
 	replayed := 0
 	for {
-		if !w.drainInitialSyncEventLoop(ctx) {
+		if ctx.Err() != nil || !w.drainInitialSyncEventLoop(ctx) {
 			w.initialSyncMu.Lock()
 			w.initialSyncActive = false
 			w.initialSyncConfig = false
@@ -335,7 +355,10 @@ func (w *Watcher) replayInitialSyncEvents(ctx context.Context) int {
 		}
 		sort.Strings(paths)
 		for _, path := range paths {
-			w.replayInitialSyncAuthPath(path)
+			w.replayInitialSyncAuthPathContext(ctx, path)
+			if ctx.Err() != nil {
+				break
+			}
 			replayed++
 		}
 	}
@@ -363,7 +386,14 @@ func (w *Watcher) drainInitialSyncEventLoop(ctx context.Context) bool {
 }
 
 func (w *Watcher) replayInitialSyncAuthPath(path string) {
-	unlockPath := authfileguard.Lock(path)
+	w.replayInitialSyncAuthPathContext(context.Background(), path)
+}
+
+func (w *Watcher) replayInitialSyncAuthPathContext(ctx context.Context, path string) {
+	unlockPath, errLock := authfileguard.LockContext(ctx, path)
+	if errLock != nil {
+		return
+	}
 	defer unlockPath()
 	info, errInfo := os.Lstat(path)
 	if errInfo == nil {

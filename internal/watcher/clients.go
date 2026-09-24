@@ -762,7 +762,12 @@ func (w *Watcher) addOrUpdateClientWithPersistedHashLocked(path, persistedHash s
 	})
 	if errTombstone := w.persistAuthDeleteGenerationTombstone(path, deleteState); errTombstone != nil {
 		w.scheduleAuthPersistenceRetry(normalized, previousGeneration, 0, fmt.Errorf("persist auth replacement quarantine: %w", errTombstone), func(int) {
-			w.addOrUpdateClient(path)
+			unlockPath, errLock := w.lockAuthPersistencePath(path)
+			if errLock != nil {
+				return
+			}
+			defer unlockPath()
+			w.addOrUpdateClientLocked(path)
 		})
 		return
 	}
@@ -784,7 +789,7 @@ func (w *Watcher) addOrUpdateClientWithPersistedHashLocked(path, persistedHash s
 		w.completeAuthPersistenceAttempt(path, normalized, fileVersion, persistenceGeneration, 0, errPersist)
 	}, path)
 	if !started {
-		w.completeAuthPersistenceAttempt(path, normalized, fileVersion, persistenceGeneration, 0, errors.New("auth persistence was not started"))
+		w.completeAuthPersistenceAttemptLocked(path, normalized, fileVersion, persistenceGeneration, 0, errors.New("auth persistence was not started"))
 	}
 }
 
@@ -793,9 +798,17 @@ func (w *Watcher) completeAuthPersistence(path, normalized, expectedHash string,
 }
 
 func (w *Watcher) completeAuthPersistenceAttempt(path, normalized string, expectedVersion authFileVersion, persistenceGeneration uint64, attempt int, errPersist error) {
-	unlockPath := authfileguard.Lock(path)
+	unlockPath, errLock := w.lockAuthPersistencePath(path)
+	if errLock != nil {
+		return
+	}
 	defer unlockPath()
+	w.completeAuthPersistenceAttemptLocked(path, normalized, expectedVersion, persistenceGeneration, attempt, errPersist)
+}
 
+// completeAuthPersistenceAttemptLocked also handles synchronous task rejection
+// while the event handler still owns the path lock.
+func (w *Watcher) completeAuthPersistenceAttemptLocked(path, normalized string, expectedVersion authFileVersion, persistenceGeneration uint64, attempt int, errPersist error) {
 	w.clientsMutex.Lock()
 	if w.retiredDeletes[normalized] != persistenceGeneration {
 		w.clientsMutex.Unlock()
@@ -892,7 +905,10 @@ func (w *Watcher) completeAuthRemoval(path, normalized string, persistenceGenera
 }
 
 func (w *Watcher) completeAuthRemovalAttempt(path, normalized string, persistenceGeneration uint64, deleteGeneration *authfileguard.DeleteGeneration, attempt int, errPersist error) {
-	unlockPath := authfileguard.Lock(path)
+	unlockPath, errLock := w.lockAuthPersistencePath(path)
+	if errLock != nil {
+		return
+	}
 	defer unlockPath()
 
 	w.clientsMutex.Lock()
@@ -953,7 +969,10 @@ func (w *Watcher) startAuthRemovalPersistence(path, normalized, message string, 
 }
 
 func (w *Watcher) retryAuthRemovalPersistence(path, normalized, message string, persistenceGeneration uint64, deleteGeneration *authfileguard.DeleteGeneration, remoteAttempt, tombstoneAttempt int, allowIdentityBinding bool) {
-	unlockPath := authfileguard.Lock(path)
+	unlockPath, errLock := w.lockAuthPersistencePath(path)
+	if errLock != nil {
+		return
+	}
 	defer unlockPath()
 	w.clientsMutex.RLock()
 	current := w.retiredDeletes[normalized] == persistenceGeneration
@@ -999,7 +1018,10 @@ func (w *Watcher) startRetiredAuthRemovalPersistence(path, normalized, message s
 }
 
 func (w *Watcher) retryRetiredAuthRemovalPersistence(path, normalized, message string, persistenceGeneration uint64, deleteGeneration *authfileguard.DeleteGeneration, retiredSnapshot authfileguard.RetiredSnapshot, remoteAttempt, tombstoneAttempt int) {
-	unlockPath := authfileguard.Lock(path)
+	unlockPath, errLock := w.lockAuthPersistencePath(path)
+	if errLock != nil {
+		return
+	}
 	defer unlockPath()
 	w.clientsMutex.RLock()
 	current := w.retiredDeletes[normalized] == persistenceGeneration
@@ -1210,7 +1232,10 @@ func (w *Watcher) completeRetiredDeleteAttempt(path, normalized string, deleteSe
 	if outcome, ok := coreauth.DeleteOutcomeFromError(errPersist); ok && outcome == coreauth.DeleteOutcomeCommitted {
 		errPersist = nil
 	}
-	unlockPath := authfileguard.Lock(path)
+	unlockPath, errLock := w.lockAuthPersistencePath(path)
+	if errLock != nil {
+		return
+	}
 	defer unlockPath()
 	w.clientsMutex.Lock()
 	if w.retiredDeletes[normalized] != deleteSeq {
@@ -1315,6 +1340,9 @@ func (w *Watcher) stopAuthPersistenceRetryTimers() {
 	if w == nil {
 		return
 	}
+	// A running retry may be waiting for a path held by persistence work.
+	// Cancel both before waiting for callbacks, not after that wait.
+	w.cancelAuthPersistenceTasks()
 	w.authRetryMu.Lock()
 	for timer := range w.authRetryTimers {
 		if timer.Stop() {
@@ -1324,6 +1352,20 @@ func (w *Watcher) stopAuthPersistenceRetryTimers() {
 	}
 	w.authRetryMu.Unlock()
 	w.authRetryWG.Wait()
+}
+
+func (w *Watcher) lockAuthPersistencePath(path string) (func(), error) {
+	w.authWorkMu.Lock()
+	if w.stopped.Load() {
+		w.authWorkMu.Unlock()
+		return nil, context.Canceled
+	}
+	if w.authWorkContext == nil {
+		w.authWorkContext, w.authWorkCancel = context.WithCancel(context.Background())
+	}
+	ctx := w.authWorkContext
+	w.authWorkMu.Unlock()
+	return authfileguard.LockContext(ctx, path)
 }
 
 func (w *Watcher) startAuthPersistenceTask(task func(context.Context)) bool {
@@ -1348,18 +1390,24 @@ func (w *Watcher) startAuthPersistenceTask(task func(context.Context)) bool {
 	return true
 }
 
-func (w *Watcher) stopAuthPersistenceTasks() {
+func (w *Watcher) cancelAuthPersistenceTasks() {
 	if w == nil {
 		return
 	}
 	w.authWorkMu.Lock()
 	cancel := w.authWorkCancel
 	w.authWorkCancel = nil
-	w.authWorkContext = nil
 	w.authWorkMu.Unlock()
 	if cancel != nil {
 		cancel()
 	}
+}
+
+func (w *Watcher) stopAuthPersistenceTasks() {
+	if w == nil {
+		return
+	}
+	w.cancelAuthPersistenceTasks()
 	done := make(chan struct{})
 	go func() {
 		w.authWorkWG.Wait()

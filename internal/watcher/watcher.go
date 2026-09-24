@@ -221,6 +221,8 @@ func (w *Watcher) SetAuthUpdateQueue(queue chan<- AuthUpdate) {
 
 // SetAuthUpdateObserver registers a callback invoked before a file or runtime
 // auth update becomes visible to the asynchronous consumer.
+// It runs under dispatch and possibly file locks; it must not synchronously
+// re-enter the watcher, save the same auth file, or wait for update consumption.
 func (w *Watcher) SetAuthUpdateObserver(observer func(AuthUpdate)) {
 	if w == nil {
 		return
