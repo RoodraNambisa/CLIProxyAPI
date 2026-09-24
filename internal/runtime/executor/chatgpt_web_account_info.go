@@ -5055,6 +5055,9 @@ func (e *ChatGPTWebExecutor) fetchChatGPTWebAccountInfo(ctx context.Context, aut
 			quotaErr = errQuotaClient
 			return
 		}
+		if expiresAt, hasExpiry := resolved.AccessTokenExpirationTime(); hasExpiry {
+			quotaClient.SetAccessTokenExpiry(credential.AccessToken, expiresAt, e.currentTime)
+		}
 		profile, quota, profileErr, quotaErr = e.fetchChatGPTWebAccountInfoPair(ctx, client, quotaClient, credential)
 		if errContext := ctx.Err(); errContext != nil {
 			client.CloseIdleConnections()
@@ -5698,6 +5701,10 @@ func accountInfoUnauthorized(errs ...error) bool {
 func classifyChatGPTWebAccountInfoError(err error) (string, bool) {
 	if err == nil {
 		return "", false
+	}
+	var expired *chatgptwebauth.AccessTokenExpiredError
+	if errors.As(err, &expired) {
+		return "access_token_expired", false
 	}
 	if authError, ok := chatgptwebauth.AsAuthError(err); ok {
 		diagnosticCode := chatgptwebauth.SafeDiagnosticCode(authError.DiagnosticCode)

@@ -916,6 +916,12 @@ func (s *RandomSelector) intN(limit int) int {
 }
 
 func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, blockReason, time.Time) {
+	expires, known := routingAccessTokenExpiration(auth)
+	return isAuthBlockedForModelWithExpiry(auth, model, now, expires, known)
+}
+
+// Indexed scheduling reuses expiry evidence parsed at credential update time.
+func isAuthBlockedForModelWithExpiry(auth *Auth, model string, now, expires time.Time, hasExpiry bool) (bool, blockReason, time.Time) {
 	if auth == nil {
 		return true, blockReasonOther, time.Time{}
 	}
@@ -925,7 +931,7 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 	if !auth.LifecycleSelectable() {
 		return true, blockReasonOther, time.Time{}
 	}
-	if expires, ok := codexAccessTokenExpiration(auth); ok && !expires.After(now) {
+	if hasExpiry && !expires.After(now) {
 		return true, blockReasonOther, time.Time{}
 	}
 	if auth.Unavailable && auth.CooldownScope == cooldownScopeAuth && auth.NextRetryAfter.After(now) {

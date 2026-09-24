@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	fhttp "github.com/bogdanfinn/fhttp"
@@ -40,6 +41,7 @@ type Client struct {
 	beforeRequest      func()
 	beforeRequestOnce  sync.Once
 	requestCancelStop  func() bool
+	accessTokenGuard   atomic.Pointer[accessTokenExpiryGuard]
 }
 
 const defaultPollCancellationGrace = 2 * time.Second
@@ -149,8 +151,23 @@ func newClientWithSessionCookiePolicy(
 	if timeout > 0 || (len(trackRequest) > 0 && trackRequest[0]) {
 		acquisitionTracker = newConnectionTracker()
 	}
+	client := &Client{
+		jar:                jar,
+		sendSessionCookies: sendSessionCookies,
+		persona:            persona,
+		proxyURL:           proxyURL,
+		acquisitionTimeout: timeout,
+		acquisitionTracker: acquisitionTracker,
+		pollCancelGrace:    defaultPollCancellationGrace,
+	}
 	newHTTPClient := func(followRedirect bool) (tls_client.HttpClient, error) {
-		return newBrowserHTTPClient(profile, jar, proxyURL, timeout, followRedirect, acquisitionTracker, timeout > 0)
+		return newBrowserHTTPClient(profile, jar, proxyURL, timeout, followRedirect, acquisitionTracker, timeout > 0,
+			func(request *fhttp.Request, via []*fhttp.Request) error {
+				if len(via) >= 10 {
+					return errors.New("stopped after 10 redirects")
+				}
+				return client.checkAccessTokenExpiry(request)
+			})
 	}
 
 	follow, err := newHTTPClient(true)
@@ -162,17 +179,8 @@ func newClientWithSessionCookiePolicy(
 		follow.CloseIdleConnections()
 		return nil, fmt.Errorf("create no-redirect browser client: %w", err)
 	}
-	client := &Client{
-		follow:             follow,
-		noRedirect:         noRedirect,
-		jar:                jar,
-		sendSessionCookies: sendSessionCookies,
-		persona:            persona,
-		proxyURL:           proxyURL,
-		acquisitionTimeout: timeout,
-		acquisitionTracker: acquisitionTracker,
-		pollCancelGrace:    defaultPollCancellationGrace,
-	}
+	client.follow = follow
+	client.noRedirect = noRedirect
 	if err := client.RestoreCookies(cookies); err != nil {
 		client.CloseIdleConnections()
 		return nil, err
@@ -224,6 +232,7 @@ func newBrowserHTTPClient(
 	followRedirect bool,
 	tracker *connectionTracker,
 	disableKeepAlives bool,
+	redirectChecks ...func(*fhttp.Request, []*fhttp.Request) error,
 ) (tls_client.HttpClient, error) {
 	timeoutMilliseconds := 0
 	if timeout > 0 {
@@ -234,6 +243,9 @@ func newBrowserHTTPClient(
 		tls_client.WithCookieJar(jar),
 		tls_client.WithRandomTLSExtensionOrder(),
 		tls_client.WithTimeoutMilliseconds(timeoutMilliseconds),
+	}
+	if len(redirectChecks) > 0 {
+		options = append(options, tls_client.WithCustomRedirectFunc(redirectChecks[0]))
 	}
 	if tracker != nil {
 		options = append(options, tls_client.WithProxyDialerFactory(tracker.dialerFactory(proxyURL)))
@@ -704,6 +716,7 @@ func (client *Client) prepareLoginRequestRetry(ctx context.Context, retryNumber 
 	if errClient != nil {
 		return errClient
 	}
+	replacement.accessTokenGuard.Store(client.accessTokenGuard.Load())
 	oldFollow := client.follow
 	oldNoRedirect := client.noRedirect
 	oldTracker := client.acquisitionTracker
@@ -738,6 +751,9 @@ func (client *Client) doStream(ctx context.Context, httpClient tls_client.HttpCl
 	client.applyHeaders(request, headers)
 	if errContext := ctx.Err(); errContext != nil {
 		return nil, errContext
+	}
+	if errExpiry := client.checkAccessTokenExpiry(request); errExpiry != nil {
+		return nil, errExpiry
 	}
 	client.runBeforeRequest()
 	return httpClient.Do(request)
@@ -969,11 +985,15 @@ func (client *Client) CloneWithProxy(proxyURL string) (*Client, error) {
 	if client == nil {
 		return nil, fmt.Errorf("browser client is nil")
 	}
-	return newClientWithSessionCookiePolicy(
+	cloned, err := newClientWithSessionCookiePolicy(
 		client.persona,
 		proxyURL,
 		client.ExportCookies(),
 		0,
 		client.sendSessionCookies,
 	)
+	if err == nil {
+		cloned.accessTokenGuard.Store(client.accessTokenGuard.Load())
+	}
+	return cloned, err
 }

@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"container/heap"
 	"context"
 	"fmt"
 	"math/rand/v2"
@@ -133,6 +134,7 @@ type modelScheduler struct {
 	priorityOrder   []int
 	readyByPriority map[int]*readyBucket
 	blocked         cooldownQueue
+	expiring        tokenExpiryQueue
 }
 
 // scheduledAuth stores the runtime scheduling state for a single auth inside a model shard.
@@ -141,6 +143,7 @@ type scheduledAuth struct {
 	auth        *Auth
 	state       scheduledState
 	nextRetryAt time.Time
+	expiryIndex int
 }
 
 // readyBucket keeps the ready views for one priority level.
@@ -1521,7 +1524,7 @@ func buildScheduledAuthMeta(auth *Auth) *scheduledAuthMeta {
 
 func buildScheduledAuthMetaWithSupportedModels(auth *Auth, supportedModelSet map[string]struct{}) *scheduledAuthMeta {
 	providerKey := strings.ToLower(strings.TrimSpace(auth.Provider))
-	expires, hasExpiry := codexAccessTokenExpiration(auth)
+	expires, hasExpiry := routingAccessTokenExpiration(auth)
 	return &scheduledAuthMeta{
 		auth:                 auth,
 		providerKey:          providerKey,
@@ -1645,14 +1648,21 @@ func (m *modelScheduler) upsertEntryLocked(meta *scheduledAuthMeta, now time.Tim
 	previousNextRetryAt := entry.nextRetryAt
 	previousPriority := 0
 	previousWebsocketEnabled := false
+	var previousExpiry time.Time
+	previousHasExpiry := false
 	if entry.meta != nil {
 		previousPriority = entry.meta.priority
 		previousWebsocketEnabled = entry.meta.websocketEnabled
+		previousExpiry = entry.meta.accessTokenExpiresAt
+		previousHasExpiry = entry.meta.hasAccessTokenExpiry
 	}
 
 	entry.applyMeta(meta, m.modelKey, now)
 
 	if ok && previousState == entry.state && previousNextRetryAt.Equal(entry.nextRetryAt) && previousPriority == meta.priority && previousWebsocketEnabled == meta.websocketEnabled {
+		if previousHasExpiry != meta.hasAccessTokenExpiry || !previousExpiry.Equal(meta.accessTokenExpiresAt) {
+			m.updateTokenExpiryLocked(entry)
+		}
 		return
 	}
 	m.rebuildIndexesLocked()
@@ -1674,7 +1684,7 @@ func (e *scheduledAuth) applyMeta(meta *scheduledAuthMeta, modelKey string, now 
 	e.meta = meta
 	e.auth = meta.auth
 	e.nextRetryAt = time.Time{}
-	blocked, reason, next := isAuthBlockedForModel(meta.auth, modelKey, now)
+	blocked, reason, next := isAuthBlockedForModelWithExpiry(meta.auth, modelKey, now, meta.accessTokenExpiresAt, meta.hasAccessTokenExpiry)
 	switch {
 	case !blocked:
 		e.state = scheduledStateReady
@@ -1701,44 +1711,27 @@ func (m *modelScheduler) removeEntryLocked(authID string) {
 	m.rebuildIndexesLocked()
 }
 
-// promoteExpiredLocked reevaluates cooldowns and expires ready Codex tokens.
+// promoteExpiredLocked checks only due tokens and cooldowns. With no due work,
+// expiry maintenance is constant time regardless of the credential count.
 func (m *modelScheduler) promoteExpiredLocked(now time.Time) {
 	if m == nil {
 		return
 	}
 	changed := false
-	for _, entry := range m.entries {
-		if entry == nil || entry.meta == nil || entry.state != scheduledStateReady || !entry.meta.hasAccessTokenExpiry {
-			continue
-		}
-		if !entry.meta.accessTokenExpiresAt.After(now) {
-			entry.state = scheduledStateBlocked
-			entry.nextRetryAt = time.Time{}
-			changed = true
-		}
+	for len(m.expiring) > 0 && !m.expiring[0].meta.accessTokenExpiresAt.After(now) {
+		entry := heap.Pop(&m.expiring).(*scheduledAuth)
+		entry.state = scheduledStateBlocked
+		entry.nextRetryAt = time.Time{}
+		changed = true
 	}
 	for _, entry := range m.blocked {
 		if entry == nil || entry.auth == nil {
 			continue
 		}
 		if entry.nextRetryAt.IsZero() || entry.nextRetryAt.After(now) {
-			continue
+			break
 		}
-		blocked, reason, next := isAuthBlockedForModel(entry.auth, m.modelKey, now)
-		switch {
-		case !blocked:
-			entry.state = scheduledStateReady
-			entry.nextRetryAt = time.Time{}
-		case reason == blockReasonCooldown:
-			entry.state = scheduledStateCooldown
-			entry.nextRetryAt = next
-		case reason == blockReasonDisabled:
-			entry.state = scheduledStateDisabled
-			entry.nextRetryAt = time.Time{}
-		default:
-			entry.state = scheduledStateBlocked
-			entry.nextRetryAt = next
-		}
+		entry.applyMeta(entry.meta, m.modelKey, now)
 		changed = true
 	}
 	if changed {
@@ -1883,35 +1876,45 @@ func (m *modelScheduler) readyWebsocketPrioritiesLocked(predicate func(*schedule
 		return nil
 	}
 	prioritySet := make(map[int]struct{})
-	for _, entry := range m.entries {
-		if entry == nil || entry.meta == nil || !entry.meta.websocketEnabled || entry.state != scheduledStateReady {
-			continue
+	for priority, bucket := range m.readyByPriority {
+		if bucket != nil && bucket.ws.pickFirst(predicate) != nil {
+			prioritySet[priority] = struct{}{}
 		}
-		if predicate != nil && !predicate(entry) {
-			continue
-		}
-		prioritySet[entry.meta.priority] = struct{}{}
 	}
 	return sortedPrioritySet(prioritySet)
 }
 
 func (m *modelScheduler) candidatePrioritiesForWebsocketLocked(predicate func(*scheduledAuth) bool) []int {
-	prioritySet := make(map[int]struct{})
-	for _, entry := range m.entries {
-		if entry == nil || entry.meta == nil || !entry.meta.websocketEnabled {
-			continue
-		}
-		if !entryCandidateForPriority(entry, predicate) {
-			continue
-		}
-		prioritySet[entry.meta.priority] = struct{}{}
-	}
-	return sortedPrioritySet(prioritySet)
+	return m.candidatePrioritiesFromIndexesLocked(true, predicate)
 }
 
 func (m *modelScheduler) candidatePrioritiesForAllLocked(predicate func(*scheduledAuth) bool) []int {
+	return m.candidatePrioritiesFromIndexesLocked(false, predicate)
+}
+
+func (m *modelScheduler) candidatePrioritiesFromIndexesLocked(websocket bool, predicate func(*scheduledAuth) bool) []int {
 	prioritySet := make(map[int]struct{})
-	for _, entry := range m.entries {
+	for priority, bucket := range m.readyByPriority {
+		if bucket == nil {
+			continue
+		}
+		view := &bucket.all
+		if websocket {
+			view = &bucket.ws
+		}
+		if view.pickFirst(predicate) != nil {
+			prioritySet[priority] = struct{}{}
+		}
+	}
+	// Timed blocks still define retry tiers, but permanent/expired blocks at
+	// the end of this sorted queue cannot contribute any candidate priority.
+	for _, entry := range m.blocked {
+		if entry.nextRetryAt.IsZero() {
+			break
+		}
+		if _, found := prioritySet[entry.meta.priority]; found || websocket && !entry.meta.websocketEnabled {
+			continue
+		}
 		if !entryCandidateForPriority(entry, predicate) {
 			continue
 		}
@@ -2215,19 +2218,27 @@ func (m *modelScheduler) rebuildIndexesLocked() {
 	m.readyByPriority = make(map[int]*readyBucket)
 	m.priorityOrder = m.priorityOrder[:0]
 	m.blocked = m.blocked[:0]
+	clear(m.expiring)
+	m.expiring = m.expiring[:0]
 	priorityBuckets := make(map[int][]*scheduledAuth)
 	for _, entry := range m.entries {
 		if entry == nil || entry.auth == nil {
 			continue
 		}
+		entry.expiryIndex = -1
 		switch entry.state {
 		case scheduledStateReady:
+			if entry.meta.hasAccessTokenExpiry {
+				entry.expiryIndex = len(m.expiring)
+				m.expiring = append(m.expiring, entry)
+			}
 			priority := entry.meta.priority
 			priorityBuckets[priority] = append(priorityBuckets[priority], entry)
 		case scheduledStateCooldown, scheduledStateBlocked:
 			m.blocked = append(m.blocked, entry)
 		}
 	}
+	heap.Init(&m.expiring)
 	for priority, entries := range priorityBuckets {
 		sort.Slice(entries, func(i, j int) bool {
 			return entries[i].auth.ID < entries[j].auth.ID
@@ -2377,6 +2388,14 @@ func (v *readyView) pickWithRequestLimit(strategy schedulerStrategy, predicate f
 			}
 		}
 	case schedulerStrategyRandom:
+		// Rejection sampling stays uniform and avoids copying a large ready
+		// pool for the common case. The bounded fallback handles sparse pools.
+		for attempt := 0; attempt < 8; attempt++ {
+			entry := v.flat[rand.IntN(len(v.flat))]
+			if tryEntry(entry) {
+				return entry, authRequestLimitBlock{}
+			}
+		}
 		candidates := make([]*scheduledAuth, 0, len(v.flat))
 		for _, entry := range v.flat {
 			if entry != nil && entry.auth != nil && (predicate == nil || predicate(entry)) {

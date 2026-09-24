@@ -400,6 +400,12 @@ func TestChatGPTWebExecutorPersistsMissingCodexSourceAsReauthRequired(t *testing
 
 func TestChatGPTWebExecutorLinkedCodexRequestPreparationPreservesRefreshLocks(t *testing.T) {
 	manager, codexExecutor, webExecutor, web, model := newLinkedChatGPTWebRuntime(t, true, false)
+	// Request preparation now applies only before expiry; already-expired
+	// credentials are reserved for independent background recovery.
+	web.Metadata["expired"] = time.Now().Add(time.Minute).UTC().Format(time.RFC3339)
+	if _, err := manager.Update(t.Context(), web); err != nil {
+		t.Fatal(err)
+	}
 
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()

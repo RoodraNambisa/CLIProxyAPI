@@ -37,6 +37,14 @@ func codexAccessTokenExpiration(auth *Auth) (time.Time, bool) {
 	return auth.AccessTokenExpirationTime()
 }
 
+// Routing blocks expired native tokens without disabling their recovery jobs.
+func routingAccessTokenExpiration(auth *Auth) (time.Time, bool) {
+	if isNativeChatGPTWebCredentialAuth(auth) {
+		return auth.AccessTokenExpirationTime()
+	}
+	return codexAccessTokenExpiration(auth)
+}
+
 func parseJWTExpiration(token string) (time.Time, bool) {
 	if len(token) > 64<<10 {
 		return time.Time{}, false

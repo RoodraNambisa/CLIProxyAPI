@@ -1273,6 +1273,10 @@ func (e *ChatGPTWebExecutor) newRuntimeClientForAcquisition(auth *cliproxyauth.A
 	if strings.TrimSpace(credential.AccessToken) == "" {
 		return nil, nil, statusErr{code: http.StatusUnauthorized, msg: "chatgpt web access token is empty"}
 	}
+	expiresAt, hasExpiry := auth.AccessTokenExpirationTime()
+	if hasExpiry && !expiresAt.After(e.currentTime()) {
+		return nil, nil, &chatgptwebauth.AccessTokenExpiredError{}
+	}
 	if err = chatgptwebauth.EnsureCredentialRuntimeIDsForURL(credential, chatgptwebauth.CredentialRuntimeIdentityReader(auth.ID, credential), e.chatGPTWebBaseURL()); err != nil {
 		return nil, nil, fmt.Errorf("initialize chatgpt web browser identity: %w", err)
 	}
@@ -1296,6 +1300,9 @@ func (e *ChatGPTWebExecutor) newRuntimeClientForAcquisition(auth *cliproxyauth.A
 	}
 	if err != nil {
 		return nil, nil, fmt.Errorf("create chatgpt web browser client: %w", err)
+	}
+	if hasExpiry {
+		client.SetAccessTokenExpiry(credential.AccessToken, expiresAt, e.currentTime)
 	}
 	baseURL := e.chatGPTWebBaseURL()
 	deviceID := strings.TrimSpace(credential.DeviceID)

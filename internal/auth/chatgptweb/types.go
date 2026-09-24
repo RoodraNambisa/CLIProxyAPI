@@ -350,7 +350,7 @@ func SafeQuotaError(value string) string {
 		"invalid_response", "identity_mismatch", "credential_unavailable", "canceled",
 		"account_unverified", "interaction_required", "relogin_pending", "reauth_required",
 		"forbidden", "cloudflare_challenge", "recovery_exhausted", "refresh_persist_backpressure",
-		"stale_quota_observation":
+		"stale_quota_observation", "access_token_expired":
 		return strings.ToLower(strings.TrimSpace(value))
 	default:
 		return "refresh_failed"

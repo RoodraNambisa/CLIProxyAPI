@@ -2066,6 +2066,15 @@ func (e *ChatGPTWebExecutor) refreshCredential(ctx context.Context, auth *clipro
 		return nil, errors.New("chatgpt web refresh returned an invalid result"), false
 	}
 	result.credential = cloneChatGPTWebCredential(result.credential)
+	if result.err == nil && result.credential != nil {
+		if expiresAt, known := chatGPTWebCredentialExpiry(result.credential); known && !expiresAt.After(e.currentTime()) {
+			// Retain rotated recovery material, but never publish expired output as
+			// a successful refresh or advance its last-success timestamp.
+			result.credential.LastRefreshAt = credential.LastRefreshAt
+			result.err = newChatGPTWebRefreshModeError("access_token_expired", "chatgpt web refresh returned an expired access token")
+			result.terminal = true
+		}
+	}
 	if result.err == nil {
 		if result.credential == nil {
 			return nil, errors.New("chatgpt web refresh returned no credential"), false

@@ -33,6 +33,12 @@ type ChatGPTWebHeaderGetter interface {
 
 // ClassifyChatGPTWebTransportDiagnostic extracts a safe transport failure class without retaining the error text.
 func ClassifyChatGPTWebTransportDiagnostic(err error, path string) *cliproxyauth.ErrorDiagnostic {
+	var expired *chatgptwebauth.AccessTokenExpiredError
+	if errors.As(err, &expired) {
+		return &cliproxyauth.ErrorDiagnostic{
+			Provider: "chatgpt-web", Stage: "credential_preparation", Code: "access_token_expired", Retryable: true,
+		}
+	}
 	code := "network_error"
 	retryable := true
 	switch {

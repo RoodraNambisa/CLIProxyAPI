@@ -13051,7 +13051,7 @@ func (m *Manager) refreshAuthExpected(ctx context.Context, id string, expected *
 		m.mu.Lock()
 		if current := m.auths[id]; runtimeMetadataMutationMatchesCurrent(current, auth) {
 			current.NextRefreshAfter = now.Add(refreshFailureBackoff)
-			if expiry, ok := codexAccessTokenExpiration(current); ok && expiry.After(now) && expiry.Before(current.NextRefreshAfter) {
+			if expiry, ok := routingAccessTokenExpiration(current); ok && expiry.After(now) && expiry.Before(current.NextRefreshAfter) {
 				current.NextRefreshAfter = expiry
 			}
 			current.LastError = executionResultError(current, err)

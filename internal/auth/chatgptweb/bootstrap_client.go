@@ -27,6 +27,7 @@ func (client *Client) NewBootstrapAttempt(ctx context.Context) (*Client, error) 
 		proxyURL: client.proxyURL, sendSessionCookies: client.sendSessionCookies,
 		acquisitionTracker: tracker, beforeRequest: client.runBeforeRequest,
 	}
+	attempt.accessTokenGuard.Store(client.accessTokenGuard.Load())
 	attempt.requestCancelStop = context.AfterFunc(ctx, tracker.closeAll)
 	return attempt, nil
 }
