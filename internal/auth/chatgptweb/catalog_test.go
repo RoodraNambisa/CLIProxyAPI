@@ -2,6 +2,26 @@ package chatgptweb
 
 import "testing"
 
+func TestDecodeCatalogInstantCategory(t *testing.T) {
+	models, err := DecodeCatalog([]byte(`{"models":[{"slug":"gpt-5-6"},{"slug":"thinking"}],"categories":["bad",{"model_lane":42},{"model_lane":"auto","default_model":"gpt-5-6"},{"model_lane":"thinking","default_model":"thinking"}]}`))
+	if err != nil || len(models) != 2 || !models[0].Instant || models[1].Instant {
+		t.Fatalf("models = %+v, error = %v", models, err)
+	}
+	for _, categories := range []string{`null`, `{}`, `"bad"`, `[{"category":"auto_no_tools","default_model":"gpt-5-6"}]`} {
+		models, err = DecodeCatalog([]byte(`{"models":[{"slug":"gpt-5-6"}],"categories":` + categories + `}`))
+		if err != nil || len(models) != 1 || models[0].Instant {
+			t.Fatalf("optional categories %s: models = %+v, error = %v", categories, models, err)
+		}
+	}
+}
+
+func TestDecodeCatalogThinkingEfforts(t *testing.T) {
+	models, err := DecodeCatalog([]byte(`{"models":[{"slug":"thinking","thinking_efforts":[null,"bad",{"thinking_effort":"min"},{"thinking_effort":"standard"},{"thinking_effort":"extended"},{"thinking_effort":"max"}]}],"categories":[{"model_lane":"thinking","default_model":"thinking"}]}`))
+	if err != nil || len(models) != 1 || !models[0].ThinkingDefault || len(models[0].ThinkingEfforts) != 4 {
+		t.Fatalf("models=%+v err=%v", models, err)
+	}
+}
+
 func TestDecodeCatalogFiltersInvalidAndDuplicateModels(t *testing.T) {
 	models, err := DecodeCatalog([]byte(`{"models":[
 		{"slug":"gpt-5","title":"GPT-5","created":10},

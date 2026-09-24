@@ -876,17 +876,20 @@ func (e *ChatGPTWebExecutor) beginChatGPTWebImage(ctx context.Context, client *c
 	if err != nil {
 		return nil, err
 	}
-	upstreamModel := e.chatGPTWebImageUpstreamModel()
+	upstreamModel := prepared.imageUpstreamModel
+	if upstreamModel == "" {
+		upstreamModel = e.chatGPTWebImageUpstreamModel()
+	}
 	prepareStarted := time.Now()
 	setChatGPTWebImageTaskStage(ctx, "preparing_conversation")
-	conduit, err := e.prepareChatGPTWebImageConversation(ctx, client, credential, requirements, upstreamModel, upstreamPrompt)
+	conduit, err := e.prepareChatGPTWebImageConversation(ctx, client, credential, requirements, upstreamModel, prepared.imageThinkingEffort, upstreamPrompt)
 	cliproxyexecutor.ObserveRequestPhaseContext(ctx, cliproxyexecutor.ImagePhaseConversationPrepare, prepareStarted)
 	if err != nil {
 		return nil, err
 	}
 	upstreamStarted := time.Now()
 	setChatGPTWebImageTaskStage(ctx, "starting_generation")
-	response, turn, err := e.openChatGPTWebImageConversation(ctx, client, credential, requirements, upstreamModel, conduit, upstreamPrompt, uploads)
+	response, turn, err := e.openChatGPTWebImageConversation(ctx, client, credential, requirements, upstreamModel, prepared.imageThinkingEffort, conduit, upstreamPrompt, uploads)
 	cliproxyexecutor.ObserveRequestPhaseContext(ctx, cliproxyexecutor.ImagePhaseUpstreamInitial, upstreamStarted)
 	if err != nil {
 		return nil, err
@@ -1680,7 +1683,7 @@ func writeChatGPTWebJSONString(output *bytes.Buffer, value string) {
 	_, _ = output.Write(encoded)
 }
 
-func (e *ChatGPTWebExecutor) prepareChatGPTWebImageConversation(ctx context.Context, client *chatgptwebauth.Client, credential *chatgptwebauth.Credential, requirements chatGPTWebRequirements, upstreamModel, prompt string) (string, error) {
+func (e *ChatGPTWebExecutor) prepareChatGPTWebImageConversation(ctx context.Context, client *chatgptwebauth.Client, credential *chatgptwebauth.Credential, requirements chatGPTWebRequirements, upstreamModel, thinkingEffort, prompt string) (string, error) {
 	path := "/backend-api/f/conversation/prepare"
 	prepareRequirements := requirements
 	prepareRequirements.SOToken = ""
@@ -1688,6 +1691,9 @@ func (e *ChatGPTWebExecutor) prepareChatGPTWebImageConversation(ctx context.Cont
 	headers["accept"] = "*/*"
 	headers["content-type"] = "application/json"
 	timezone := e.chatGPTWebTimezone()
+	prompt, metadata := helps.ChatGPTWebImageToolInput(prompt)
+	partialQuery := chatGPTWebUserTextMessage(prompt)
+	partialQuery["metadata"] = metadata
 	body := map[string]any{
 		"action":                 "next",
 		"fork_from_shared_post":  false,
@@ -1698,10 +1704,13 @@ func (e *ChatGPTWebExecutor) prepareChatGPTWebImageConversation(ctx context.Cont
 		"timezone":               timezone.Timezone,
 		"conversation_mode":      map[string]any{"kind": "primary_assistant"},
 		"system_hints":           []string{"picture_v2"},
-		"partial_query":          chatGPTWebUserTextMessage(prompt),
+		"partial_query":          partialQuery,
 		"supports_buffering":     true,
 		"supported_encodings":    []string{"v1"},
 		"client_contextual_info": map[string]any{"app_name": "chatgpt.com"},
+	}
+	if thinkingEffort != "" {
+		body["thinking_effort"] = thinkingEffort
 	}
 	_, data, err := e.doChatGPTWebJSONWithHeaders(ctx, client, credential, path, headers, body)
 	if err != nil {
@@ -1717,13 +1726,14 @@ func (e *ChatGPTWebExecutor) prepareChatGPTWebImageConversation(ctx context.Cont
 	return token, nil
 }
 
-func (e *ChatGPTWebExecutor) openChatGPTWebImageConversation(ctx context.Context, client *chatgptwebauth.Client, credential *chatgptwebauth.Credential, requirements chatGPTWebRequirements, upstreamModel, conduit, prompt string, uploads []chatGPTWebUploadedImage) (*fhttp.Response, helps.ChatGPTWebImageTurn, error) {
+func (e *ChatGPTWebExecutor) openChatGPTWebImageConversation(ctx context.Context, client *chatgptwebauth.Client, credential *chatgptwebauth.Credential, requirements chatGPTWebRequirements, upstreamModel, thinkingEffort, conduit, prompt string, uploads []chatGPTWebUploadedImage) (*fhttp.Response, helps.ChatGPTWebImageTurn, error) {
 	path := "/backend-api/f/conversation"
 	headers := chatGPTWebRequirementsHeaders(e.chatGPTWebHeaders(credential, path, nil), requirements)
 	headers["accept"] = "text/event-stream"
 	headers["content-type"] = "application/json"
 	headers["x-conduit-token"] = conduit
 	headers["x-oai-turn-trace-id"] = uuid.NewString()
+	prompt, metadata := helps.ChatGPTWebImageToolInput(prompt)
 	parts := make([]any, 0, len(uploads)+1)
 	attachments := make([]any, 0, len(uploads))
 	for _, uploaded := range uploads {
@@ -1741,13 +1751,9 @@ func (e *ChatGPTWebExecutor) openChatGPTWebImageConversation(ctx context.Context
 	if len(uploads) > 0 {
 		content = map[string]any{"content_type": "multimodal_text", "parts": parts}
 	}
-	metadata := map[string]any{
-		"developer_mode_connector_ids": []any{},
-		"selected_github_repos":        []any{},
-		"selected_all_github_repos":    false,
-		"system_hints":                 []string{"picture_v2"},
-		"serialization_metadata":       map[string]any{"custom_symbol_offsets": []any{}},
-	}
+	metadata["developer_mode_connector_ids"] = []any{}
+	metadata["selected_github_repos"] = []any{}
+	metadata["selected_all_github_repos"] = false
 	if len(attachments) > 0 {
 		metadata["attachments"] = attachments
 	}
@@ -1775,6 +1781,9 @@ func (e *ChatGPTWebExecutor) openChatGPTWebImageConversation(ctx context.Context
 		"client_contextual_info":               chatGPTWebClientContext(),
 		"paragen_cot_summary_display_override": "allow",
 		"force_parallel_switch":                "auto",
+	}
+	if thinkingEffort != "" {
+		body["thinking_effort"] = thinkingEffort
 	}
 	response, err := e.doChatGPTWebJSONStream(ctx, client, credential, path, headers, body)
 	return response, turn, err

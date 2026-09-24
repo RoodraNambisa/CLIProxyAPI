@@ -126,6 +126,9 @@ func chatGPTWebCatalogModelInfos(models []chatgptwebauth.CatalogModel, imageMode
 		}
 		seen[key] = struct{}{}
 		if info := chatGPTWebTextModelInfo(modelID, model.DisplayName, model.Created, model.OwnedBy); info != nil {
+			info.ChatGPTWebInstant = model.Instant
+			info.ChatGPTWebThinkingDefault = model.ThinkingDefault
+			info.ChatGPTWebThinkingEfforts = append([]string(nil), model.ThinkingEfforts...)
 			output = append(output, info)
 		}
 	}
@@ -261,6 +264,7 @@ func cloneChatGPTWebModelInfos(models []*registry.ModelInfo) []*registry.ModelIn
 			continue
 		}
 		clone := *model
+		clone.ChatGPTWebThinkingEfforts = append([]string(nil), model.ChatGPTWebThinkingEfforts...)
 		clone.SupportedParameters = append([]string(nil), model.SupportedParameters...)
 		clone.SupportedInputModalities = append([]string(nil), model.SupportedInputModalities...)
 		clone.SupportedOutputModalities = append([]string(nil), model.SupportedOutputModalities...)

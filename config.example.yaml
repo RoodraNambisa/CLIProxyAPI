@@ -639,6 +639,11 @@ nonstream-keepalive-interval: 0
 #   stream-flush-min-bytes: 0        # Image-specific byte threshold. 0 falls back to streaming.stream-flush-min-bytes.
 #   chatgpt-web:
 #     upstream-model: "auto"       # Web conversation router used with picture_v2; explicit saved values are preserved.
+#     reasoning-mode: "auto"       # auto | instant | low | medium | high | xhigh. auto preserves the carrier above.
+#                                 # Instant uses the credential's cached catalog, falling back to verified gpt-5-6.
+#                                 # Instant requires upstream-model auto. Other explicit modes require a supported
+#                                 # effort in this credential's cached catalog; unsupported modes never silently downgrade.
+#                                 # Only new Web image requests are affected; this does not disable safety checks.
 #     image-models: ["gpt-image-2", "gpt-image-2.5", "gpt-image-2.5-flare", "gpt-image-2.5-sunburst"] # Independent public aliases, not upstream image engine selectors. All share quota.
 #     remote-image-url-enabled: false # Fetch public HTTP(S) image_url inputs with SSRF and 50 MiB safeguards.
 #     remote-image-url-download-mode: direct # direct or credential-proxy; missing credential proxy falls back to direct.

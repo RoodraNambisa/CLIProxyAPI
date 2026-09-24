@@ -63,6 +63,10 @@ type ModelInfo struct {
 	// SupportsWebSearch indicates this Antigravity model is listed by
 	// fetchAvailableModels.webSearchModelIds and can execute native googleSearch.
 	SupportsWebSearch bool `json:"supports_web_search,omitempty"`
+	// ChatGPTWebInstant marks the credential's cached Instant carrier category.
+	ChatGPTWebInstant         bool     `json:"-"`
+	ChatGPTWebThinkingDefault bool     `json:"-"`
+	ChatGPTWebThinkingEfforts []string `json:"-"`
 
 	// Thinking holds provider-specific reasoning/thinking budget capabilities.
 	// This is optional and currently used for Gemini thinking budget normalization.
@@ -98,6 +102,27 @@ func (r *ModelRegistry) ClientSupportsWebSearch(clientID, modelID string) bool {
 		}
 	}
 	return false
+}
+
+// ChatGPTWebInstantModelForClient reads only the selected client's cached models.
+// It does not fetch a catalog or scan other credentials.
+func (r *ModelRegistry) ChatGPTWebInstantModelForClient(clientID string) string {
+	r.mutex.RLock()
+	defer r.mutex.RUnlock()
+	selected := ""
+	for _, info := range r.clientModelInfos[clientID] {
+		if info == nil || !info.ChatGPTWebInstant {
+			continue
+		}
+		model := strings.TrimSpace(info.UpstreamID)
+		if model == "" {
+			model = strings.TrimSpace(info.ID)
+		}
+		if model != "" && (selected == "" || model < selected) {
+			selected = model
+		}
+	}
+	return selected
 }
 
 func normalizeRegistryCapabilityModelID(modelID string) string {
@@ -617,6 +642,9 @@ func cloneModelInfo(model *ModelInfo) *ModelInfo {
 		return nil
 	}
 	copyModel := *model
+	if len(model.ChatGPTWebThinkingEfforts) > 0 {
+		copyModel.ChatGPTWebThinkingEfforts = append([]string(nil), model.ChatGPTWebThinkingEfforts...)
+	}
 	if len(model.SupportedGenerationMethods) > 0 {
 		copyModel.SupportedGenerationMethods = append([]string(nil), model.SupportedGenerationMethods...)
 	}

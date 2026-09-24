@@ -36,6 +36,31 @@ type chatGPTWebCatalogTestExecutor struct {
 	once     sync.Once
 }
 
+func TestChatGPTWebCatalogPreservesImageModeCapabilities(t *testing.T) {
+	models := chatGPTWebCatalogModelInfos([]chatgptwebauth.CatalogModel{{
+		Slug: "thinking", ThinkingDefault: true, ThinkingEfforts: []string{"min", "standard", "extended", "max"},
+	}, {Slug: "instant", Instant: true}})
+	cloned := cloneChatGPTWebModelInfos(models)
+	var sawThinking, sawInstant bool
+	for _, model := range cloned {
+		if model.ID == "instant" {
+			sawInstant = model.ChatGPTWebInstant
+		}
+		if model.ID == "thinking" {
+			sawThinking = model.ChatGPTWebThinkingDefault && len(model.ChatGPTWebThinkingEfforts) == 4
+			model.ChatGPTWebThinkingEfforts[0] = "changed"
+		}
+	}
+	if !sawThinking || !sawInstant {
+		t.Fatal("catalog capabilities lost")
+	}
+	for _, model := range models {
+		if model.ID == "thinking" && model.ChatGPTWebThinkingEfforts[0] != "min" {
+			t.Fatal("cache cloned shallowly")
+		}
+	}
+}
+
 type chatGPTWebCatalogDiagnosticError struct {
 	diagnostic *coreauth.ErrorDiagnostic
 }

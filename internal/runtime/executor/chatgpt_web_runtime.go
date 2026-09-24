@@ -23,6 +23,7 @@ import (
 	chatgptwebauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/chatgptweb"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/sentinelcompat"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
@@ -76,6 +77,8 @@ func (body *chatGPTWebChallengeInspectingBody) challengeError() error {
 type chatGPTWebPreparedRequest struct {
 	sentinelPolicy         *sentinelcompat.Policy
 	bootstrapPolicy        cliproxyexecutor.ImageBootstrapPolicy
+	imageUpstreamModel     string
+	imageThinkingEffort    string
 	baseModel              string
 	routeModel             string
 	responseFormat         sdktranslator.Format
@@ -651,7 +654,41 @@ func (e *ChatGPTWebExecutor) executeRuntimeStream(ctx context.Context, auth *cli
 	return &cliproxyexecutor.StreamResult{Headers: headers, Chunks: out}, nil
 }
 
-func (e *ChatGPTWebExecutor) prepareRuntimeRequest(ctx context.Context, _ *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, stream bool) (*chatGPTWebPreparedRequest, error) {
+func (e *ChatGPTWebExecutor) prepareRuntimeRequest(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, stream bool) (prepared *chatGPTWebPreparedRequest, err error) {
+	defer func() {
+		if err != nil || prepared == nil || prepared.request.Image == nil {
+			return
+		}
+		policy := config.ChatGPTWebImageConfig{
+			UpstreamModel: prepared.imageConfigSnapshot.UpstreamModel,
+			ReasoningMode: prepared.imageConfigSnapshot.ReasoningMode,
+		}
+		if invalid := policy.ValidateReasoningMode(); invalid != nil {
+			err = statusErr{code: http.StatusBadRequest, msg: invalid.Error(), skipAuthResult: true}
+			prepared.discardUsageProjection()
+			prepared = nil
+			return
+		}
+		prepared.imageUpstreamModel = policy.ResolvedUpstreamModel()
+		if policy.ResolvedReasoningMode() == config.ChatGPTWebImageReasoningInstant {
+			prepared.imageUpstreamModel = ""
+			if auth != nil {
+				prepared.imageUpstreamModel = registry.GetGlobalRegistry().ChatGPTWebInstantModelForClient(auth.ID)
+			}
+			if prepared.imageUpstreamModel == "" {
+				prepared.imageUpstreamModel = config.DefaultChatGPTWebImageInstantModel
+			}
+		} else if mode := policy.ResolvedReasoningMode(); mode != config.ChatGPTWebImageReasoningAuto {
+			if auth != nil {
+				prepared.imageUpstreamModel, prepared.imageThinkingEffort = registry.GetGlobalRegistry().ChatGPTWebImageThinkingModel(auth.ID, policy.ResolvedUpstreamModel(), mode)
+			}
+			if prepared.imageThinkingEffort == "" {
+				err = statusErr{code: http.StatusBadRequest, msg: fmt.Sprintf(`{"error":{"type":"invalid_request_error","code":"chatgpt_web_image_reasoning_unsupported","message":"The selected credential's cached model catalog does not support Web image reasoning mode %s for the configured carrier."}}`, mode), skipAuthResult: true, retryOtherAuth: true, localPolicy: "chatgpt_web_image_reasoning_unsupported"}
+				prepared.discardUsageProjection()
+				prepared = nil
+			}
+		}
+	}()
 	if opaque, ok := cliproxyexecutor.ProviderPreparedRequest(opts, e.Identifier()); ok {
 		if template, okTemplate := opaque.(*chatGPTWebPreparedRequest); okTemplate {
 			effectiveModel := strings.TrimSpace(thinking.ParseSuffix(req.Model).ModelName)
@@ -720,6 +757,8 @@ func (e *ChatGPTWebExecutor) prepareRuntimeRequestTemplate(ctx context.Context, 
 		resolvedImageConfig = cfg.Images.ChatGPTWeb.Resolved()
 	}
 	imageConfigSnapshot := cliproxyexecutor.ChatGPTWebImageConfigSnapshot{
+		UpstreamModel:                resolvedImageConfig.UpstreamModel,
+		ReasoningMode:                resolvedImageConfig.ReasoningMode,
 		AutoCleanupLibraryOnFull:     resolvedImageConfig.AutoCleanupLibraryOnFull,
 		RemoteImageURLEnabled:        resolvedImageConfig.RemoteImageURLEnabled,
 		RemoteImageURLDownloadMode:   resolvedImageConfig.RemoteImageURLDownloadMode,
@@ -736,6 +775,10 @@ func (e *ChatGPTWebExecutor) prepareRuntimeRequestTemplate(ctx context.Context, 
 	}
 	if pinned, ok := opts.Metadata[cliproxyexecutor.ChatGPTWebImageConfigSnapshotMetadataKey].(cliproxyexecutor.ChatGPTWebImageConfigSnapshot); ok {
 		imageConfigSnapshot = pinned
+	} else if opaque, ok := cliproxyexecutor.ProviderPreparedRequest(opts, e.Identifier()); ok {
+		if previous, ok := opaque.(*chatGPTWebPreparedRequest); ok {
+			imageConfigSnapshot = previous.imageConfigSnapshot
+		}
 	}
 	canonicalBody = helps.ApplyPayloadConfigWithRequest(cfg, baseModel, sdktranslator.FormatCodex.String(), opts.SourceFormat.String(), "",
 		canonicalBody, originalSource, routeModel, helps.PayloadRequestPath(opts), opts.Headers)
@@ -1378,12 +1421,7 @@ func (e *ChatGPTWebExecutor) FetchModels(ctx context.Context, auth *cliproxyauth
 	}
 	defer e.finishChatGPTWebRuntimeClient(ctx, auth, credential, client)
 	bootstrapPath := "/"
-	bootstrapHeaders := e.chatGPTWebHeaders(credential, bootstrapPath, map[string]string{
-		"accept":         "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-		"sec-fetch-dest": "document",
-		"sec-fetch-mode": "navigate",
-		"sec-fetch-site": "none",
-	})
+	bootstrapHeaders := e.chatGPTWebHeaders(credential, bootstrapPath, nil)
 	response, err := e.doChatGPTWebBootstrapRequest(
 		ctx,
 		client,
@@ -1536,12 +1574,7 @@ func (e *ChatGPTWebExecutor) chatGPTWebRequirements(ctx context.Context, client 
 	setPhase(cliproxyexecutor.ImagePhaseRequirementsBootstrap)
 	baseURL := e.chatGPTWebBaseURL()
 	bootstrapPath := "/"
-	bootstrapHeaders := e.chatGPTWebHeaders(credential, bootstrapPath, map[string]string{
-		"accept":         "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-		"sec-fetch-dest": "document",
-		"sec-fetch-mode": "navigate",
-		"sec-fetch-site": "none",
-	})
+	bootstrapHeaders := e.chatGPTWebHeaders(credential, bootstrapPath, nil)
 	var response *fhttp.Response
 	var bootstrap []byte
 	var err error
@@ -2365,7 +2398,21 @@ func chatGPTWebUpstreamProtocolError(ctx context.Context, err error) error {
 }
 
 func (e *ChatGPTWebExecutor) chatGPTWebHeaders(credential *chatgptwebauth.Credential, path string, extra map[string]string) map[string]string {
+	// A top-level document must not inherit API routing/identity headers, Origin,
+	// Referer, or caller-supplied authorization. Cookies stay in the client's jar.
+	if path == "/" {
+		return map[string]string{
+			"accept":                    "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+			"sec-fetch-dest":            "document",
+			"sec-fetch-mode":            "navigate",
+			"sec-fetch-site":            "none",
+			"sec-fetch-user":            "?1",
+			"upgrade-insecure-requests": "1",
+			"priority":                  "u=0, i",
+		}
+	}
 	headers := map[string]string{
+		"authorization":           "Bearer " + strings.TrimSpace(credential.AccessToken),
 		"origin":                  e.chatGPTWebBaseURL(),
 		"referer":                 e.chatGPTWebBaseURL() + "/",
 		"oai-device-id":           strings.TrimSpace(credential.DeviceID),
@@ -2380,11 +2427,6 @@ func (e *ChatGPTWebExecutor) chatGPTWebHeaders(credential *chatgptwebauth.Creden
 		"sec-fetch-dest":          "empty",
 		"sec-fetch-mode":          "cors",
 		"sec-fetch-site":          "same-origin",
-	}
-	// The HTML document is a browser navigation, not a bearer-authenticated
-	// API call. Keep account authorization on backend API requests only.
-	if path != "/" {
-		headers["authorization"] = "Bearer " + strings.TrimSpace(credential.AccessToken)
 	}
 	for key, value := range extra {
 		if strings.TrimSpace(value) != "" {

@@ -198,6 +198,8 @@ const (
 
 // ChatGPTWebImageConfigSnapshot contains request-scoped Web image adaptation settings.
 type ChatGPTWebImageConfigSnapshot struct {
+	UpstreamModel                string
+	ReasoningMode                string
 	AutoCleanupLibraryOnFull     bool
 	RemoteImageURLEnabled        bool
 	RemoteImageURLDownloadMode   string

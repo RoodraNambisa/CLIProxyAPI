@@ -37,6 +37,19 @@ func TestImageBootstrapConfigChangeDetails(t *testing.T) {
 	}
 }
 
+func TestImageReasoningConfigChangeDetails(t *testing.T) {
+	oldCfg, newCfg := &config.Config{}, &config.Config{}
+	newCfg.Images.ChatGPTWeb.ReasoningMode = "auto"
+	if changes := BuildConfigChangeDetails(oldCfg, newCfg); len(changes) != 0 {
+		t.Fatal(changes)
+	}
+	newCfg.Images.ChatGPTWeb.ReasoningMode = "instant"
+	changes := strings.Join(BuildConfigChangeDetails(oldCfg, newCfg), "\n")
+	if !strings.Contains(changes, "images.chatgpt-web.reasoning-mode: auto -> instant") {
+		t.Fatal(changes)
+	}
+}
+
 func TestCodexLiveEnabledConfigChangeDetails(t *testing.T) {
 	oldCfg, newCfg := &config.Config{}, &config.Config{Codex: config.CodexConfig{LiveEnabled: true}}
 	if changes := BuildConfigChangeDetails(oldCfg, newCfg); len(changes) != 1 || changes[0] != "codex.live-enabled: false -> true" {

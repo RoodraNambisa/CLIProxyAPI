@@ -229,6 +229,8 @@ type ChatGPTWebImageConfig struct {
 	ImageModels []string `yaml:"image-models,omitempty" json:"image-models,omitempty"`
 	// UpstreamModel is the ChatGPT Web conversation model that invokes picture_v2.
 	UpstreamModel string `yaml:"upstream-model,omitempty" json:"upstream-model,omitempty"`
+	// ReasoningMode selects the image conversation carrier, not the image tool's quality.
+	ReasoningMode string `yaml:"reasoning-mode,omitempty" json:"reasoning-mode,omitempty"`
 	// RemoteImageURLEnabled allows protected downloads for remote image inputs.
 	RemoteImageURLEnabled bool `yaml:"remote-image-url-enabled,omitempty" json:"remote-image-url-enabled,omitempty"`
 	// RemoteImageURLDownloadMode selects direct downloads or the selected credential's effective proxy.
@@ -375,6 +377,7 @@ func ChatGPTWebImageAdmissionWaitDuration(milliseconds int) (time.Duration, erro
 // ResolvedChatGPTWebImageConfig contains effective ChatGPT Web image compatibility values.
 type ResolvedChatGPTWebImageConfig struct {
 	UpstreamModel                string
+	ReasoningMode                string
 	RemoteImageURLEnabled        bool
 	RemoteImageURLDownloadMode   string
 	IgnoreUnsupportedParams      bool
@@ -414,6 +417,7 @@ func (cfg ChatGPTWebImageConfig) ResolvedUpstreamModel() string {
 func (cfg ChatGPTWebImageConfig) Resolved() ResolvedChatGPTWebImageConfig {
 	resolved := ResolvedChatGPTWebImageConfig{
 		UpstreamModel:                cfg.ResolvedUpstreamModel(),
+		ReasoningMode:                cfg.ResolvedReasoningMode(),
 		RemoteImageURLEnabled:        cfg.RemoteImageURLEnabled,
 		RemoteImageURLDownloadMode:   DefaultChatGPTWebRemoteImageDownloadMode,
 		IgnoreUnsupportedParams:      cfg.IgnoreUnsupportedParams,

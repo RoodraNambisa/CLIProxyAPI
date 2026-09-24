@@ -436,6 +436,9 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	if oldCfg.Images.ChatGPTWeb.ResolvedUpstreamModel() != newCfg.Images.ChatGPTWeb.ResolvedUpstreamModel() {
 		changes = append(changes, fmt.Sprintf("images.chatgpt-web.upstream-model: %s -> %s", oldCfg.Images.ChatGPTWeb.ResolvedUpstreamModel(), newCfg.Images.ChatGPTWeb.ResolvedUpstreamModel()))
 	}
+	if oldCfg.Images.ChatGPTWeb.ResolvedReasoningMode() != newCfg.Images.ChatGPTWeb.ResolvedReasoningMode() {
+		changes = append(changes, fmt.Sprintf("images.chatgpt-web.reasoning-mode: %s -> %s", oldCfg.Images.ChatGPTWeb.ResolvedReasoningMode(), newCfg.Images.ChatGPTWeb.ResolvedReasoningMode()))
+	}
 	if strings.Join(oldCfg.Images.ResolvedImageModels(), "\x00") != strings.Join(newCfg.Images.ResolvedImageModels(), "\x00") {
 		changes = append(changes, fmt.Sprintf("images.image-models: %v -> %v", oldCfg.Images.ResolvedImageModels(), newCfg.Images.ResolvedImageModels()))
 	}

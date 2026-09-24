@@ -5881,6 +5881,7 @@ func TestPrepareChatGPTWebImageMissingConduitSkipsCredentialState(t *testing.T) 
 		credential,
 		chatGPTWebRequirements{},
 		"gpt-5-5",
+		"",
 		"draw",
 	)
 	if err == nil || !strings.Contains(err.Error(), "missing conduit token") {
@@ -5919,6 +5920,7 @@ func TestPrepareChatGPTWebImageDoesNotConsumeSessionObserverToken(t *testing.T) 
 		credential,
 		chatGPTWebRequirements{Token: "requirements", SOToken: "one-request-token"},
 		"gpt-5-5",
+		"",
 		"draw",
 	)
 	if err != nil {

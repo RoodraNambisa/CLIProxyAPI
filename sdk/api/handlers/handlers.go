@@ -331,6 +331,8 @@ func (h *BaseAPIHandler) filterChatGPTWebStrictImageSize(
 			resolved = h.Cfg.Images.ChatGPTWeb.Resolved()
 		}
 		snapshot = coreexecutor.ChatGPTWebImageConfigSnapshot{
+			UpstreamModel:                resolved.UpstreamModel,
+			ReasoningMode:                resolved.ReasoningMode,
 			AutoCleanupLibraryOnFull:     resolved.AutoCleanupLibraryOnFull,
 			RemoteImageURLEnabled:        resolved.RemoteImageURLEnabled,
 			RemoteImageURLDownloadMode:   resolved.RemoteImageURLDownloadMode,

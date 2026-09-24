@@ -26,6 +26,11 @@ func (cfg *ChatGPTWebImageConfig) UnmarshalYAML(node *yaml.Node) error {
 			return fmt.Errorf("images.chatgpt-web.auto-cleanup-library-on-full must be a boolean")
 		}
 	}
+	if value, present := fields["reasoning-mode"]; present {
+		if _, ok := value.(string); !ok {
+			return fmt.Errorf("images.chatgpt-web.reasoning-mode must be a string")
+		}
+	}
 	for _, key := range []string{"bootstrap-timeout-seconds", "bootstrap-retries"} {
 		if value, present := fields[key]; present {
 			switch value.(type) {
@@ -41,6 +46,9 @@ func (cfg *ChatGPTWebImageConfig) UnmarshalYAML(node *yaml.Node) error {
 		return err
 	}
 	if err := ChatGPTWebImageConfig(decoded).ValidateBootstrap(); err != nil {
+		return err
+	}
+	if err := ChatGPTWebImageConfig(decoded).ValidateReasoningMode(); err != nil {
 		return err
 	}
 	*cfg = ChatGPTWebImageConfig(decoded)

@@ -756,6 +756,8 @@ func TestOpenAIImagesPinsChatGPTWebImageAspectConfig(t *testing.T) {
 	h.Cfg.Images.ChatGPTWeb.StrictSize = true
 	h.Cfg.Images.ChatGPTWeb.NormalizeMismatchedImageMIME = true
 	h.Cfg.Images.ChatGPTWeb.NormalizeRemoteImageMIME = &disabled
+	h.Cfg.Images.ChatGPTWeb.UpstreamModel = "pinned-carrier"
+	h.Cfg.Images.ChatGPTWeb.ReasoningMode = "high"
 	router := gin.New()
 	router.Use(allowedImageProvidersMiddleware(constant.ChatGPTWeb))
 	router.POST("/v1/images/generations", h.Generations)
@@ -770,7 +772,7 @@ func TestOpenAIImagesPinsChatGPTWebImageAspectConfig(t *testing.T) {
 	if response.Code != http.StatusOK {
 		t.Fatalf("status = %d, body=%s", response.Code, response.Body.String())
 	}
-	if !executor.hasImageConfigSnapshot || !executor.imageConfigSnapshot.AdaptSizeToAspectRatio || !executor.imageConfigSnapshot.StrictSize ||
+	if !executor.hasImageConfigSnapshot || executor.imageConfigSnapshot.UpstreamModel != "pinned-carrier" || executor.imageConfigSnapshot.ReasoningMode != "high" || !executor.imageConfigSnapshot.AdaptSizeToAspectRatio || !executor.imageConfigSnapshot.StrictSize ||
 		!executor.imageConfigSnapshot.NormalizeMismatchedImageMIME || executor.imageConfigSnapshot.NormalizeRemoteImageMIME ||
 		executor.imageConfigSnapshot.AspectRatioMaxErrorPercent != 1 || executor.imageConfigSnapshot.MaxResizeEdgePixels != 3840 ||
 		executor.imageConfigSnapshot.ResizeFilter != sdkconfig.DefaultChatGPTWebResizeFilter ||

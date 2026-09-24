@@ -4107,6 +4107,9 @@ func SaveConfigPreserveComments(configFile string, cfg *Config) error {
 	if errBootstrap := cfg.Images.ChatGPTWeb.ValidateBootstrap(); errBootstrap != nil {
 		return errBootstrap
 	}
+	if errReasoning := cfg.Images.ChatGPTWeb.ValidateReasoningMode(); errReasoning != nil {
+		return errReasoning
+	}
 	if errWeight := cfg.ValidateCredentialWeights(); errWeight != nil {
 		return errWeight
 	}

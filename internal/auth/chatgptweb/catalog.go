@@ -11,17 +11,21 @@ import (
 // CatalogModel is the subset of ChatGPT Web model metadata used by the runtime
 // registry.
 type CatalogModel struct {
-	Slug        string
-	Created     int64
-	OwnedBy     string
-	DisplayName string
+	Slug            string
+	Created         int64
+	OwnedBy         string
+	DisplayName     string
+	Instant         bool
+	ThinkingDefault bool
+	ThinkingEfforts []string
 }
 
 // DecodeCatalog parses /backend-api/models and drops malformed model entries.
 // A valid empty models array is a successful empty catalog.
 func DecodeCatalog(payload []byte) ([]CatalogModel, error) {
 	var root struct {
-		Models json.RawMessage `json:"models"`
+		Models     json.RawMessage `json:"models"`
+		Categories json.RawMessage `json:"categories"`
 	}
 	if err := json.Unmarshal(payload, &root); err != nil {
 		return nil, fmt.Errorf("decode chatgpt web model catalog: %w", err)
@@ -34,6 +38,27 @@ func DecodeCatalog(payload []byte) ([]CatalogModel, error) {
 		return nil, fmt.Errorf("decode chatgpt web model entries: %w", err)
 	}
 	seen := make(map[string]struct{}, len(entries))
+	instantModels := make(map[string]bool)
+	thinkingModels := make(map[string]bool)
+	// Optional category drift must not discard an otherwise valid model list.
+	var categories []json.RawMessage
+	_ = json.Unmarshal(root.Categories, &categories)
+	for _, rawCategory := range categories {
+		var category struct {
+			ModelLane    string `json:"model_lane"`
+			DefaultModel string `json:"default_model"`
+		}
+		if json.Unmarshal(rawCategory, &category) != nil {
+			continue
+		}
+		model := strings.ToLower(strings.TrimSpace(category.DefaultModel))
+		if (category.ModelLane == "auto" || category.ModelLane == "instant") && model != "" && model != "auto" {
+			instantModels[model] = true
+		}
+		if category.ModelLane == "thinking" && model != "" {
+			thinkingModels[model] = true
+		}
+	}
 	models := make([]CatalogModel, 0, len(entries))
 	recognizedEntries := 0
 	for _, rawEntry := range entries {
@@ -71,8 +96,20 @@ func DecodeCatalog(payload []byte) ([]CatalogModel, error) {
 		if displayName == "" {
 			displayName = slug
 		}
+		var efforts []string
+		if values, ok := entry["thinking_efforts"].([]any); ok {
+			for _, value := range values {
+				if item, okItem := value.(map[string]any); okItem {
+					if effort := strings.TrimSpace(valueString(item["thinking_effort"])); effort != "" {
+						efforts = append(efforts, effort)
+					}
+				}
+			}
+		}
 		models = append(models, CatalogModel{
 			Slug: slug, Created: created, OwnedBy: ownedBy, DisplayName: displayName,
+			Instant:         instantModels[key],
+			ThinkingDefault: thinkingModels[key], ThinkingEfforts: efforts,
 		})
 	}
 	if len(entries) > 0 && recognizedEntries == 0 {
