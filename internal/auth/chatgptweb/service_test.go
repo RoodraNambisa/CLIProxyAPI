@@ -2506,6 +2506,7 @@ func TestServiceRefreshSessionRejectsAccountSwitch(t *testing.T) {
 			return
 		}
 		response.Header().Set("Content-Type", "application/json")
+		http.SetCookie(response, &http.Cookie{Name: "next-auth.session-token", Value: "foreign-session", Path: "/"})
 		_, _ = io.WriteString(response, `{"accessToken":"opaque-new-token","user":{"id":"user-b","email":"other@example.com"},"account":{"id":"account-b"}}`)
 	}))
 	defer server.Close()
@@ -2528,6 +2529,9 @@ func TestServiceRefreshSessionRejectsAccountSwitch(t *testing.T) {
 	}
 	if credential.AccountID != "account-a" || credential.Email != "person@example.com" || credential.LifecycleState != LifecycleReauthRequired {
 		t.Fatalf("credential = %#v", credential)
+	}
+	if credential.SessionToken != "session-value" {
+		t.Fatal("foreign session cookie was retained after an identity conflict")
 	}
 }
 

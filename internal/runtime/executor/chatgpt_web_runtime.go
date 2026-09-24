@@ -1358,7 +1358,12 @@ func chatGPTWebMetadataString(metadata map[string]any, key string) string {
 }
 
 // FetchModels refreshes the authenticated ChatGPT Web model catalog.
-func (e *ChatGPTWebExecutor) FetchModels(ctx context.Context, auth *cliproxyauth.Auth) ([]chatgptwebauth.CatalogModel, error) {
+func (e *ChatGPTWebExecutor) FetchModels(ctx context.Context, auth *cliproxyauth.Auth) (models []chatgptwebauth.CatalogModel, errResult error) {
+	defer func() {
+		if e.manager != nil {
+			errResult = e.manager.RecoverChatGPTWebUnauthorizedInBackground(ctx, auth, errResult)
+		}
+	}()
 	client, credential, err := e.newRuntimeClient(auth)
 	if err != nil {
 		return nil, err
@@ -2677,6 +2682,9 @@ func (e chatGPTWebHTTPError) ChatGPTWebLifecycleError() *chatgptwebauth.AuthErro
 func newChatGPTWebStatusError(code int, path string, body []byte, headers fhttp.Header) chatGPTWebHTTPError {
 	sanitizedBody := chatGPTWebStatusErrorBody(path, body)
 	lifecycleError := chatgptwebauth.ClassifyPermanentAccountResponse(code, body)
+	if lifecycleError == nil {
+		lifecycleError = chatgptwebauth.ClassifyRevokedAccessTokenResponse(code, body)
+	}
 	turnstileFinalizeRejection := false
 	sentinelFinalizeRejection := false
 	if path == "/backend-api/sentinel/chat-requirements/finalize" &&

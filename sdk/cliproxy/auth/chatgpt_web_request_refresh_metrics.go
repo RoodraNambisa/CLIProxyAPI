@@ -12,6 +12,7 @@ const (
 	ChatGPTWebRequestRefreshOutcomeProbeSucceeded    = "probe_succeeded"
 	ChatGPTWebRequestRefreshOutcomeProbeUnauthorized = "probe_unauthorized"
 	ChatGPTWebRequestRefreshOutcomeProbeTransient    = "probe_transient"
+	ChatGPTWebRequestRefreshOutcomeTokenRevoked      = "token_revoked"
 )
 
 type chatGPTWebRequestRefreshMetrics struct {

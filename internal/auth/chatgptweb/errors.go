@@ -1,8 +1,10 @@
 package chatgptweb
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 	"time"
 )
@@ -110,6 +112,27 @@ func ClassifyPermanentAccountResponse(status int, payload []byte) *AuthError {
 	return &result
 }
 
+// ClassifyRevokedAccessTokenResponse requires an explicit upstream error code;
+// HTML, arbitrary messages and ordinary unauthorized responses are not revocation evidence.
+func ClassifyRevokedAccessTokenResponse(status int, payload []byte) *AuthError {
+	if status != http.StatusUnauthorized {
+		return nil
+	}
+	type codeValue struct {
+		Code string `json:"code"`
+	}
+	var body struct {
+		Code   string    `json:"code"`
+		Error  codeValue `json:"error"`
+		Detail codeValue `json:"detail"`
+	}
+	if json.Unmarshal(payload, &body) != nil ||
+		(body.Code != "token_revoked" && body.Error.Code != "token_revoked" && body.Detail.Code != "token_revoked") {
+		return nil
+	}
+	return newAuthError("token_revoked", LifecycleReauthRequired, status, false, true, "upstream revoked the access token; sign in again", nil)
+}
+
 // SafeLifecycleReason returns a stable, non-sensitive lifecycle error code.
 func SafeLifecycleReason(value string) string {
 	normalized := strings.ToLower(strings.TrimSpace(value))
@@ -178,7 +201,11 @@ func SafeLifecycleReason(value string) string {
 		"session_cookie_missing",
 		"session_expired",
 		"session_response_invalid",
+		"session_response_error",
+		"session_refresh_failed",
 		"session_refresh_network_error",
+		"access_token_expired",
+		"token_revoked",
 		"token_only_expired",
 		"refresh_strategy_invalid",
 		"source_auth_missing",

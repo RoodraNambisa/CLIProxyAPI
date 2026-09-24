@@ -683,6 +683,13 @@ func (e *ChatGPTWebExecutor) RefreshToCompletion(ctx context.Context, auth *clip
 	return nil, newChatGPTWebCredentialUnavailableError(refreshErr, false)
 }
 
+// RejectRevokedAccessToken keeps explicitly revoked credentials out of routing
+// and delegates recovery to the existing bounded re-login queue.
+func (e *ChatGPTWebExecutor) RejectRevokedAccessToken(auth *cliproxyauth.Auth) (*cliproxyauth.Auth, error) {
+	return e.chatGPTWebUnauthorizedRefreshLifecycleResult(auth, "token_revoked",
+		cliproxyauth.ChatGPTWebRequestRefreshOutcomeTokenRevoked, http.StatusUnauthorized)
+}
+
 // Login exposes the provider-local login implementation to management tasks.
 func (e *ChatGPTWebExecutor) Login(ctx context.Context, input chatgptwebauth.LoginInput) (*chatgptwebauth.Credential, error) {
 	if e == nil || e.authService == nil {
@@ -2341,16 +2348,10 @@ func chatGPTWebCredentialExpiry(credential *chatgptwebauth.Credential) (time.Tim
 	if credential == nil {
 		return time.Time{}, false
 	}
-	if value := strings.TrimSpace(credential.Expired); value != "" {
-		if parsed, err := time.Parse(time.RFC3339, value); err == nil {
-			return parsed, true
-		}
-		return time.Time{}, true
-	}
-	if expiresAt, ok := chatgptwebauth.JWTExpiry(credential.AccessToken); ok {
-		return expiresAt, true
-	}
-	return chatgptwebauth.JWTExpiry(credential.IDToken)
+	return (&cliproxyauth.Auth{Provider: chatgptwebauth.Provider, Metadata: map[string]any{
+		"access_token": credential.AccessToken,
+		"expired":      credential.Expired,
+	}}).AccessTokenExpirationTime()
 }
 
 func chatGPTWebRefreshKey(auth *cliproxyauth.Auth) string {

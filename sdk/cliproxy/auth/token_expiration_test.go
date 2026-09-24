@@ -30,7 +30,7 @@ func TestCodexTokenExpirationUsesJWTWithoutAssumingAuthorization(t *testing.T) {
 	if blocked, _, _ := isAuthBlockedForModel(credential, "gpt-5.4", now); !blocked {
 		t.Fatal("an unexpired claim bypassed revoked credential state")
 	}
-	credential.Provider = "chatgpt-web"
+	credential.Provider = "unrelated-provider"
 	credential.Metadata["expires_at"] = now.Add(2 * time.Hour).Format(time.RFC3339)
 	if exp, _ := credential.ExpirationTime(); !exp.Equal(now.Add(2 * time.Hour)) {
 		t.Fatal("Codex expiry update changed another provider's expiry precedence")

@@ -18,7 +18,13 @@ func (a *Auth) AccessTokenExpirationTime() (time.Time, bool) {
 	if expires, ok := parseJWTExpiration(authAccessToken(a)); ok {
 		return expires, true
 	}
-	return expirationFromMap(a.Metadata)
+	if expires, ok := expirationFromMap(a.Metadata); ok {
+		return expires, true
+	}
+	if strings.EqualFold(strings.TrimSpace(a.Provider), "chatgpt-web") && authMetadataString(a, "expired") != "" {
+		return time.Time{}, true
+	}
+	return time.Time{}, false
 }
 
 func codexAccessTokenExpiration(auth *Auth) (time.Time, bool) {

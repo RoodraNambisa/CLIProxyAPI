@@ -80,6 +80,12 @@ type UnauthorizedRequestRefreshValidator interface {
 	ValidateUnauthorizedRequestRefresh(ctx context.Context, failedAccessToken string, previous, refreshed *Auth) (*Auth, error)
 }
 
+// RevokedAccessTokenHandler plans a terminal recovery transition without
+// exchanging credentials that the provider has explicitly revoked.
+type RevokedAccessTokenHandler interface {
+	RejectRevokedAccessToken(auth *Auth) (*Auth, error)
+}
+
 type backgroundReloginTrigger interface {
 	TriggerBackgroundRelogin(expected *Auth) bool
 }
@@ -9044,6 +9050,7 @@ type chatGPTWebUnauthorizedRequestError struct {
 }
 
 type chatGPTWebUnauthorizedRefreshContextKey struct{}
+type chatGPTWebRevokedAccessTokenContextKey struct{}
 
 type chatGPTWebRequestRefreshFlight struct {
 	done   chan struct{}
@@ -9103,6 +9110,22 @@ func triggerChatGPTWebUnauthorizedRequestRefresh(err error) {
 	wrapped.startOnce.Do(wrapped.startRefresh)
 }
 
+// RecoverChatGPTWebUnauthorizedInBackground lets per-credential maintenance
+// reuse request recovery without waiting for refresh or substituting accounts.
+func (m *Manager) RecoverChatGPTWebUnauthorizedInBackground(ctx context.Context, auth *Auth, err error) error {
+	if cliproxyexecutor.SingleAttempt(ctx) || m == nil || auth == nil || !strings.EqualFold(auth.Provider, "chatgpt-web") || !isChatGPTWebAuthenticationRecoveryError(err) {
+		return err
+	}
+	// Credential acquisition already owns recovery and its refresh locks. Do not
+	// pass those lock-ownership markers into a second asynchronous recovery job.
+	if _, held := authRequestRefreshLockFromContext(ctx, m, auth.ID); held {
+		return err
+	}
+	wrapped := m.wrapChatGPTWebUnauthorizedRequestError(ctx, auth, err)
+	triggerChatGPTWebUnauthorizedRequestRefresh(wrapped)
+	return wrapped
+}
+
 func (m *Manager) wrapChatGPTWebUnauthorizedRequestError(ctx context.Context, auth *Auth, err error) error {
 	if isChatGPTWebUnauthorizedRequestError(err) {
 		return err
@@ -9113,8 +9136,11 @@ func (m *Manager) wrapChatGPTWebUnauthorizedRequestError(ctx context.Context, au
 	var lifecycleProvider interface {
 		ChatGPTWebLifecycleError() *chatgptwebauth.AuthError
 	}
+	var revoked bool
 	if errors.As(err, &lifecycleProvider) && lifecycleProvider != nil {
-		if lifecycle := lifecycleProvider.ChatGPTWebLifecycleError(); lifecycle != nil && lifecycle.State == chatgptwebauth.LifecycleDead {
+		lifecycle := lifecycleProvider.ChatGPTWebLifecycleError()
+		revoked = lifecycle != nil && lifecycle.Code == "token_revoked"
+		if lifecycle != nil && lifecycle.State == chatgptwebauth.LifecycleDead {
 			reason := chatgptwebauth.SafeLifecycleReason(lifecycle.Code)
 			if reason != "account_deleted" && reason != "account_deactivated" {
 				if m != nil {
@@ -9156,6 +9182,9 @@ func (m *Manager) wrapChatGPTWebUnauthorizedRequestError(ctx context.Context, au
 		refreshCtx := context.Background()
 		if ctx != nil {
 			refreshCtx = context.WithoutCancel(ctx)
+		}
+		if revoked {
+			refreshCtx = context.WithValue(refreshCtx, chatGPTWebRevokedAccessTokenContextKey{}, true)
 		}
 		_, errStart := m.startChatGPTWebRequestRefreshFlight(refreshCtx, refreshAuth.ID, failedAccessToken, refreshAuth, true)
 		if errStart != nil {
@@ -11725,6 +11754,9 @@ func (m *Manager) startChatGPTWebRequestRefreshFlight(
 	key := chatGPTWebRequestRefreshFlightKey(id, expected)
 	if validateUnauthorized {
 		key += "\x00unauthorized"
+		if revoked, _ := ctx.Value(chatGPTWebRevokedAccessTokenContextKey{}).(bool); revoked {
+			key += "\x00revoked"
+		}
 	} else {
 		key += "\x00maintenance"
 	}
@@ -12101,17 +12133,23 @@ func (m *Manager) refreshProviderForRequestSynchronized(ctx context.Context, id,
 	if !active {
 		return nil, runtimeAuthInstanceRetiredError()
 	}
-	resolvedRefreshInput, errProxy := m.ResolveProxyAuth(refreshCtx, refreshInput)
-	if errProxy != nil {
-		retiredDuringRefresh := releaseRefresh()
-		if retiredDuringRefresh || runtimeAuthInstanceRetiredContext(refreshCtx) {
-			return nil, runtimeAuthInstanceRetiredError()
+	var updated *Auth
+	var errRefresh error
+	revoked, _ := refreshCtx.Value(chatGPTWebRevokedAccessTokenContextKey{}).(bool)
+	if handler, ok := exec.(RevokedAccessTokenHandler); ok && provider == "chatgpt-web" && requestUnauthorized && revoked {
+		updated, errRefresh = handler.RejectRevokedAccessToken(refreshInput)
+	} else {
+		resolvedRefreshInput, errProxy := m.ResolveProxyAuth(refreshCtx, refreshInput)
+		if errProxy != nil {
+			retiredDuringRefresh := releaseRefresh()
+			if retiredDuringRefresh || runtimeAuthInstanceRetiredContext(refreshCtx) {
+				return nil, runtimeAuthInstanceRetiredError()
+			}
+			return nil, errProxy
 		}
-		return nil, errProxy
+		refreshInput = resolvedRefreshInput
+		updated, errRefresh = refreshExecutorCredential(refreshCtx, exec, refreshInput)
 	}
-	refreshInput = resolvedRefreshInput
-
-	updated, errRefresh := refreshExecutorCredential(refreshCtx, exec, refreshInput)
 	if errRefresh == nil && provider == "chatgpt-web" {
 		if requestUnauthorized {
 			if validator, ok := exec.(UnauthorizedRequestRefreshValidator); ok {

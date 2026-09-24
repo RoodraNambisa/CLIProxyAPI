@@ -5087,6 +5087,12 @@ func (e *ChatGPTWebExecutor) fetchChatGPTWebAccountInfo(ctx context.Context, aut
 			chatGPTWebAccountInfoManualLifecycleBypass(ctx) {
 			return
 		}
+		for _, failure := range []error{profileErr, quotaErr} {
+			if lifecycle := chatGPTWebLifecycleError(failure); e.manager != nil && lifecycle != nil && lifecycle.Code == "token_revoked" {
+				e.manager.RecoverChatGPTWebUnauthorizedInBackground(ctx, current, failure)
+				return
+			}
+		}
 		installed, errRefresh := e.refreshChatGPTWebAccountInfoCredential(ctx, current)
 		if installed != nil {
 			current = installed
@@ -5274,6 +5280,9 @@ func (e *ChatGPTWebExecutor) chatGPTWebUnauthorizedRefreshLifecycleResult(
 		StatusCode:     status,
 		Terminal:       true,
 		Message:        "refreshed credential did not pass authenticated validation",
+	}
+	if reason == "token_revoked" {
+		authError.Message = "upstream revoked the access token; sign in again"
 	}
 	return updated, newChatGPTWebCredentialUnavailableError(
 		newChatGPTWebUnauthorizedRefreshValidationError(authError, outcome),

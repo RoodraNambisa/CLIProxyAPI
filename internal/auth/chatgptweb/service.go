@@ -648,46 +648,7 @@ func (service *Service) RefreshSession(ctx context.Context, credential Credentia
 		return refreshed, authError
 	}
 
-	response, payload, err := client.DoNoRedirect(acquisitionContext, http.MethodGet,
-		service.options.SessionBaseURL+"/api/auth/session?refresh=true",
-		map[string]string{
-			"accept":         "application/json",
-			"referer":        service.options.SessionBaseURL + "/",
-			"sec-fetch-dest": "empty",
-			"sec-fetch-mode": "cors",
-			"sec-fetch-site": "same-origin",
-		}, nil)
-	if err != nil {
-		authError := networkAuthError("session_refresh_network_error", LifecycleActive, err)
-		service.applyFailure(refreshed, authError, false)
-		return refreshed, authError
-	}
-	if isCloudflareChallenge(response, payload) {
-		authError := newAuthError("cloudflare_challenge", LifecycleActive, response.StatusCode, true, false, "Cloudflare challenge blocked session refresh", nil)
-		service.applyFailure(refreshed, authError, false)
-		return refreshed, authError
-	}
-	if response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden ||
-		(response.StatusCode >= http.StatusMultipleChoices && response.StatusCode < http.StatusBadRequest) {
-		authError := newAuthError("session_expired", LifecycleReauthRequired, response.StatusCode, false, true, "chatgpt session must be renewed", nil)
-		service.applyFailure(refreshed, authError, false)
-		return refreshed, authError
-	}
-	if authError := classifyHTTPResponse("session_refresh", response.StatusCode, payload, LifecycleActive); authError != nil {
-		service.applyFailure(refreshed, authError, false)
-		return refreshed, authError
-	}
-	var session sessionPayload
-	if err = json.Unmarshal(payload, &session); err != nil {
-		authError := newAuthError("session_response_invalid", LifecycleActive, response.StatusCode, true, false, "session endpoint returned invalid JSON", err)
-		service.applyFailure(refreshed, authError, false)
-		return refreshed, authError
-	}
-	if strings.TrimSpace(session.AccessToken) == "" {
-		authError := newAuthError("access_token_missing", LifecycleReauthRequired, response.StatusCode, false, true, "session endpoint did not return an access token", nil)
-		service.applyFailure(refreshed, authError, false)
-		return refreshed, authError
-	}
+	session, authError := service.refreshSessionToken(acquisitionContext, client)
 	incomingIdentity := &Credential{
 		Email:       strings.TrimSpace(session.User.Email),
 		AccountID:   strings.TrimSpace(session.Account.ID),
@@ -700,11 +661,14 @@ func (service *Service) RefreshSession(ctx context.Context, credential Credentia
 		service.applyFailure(refreshed, authError, false)
 		return refreshed, authError
 	}
+	refreshed.Cookies = client.ExportCookies()
+	refreshed.Cookies, refreshed.SessionToken = normalizeSessionCookies(refreshed.Cookies)
+	if authError != nil {
+		service.applyFailure(refreshed, authError, false)
+		return refreshed, authError
+	}
 	refreshed.AccessToken = strings.TrimSpace(session.AccessToken)
 	refreshed.Expired = tokenExpiryString(refreshed.AccessToken)
-	if refreshed.Expired == "" {
-		refreshed.Expired = strings.TrimSpace(session.Expires)
-	}
 	if email := strings.TrimSpace(session.User.Email); email != "" {
 		refreshed.Email = email
 	}
@@ -717,8 +681,6 @@ func (service *Service) RefreshSession(ctx context.Context, credential Credentia
 	if planType := strings.TrimSpace(session.Account.PlanType); planType != "" {
 		refreshed.PlanType = planType
 	}
-	refreshed.Cookies = client.ExportCookies()
-	refreshed.Cookies, refreshed.SessionToken = normalizeSessionCookies(refreshed.Cookies)
 	refreshed.LastRefreshAt = service.timestamp()
 	service.updateLifecycle(refreshed, LifecycleActive, "")
 	return refreshed, nil
@@ -881,9 +843,10 @@ type tokenPayload struct {
 }
 
 type sessionPayload struct {
-	AccessToken string `json:"accessToken"`
-	IDToken     string `json:"idToken"`
-	Expires     string `json:"expires"`
+	AccessToken string          `json:"accessToken"`
+	IDToken     string          `json:"idToken"`
+	Expires     string          `json:"expires"`
+	Error       json.RawMessage `json:"error"`
 	User        struct {
 		ID    string `json:"id"`
 		Email string `json:"email"`
