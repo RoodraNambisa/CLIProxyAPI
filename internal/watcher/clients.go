@@ -608,6 +608,10 @@ func (w *Watcher) addOrUpdateClientWithPersistedHashLocked(path, persistedHash s
 	}
 	data, fileVersion, errRead := readAuthFileVersionUnderRoot(w.authRootDir(), path)
 	if errRead != nil {
+		if os.IsNotExist(errRead) {
+			log.Debugf("ignoring auth file that disappeared before reading: %s", filepath.Base(path))
+			return
+		}
 		log.Errorf("failed to read auth file %s: %v", filepath.Base(path), errRead)
 		return
 	}
@@ -1131,12 +1135,7 @@ func (w *Watcher) requiresRetiredAuthDeletion(path string) bool {
 	return len(synthesizer.SynthesizeAuthFile(sctx, path, data)) > 0
 }
 
-func (w *Watcher) finalizeRetiredAuthReplacement(path string) bool {
-	if !w.requiresRetiredAuthDeletion(path) {
-		return false
-	}
-	unlockPath := authfileguard.Lock(path)
-	defer unlockPath()
+func (w *Watcher) finalizeRetiredAuthReplacementLocked(path string) bool {
 	if !w.requiresRetiredAuthDeletion(path) {
 		return false
 	}

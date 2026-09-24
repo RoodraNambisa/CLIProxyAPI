@@ -214,39 +214,33 @@ func (w *Watcher) handleEvent(event fsnotify.Event) {
 		w.scheduleConfigReload()
 		return
 	}
-	if event.Op&(fsnotify.Create|fsnotify.Write) != 0 {
-		defer w.clearRemoveDebounce(normalizedName)
-	}
-	if info, errInfo := os.Lstat(event.Name); errInfo == nil && info.Mode()&os.ModeSymlink != 0 {
-		log.Warnf("ignoring symlink auth file event: %s", filepath.Base(event.Name))
-		w.removeClientState(event.Name, false)
-		return
-	}
-
-	// Handle auth directory changes incrementally (.json only)
-	if event.Op&(fsnotify.Remove|fsnotify.Rename) != 0 {
+	removal := event.Op&(fsnotify.Remove|fsnotify.Rename) != 0
+	if removal {
 		if w.shouldDebounceRemove(normalizedName, now) {
 			log.Debugf("debouncing remove event for %s", filepath.Base(event.Name))
 			return
 		}
-		// Atomic replace on some platforms may surface as Rename (or Remove) before the new file is ready.
-		// Wait briefly; if the path exists again, treat it as an update unless the previous
-		// credential was retired and still requires confirmed deletion.
-		time.Sleep(replaceCheckDelay)
-		if _, statErr := os.Stat(event.Name); statErr == nil {
-			if w.finalizeRetiredAuthReplacement(event.Name) {
-				log.Infof("auth file changed (%s): %s, finalizing retired deletion before replacement", event.Op.String(), filepath.Base(event.Name))
-				if !w.requiresRetiredAuthDeletion(event.Name) {
-					w.addOrUpdateClient(event.Name)
-				}
-				return
-			}
-			if unchanged, errSame := w.authFileUnchanged(event.Name); errSame == nil && unchanged {
-				log.Debugf("auth file unchanged (hash match), skipping reload: %s", filepath.Base(event.Name))
-				return
-			}
-			log.Infof("auth file changed (%s): %s, processing incrementally", event.Op.String(), filepath.Base(event.Name))
-			w.addOrUpdateClient(event.Name)
+		// Give external, non-atomic replacements a short grace period without
+		// holding the save lock. Existing atomic replacements need no delay.
+		if _, errInfo := os.Lstat(event.Name); os.IsNotExist(errInfo) {
+			time.Sleep(replaceCheckDelay)
+		}
+	}
+
+	// Events describe past changes, not the current filesystem state. Inspect
+	// and apply under the same path lock as saves; never delete based on a
+	// missing-path observation made before waiting for an in-flight save.
+	unlockPath := authfileguard.Lock(event.Name)
+	defer unlockPath()
+	info, errInfo := os.Lstat(event.Name)
+	if errInfo != nil {
+		if !os.IsNotExist(errInfo) {
+			w.clearRemoveDebounce(normalizedName)
+			log.Warnf("failed to inspect auth file %s; keeping current credential: %v", filepath.Base(event.Name), errInfo)
+			return
+		}
+		if !removal {
+			log.Debugf("ignoring stale auth file event (%s): %s no longer exists", event.Op.String(), filepath.Base(event.Name))
 			return
 		}
 		if !w.isKnownAuthFile(event.Name) {
@@ -254,24 +248,28 @@ func (w *Watcher) handleEvent(event fsnotify.Event) {
 			return
 		}
 		log.Infof("auth file changed (%s): %s, processing incrementally", event.Op.String(), filepath.Base(event.Name))
-		w.removeClient(event.Name)
+		w.removeClientStateLocked(event.Name, true)
 		return
 	}
-	if event.Op&(fsnotify.Create|fsnotify.Write) != 0 {
-		if w.finalizeRetiredAuthReplacement(event.Name) {
-			log.Infof("auth file changed (%s): %s, finalizing retired deletion before replacement", event.Op.String(), filepath.Base(event.Name))
-			if !w.requiresRetiredAuthDeletion(event.Name) {
-				w.addOrUpdateClient(event.Name)
-			}
-			return
-		}
-		if unchanged, errSame := w.authFileUnchanged(event.Name); errSame == nil && unchanged {
-			log.Debugf("auth file unchanged (hash match), skipping reload: %s", filepath.Base(event.Name))
-			return
-		}
-		log.Infof("auth file changed (%s): %s, processing incrementally", event.Op.String(), filepath.Base(event.Name))
-		w.addOrUpdateClient(event.Name)
+	w.clearRemoveDebounce(normalizedName)
+	if info.Mode()&os.ModeSymlink != 0 {
+		log.Warnf("ignoring symlink auth file event: %s", filepath.Base(event.Name))
+		w.removeClientStateLocked(event.Name, false)
+		return
 	}
+	if w.finalizeRetiredAuthReplacementLocked(event.Name) {
+		log.Infof("auth file changed (%s): %s, finalizing retired deletion before replacement", event.Op.String(), filepath.Base(event.Name))
+		if !w.requiresRetiredAuthDeletion(event.Name) {
+			w.addOrUpdateClientLocked(event.Name)
+		}
+		return
+	}
+	if unchanged, errSame := w.authFileUnchangedLocked(event.Name); errSame == nil && unchanged {
+		log.Debugf("auth file unchanged (hash match), skipping reload: %s", filepath.Base(event.Name))
+		return
+	}
+	log.Infof("auth file changed (%s): %s, processing incrementally", event.Op.String(), filepath.Base(event.Name))
+	w.addOrUpdateClientLocked(event.Name)
 }
 
 func (w *Watcher) beginInitialSyncEventBuffer() {
@@ -365,19 +363,21 @@ func (w *Watcher) drainInitialSyncEventLoop(ctx context.Context) bool {
 }
 
 func (w *Watcher) replayInitialSyncAuthPath(path string) {
+	unlockPath := authfileguard.Lock(path)
+	defer unlockPath()
 	info, errInfo := os.Lstat(path)
 	if errInfo == nil {
 		if info.Mode()&os.ModeSymlink != 0 {
-			w.removeClientState(path, false)
+			w.removeClientStateLocked(path, false)
 			return
 		}
 		if info.Mode().IsRegular() {
-			w.addOrUpdateClient(path)
+			w.addOrUpdateClientLocked(path)
 		}
 		return
 	}
 	if os.IsNotExist(errInfo) && w.isTrackedAuthFile(path) {
-		w.removeClient(path)
+		w.removeClientStateLocked(path, true)
 	}
 }
 
@@ -422,6 +422,10 @@ func (w *Watcher) authFileUnchanged(path string) (bool, error) {
 	// manager generation is marked before the watcher classifies it.
 	unlockPath := authfileguard.Lock(path)
 	defer unlockPath()
+	return w.authFileUnchangedLocked(path)
+}
+
+func (w *Watcher) authFileUnchangedLocked(path string) (bool, error) {
 	if info, errInfo := os.Lstat(path); errInfo == nil && info.Mode()&os.ModeSymlink != 0 {
 		return false, os.ErrInvalid
 	}
