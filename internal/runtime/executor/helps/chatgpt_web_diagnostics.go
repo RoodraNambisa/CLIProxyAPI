@@ -17,6 +17,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/managementdiag"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	"github.com/tidwall/gjson"
+	"golang.org/x/net/html"
 )
 
 const (
@@ -89,6 +90,10 @@ func ClassifyChatGPTWebHTTPDiagnostic(status int, path string, body []byte, head
 	}
 	responseType := chatGPTWebDiagnosticResponseType(contentType, body)
 	responseBody, responseBodyTruncated := chatGPTWebDiagnosticResponseBody(body, responseType)
+	responseText := ""
+	if status >= http.StatusBadRequest && responseType == "html" {
+		responseText = chatGPTWebHTMLDiagnosticText(body)
+	}
 	cloudflare := chatGPTWebDiagnosticCloudflare(status, cfMitigated, server, responseType, body)
 	code := chatGPTWebDiagnosticErrorCode(status, responseType, cloudflare, body)
 	retryable := cloudflare || status == http.StatusRequestTimeout || status == http.StatusTooEarly ||
@@ -104,11 +109,46 @@ func ClassifyChatGPTWebHTTPDiagnostic(status int, path string, body []byte, head
 		TargetPath:            safeChatGPTWebDiagnosticPath(path),
 		ResponseBytes:         int64(len(body)),
 		ResponseBody:          responseBody,
+		ResponseText:          responseText,
 		ResponseBodyTruncated: responseBodyTruncated,
 		HTTPStatus:            status,
 		Cloudflare:            cloudflare,
 		Retryable:             retryable,
 	}
+}
+
+// Error-page text must not disappear behind a long inline logo or stylesheet.
+// Tokenization never executes scripts and remains bounded on oversized pages.
+func chatGPTWebHTMLDiagnosticText(body []byte) string {
+	if len(body) > 64<<10 {
+		body = body[:64<<10]
+	}
+	tokens := html.NewTokenizer(bytes.NewReader(body))
+	var result strings.Builder
+	skip := ""
+	for result.Len() < 4096 {
+		kind := tokens.Next()
+		if kind == html.ErrorToken {
+			break
+		}
+		token := tokens.Token()
+		if skip != "" {
+			if kind == html.EndTagToken && token.Data == skip {
+				skip = ""
+			}
+			continue
+		}
+		if kind == html.StartTagToken && (token.Data == "script" || token.Data == "style" || token.Data == "svg") {
+			skip = token.Data
+			continue
+		}
+		if kind == html.TextToken {
+			result.WriteString(token.Data)
+			result.WriteByte(' ')
+		}
+	}
+	summary, _ := managementdiag.ProcessText(strings.Join(strings.Fields(result.String()), " "), managementdiag.DetailLevelSafe, 1024)
+	return summary
 }
 
 func chatGPTWebDiagnosticResponseBody(body []byte, responseType string) (string, bool) {
@@ -353,6 +393,10 @@ func ChatGPTWebDiagnosticLogFields(diagnostic *cliproxyauth.ErrorDiagnostic) map
 	}
 	if diagnostic.CFRay != "" {
 		fields["cf_ray"] = diagnostic.CFRay
+	}
+	if diagnostic.ResponseText != "" {
+		text, _ := managementdiag.ProcessText(diagnostic.ResponseText, managementdiag.DetailLevelSafe, 1024)
+		fields["response_text"] = managementdiag.NewManagementOnlyValueWithFallback(text, text)
 	}
 	return fields
 }

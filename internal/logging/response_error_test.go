@@ -70,6 +70,52 @@ func TestGinAccessLogRetainsHTTPStatusWhenStreamReportsFailure(t *testing.T) {
 	}
 }
 
+func TestGinAccessLogKeepsUpstreamEvidencePrivateAndClearsRetries(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	hook := logtest.NewGlobal()
+	defer hook.Reset()
+	for _, mode := range []string{"failure", "retry", "success", "late"} {
+		router := gin.New()
+		router.Use(GinLogrusLogger())
+		router.POST("/v1/images/generations", func(c *gin.Context) {
+			ctx := c.Request.Context()
+			SetRequestCredential(ctx, CredentialIdentity{Provider: "chatgpt-web", Index: "first"})
+			fields := log.Fields{"stage": "upstream_request", "code": "cloudflare_challenge", "status": 403, "response_type": "html", "response_body": managementdiag.NewManagementOnlyValueWithFallback("<html>upstream detail</html>", "<html>upstream detail</html>")}
+			SetRequestUpstreamDiagnostic(ctx, "first", fields)
+			if mode == "retry" || mode == "late" {
+				SetRequestCredential(ctx, CredentialIdentity{Provider: "chatgpt-web", Index: "second"})
+			}
+			if mode == "late" {
+				SetRequestUpstreamDiagnostic(ctx, "first", fields)
+			}
+			if mode == "success" {
+				c.String(200, "image-result")
+				return
+			}
+			c.JSON(403, gin.H{"error": gin.H{"code": "permission_denied", "message": "<redacted-non-json-response-body>"}})
+		})
+		writer := httptest.NewRecorder()
+		router.ServeHTTP(writer, httptest.NewRequest("POST", "/v1/images/generations", nil))
+		entry := hook.LastEntry()
+		if entry.Data["request_id"] == "--------" {
+			t.Fatal("images request missing correlation ID")
+		}
+		_, has := entry.Data["upstream_code"]
+		if has != (mode == "failure") {
+			t.Fatalf("mode %s leaked/lost attempt diagnostic", mode)
+		}
+		if strings.Contains(writer.Body.String(), "upstream detail") {
+			t.Fatal("internal evidence entered API response")
+		}
+		if mode == "failure" {
+			raw, _ := (&LogFormatter{}).Format(entry)
+			if !strings.Contains(string(raw), "upstream detail") {
+				t.Fatal("file log lost upstream evidence")
+			}
+		}
+	}
+}
+
 func TestErrorResponseWriterBoundsCaptureAndPreservesFlushing(t *testing.T) {
 	for _, status := range []int{200, 502} {
 		base := httptest.NewRecorder()

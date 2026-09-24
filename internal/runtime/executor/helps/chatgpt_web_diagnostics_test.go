@@ -98,6 +98,22 @@ func TestClassifyChatGPTWebHTTPDiagnostic(t *testing.T) {
 	}
 }
 
+func TestChatGPTWebHTMLDiagnosticTextFindsMessageAfterLogo(t *testing.T) {
+	body := "<html><style>secret layout</style><svg><path d='" + strings.Repeat("0 1 ", 3000) + "'/></svg><p>Enable JavaScript to continue</p><p>access_token=secret-fixture</p><script>secret script</script></html>"
+	diagnostic := ClassifyChatGPTWebHTTPDiagnostic(403, "/", []byte(body), http.Header{"Content-Type": {"text/html"}, "Cf-Mitigated": {"challenge"}})
+	if !strings.Contains(diagnostic.ResponseText, "Enable JavaScript to continue") {
+		t.Fatal("logo displaced the useful diagnostic text")
+	}
+	for _, secret := range []string{"secret layout", "secret script", "secret-fixture"} {
+		if strings.Contains(diagnostic.ResponseText, secret) {
+			t.Fatal("sensitive or executable text in summary")
+		}
+	}
+	if !diagnostic.ResponseBodyTruncated || len(diagnostic.ResponseText) > 1024 {
+		t.Fatal("HTML evidence bounds lost")
+	}
+}
+
 func TestChatGPTWebDiagnosticLogFieldsIncludeCatalogIdentity(t *testing.T) {
 	diagnostic := ClassifyChatGPTWebHTTPDiagnostic(
 		http.StatusForbidden,

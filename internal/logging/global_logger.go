@@ -11,6 +11,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/managementdiag"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	log "github.com/sirupsen/logrus"
 	"gopkg.in/natefinch/lumberjack.v2"
@@ -30,7 +31,7 @@ var (
 type LogFormatter struct{}
 
 // logFieldOrder defines the display order for common log fields.
-var logFieldOrder = []string{"request_id", "provider", "auth_name", "auth_index", "model", "stage", "error_origin", "policy", "code", "status", "upstream_status", "upstream_request_id", "version", "mode", "budget", "level", "original_mode", "original_value", "min", "max", "clamped_to", "error"}
+var logFieldOrder = []string{"request_id", "provider", "auth_name", "auth_index", "model", "stage", "error_origin", "policy", "code", "status", "upstream_stage", "upstream_code", "upstream_status", "upstream_request_id", "response_type", "content_type", "target_host", "target_path", "cf_ray", "response_text", "response_body", "response_body_truncated", "version", "mode", "budget", "level", "original_mode", "original_value", "min", "max", "clamped_to", "error"}
 
 // Format renders a single log entry with custom formatting.
 func (m *LogFormatter) Format(entry *log.Entry) ([]byte, error) {
@@ -61,6 +62,24 @@ func (m *LogFormatter) Format(entry *log.Entry) ([]byte, error) {
 		var fields []string
 		for _, k := range logFieldOrder {
 			if v, ok := entry.Data[k]; ok {
+				if k == "response_body" || k == "response_text" {
+					// Only explicit safe fallbacks may enter file/console logs.
+					value, safe := v.(managementdiag.ManagementOnlyValue)
+					if !safe || value.String() == "<management-only-diagnostic>" {
+						continue
+					}
+					preview, truncated := managementdiag.ProcessResponseBody(value.String(), managementdiag.DetailLevelFull, 2048)
+					fields = append(fields, fmt.Sprintf("%s=%q", k, preview))
+					if truncated {
+						fields = append(fields, "log_preview_truncated=true")
+					}
+					continue
+				}
+				if k == "target_path" || k == "target_host" || k == "content_type" || k == "cf_ray" {
+					value, _ := managementdiag.ProcessText(fmt.Sprint(v), managementdiag.DetailLevelSafe, 256)
+					fields = append(fields, fmt.Sprintf("%s=%q", k, value))
+					continue
+				}
 				if k == "auth_name" || k == "request_id" || k == "upstream_request_id" {
 					if value := fmt.Sprint(v); value != "" && value != "--------" {
 						fields = append(fields, fmt.Sprintf("%s=%q", k, value))

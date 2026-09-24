@@ -65,7 +65,7 @@ func TestChatGPTWebRuntimeClientGuardsLaterExpiryAndCommittedRetry(t *testing.T)
 	}
 	defer client.CloseIdleConnections()
 	now = now.Add(time.Second)
-	_, _, err = client.DoNoRedirect(t.Context(), http.MethodGet, "http://127.0.0.1:1/", executor.chatGPTWebHeaders(credential, "/", nil), nil)
+	_, _, err = client.DoNoRedirect(t.Context(), http.MethodGet, "http://127.0.0.1:1/backend-api/files", executor.chatGPTWebHeaders(credential, "/backend-api/files", nil), nil)
 	var expired *chatgptwebauth.AccessTokenExpiredError
 	if !errors.As(err, &expired) {
 		t.Fatalf("runtime did not bind the expiry guard: %v", err)

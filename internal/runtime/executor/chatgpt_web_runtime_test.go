@@ -942,6 +942,25 @@ func TestChatGPTWebExecutorExecuteImageGeneration(t *testing.T) {
 	t.Cleanup(func() { cliproxyexecutor.ConfigureChatGPTWebImageAdmissions(64, 64, 8) })
 	server := newChatGPTWebImageFixture(t)
 	defer server.Close()
+	fixture := server.Config.Handler
+	server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/" {
+			if got := request.Header.Get("Authorization"); got != "" {
+				t.Errorf("homepage must not send bearer authorization: %q", got)
+				http.Error(w, "unexpected bearer on document", http.StatusForbidden)
+				return
+			}
+			http.SetCookie(w, &http.Cookie{Name: "bootstrap", Value: "ready", Path: "/"})
+		} else if strings.HasPrefix(request.URL.Path, "/backend-api/") {
+			if got := request.Header.Get("Authorization"); got != "Bearer access-token" {
+				t.Errorf("API authorization = %q", got)
+			}
+			if cookie, err := request.Cookie("bootstrap"); err != nil || cookie.Value != "ready" {
+				t.Errorf("API lost bootstrap cookie: %v", err)
+			}
+		}
+		fixture.ServeHTTP(w, request)
+	})
 	executor := NewChatGPTWebExecutor(nil, nil)
 	executor.runtimeBaseURL = server.URL
 	disableChatGPTWebImagePollWaits(executor)
@@ -1260,8 +1279,18 @@ func TestChatGPTWebExecutorFetchModels(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		switch request.URL.Path {
 		case "/":
+			if got := request.Header.Get("Authorization"); got != "" {
+				t.Errorf("homepage authorization = %q, want absent", got)
+			}
+			http.SetCookie(w, &http.Cookie{Name: "bootstrap", Value: "ready", Path: "/"})
 			_, _ = io.WriteString(w, `<html><script src="/c/build/_next/a.js"></script></html>`)
 		case "/backend-api/models":
+			if got := request.Header.Get("Authorization"); got != "Bearer access-token" {
+				t.Errorf("catalog authorization = %q", got)
+			}
+			if cookie, err := request.Cookie("bootstrap"); err != nil || cookie.Value != "ready" {
+				t.Errorf("catalog lost bootstrap cookie: %v", err)
+			}
 			_ = json.NewEncoder(w).Encode(map[string]any{"models": []any{
 				map[string]any{"slug": "gpt-5", "title": "GPT-5"},
 				map[string]any{"slug": "gpt-image-2"},
@@ -1285,6 +1314,11 @@ func TestChatGPTWebExecutorFetchModels(t *testing.T) {
 func TestChatGPTWebExecutorFetchModelsFollowsSameOriginBootstrapRedirect(t *testing.T) {
 	var bootstrapHits int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/" || request.URL.Path == "/home" {
+			if got := request.Header.Get("Authorization"); got != "" {
+				t.Errorf("homepage redirect authorization = %q, want absent", got)
+			}
+		}
 		switch request.URL.Path {
 		case "/":
 			bootstrapHits++
@@ -1319,6 +1353,11 @@ func TestChatGPTWebExecutorFetchModelsFollowsSameOriginBootstrapRedirect(t *test
 func TestChatGPTWebExecutorFetchModelsFollowsSameOriginCatalogRedirect(t *testing.T) {
 	var catalogHits int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if strings.HasPrefix(request.URL.Path, "/backend-api/") {
+			if got := request.Header.Get("Authorization"); got != "Bearer access-token" {
+				t.Errorf("catalog redirect authorization = %q", got)
+			}
+		}
 		switch request.URL.Path {
 		case "/":
 			_, _ = io.WriteString(w, `<html><script src="/c/build/_next/a.js"></script></html>`)

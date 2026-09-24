@@ -38,6 +38,7 @@ type ErrorDiagnostic struct {
 	Platform             string `json:"platform,omitempty"`
 	ResponseBytes        int64  `json:"response_bytes,omitempty"`
 	ResponseBody         string `json:"response_body,omitempty"`
+	ResponseText         string `json:"response_text,omitempty"`
 	// ResponseBodyTruncated reports that ResponseBody contains only the bounded prefix.
 	ResponseBodyTruncated bool `json:"response_body_truncated,omitempty"`
 	Attempts              int  `json:"attempts,omitempty"`

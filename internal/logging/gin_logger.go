@@ -23,6 +23,8 @@ var aiAPIPrefixes = []string{
 	"/v1/completions",
 	"/v1/messages",
 	"/v1/responses",
+	"/v1/images/generations",
+	"/v1/images/edits",
 	"/v1/alpha/search",
 	"/backend-api/codex/alpha/search",
 	"/v1beta/models/",
@@ -116,6 +118,16 @@ func GinLogrusLogger() gin.HandlerFunc {
 			fields["response_body_truncated"] = diagnostic.truncated
 			if diagnostic.status > levelStatus {
 				levelStatus = diagnostic.status
+			}
+			if diagnostic.localPolicy == "" {
+				for key, value := range requestUpstreamDiagnostic(c.Request.Context()) {
+					switch key {
+					case "stage", "code", "status":
+						fields["upstream_"+key] = value
+					default:
+						fields[key] = value
+					}
+				}
 			}
 		}
 		entry := log.WithFields(fields)

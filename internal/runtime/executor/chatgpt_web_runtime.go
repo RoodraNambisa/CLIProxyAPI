@@ -22,6 +22,7 @@ import (
 	"github.com/google/uuid"
 	chatgptwebauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/chatgptweb"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/sentinelcompat"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
@@ -2365,7 +2366,6 @@ func chatGPTWebUpstreamProtocolError(ctx context.Context, err error) error {
 
 func (e *ChatGPTWebExecutor) chatGPTWebHeaders(credential *chatgptwebauth.Credential, path string, extra map[string]string) map[string]string {
 	headers := map[string]string{
-		"authorization":           "Bearer " + strings.TrimSpace(credential.AccessToken),
 		"origin":                  e.chatGPTWebBaseURL(),
 		"referer":                 e.chatGPTWebBaseURL() + "/",
 		"oai-device-id":           strings.TrimSpace(credential.DeviceID),
@@ -2380,6 +2380,11 @@ func (e *ChatGPTWebExecutor) chatGPTWebHeaders(credential *chatgptwebauth.Creden
 		"sec-fetch-dest":          "empty",
 		"sec-fetch-mode":          "cors",
 		"sec-fetch-site":          "same-origin",
+	}
+	// The HTML document is a browser navigation, not a bearer-authenticated
+	// API call. Keep account authorization on backend API requests only.
+	if path != "/" {
+		headers["authorization"] = "Bearer " + strings.TrimSpace(credential.AccessToken)
 	}
 	for key, value := range extra {
 		if strings.TrimSpace(value) != "" {
@@ -2793,6 +2798,7 @@ func logChatGPTWebSafeDiagnostic(ctx context.Context, auth *cliproxyauth.Auth, e
 		}
 	}
 	fields := helps.ChatGPTWebDiagnosticLogFields(diagnostic)
+	logging.SetRequestUpstreamDiagnostic(ctx, diagnostic.AuthIndex, log.Fields(fields))
 	helps.LogWithRequestID(ctx).WithFields(log.Fields(fields)).Warn("chatgpt web upstream request failed")
 }
 

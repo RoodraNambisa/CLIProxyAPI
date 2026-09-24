@@ -5,6 +5,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/managementdiag"
+
 	log "github.com/sirupsen/logrus"
 )
 
@@ -23,6 +25,30 @@ func TestLogFormatterPrintsVersionField(t *testing.T) {
 	line := string(formatted)
 	if !strings.Contains(line, "version=2.2.1") {
 		t.Fatalf("formatted line %q missing version field", line)
+	}
+}
+
+func TestLogFormatterPrintsOnlyBoundedSafeUpstreamEvidence(t *testing.T) {
+	entry := log.NewEntry(log.New())
+	entry.Data = log.Fields{
+		"upstream_status": 403, "upstream_stage": "upstream_request", "upstream_code": "cloudflare_challenge",
+		"target_path":   managementdiag.NewManagementOnlyValueWithFallback("/?private=value", "/"),
+		"response_type": "html", "content_type": "text/html", "cf_ray": "fixture-YUL",
+		"response_text": managementdiag.NewManagementOnlyValueWithFallback("private management text", "Enable JavaScript"),
+		"response_body": managementdiag.NewManagementOnlyValueWithFallback("private management body", "<html>token=secret-value\n"+strings.Repeat("detail ", 800)+"</html>"),
+	}
+	raw, err := (&LogFormatter{}).Format(entry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	line := string(raw)
+	for _, want := range []string{"upstream_status=403", "upstream_code=cloudflare_challenge", "response_type=html", `target_path="/"`, `response_text="Enable JavaScript"`, "response_body=", "log_preview_truncated=true"} {
+		if !strings.Contains(line, want) {
+			t.Fatalf("missing %q", want)
+		}
+	}
+	if strings.Contains(line, "private management") || strings.Contains(line, "secret-value") || strings.Count(line, "\n") != 1 || len(line) > 3200 {
+		t.Fatal("unsafe/unbounded diagnostic log")
 	}
 }
 
