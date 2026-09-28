@@ -101,10 +101,7 @@ func (e *CodexExecutor) executeOpenAIImage(ctx context.Context, auth *cliproxyau
 		return resp, disabledImageGenerationToolError(e.cfg)
 	}
 
-	apiKey, baseURL := codexCreds(auth)
-	if baseURL == "" {
-		baseURL = "https://chatgpt.com/backend-api/codex"
-	}
+	apiKey, baseURL := codexCreds(auth, e.cfg)
 	reporter := helps.NewUsageReporter(ctx, e.Identifier(), model, auth, false)
 	defer reporter.TrackFailure(ctx, &err)
 
@@ -182,10 +179,7 @@ func (e *CodexExecutor) executeOpenAIImageStream(ctx context.Context, auth *clip
 		return nil, disabledImageGenerationToolError(e.cfg)
 	}
 
-	apiKey, baseURL := codexCreds(auth)
-	if baseURL == "" {
-		baseURL = "https://chatgpt.com/backend-api/codex"
-	}
+	apiKey, baseURL := codexCreds(auth, e.cfg)
 	reporter := helps.NewUsageReporter(ctx, e.Identifier(), model, auth, true)
 	defer reporter.TrackFailure(ctx, &err)
 

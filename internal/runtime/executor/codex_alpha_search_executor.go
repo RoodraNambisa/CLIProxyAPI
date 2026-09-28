@@ -33,7 +33,7 @@ func (e *CodexExecutor) executeAlphaSearch(ctx context.Context, auth *cliproxyau
 	if !cliproxyauth.SupportsCodexAlphaSearch(auth) {
 		return resp, statusErr{code: http.StatusNotImplemented, msg: "Selected credential does not support Codex search", skipAuthResult: true}
 	}
-	token, baseURL := codexCreds(auth)
+	token, baseURL := codexCreds(auth, e.cfg)
 	if strings.TrimSpace(token) == "" {
 		return resp, statusErr{code: http.StatusServiceUnavailable, msg: "Codex search access token is unavailable", skipAuthResult: true, retryOtherAuth: true}
 	}

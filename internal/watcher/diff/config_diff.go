@@ -316,6 +316,9 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	if oldCfg.Codex.IdentityConfuse != newCfg.Codex.IdentityConfuse {
 		changes = append(changes, fmt.Sprintf("codex.identity-confuse: %t -> %t", oldCfg.Codex.IdentityConfuse, newCfg.Codex.IdentityConfuse))
 	}
+	if oldCfg.Codex.BaseURL != newCfg.Codex.BaseURL {
+		changes = append(changes, "codex.base-url: updated")
+	}
 	if oldCfg.Codex.LiveEnabled != newCfg.Codex.LiveEnabled {
 		changes = append(changes, fmt.Sprintf("codex.live-enabled: %t -> %t", oldCfg.Codex.LiveEnabled, newCfg.Codex.LiveEnabled))
 	}

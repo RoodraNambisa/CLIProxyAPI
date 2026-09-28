@@ -848,7 +848,7 @@ func (e *CodexExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Aut
 	if req == nil {
 		return nil
 	}
-	apiKey, _ := codexCreds(auth)
+	apiKey, _ := codexCreds(auth, e.cfg)
 	var attrs map[string]string
 	if auth != nil {
 		attrs = auth.Attributes
@@ -913,10 +913,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	}
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 
-	apiKey, baseURL := codexCreds(auth)
-	if baseURL == "" {
-		baseURL = "https://chatgpt.com/backend-api/codex"
-	}
+	apiKey, baseURL := codexCreds(auth, e.cfg)
 
 	reporter := helps.NewUsageReporter(ctx, e.Identifier(), baseModel, auth, false)
 	defer reporter.TrackFailure(ctx, &err)
@@ -1160,10 +1157,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	ctx = contextWithCodexFingerprintPersona(ctx, e.cfg, auth)
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 
-	apiKey, baseURL := codexCreds(auth)
-	if baseURL == "" {
-		baseURL = "https://chatgpt.com/backend-api/codex"
-	}
+	apiKey, baseURL := codexCreds(auth, e.cfg)
 
 	reporter := helps.NewUsageReporter(ctx, e.Identifier(), baseModel, auth, false)
 	defer reporter.TrackFailure(ctx, &err)
@@ -1315,10 +1309,7 @@ func (e *CodexExecutor) executeStream(ctx context.Context, auth *cliproxyauth.Au
 	}
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 
-	apiKey, baseURL := codexCreds(auth)
-	if baseURL == "" {
-		baseURL = "https://chatgpt.com/backend-api/codex"
-	}
+	apiKey, baseURL := codexCreds(auth, e.cfg)
 
 	reporter := helps.NewUsageReporter(ctx, e.Identifier(), baseModel, auth, true)
 	defer reporter.TrackFailure(ctx, &err)
@@ -3263,13 +3254,13 @@ func parseCodexRetryAfter(statusCode int, errorBody []byte, now time.Time) *time
 	return helps.CodexUsageLimitRetryAfter(errorBody, now)
 }
 
-func codexCreds(a *cliproxyauth.Auth) (apiKey, baseURL string) {
+func codexCreds(a *cliproxyauth.Auth, cfg *config.Config) (apiKey, baseURL string) {
+	baseURL = helps.ResolveCodexUpstream(a, cfg).BaseURL
 	if a == nil {
-		return "", ""
+		return
 	}
 	if a.Attributes != nil {
 		apiKey = a.Attributes["api_key"]
-		baseURL = a.Attributes["base_url"]
 	}
 	if apiKey == "" && a.Metadata != nil {
 		if v, ok := a.Metadata["access_token"].(string); ok {

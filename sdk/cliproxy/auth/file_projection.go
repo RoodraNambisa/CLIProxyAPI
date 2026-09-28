@@ -113,6 +113,9 @@ func ApplyFileAuthProjection(auth *Auth, opts FileAuthProjectionOptions) error {
 		auth.Attributes["note"] = note
 	}
 	ApplyFileBackedGeminiAPIKey(auth)
+	if errBase := ApplyCodexBaseURLMetadata(auth); errBase != nil {
+		return errBase
+	}
 	ApplyCustomHeadersFromMetadata(auth)
 	ApplyAuthExcludedModelsMeta(auth, opts.Config, fileAuthExcludedModels(metadata), fileAuthKind(auth))
 	if provider == "codex" {

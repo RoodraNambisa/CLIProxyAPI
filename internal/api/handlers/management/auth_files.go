@@ -570,6 +570,9 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context, manager *coreauth.Manage
 					h.applyXAIUpstreamInfo(fileData, &coreauth.Auth{Provider: "xai", Metadata: metadata})
 				}
 			}
+			if strings.EqualFold(strings.TrimSpace(typeValue), "codex") {
+				h.applyCodexUpstreamInfo(fileData, &coreauth.Auth{Provider: "codex", Metadata: dependencyMetadata})
+			}
 			if strings.EqualFold(strings.TrimSpace(typeValue), "chatgpt-web") {
 				if dependencyMetadata != nil {
 					state := (&coreauth.Auth{Provider: typeValue, Metadata: dependencyMetadata}).LifecycleState()
@@ -715,6 +718,7 @@ func (h *Handler) buildAuthFileEntryAtWithRuntime(auth *coreauth.Auth, now time.
 		entry["plan_type"] = planType
 	}
 	if strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
+		h.applyCodexUpstreamInfo(entry, auth)
 		entry["quota_observation_enabled"] = false
 		if cfg := h.currentConfig(); cfg != nil {
 			entry["quota_observation_enabled"] = cfg.Codex.ObserveQuota
@@ -3168,6 +3172,9 @@ func (h *Handler) buildAuthFromFileData(path string, data []byte) (*coreauth.Aut
 		UpdatedAt:     time.Now(),
 	}
 	coreauth.ApplyFileBackedGeminiAPIKey(auth)
+	if errBase := coreauth.ApplyCodexBaseURLMetadata(auth); errBase != nil {
+		return nil, fmt.Errorf("%w: %v", errInvalidAuthFileData, errBase)
+	}
 	if errWeight := coreauth.ApplyAuthWeightMetadata(auth, metadata); errWeight != nil {
 		return nil, fmt.Errorf("%w: %v", errInvalidAuthFileData, errWeight)
 	}

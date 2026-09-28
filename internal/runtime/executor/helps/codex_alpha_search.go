@@ -77,10 +77,10 @@ func RewriteCodexAlphaSearchBody(body []byte, model string) ([]byte, error) {
 	return json.Marshal(payload)
 }
 
-// CodexAlphaSearchURL uses the OAuth endpoint or the opted-in API key's base.
+// CodexAlphaSearchURL uses the resolved OAuth endpoint or the opted-in API key's base.
 // Query parameters and escaped path components belong to that configured base.
 func CodexAlphaSearchURL(baseURL string, isAPIKey bool) (string, error) {
-	if !isAPIKey {
+	if !isAPIKey && strings.TrimSpace(baseURL) == "" {
 		return CodexAlphaSearchOAuthURL, nil
 	}
 	u, err := url.Parse(strings.TrimSpace(baseURL))

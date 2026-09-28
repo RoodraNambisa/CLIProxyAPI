@@ -932,6 +932,12 @@ xai:
 # `same-account-only` keeps only states known to belong to the selected account, and `strip` removes all.
 # Upstream response states are always recorded and returned to the client. The default is `guard-cross-account`.
 # codex:
+#   # OAuth model requests only: Responses (HTTP/SSE/WebSocket), compact, images and alpha/search.
+#   # Empty keeps https://chatgpt.com/backend-api/codex. A credential's base_url overrides this.
+#   # Supply a Codex-compatible base without /responses, query, fragment or URL credentials.
+#   # The server receives OAuth access tokens; configure only a trusted upstream.
+#   # API-key entries, login/refresh, quota queries and native Realtime endpoints are unchanged.
+#   base-url: ""
 #   # Boolean, default false (missing/null also disable new Live work).
 #   # Disabling blocks new sessions, client secrets and connections, cancels pending setup,
 #   # and keeps established sessions and authenticated hangup/cleanup available.

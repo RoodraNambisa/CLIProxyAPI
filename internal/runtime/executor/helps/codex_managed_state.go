@@ -261,10 +261,7 @@ func ApplyManagedState(ctx context.Context, cfg *config.Config, a *auth.Auth, mo
 			headers.Set("X-Codex-Turn-State", value)
 		}
 	}
-	targetURL := "https://chatgpt.com/backend-api/codex/responses"
-	if a != nil && a.Attributes["base_url"] != "" {
-		targetURL = strings.TrimRight(a.Attributes["base_url"], "/") + "/responses"
-	}
+	targetURL := ResolveCodexUpstream(a, cfg).BaseURL + "/responses"
 	if len(targetURLs) > 0 {
 		targetURL = targetURLs[0]
 	}

@@ -285,10 +285,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	}
 
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
-	apiKey, baseURL := codexCreds(auth)
-	if baseURL == "" {
-		baseURL = "https://chatgpt.com/backend-api/codex"
-	}
+	apiKey, baseURL := codexCreds(auth, e.cfg)
 
 	reporter := helps.NewUsageReporter(ctx, e.Identifier(), baseModel, auth, false)
 	defer reporter.TrackFailure(ctx, &err)
@@ -679,10 +676,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	}
 
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
-	apiKey, baseURL := codexCreds(auth)
-	if baseURL == "" {
-		baseURL = "https://chatgpt.com/backend-api/codex"
-	}
+	apiKey, baseURL := codexCreds(auth, e.cfg)
 
 	reporter := helps.NewUsageReporter(ctx, e.Identifier(), baseModel, auth, true)
 	defer reporter.TrackFailure(ctx, &err)

@@ -436,8 +436,8 @@ func validateBatchAuthFileFields(auth *coreauth.Auth, values authFileFieldValues
 		return errors.New("Grok model sources and routes are only supported for xai auth files")
 	}
 	if values.baseURL != nil {
-		if provider != "xai" {
-			return errors.New("base_url is only supported for xai auth files")
+		if provider != "xai" && provider != "codex" {
+			return errors.New("base_url is only supported for codex and xai auth files")
 		}
 		if _, err := config.NormalizeXAIBaseURL(*values.baseURL); err != nil {
 			return err
@@ -643,10 +643,12 @@ func (h *Handler) applyAuthFileFieldValues(auth *coreauth.Auth, values authFileF
 		} else {
 			auth.Attributes["base_url"] = baseURL
 		}
-		cliURL, _ := config.XAIBaseURLForMode("cli")
-		usingAPI := baseURL != "" && baseURL != cliURL
-		auth.Metadata["using_api"] = usingAPI
-		auth.Attributes["using_api"] = strconv.FormatBool(usingAPI)
+		if strings.EqualFold(strings.TrimSpace(auth.Provider), "xai") {
+			cliURL, _ := config.XAIBaseURLForMode("cli")
+			usingAPI := baseURL != "" && baseURL != cliURL
+			auth.Metadata["using_api"] = usingAPI
+			auth.Attributes["using_api"] = strconv.FormatBool(usingAPI)
+		}
 	}
 	if values.xaiCatalogSources != nil {
 		auth.Metadata["xai_model_catalog_sources"] = *values.xaiCatalogSources

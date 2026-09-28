@@ -90,8 +90,12 @@ func TestCodexAlphaSearchURLs(t *testing.T) {
 			t.Fatal("accepted invalid API key endpoint")
 		}
 	}
-	got, err := CodexAlphaSearchURL("https://other.invalid", false)
+	got, err := CodexAlphaSearchURL("", false)
 	if err != nil || got != CodexAlphaSearchOAuthURL {
 		t.Fatal("OAuth did not use its search endpoint")
+	}
+	got, err = CodexAlphaSearchURL("https://other.invalid/codex", false)
+	if err != nil || got != "https://other.invalid/codex/alpha/search" {
+		t.Fatal("OAuth ignored its configured endpoint")
 	}
 }

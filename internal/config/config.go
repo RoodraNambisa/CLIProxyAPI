@@ -554,6 +554,8 @@ type CodexHeaderDefaults struct {
 
 // CodexConfig configures provider-wide Codex request behavior.
 type CodexConfig struct {
+	// BaseURL overrides the default Codex OAuth model endpoint, not OAuth or quota endpoints.
+	BaseURL string `yaml:"base-url" json:"base-url"`
 	// AutoCookie passively stores allowlisted upstream cookies per credential.
 	AutoCookie bool `yaml:"auto-cookie" json:"auto-cookie"`
 	// AutoCookieOverride defaults to taking ownership of the outbound Cookie header.
@@ -2380,6 +2382,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	if errQuota := cfg.ValidateCodexQuotaAutoDisable(); errQuota != nil {
 		return nil, errQuota
 	}
+	if errBase := cfg.ValidateCodexBaseURL(); errBase != nil {
+		return nil, errBase
+	}
 	if errState := cfg.ValidateCodexStateOverride(); errState != nil {
 		return nil, errState
 	}
@@ -4085,6 +4090,9 @@ func SaveConfigPreserveComments(configFile string, cfg *Config) error {
 	}
 	if errQuota := cfg.ValidateCodexQuotaAutoDisable(); errQuota != nil {
 		return errQuota
+	}
+	if errBase := cfg.ValidateCodexBaseURL(); errBase != nil {
+		return errBase
 	}
 	if errState := cfg.ValidateCodexStateOverride(); errState != nil {
 		return errState
