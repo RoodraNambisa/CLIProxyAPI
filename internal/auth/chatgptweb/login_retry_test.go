@@ -55,6 +55,18 @@ func TestCloudflareChallengeDetectionUsesMitigatedHeader(t *testing.T) {
 	}
 }
 
+func TestCloudflareEdgeHeadersAreNotChallengeEvidence(t *testing.T) {
+	for _, body := range []string{"", `<html>Access denied</html>`, `{"error":{"code":"account_deactivated"}}`, `{"error":{"code":"account_deleted","message":"Just a moment"}}`} {
+		response := &fhttp.Response{StatusCode: http.StatusForbidden, Header: fhttp.Header{}}
+		response.Header.Set("CF-Ray", "ordinary-edge-ray")
+		response.Header.Set("Server", "cloudflare")
+		response.Header.Set("Content-Type", "text/html")
+		if isCloudflareChallenge(response, []byte(body)) {
+			t.Fatalf("edge response %q was treated as a challenge", body)
+		}
+	}
+}
+
 func TestLoginClientRotatesProxyAndPreservesCookies(t *testing.T) {
 	var (
 		calls          atomic.Int32

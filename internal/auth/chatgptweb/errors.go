@@ -66,6 +66,7 @@ func newAuthError(code string, state LifecycleState, status int, retryable, term
 		Terminal:       terminal,
 		Message:        message,
 		Cause:          cause,
+		Cloudflare:     code == "cloudflare_challenge",
 	}
 }
 
@@ -196,6 +197,7 @@ func SafeLifecycleReason(value string) string {
 		"api798_email_otp_rejected",
 		"authorization_completion_required",
 		"cloudflare_challenge",
+		"authentication_forbidden",
 		"login_proxy_invalid",
 		"refresh_token_missing",
 		"session_cookie_missing",
@@ -203,6 +205,7 @@ func SafeLifecycleReason(value string) string {
 		"session_response_invalid",
 		"session_response_error",
 		"session_refresh_failed",
+		"session_refresh_forbidden",
 		"session_refresh_network_error",
 		"access_token_expired",
 		"token_revoked",

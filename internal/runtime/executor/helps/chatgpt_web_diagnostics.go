@@ -95,7 +95,7 @@ func ClassifyChatGPTWebHTTPDiagnostic(status int, path string, body []byte, head
 	if status >= http.StatusBadRequest && responseType == "html" {
 		responseText = chatGPTWebHTMLDiagnosticText(body)
 	}
-	cloudflare := chatGPTWebDiagnosticCloudflare(status, cfMitigated, server, responseType, body)
+	cloudflare := (responseType != "json" || cfMitigated == "challenge") && chatGPTWebDiagnosticCloudflare(cfMitigated, server, body)
 	code := chatGPTWebDiagnosticErrorCode(status, responseType, cloudflare, body)
 	if status >= http.StatusBadRequest && responseType == "xml" && !cloudflare {
 		if xmlCode, xmlText := chatGPTWebXMLDiagnostic(body); xmlCode != "" {
@@ -289,19 +289,17 @@ func chatGPTWebDiagnosticResponseType(contentType string, body []byte) string {
 	return "binary"
 }
 
-func chatGPTWebDiagnosticCloudflare(status int, cfMitigated, server, responseType string, body []byte) bool {
-	if cfMitigated != "" && cfMitigated != "none" {
+func chatGPTWebDiagnosticCloudflare(cfMitigated, server string, body []byte) bool {
+	if cfMitigated == "challenge" {
 		return true
 	}
 	lower := bytes.ToLower(body)
 	bodyChallenge := bytes.Contains(lower, []byte("/cdn-cgi/challenge-platform")) ||
 		bytes.Contains(lower, []byte("cf-chl-")) ||
 		bytes.Contains(lower, []byte("challenge-platform")) ||
-		bytes.Contains(lower, []byte("just a moment")) ||
+		bytes.Contains(lower, []byte("just a moment")) && (strings.Contains(server, "cloudflare") || bytes.Contains(lower, []byte("cloudflare"))) ||
 		bytes.Contains(lower, []byte("attention required! | cloudflare"))
-	serverChallenge := responseType == "html" && strings.Contains(server, "cloudflare") &&
-		(status == http.StatusForbidden || status == http.StatusTooManyRequests || status == http.StatusServiceUnavailable)
-	return bodyChallenge || serverChallenge
+	return bodyChallenge
 }
 
 func normalizeChatGPTWebDiagnosticContentType(value string) string {

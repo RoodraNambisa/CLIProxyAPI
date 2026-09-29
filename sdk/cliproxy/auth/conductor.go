@@ -11983,6 +11983,7 @@ func (m *Manager) markChatGPTWebTerminalLifecycle(expected *Auth, lifecycle *cha
 		current.Metadata["lifecycle_state"] = LifecycleStateDead
 		current.Metadata["lifecycle_reason"] = reason
 		current.Metadata["lifecycle_updated_at"] = now.UTC().Format(time.RFC3339)
+		chatgptwebauth.RecordLifecycleFailure(current.Metadata, lifecycle)
 		current.LastError = &Error{
 			Code:       reason,
 			Message:    "upstream confirmed that the account is unavailable",

@@ -570,6 +570,12 @@ func (service *Service) Refresh(ctx context.Context, credential Credential, prox
 		service.applyFailure(refreshed, authError, false)
 		return refreshed, authError
 	}
+	if isCloudflareChallenge(response, payload) {
+		authError := newAuthError("cloudflare_challenge", LifecycleActive, response.StatusCode, true, false, "Cloudflare challenge blocked token refresh", nil)
+		authError.FailureStage = "token_refresh"
+		service.applyFailure(refreshed, authError, false)
+		return refreshed, authError
+	}
 	if authError := classifyHTTPResponse("token_refresh", response.StatusCode, payload, LifecycleActive); authError != nil {
 		service.applyFailure(refreshed, authError, false)
 		return refreshed, authError
@@ -1205,12 +1211,14 @@ func (service *Service) applyFailure(credential *Credential, authError *AuthErro
 		authError.LifecycleState = state
 	}
 	service.updateLifecycle(credential, state, authError.Code)
+	credential.RecordLifecycleFailure(authError)
 }
 
 func (service *Service) updateLifecycle(credential *Credential, state LifecycleState, reason string) {
 	credential.LifecycleState = state
 	credential.LifecycleReason = reason
 	credential.LifecycleUpdatedAt = service.timestamp()
+	credential.RecordLifecycleFailure(nil)
 }
 
 func (service *Service) timestamp() string {
@@ -2382,9 +2390,9 @@ func classifyPageType(pageType string) *AuthError {
 		reason = "turnstile_required"
 	case strings.Contains(normalized, "arkose"):
 		reason = "arkose_required"
-	case strings.Contains(normalized, "account_deactivated") || normalized == "deactivated":
+	case normalized == "account_deactivated" || normalized == "deactivated":
 		return newAuthError("account_deactivated", LifecycleDead, 0, false, true, "account is deactivated", nil)
-	case strings.Contains(normalized, "account_deleted") || normalized == "deleted":
+	case normalized == "account_deleted" || normalized == "deleted":
 		return newAuthError("account_deleted", LifecycleDead, 0, false, true, "account is deleted", nil)
 	}
 	if reason == "" {
@@ -2420,15 +2428,11 @@ func classifyHTTPResponse(stage string, status int, payload []byte, defaultState
 		}
 	}
 	messageLower := strings.ToLower(message)
-	responseTextLower := strings.ToLower(string(payload))
 	if normalized == "" {
 		normalized = normalizeCode(stage + "_failed")
 	}
-	if strings.Contains(messageLower, "deactivated") || strings.Contains(responseTextLower, "deleted or deactivated") || strings.Contains(responseTextLower, "account deactivated") {
-		return newAuthError("account_deactivated", LifecycleDead, status, false, true, "account is deactivated", nil)
-	}
-	if strings.Contains(messageLower, "account has been deleted") || strings.Contains(responseTextLower, "account because it has been deleted") {
-		return newAuthError("account_deleted", LifecycleDead, status, false, true, "account is deleted", nil)
+	if normalized == "cloudflare_challenge" {
+		return newAuthError(normalized, defaultState, status, true, false, "Cloudflare challenge blocked authentication", nil)
 	}
 	if status == http.StatusRequestTimeout || status == http.StatusTooEarly || status == http.StatusTooManyRequests || status >= http.StatusInternalServerError {
 		return newAuthError(normalized, defaultState, status, true, false, "upstream authentication service is temporarily unavailable", nil)
@@ -2449,13 +2453,16 @@ func classifyHTTPResponse(stage string, status int, payload []byte, defaultState
 	if normalized == "invalid_totp" || strings.Contains(normalized, "invalid_otp") {
 		return newAuthError("invalid_totp", LifecycleReauthRequired, status, false, true, "TOTP was rejected", nil)
 	}
-	if stage == "mfa_verify" && (status == http.StatusBadRequest || status == http.StatusUnauthorized || status == http.StatusForbidden) {
-		return newAuthError("invalid_totp", LifecycleReauthRequired, status, false, true, "TOTP was rejected", nil)
-	}
 	if strings.Contains(normalized, "turnstile") || strings.Contains(normalized, "arkose") {
 		return newAuthError(normalized, LifecycleInteractionRequired, status, false, true, "interactive challenge is required", nil)
 	}
-	if stage == "password_verify" && (status == http.StatusBadRequest || status == http.StatusUnauthorized || status == http.StatusForbidden) {
+	if status == http.StatusForbidden {
+		return newAuthError("authentication_forbidden", defaultState, status, true, false, "authentication was forbidden without explicit credential failure evidence", nil)
+	}
+	if stage == "mfa_verify" && (status == http.StatusBadRequest || status == http.StatusUnauthorized) {
+		return newAuthError("invalid_totp", LifecycleReauthRequired, status, false, true, "TOTP was rejected", nil)
+	}
+	if stage == "password_verify" && (status == http.StatusBadRequest || status == http.StatusUnauthorized) {
 		return newAuthError("invalid_password", LifecycleReauthRequired, status, false, true, "password was rejected", nil)
 	}
 	return newAuthError(normalized, defaultState, status, false, true, "authentication request was rejected", nil)

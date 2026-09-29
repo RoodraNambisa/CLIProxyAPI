@@ -90,6 +90,8 @@ chatgpt-web:
     # when automatic account-info refresh is disabled.
     refresh-account-info-after-upload: false
   # Remove credentials only after ChatGPT Web confirms the account lifecycle is dead.
+  # CF/network/unknown 403 failures never qualify. Legacy session-expired records
+  # without preserved failure evidence remain quarantined for manual review.
   auto-delete-dead-auths: false
   # Treat an exhausted Passkey-only recovery as permanently dead only when the
   # access token and every other refresh or login path are already unavailable.

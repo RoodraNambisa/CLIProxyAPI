@@ -1458,6 +1458,9 @@ func authEligibleForChatGPTWebDeadDelete(auth *coreauth.Auth, policy chatGPTWebD
 	if !isNativeChatGPTWebAuth(auth) || auth.LifecycleState() != coreauth.LifecycleStateDead {
 		return "", false
 	}
+	if !chatgptwebauth.DeadLifecycleDeletionAllowed(auth.Metadata) {
+		return "", false
+	}
 	priority := 0
 	if auth.Attributes != nil {
 		if parsed, errParse := strconv.Atoi(strings.TrimSpace(auth.Attributes["priority"])); errParse == nil {

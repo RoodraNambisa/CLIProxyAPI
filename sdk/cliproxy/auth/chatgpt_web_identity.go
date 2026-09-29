@@ -295,6 +295,8 @@ func clearCarriedChatGPTWebCredentialMetadata(existing, next *Auth, now time.Tim
 		"last_login_at",
 		"last_refresh_at",
 		"last_relogin_at",
+		"lifecycle_failure_code",
+		"lifecycle_failure_status",
 	} {
 		existingValue, existingOK := existing.Metadata[key]
 		nextValue, nextOK := next.Metadata[key]

@@ -2057,7 +2057,6 @@ func TestServiceAcquisitionContextUsesShorterDeadline(t *testing.T) {
 
 func TestDeletedOrDeactivatedTextIsPermanent(t *testing.T) {
 	for _, body := range []string{
-		`<html>This account was deleted or deactivated.</html>`,
 		`You do not have an account because it has been deleted.`,
 		`account_deactivated`,
 		`account_deleted`,

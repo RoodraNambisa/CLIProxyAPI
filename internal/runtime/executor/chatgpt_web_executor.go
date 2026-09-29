@@ -578,6 +578,7 @@ func (e *ChatGPTWebExecutor) handleChatGPTWebRuntimeLifecycleError(ctx context.C
 	}
 	updated := auth.Clone()
 	setChatGPTWebLifecycle(updated, cliproxyauth.LifecycleStateDead, authError.Code, e.currentTime())
+	chatgptwebauth.RecordLifecycleFailure(updated.Metadata, authError)
 	persistCtx := context.Background()
 	if ctx != nil {
 		persistCtx = context.WithoutCancel(ctx)
@@ -1384,7 +1385,7 @@ func (e *ChatGPTWebExecutor) executeBackgroundReloginTask(ctx context.Context, t
 	maxAttempts := policy.MaxRetries + 1
 	if task.attempt >= maxAttempts {
 		logChatGPTWebBackgroundReloginFailure(current, errRelogin)
-		e.markBackgroundReloginExhausted(ctx, current)
+		e.markBackgroundReloginExhausted(ctx, current, errRelogin)
 		if e.backgroundQueue != nil {
 			e.backgroundQueue.exhausted.Add(1)
 		}
@@ -1419,17 +1420,21 @@ func (e *ChatGPTWebExecutor) backgroundReloginTaskPending(task *chatGPTWebRelogi
 	return pending
 }
 
-func (e *ChatGPTWebExecutor) markBackgroundReloginExhausted(ctx context.Context, expected *cliproxyauth.Auth) {
+func (e *ChatGPTWebExecutor) markBackgroundReloginExhausted(ctx context.Context, expected *cliproxyauth.Auth, cause error) {
 	if e == nil || e.manager == nil || expected == nil {
 		return
 	}
 	updated := expected.Clone()
 	setChatGPTWebLifecycle(updated, cliproxyauth.LifecycleStateReauthRequired, "auto_relogin_exhausted", e.currentTime())
+	chatgptwebauth.RecordLifecycleFailure(updated.Metadata, cause)
+	updated.LastError = cliproxyauth.NewProviderError(updated, cause)
 	persistCtx := context.Background()
 	if ctx != nil {
 		persistCtx = context.WithoutCancel(ctx)
 	}
-	_, current, errUpdate := e.manager.UpdateIfCurrent(persistCtx, expected, updated)
+	// Keep the final recovery error instead of carrying the original request's
+	// runtime error forward. The terminal lifecycle remains non-selectable.
+	_, current, errUpdate := e.manager.UpdateIfCurrent(cliproxyauth.WithSkipStateCarryForward(persistCtx), expected, updated)
 	if errUpdate != nil {
 		log.WithFields(log.Fields{
 			"auth_id":    expected.ID,
@@ -1677,9 +1682,14 @@ func (e *ChatGPTWebExecutor) reloginCurrent(ctx context.Context, expected *clipr
 		latest, _ = e.manager.GetByID(expected.ID)
 		return cloneChatGPTWebAuth(latest), false, chatgptwebauth.ErrCredentialSuperseded
 	}
-	if errLogin != nil && chatgptwebauth.IsRetryable(errLogin) && !loginProxyEnabled &&
+	if errLogin != nil && chatgptwebauth.IsRetryable(errLogin) &&
 		chatGPTWebErrorCode(errLogin) != "passkey_state_persist_failed" {
-		return nil, false, e.manager.ReportProxyFailure(ctx, resolved, errLogin)
+		if !loginProxyEnabled {
+			errLogin = e.manager.ReportProxyFailure(ctx, resolved, errLogin)
+		}
+		// A transient login result must not replace the pending generation: doing
+		// so invalidates its queued retry and loses the attempt budget.
+		return nil, false, errLogin
 	}
 	if result == nil {
 		return nil, false, firstNonNilError(errLogin, errors.New("chatgpt web re-login returned no credential"))
@@ -1694,6 +1704,7 @@ func (e *ChatGPTWebExecutor) reloginCurrent(ctx context.Context, expected *clipr
 			e.currentTime(),
 		)
 	}
+	result.RecordLifecycleFailure(errLogin)
 	updated := applyChatGPTWebCredential(expected, result)
 	updateCtx := ctx
 	if result.LifecycleState == chatgptwebauth.LifecycleDead &&
@@ -2110,6 +2121,7 @@ func (e *ChatGPTWebExecutor) refreshCredential(ctx context.Context, auth *clipro
 	result.credential.LifecycleState = chatgptwebauth.LifecycleState(state)
 	result.credential.LifecycleReason = reason
 	result.credential.LifecycleUpdatedAt = e.currentTime().UTC().Format(time.RFC3339)
+	result.credential.RecordLifecycleFailure(result.err)
 	return applyChatGPTWebCredential(auth, result.credential), result.err, true
 }
 
@@ -2186,6 +2198,10 @@ func classifyChatGPTWebSessionCookieRefresh(
 	}
 	authError, ok := chatgptwebauth.AsAuthError(err)
 	if !ok || (authError.Code != "session_expired" && authError.Code != "access_token_missing") {
+		return credential, err, false
+	}
+	if authError.Retryable || !authError.Terminal || authError.Cloudflare ||
+		(authError.DiagnosticCode != "" && authError.DiagnosticCode != authError.Code) {
 		return credential, err, false
 	}
 	promoted := *authError
@@ -2351,6 +2367,7 @@ func setChatGPTWebLifecycle(auth *cliproxyauth.Auth, state, reason string, now t
 	auth.Metadata["lifecycle_state"] = state
 	auth.Metadata["lifecycle_reason"] = chatgptwebauth.SafeLifecycleReason(reason)
 	auth.Metadata["lifecycle_updated_at"] = now.UTC().Format(time.RFC3339)
+	chatgptwebauth.RecordLifecycleFailure(auth.Metadata, nil)
 }
 
 func chatGPTWebCredentialExpiry(credential *chatgptwebauth.Credential) (time.Time, bool) {

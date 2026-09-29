@@ -53,11 +53,19 @@ func (service *Service) fetchSessionToken(ctx context.Context, client *Client) (
 	if isCloudflareChallenge(response, payload) {
 		return session, newAuthError("cloudflare_challenge", LifecycleActive, response.StatusCode, true, false, "Cloudflare challenge blocked session refresh", nil)
 	}
-	if response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden ||
+	if authError := ClassifyPermanentAccountResponse(response.StatusCode, payload); authError != nil {
+		return session, authError
+	}
+	code, _ := responseError(payload)
+	if response.StatusCode == http.StatusUnauthorized ||
+		(response.StatusCode == http.StatusForbidden && normalizeCode(code) == "session_expired") ||
 		(response.StatusCode >= http.StatusMultipleChoices && response.StatusCode < http.StatusBadRequest) {
 		return session, newAuthError("session_expired", LifecycleReauthRequired, response.StatusCode, false, true, "chatgpt session must be renewed", nil)
 	}
 	if authError := classifyHTTPResponse("session_refresh", response.StatusCode, payload, LifecycleActive); authError != nil {
+		if authError.Code == "authentication_forbidden" {
+			authError.Code = "session_refresh_forbidden"
+		}
 		return session, authError
 	}
 	if err = json.Unmarshal(payload, &session); err != nil {

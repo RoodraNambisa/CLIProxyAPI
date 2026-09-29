@@ -599,7 +599,7 @@ func TestAPI798EmailOTPActivationResponseClassification(t *testing.T) {
 			name:          "challenge response",
 			status:        http.StatusForbidden,
 			payload:       `<html>challenge</html>`,
-			wantCode:      "email_otp_send_failed",
+			wantCode:      "authentication_forbidden",
 			wantState:     LifecycleReloginPending,
 			wantRetryable: true,
 		},

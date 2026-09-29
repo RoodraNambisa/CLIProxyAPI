@@ -2,6 +2,7 @@ package chatgptweb
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -202,6 +203,9 @@ func isCloudflareChallenge(response *fhttp.Response, payload []byte) bool {
 	if strings.EqualFold(strings.TrimSpace(response.Header.Get("CF-Mitigated")), "challenge") {
 		return true
 	}
+	if json.Valid(payload) {
+		return false
+	}
 	statusCandidate := response.StatusCode == http.StatusForbidden ||
 		response.StatusCode == http.StatusTooManyRequests ||
 		response.StatusCode == http.StatusServiceUnavailable
@@ -211,23 +215,22 @@ func isCloudflareChallenge(response *fhttp.Response, payload []byte) bool {
 		strings.Contains(server, "cloudflare")
 	pathSignal := false
 	if response.Request != nil && response.Request.URL != nil {
-		pathSignal = strings.Contains(strings.ToLower(response.Request.URL.Path), "/cdn-cgi/")
+		pathSignal = strings.Contains(strings.ToLower(response.Request.URL.Path), "/cdn-cgi/challenge-platform/")
 	}
 	body := strings.ToLower(string(payload))
 	bodySignal := strings.Contains(body, "/cdn-cgi/challenge-platform") ||
 		strings.Contains(body, "cf-chl-") ||
 		strings.Contains(body, "challenge-platform") ||
-		strings.Contains(body, "just a moment") && strings.Contains(body, "cloudflare")
-	contentType := strings.ToLower(response.Header.Get("Content-Type"))
-	htmlResponse := strings.Contains(contentType, "text/html") || strings.Contains(body, "<html")
+		strings.Contains(body, "attention required! | cloudflare") ||
+		strings.Contains(body, "just a moment") && (headerSignal || strings.Contains(body, "cloudflare"))
 	if pathSignal {
 		return true
 	}
-	if statusCandidate && (bodySignal || headerSignal && htmlResponse) {
+	if statusCandidate && bodySignal {
 		return true
 	}
 	if bodySignal && response.StatusCode >= 200 && response.StatusCode < 300 {
 		return true
 	}
-	return statusCandidate && strings.Contains(contentType, "text/html") && strings.Contains(body, "cloudflare")
+	return false
 }

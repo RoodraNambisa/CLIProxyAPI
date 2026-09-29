@@ -142,6 +142,8 @@ type Credential struct {
 	SessionID                string                             `json:"session_id,omitempty"`
 	LifecycleState           LifecycleState                     `json:"lifecycle_state"`
 	LifecycleReason          string                             `json:"lifecycle_reason"`
+	LifecycleFailureCode     string                             `json:"lifecycle_failure_code,omitempty"`
+	LifecycleFailureStatus   int                                `json:"lifecycle_failure_status,omitempty"`
 	LifecycleUpdatedAt       string                             `json:"lifecycle_updated_at"`
 	LastLoginAt              string                             `json:"last_login_at"`
 	LastRefreshAt            string                             `json:"last_refresh_at"`
@@ -306,6 +308,14 @@ func (credential *Credential) ApplyToMetadata(metadata map[string]any) {
 	metadata["session_id"] = credential.SessionID
 	metadata["lifecycle_state"] = string(normalizedCredentialLifecycleState(credential))
 	metadata["lifecycle_reason"] = SafeLifecycleReason(credential.LifecycleReason)
+	if code := SafeDiagnosticCode(credential.LifecycleFailureCode); code != "" &&
+		!(credential.LifecycleState == LifecycleActive && credential.LifecycleReason == "") {
+		metadata["lifecycle_failure_code"] = code
+		metadata["lifecycle_failure_status"] = credential.LifecycleFailureStatus
+	} else {
+		delete(metadata, "lifecycle_failure_code")
+		delete(metadata, "lifecycle_failure_status")
+	}
 	metadata["lifecycle_updated_at"] = credential.LifecycleUpdatedAt
 	metadata["last_login_at"] = credential.LastLoginAt
 	metadata["last_refresh_at"] = credential.LastRefreshAt
