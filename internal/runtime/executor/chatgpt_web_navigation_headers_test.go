@@ -50,6 +50,12 @@ func TestChatGPTWebHomepageRedirectPreservesCookiesWithoutAPIHeaders(t *testing.
 		if r.Header.Get("Sec-Fetch-Mode") != "navigate" || r.Header.Get("Sec-Fetch-User") != "?1" {
 			t.Error("not a document navigation")
 		}
+		if values := r.Header.Values("Accept"); len(values) != 1 || !strings.HasPrefix(values[0], "text/html") {
+			t.Errorf("%s Accept = %q, want one document value", r.URL.Path, values)
+		}
+		if values := r.Header.Values("User-Agent"); len(values) != 1 || !strings.Contains(values[0], "Chrome/146") {
+			t.Errorf("%s User-Agent = %q, want one browser persona", r.URL.Path, values)
+		}
 		if r.URL.Path == "/" {
 			http.Redirect(w, r, "/landing", http.StatusFound)
 			return

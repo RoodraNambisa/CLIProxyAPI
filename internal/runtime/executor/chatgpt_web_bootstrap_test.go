@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -82,6 +83,9 @@ func TestImageBootstrapRetryUsesFreshConnectionAndSharesCookies(t *testing.T) {
 	var mu sync.Mutex
 	var addresses []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if values := r.Header.Values("Accept"); len(values) != 1 || !strings.HasPrefix(values[0], "text/html") {
+			t.Errorf("retry Accept = %q, want one document value", values)
+		}
 		mu.Lock()
 		addresses = append(addresses, r.RemoteAddr)
 		mu.Unlock()
@@ -109,7 +113,7 @@ func TestImageBootstrapRetryUsesFreshConnectionAndSharesCookies(t *testing.T) {
 	ctx := core.WithRequestPhaseObserver(t.Context(), observer)
 	ctx = core.WithImageBootstrapPolicy(ctx, core.ImageBootstrapPolicy{Retries: 1})
 	before := core.ImageBootstrapSnapshot()
-	_, body, err := e.fetchChatGPTWebImageBootstrap(ctx, client, credential, server.URL, nil)
+	_, body, err := e.fetchChatGPTWebImageBootstrap(ctx, client, credential, server.URL, e.chatGPTWebHeaders(credential, "/", nil))
 	if err != nil || string(body) != "<html>ok</html>" {
 		t.Fatalf("body %q: %v", body, err)
 	}
@@ -234,6 +238,11 @@ func TestImageBootstrapRetriesDoNotReplayGeneration(t *testing.T) {
 		calls[r.URL.Path]++
 		attempt := calls[r.URL.Path]
 		mu.Unlock()
+		if values := r.Header.Values("Accept"); len(values) != 1 {
+			t.Errorf("%s Accept = %q, want exactly one value", r.URL.Path, values)
+		} else if r.URL.Path == "/" && !strings.HasPrefix(values[0], "text/html") {
+			t.Errorf("homepage Accept = %q, want document navigation", values)
+		}
 		if r.URL.Path == "/" && attempt == 1 {
 			w.Header().Set("Content-Length", "100")
 			_, _ = io.WriteString(w, "partial")

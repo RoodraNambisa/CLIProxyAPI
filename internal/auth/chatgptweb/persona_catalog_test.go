@@ -66,16 +66,9 @@ func TestPersonaCatalogV3LocalePackMatchesHeadersAndNavigator(t *testing.T) {
 			t.Fatalf("NewRequest(%q) error = %v", persona.Language, errRequest)
 		}
 		client.applyHeaders(request, nil)
-		headerValue := func(name string) string {
-			values := request.Header[name]
-			if len(values) == 0 {
-				return ""
-			}
-			return values[0]
-		}
-		if headerValue("accept-language") != persona.AcceptLanguage ||
-			headerValue("user-agent") != persona.UserAgent ||
-			!strings.Contains(headerValue("sec-ch-ua"), `v="146"`) {
+		if request.Header.Get("Accept-Language") != persona.AcceptLanguage ||
+			request.Header.Get("User-Agent") != persona.UserAgent ||
+			!strings.Contains(request.Header.Get("Sec-Ch-Ua"), `v="146"`) {
 			client.CloseIdleConnections()
 			t.Fatalf("locale %q headers = %#v", persona.Language, request.Header)
 		}

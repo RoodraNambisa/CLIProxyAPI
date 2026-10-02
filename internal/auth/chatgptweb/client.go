@@ -783,16 +783,18 @@ func (client *Client) SetBeforeRequestHook(hook func()) {
 func (client *Client) applyHeaders(request *fhttp.Request, overrides map[string]string) {
 	major := chromeMajor(client.persona.UserAgent)
 	platform := secCHPlatform(client.persona.Platform)
+	// Header.Set canonicalizes override keys. Defaults must use the same form
+	// or both values survive and are sent as duplicate HTTP/1 and HTTP/2 fields.
 	request.Header = fhttp.Header{
-		"accept":             {"application/json"},
-		"accept-encoding":    {"gzip, deflate, br"},
-		"accept-language":    {client.persona.AcceptLanguage},
-		"cache-control":      {"no-cache"},
-		"dnt":                {"1"},
-		"sec-ch-ua":          {fmt.Sprintf(`"Google Chrome";v="%s", "Chromium";v="%s", "Not.A/Brand";v="24"`, major, major)},
-		"sec-ch-ua-mobile":   {"?0"},
-		"sec-ch-ua-platform": {platform},
-		"user-agent":         {client.persona.UserAgent},
+		"Accept":             {"application/json"},
+		"Accept-Encoding":    {"gzip, deflate, br"},
+		"Accept-Language":    {client.persona.AcceptLanguage},
+		"Cache-Control":      {"no-cache"},
+		"Dnt":                {"1"},
+		"Sec-Ch-Ua":          {fmt.Sprintf(`"Google Chrome";v="%s", "Chromium";v="%s", "Not.A/Brand";v="24"`, major, major)},
+		"Sec-Ch-Ua-Mobile":   {"?0"},
+		"Sec-Ch-Ua-Platform": {platform},
+		"User-Agent":         {client.persona.UserAgent},
 		fhttp.HeaderOrderKey: {
 			"accept", "content-type", "origin", "referer", "user-agent",
 			"sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform",
