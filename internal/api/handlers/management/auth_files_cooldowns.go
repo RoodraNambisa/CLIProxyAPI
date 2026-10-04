@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 )
 
@@ -40,7 +41,6 @@ func (h *Handler) ClearAllAuthCooldowns(c *gin.Context) {
 	}
 
 	ctx := c.Request.Context()
-	now := time.Now()
 	authIDs := h.authManager.AuthIDs()
 	verifiedIDs := make([]string, 0, len(authIDs))
 	for start := 0; start < len(authIDs); start += cooldownAuthReadBatchSize {
@@ -61,14 +61,14 @@ func (h *Handler) ClearAllAuthCooldowns(c *gin.Context) {
 	for start := 0; start < len(verifiedIDs); start += cooldownAuthReadBatchSize {
 		end := min(start+cooldownAuthReadBatchSize, len(verifiedIDs))
 		for _, auth := range h.authManager.GetByIDs(verifiedIDs[start:end]) {
-			if !clearFullAuthCooldownState(auth, now) {
-				continue
-			}
-			if err := h.updateClearedAuthCooldown(ctx, auth); err != nil {
+			changed, err := h.clearCurrentAuthCooldown(ctx, auth, nil, true)
+			if err != nil {
 				c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to update auth %s: %v", auth.ID, err)})
 				return
 			}
-			updated++
+			if changed {
+				updated++
+			}
 		}
 	}
 
@@ -129,23 +129,16 @@ func (h *Handler) ClearSelectedAuthCooldowns(c *gin.Context) {
 	}
 
 	ctx := c.Request.Context()
-	now := time.Now()
 	updated := 0
 	for _, target := range targets {
-		changed := false
-		if target.clearAll {
-			changed = clearFullAuthCooldownState(target.auth, now)
-		} else {
-			changed = clearSelectedModelCooldownState(target.auth, target.models, now)
-		}
-		if !changed {
-			continue
-		}
-		if err := h.updateClearedAuthCooldown(ctx, target.auth); err != nil {
+		changed, err := h.clearCurrentAuthCooldown(ctx, target.auth, target.models, target.clearAll)
+		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to update auth %s: %v", target.auth.ID, err)})
 			return
 		}
-		updated++
+		if changed {
+			updated++
+		}
 	}
 
 	c.JSON(http.StatusOK, gin.H{
@@ -271,18 +264,67 @@ func normalizeCooldownModels(models []string) []string {
 	return out
 }
 
-func (h *Handler) updateClearedAuthCooldown(ctx context.Context, auth *coreauth.Auth) error {
+func (h *Handler) clearCurrentAuthCooldown(ctx context.Context, auth *coreauth.Auth, models map[string]struct{}, clearAll bool) (bool, error) {
 	if h == nil || h.authManager == nil || auth == nil {
-		return nil
+		return false, nil
 	}
-	updated, err := h.authManager.Update(coreauth.WithSkipStateCarryForward(ctx), auth)
-	if err != nil {
-		return err
+	lockedCtx, unlock, errLock := h.authManager.LockAuthMutation(ctx, auth)
+	if errLock != nil {
+		return false, errLock
 	}
+	defer unlock()
+	current, ok := h.authManager.CurrentAuthInstallation(auth)
+	if !ok {
+		return false, errors.New("auth changed while clearing cooldown; retry with the current credential")
+	}
+	updated := current.Clone()
+	now := time.Now()
+	changed := false
+	if clearAll {
+		changed = clearFullAuthCooldownState(updated, now)
+	} else {
+		changed = clearSelectedModelCooldownState(updated, models, now)
+	}
+	if changed {
+		var errUpdate error
+		updated, ok, errUpdate = h.authManager.UpdateIfCurrent(coreauth.WithSkipStateCarryForward(lockedCtx), current, updated)
+		if errUpdate != nil {
+			return false, errUpdate
+		}
+		if !ok || updated == nil {
+			return false, errors.New("auth changed while clearing cooldown; retry with the current credential")
+		}
+	}
+	// Registry suspension is independent of Auth.ModelStates. Repair it even
+	// when an earlier clear already removed all runtime cooldown fields.
+	if !updated.Disabled && updated.Status != coreauth.StatusDisabled && updated.LifecycleSelectable() {
+		var resumeModels []string
+		disabledModels := make(map[string]bool)
+		for stateModel, state := range updated.ModelStates {
+			if state != nil && state.Status == coreauth.StatusDisabled {
+				disabledModels[strings.ToLower(strings.TrimSpace(stateModel))] = true
+			}
+		}
+		for _, model := range registry.GetGlobalRegistry().GetModelsForClient(updated.ID) {
+			key := strings.ToLower(strings.TrimSpace(model.ID))
+			if _, selected := models[key]; (!clearAll && !selected) || disabledModels[key] {
+				continue
+			}
+			resumeModels = append(resumeModels, model.ID)
+		}
+		if registry.GetGlobalRegistry().ClearClientModelCooldowns(updated.ID, resumeModels) {
+			changed = true
+		}
+	}
+	if !changed {
+		return false, nil
+	}
+	h.authManager.RefreshSchedulerEntry(updated.ID)
+	unlock()
 	if hook := h.authStatusHookSnapshot(); hook != nil {
 		hook(ctx, updated.Clone())
 	}
-	return nil
+	return true, nil
 }
 
 func clearFullAuthCooldownState(auth *coreauth.Auth, now time.Time) bool {
@@ -297,6 +339,9 @@ func clearFullAuthCooldownState(auth *coreauth.Auth, now time.Time) bool {
 		if clearModelCooldownFields(state, now) {
 			changed = true
 		}
+	}
+	if refreshAuthCooldownAggregate(auth, now) {
+		changed = true
 	}
 	if changed {
 		auth.UpdatedAt = now
@@ -375,7 +420,7 @@ func clearModelCooldownFields(state *coreauth.ModelState, now time.Time) bool {
 }
 
 func refreshAuthCooldownAggregate(auth *coreauth.Auth, now time.Time) bool {
-	if auth == nil || auth.Disabled || auth.Status == coreauth.StatusDisabled {
+	if auth == nil || auth.Disabled || auth.Status == coreauth.StatusDisabled || !auth.LifecycleSelectable() {
 		return false
 	}
 	if auth.Unavailable && auth.CooldownScope == "auth" && auth.NextRetryAfter.After(now) {
@@ -386,6 +431,7 @@ func refreshAuthCooldownAggregate(auth *coreauth.Auth, now time.Time) bool {
 	beforeNextRetry := auth.NextRetryAfter
 	beforeScope := auth.CooldownScope
 	beforeQuota := auth.Quota
+	beforeStatus, beforeMessage, beforeError := auth.Status, auth.StatusMessage, auth.LastError
 
 	anyState := false
 	allUnavailable := true
@@ -443,5 +489,6 @@ func refreshAuthCooldownAggregate(auth *coreauth.Auth, now time.Time) bool {
 	return beforeUnavailable != auth.Unavailable ||
 		!beforeNextRetry.Equal(auth.NextRetryAfter) ||
 		beforeScope != auth.CooldownScope ||
-		beforeQuota != auth.Quota
+		beforeQuota != auth.Quota || beforeStatus != auth.Status ||
+		beforeMessage != auth.StatusMessage || beforeError != auth.LastError
 }
