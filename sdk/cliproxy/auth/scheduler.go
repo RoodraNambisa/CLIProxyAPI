@@ -125,16 +125,19 @@ type scheduledAuthMeta struct {
 	supportedModelSet    map[string]struct{}
 	accessTokenExpiresAt time.Time
 	hasAccessTokenExpiry bool
+	uploadCooldownUntil  time.Time
 }
 
 // modelScheduler tracks ready and blocked auths for one provider/model combination.
 type modelScheduler struct {
-	modelKey        string
-	entries         map[string]*scheduledAuth
-	priorityOrder   []int
-	readyByPriority map[int]*readyBucket
-	blocked         cooldownQueue
-	expiring        tokenExpiryQueue
+	modelKey                string
+	requiresUpload          bool
+	uploadBlockedByPriority map[int][]*scheduledAuth
+	entries                 map[string]*scheduledAuth
+	priorityOrder           []int
+	readyByPriority         map[int]*readyBucket
+	blocked                 cooldownQueue
+	expiring                tokenExpiryQueue
 }
 
 // scheduledAuth stores the runtime scheduling state for a single auth inside a model shard.
@@ -820,7 +823,7 @@ func (s *authScheduler) pickSingle(ctx context.Context, provider, model string, 
 	if err := schedulerContextError(ctx); err != nil {
 		return nil, err
 	}
-	shard := providerState.ensureModelLocked(modelKey, time.Now())
+	shard := providerState.ensureModelLocked(modelKey, time.Now(), cliproxyexecutor.ChatGPTWebUploadRequired(opts))
 	if shard == nil {
 		return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
@@ -925,7 +928,7 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 		if err := schedulerContextError(ctx); err != nil {
 			return nil, "", err
 		}
-		shard := providerState.ensureModelLocked(modelKey, time.Now())
+		shard := providerState.ensureModelLocked(modelKey, time.Now(), cliproxyexecutor.ChatGPTWebUploadRequired(opts))
 		priorityPredicate := func(entry *scheduledAuth) bool {
 			if entry == nil || entry.auth == nil {
 				return false
@@ -979,7 +982,7 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 		if providerState == nil {
 			continue
 		}
-		shard := providerState.ensureModelLocked(modelKey, now)
+		shard := providerState.ensureModelLocked(modelKey, now, cliproxyexecutor.ChatGPTWebUploadRequired(opts))
 		candidateShards[providerIndex] = shard
 		if shard == nil {
 			continue
@@ -1533,6 +1536,7 @@ func buildScheduledAuthMetaWithSupportedModels(auth *Auth, supportedModelSet map
 		supportedModelSet:    supportedModelSet,
 		accessTokenExpiresAt: expires,
 		hasAccessTokenExpiry: hasExpiry,
+		uploadCooldownUntil:  ChatGPTWebUploadCooldownUntil(auth),
 	}
 }
 
@@ -1566,11 +1570,11 @@ func (p *providerScheduler) upsertAuthLocked(meta *scheduledAuthMeta, now time.T
 		return
 	}
 	p.auths[meta.auth.ID] = meta
-	for modelKey, shard := range p.modelShards {
+	for _, shard := range p.modelShards {
 		if shard == nil {
 			continue
 		}
-		if !meta.supportsModel(modelKey) {
+		if !meta.supportsModel(shard.modelKey) {
 			shard.removeEntryLocked(meta.auth.ID)
 			continue
 		}
@@ -1592,17 +1596,23 @@ func (p *providerScheduler) removeAuthLocked(authID string) {
 }
 
 // ensureModelLocked returns the shard for modelKey, building it lazily from provider auths.
-func (p *providerScheduler) ensureModelLocked(modelKey string, now time.Time) *modelScheduler {
+func (p *providerScheduler) ensureModelLocked(modelKey string, now time.Time, upload ...bool) *modelScheduler {
 	if p == nil {
 		return nil
 	}
 	modelKey = canonicalModelKey(modelKey)
-	if shard, ok := p.modelShards[modelKey]; ok && shard != nil {
+	requiresUpload := p.providerKey == "chatgpt-web" && len(upload) > 0 && upload[0]
+	shardKey := modelKey
+	if requiresUpload {
+		shardKey = "\x00upload:" + modelKey
+	}
+	if shard, ok := p.modelShards[shardKey]; ok && shard != nil {
 		shard.promoteExpiredLocked(now)
 		return shard
 	}
 	shard := &modelScheduler{
 		modelKey:        modelKey,
+		requiresUpload:  requiresUpload,
 		entries:         make(map[string]*scheduledAuth),
 		readyByPriority: make(map[int]*readyBucket),
 	}
@@ -1610,14 +1620,14 @@ func (p *providerScheduler) ensureModelLocked(modelKey string, now time.Time) *m
 		if meta == nil || !meta.supportsModel(modelKey) {
 			continue
 		}
-		if entry := buildScheduledAuth(meta, modelKey, now); entry != nil && entry.auth != nil {
+		if entry := buildScheduledAuth(meta, modelKey, now, requiresUpload); entry != nil && entry.auth != nil {
 			shard.entries[entry.auth.ID] = entry
 		}
 	}
 	if len(shard.entries) > 0 {
 		shard.rebuildIndexesLocked()
 	}
-	p.modelShards[modelKey] = shard
+	p.modelShards[shardKey] = shard
 	return shard
 }
 
@@ -1657,7 +1667,7 @@ func (m *modelScheduler) upsertEntryLocked(meta *scheduledAuthMeta, now time.Tim
 		previousHasExpiry = entry.meta.hasAccessTokenExpiry
 	}
 
-	entry.applyMeta(meta, m.modelKey, now)
+	entry.applyMeta(meta, m.modelKey, now, m.requiresUpload)
 
 	if ok && previousState == entry.state && previousNextRetryAt.Equal(entry.nextRetryAt) && previousPriority == meta.priority && previousWebsocketEnabled == meta.websocketEnabled {
 		if previousHasExpiry != meta.hasAccessTokenExpiry || !previousExpiry.Equal(meta.accessTokenExpiresAt) {
@@ -1668,16 +1678,16 @@ func (m *modelScheduler) upsertEntryLocked(meta *scheduledAuthMeta, now time.Tim
 	m.rebuildIndexesLocked()
 }
 
-func buildScheduledAuth(meta *scheduledAuthMeta, modelKey string, now time.Time) *scheduledAuth {
+func buildScheduledAuth(meta *scheduledAuthMeta, modelKey string, now time.Time, upload ...bool) *scheduledAuth {
 	if meta == nil || meta.auth == nil {
 		return nil
 	}
 	entry := &scheduledAuth{}
-	entry.applyMeta(meta, modelKey, now)
+	entry.applyMeta(meta, modelKey, now, len(upload) > 0 && upload[0])
 	return entry
 }
 
-func (e *scheduledAuth) applyMeta(meta *scheduledAuthMeta, modelKey string, now time.Time) {
+func (e *scheduledAuth) applyMeta(meta *scheduledAuthMeta, modelKey string, now time.Time, upload ...bool) {
 	if e == nil || meta == nil || meta.auth == nil {
 		return
 	}
@@ -1685,6 +1695,9 @@ func (e *scheduledAuth) applyMeta(meta *scheduledAuthMeta, modelKey string, now 
 	e.auth = meta.auth
 	e.nextRetryAt = time.Time{}
 	blocked, reason, next := isAuthBlockedForModelWithExpiry(meta.auth, modelKey, now, meta.accessTokenExpiresAt, meta.hasAccessTokenExpiry)
+	if len(upload) > 0 && upload[0] {
+		blocked, reason, next = withChatGPTWebUploadBlock(blocked, reason, next, meta.uploadCooldownUntil, now)
+	}
 	switch {
 	case !blocked:
 		e.state = scheduledStateReady
@@ -1731,7 +1744,7 @@ func (m *modelScheduler) promoteExpiredLocked(now time.Time) {
 		if entry.nextRetryAt.IsZero() || entry.nextRetryAt.After(now) {
 			break
 		}
-		entry.applyMeta(entry.meta, m.modelKey, now)
+		entry.applyMeta(entry.meta, m.modelKey, now, m.requiresUpload)
 		changed = true
 	}
 	if changed {
@@ -1908,6 +1921,25 @@ func (m *modelScheduler) candidatePrioritiesFromIndexesLocked(websocket bool, pr
 	}
 	// Timed blocks still define retry tiers, but permanent/expired blocks at
 	// the end of this sorted queue cannot contribute any candidate priority.
+	if m.requiresUpload {
+		// Reuse the capability index instead of walking a large upload-limited
+		// pool when an eligible credential already exists at that priority.
+		for priority, entries := range m.uploadBlockedByPriority {
+			if _, found := prioritySet[priority]; found {
+				continue
+			}
+			for _, entry := range entries {
+				if websocket && !entry.meta.websocketEnabled {
+					continue
+				}
+				if entryCandidateForPriority(entry, predicate) {
+					prioritySet[priority] = struct{}{}
+					break
+				}
+			}
+		}
+		return sortedPrioritySet(prioritySet)
+	}
 	for _, entry := range m.blocked {
 		if entry.nextRetryAt.IsZero() {
 			break
@@ -2271,6 +2303,16 @@ func (m *modelScheduler) rebuildIndexesLocked() {
 		}
 		return left.nextRetryAt.Before(right.nextRetryAt)
 	})
+	if m.requiresUpload {
+		m.uploadBlockedByPriority = make(map[int][]*scheduledAuth)
+		for _, entry := range m.blocked {
+			if entry.nextRetryAt.IsZero() {
+				break
+			}
+			priority := entry.meta.priority
+			m.uploadBlockedByPriority[priority] = append(m.uploadBlockedByPriority[priority], entry)
+		}
+	}
 }
 
 // buildReadyBucket prepares the general and websocket-only ready views for one priority bucket.

@@ -529,6 +529,10 @@ func chatGPTWebImageRequestError(err error) (projectedError error) {
 	defer func() {
 		projectedError = preserveChatGPTWebFailureStage(err, projectedError)
 	}()
+	var uploadError chatGPTWebHTTPError
+	if errors.As(err, &uploadError) && uploadError.uploadRateLimited {
+		return err
+	}
 	var projected *chatGPTWebImageQuotaResultError
 	if errors.As(err, &projected) {
 		return err
@@ -3352,7 +3356,8 @@ func (e *ChatGPTWebExecutor) watchChatGPTWebImageTasks(ctx context.Context, clie
 
 		candidate := buildCandidate()
 		outputCount := chatGPTWebImageOutputCount(candidate)
-		if conversationSettled(now) {
+		if conversationSettled(now) && (outputCount > 0 ||
+			(taskPoll == nil && (!tasksEnabled || (taskSnapshot != nil && !taskState.HasPending())))) {
 			if outputCount == 0 && candidate.FailureStatus == "" && lastTaskFailure != "" {
 				candidate.FailureStatus = lastTaskFailure
 			}
@@ -3431,6 +3436,7 @@ func (e *ChatGPTWebExecutor) pollChatGPTWebImageConversation(ctx context.Context
 	lastTaskFailure := ""
 	var lastConversationErr error
 	conversationTerminal := false
+	emptyTerminalSnapshots := 0
 	baseAccumulator, errClone := helps.MergeChatGPTWebImageAccumulators(nil, accumulator)
 	if errClone != nil {
 		return errClone
@@ -3688,6 +3694,7 @@ func (e *ChatGPTWebExecutor) pollChatGPTWebImageConversation(ctx context.Context
 					return chatGPTWebImageFailureError(conversationFailure)
 				}
 				if outputCount > 0 {
+					emptyTerminalSnapshots = 0
 					if taskStateKnown && taskState.HasPending() && !conversationTerminal {
 						lastStableSignature = ""
 						stableSnapshots = 0
@@ -3713,11 +3720,10 @@ func (e *ChatGPTWebExecutor) pollChatGPTWebImageConversation(ctx context.Context
 					nextConversationPollAt = now.Add(delay)
 				} else {
 					nextConversationPollAt = now.Add(e.imagePollInterval)
-					if conversationTerminal && (!taskStateKnown || !taskState.HasPending()) {
-						if lastTaskFailure != "" {
-							return chatGPTWebImageFailureError(lastTaskFailure)
-						}
-						return newChatGPTWebImageNoOutputResultError()
+					if conversationTerminal {
+						emptyTerminalSnapshots++
+					} else {
+						emptyTerminalSnapshots = 0
 					}
 				}
 				if taskFallbackNeedsConversationRefresh {
@@ -3751,6 +3757,22 @@ func (e *ChatGPTWebExecutor) pollChatGPTWebImageConversation(ctx context.Context
 					}
 				}
 			}
+		}
+
+		// An empty terminal conversation can precede the task's image reference.
+		// Do not cancel an in-flight task lookup on the strength of one snapshot.
+		if conversationTerminal && emptyTerminalSnapshots >= 2 && chatGPTWebImageOutputCount(accumulator) == 0 &&
+			(taskPoll == nil && (!tasksEnabled || (taskStateKnown && !taskState.HasPending()))) {
+			if lastTaskFailure != "" {
+				return chatGPTWebImageFailureError(lastTaskFailure)
+			}
+			helps.LogWithRequestID(ctx).WithFields(log.Fields{
+				"provider": "chatgpt-web", "stage": "settle", "code": chatGPTWebImageErrorNoOutput,
+				"conversation_polls": conversationPolls, "task_polls": taskPolls,
+				"empty_terminal_snapshots": emptyTerminalSnapshots, "tasks_enabled": tasksEnabled,
+				"task_state_known": taskStateKnown,
+			}).Warn("chatgpt web image lookup confirmed terminal conversation without output")
+			return newChatGPTWebImageNoOutputResultError()
 		}
 
 		conversationStable := !conversationTerminal || stableSnapshots >= 1
@@ -4557,8 +4579,9 @@ func chatGPTWebCommittedRequestError(ctx context.Context, err error) (committedE
 	}
 	var httpErr chatGPTWebHTTPError
 	if errors.As(err, &httpErr) {
-		httpErr.statusErr.skipAuthResult = true
+		httpErr.statusErr.skipAuthResult = !httpErr.uploadRateLimited
 		httpErr.statusErr.retryOtherAuth = false
+		httpErr.requestCommitted = true
 		return httpErr
 	}
 	var localErr statusErr

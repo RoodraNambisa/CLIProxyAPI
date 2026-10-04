@@ -7803,6 +7803,17 @@ func (m *Manager) prepareProviderRequests(
 			continue
 		}
 		preparedOpts = cliproxyexecutor.WithProviderPreparedRequest(preparedOpts, provider, prepared)
+		if provider == "chatgpt-web" {
+			if prepared == nil {
+				metadata := make(map[string]any, len(preparedOpts.Metadata)+1)
+				for key, value := range preparedOpts.Metadata {
+					metadata[key] = value
+				}
+				preparedOpts.Metadata = metadata
+			}
+			upload, ok := prepared.(interface{ RequiresUpload() bool })
+			preparedOpts.Metadata[cliproxyexecutor.ChatGPTWebUploadRequiredMetadataKey] = ok && operation != cliproxyexecutor.RequestOperationCount && upload.RequiresUpload()
+		}
 		preparedProviders = append(preparedProviders, provider)
 	}
 	if len(preparedProviders) == 0 && firstErr != nil {
@@ -8318,12 +8329,14 @@ func (m *Manager) markResult(
 		}
 		chatGPTWebImageQuotaResult := result.Error != nil &&
 			strings.EqualFold(strings.TrimSpace(result.Error.Code), "chatgpt_web_image_quota")
+		uploadLimited := isChatGPTWebUploadLimitResult(auth, result)
 		chatGPTWebImage429Result := resultStatusCode == http.StatusTooManyRequests &&
 			chatGPTWebImageModelProjectionForModels(auth, result.Model, registeredImageModels)
 		if (chatGPTWebImageQuotaResult || chatGPTWebImage429Result) && hasDynamicFixedCooldown {
 			dynamicFixedCooldown.scope = cooldownScopeModel
 		}
 		chatGPTWebInFlightModelResult := authInstanceID != "" &&
+			!uploadLimited &&
 			result.Model != "" &&
 			strings.EqualFold(strings.TrimSpace(auth.Provider), "chatgpt-web") &&
 			!(!result.Success && isInvalidGrantResultError(result.Error))
@@ -8344,6 +8357,8 @@ func (m *Manager) markResult(
 			// Preserve an explicit disabled state against late in-flight results.
 		} else if !result.Success && (availabilityNeutral || isCredentialNeutralFailure(result.Error)) {
 			// Request faults and connection lifecycles do not change credential availability.
+		} else if uploadLimited {
+			m.applyChatGPTWebUploadCooldown(ctx, auth, result, now)
 		} else if staleDynamicModelResult {
 			// A dynamic catalog refresh already removed this model while the
 			// request was in flight. Keep the result observable to hooks without
@@ -9969,7 +9984,7 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		if pinnedAuthID != "" && candidate.ID != pinnedAuthID {
 			continue
 		}
-		candidates = append(candidates, candidate.Clone())
+		candidates = append(candidates, cloneAuthForRequestSelection(candidate, opts))
 	}
 	m.mu.RUnlock()
 	if modelKey != "" {
@@ -9994,7 +10009,7 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		if opts.AuthRequestSlot != nil {
 			opts.AuthRequestSlot.Bind(&authRequestReservation{noOp: true})
 		}
-		return available[0].Clone(), executor, nil
+		return cloneSelectedAuth(available[0]), executor, nil
 	}
 	requestLimiter := m.authRequestLimiter()
 	requestBlocked := authRequestLimitBlock{}
@@ -10093,7 +10108,7 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 			}
 			continue
 		}
-		authCopy := selected.Clone()
+		authCopy := cloneSelectedAuth(selected)
 		if !selected.indexAssigned {
 			m.mu.Lock()
 			if current := m.auths[authCopy.ID]; current != nil &&
@@ -10144,7 +10159,7 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 	if selected == nil {
 		return nil, nil, &Error{Code: "auth_not_found", Message: "selector returned no auth"}
 	}
-	authCopy := selected.Clone()
+	authCopy := cloneSelectedAuth(selected)
 	if !selected.indexAssigned {
 		m.mu.Lock()
 		if current := m.auths[authCopy.ID]; current != nil && !current.indexAssigned {
@@ -10208,7 +10223,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		if _, ok := executors[providerKey]; !ok {
 			continue
 		}
-		candidates = append(candidates, candidate.Clone())
+		candidates = append(candidates, cloneAuthForRequestSelection(candidate, opts))
 	}
 	m.mu.RUnlock()
 	if modelKey != "" {
@@ -10235,7 +10250,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		if err != nil {
 			return nil, nil, "", err
 		}
-		selected := available[0].Clone()
+		selected := cloneSelectedAuth(available[0])
 		if opts.AuthRequestSlot != nil {
 			opts.AuthRequestSlot.Bind(&authRequestReservation{noOp: true})
 		}
@@ -10346,7 +10361,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		if !okExecutor {
 			return nil, nil, "", &Error{Code: "executor_not_found", Message: "executor not registered"}
 		}
-		authCopy := selected.Clone()
+		authCopy := cloneSelectedAuth(selected)
 		if !selected.indexAssigned {
 			m.mu.Lock()
 			if current := m.auths[authCopy.ID]; current != nil &&
@@ -10422,7 +10437,7 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 	if !okExecutor {
 		return nil, nil, "", &Error{Code: "executor_not_found", Message: "executor not registered"}
 	}
-	authCopy := selected.Clone()
+	authCopy := cloneSelectedAuth(selected)
 	if !selected.indexAssigned {
 		m.mu.Lock()
 		if current := m.auths[authCopy.ID]; current != nil && !current.indexAssigned {
@@ -13535,6 +13550,14 @@ func carryForwardConcurrentRefreshMetadata(baseline, current, refreshed, next *A
 	if strings.EqualFold(strings.TrimSpace(current.Provider), "codex") {
 		next.Metadata = mergeCodexRefreshMetadata(baseline.Metadata, current.Metadata, refreshed.Metadata)
 		return
+	}
+	if strings.EqualFold(strings.TrimSpace(current.Provider), "chatgpt-web") {
+		// Credential refresh cannot reset a capability cooldown observed by a
+		// concurrent request. Only expiry or an explicit cooldown reset does so.
+		for _, key := range []string{chatGPTWebUploadResetKey, chatGPTWebUploadBackoffKey} {
+			value, present := authMetadataEntry(current.Metadata, key)
+			setAuthMetadataEntry(next, key, value, present)
+		}
 	}
 	baselineCredential, errBaseline := chatgptwebauth.ParseCredential(baseline.Metadata)
 	currentCredential, errCurrent := chatgptwebauth.ParseCredential(current.Metadata)

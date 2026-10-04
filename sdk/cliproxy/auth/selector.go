@@ -917,7 +917,11 @@ func (s *RandomSelector) intN(limit int) int {
 
 func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, blockReason, time.Time) {
 	expires, known := routingAccessTokenExpiration(auth)
-	return isAuthBlockedForModelWithExpiry(auth, model, now, expires, known)
+	blocked, reason, next := isAuthBlockedForModelWithExpiry(auth, model, now, expires, known)
+	if auth != nil && auth.selectionUploadRequired {
+		return withChatGPTWebUploadBlock(blocked, reason, next, ChatGPTWebUploadCooldownUntil(auth), now)
+	}
+	return blocked, reason, next
 }
 
 // Indexed scheduling reuses expiry evidence parsed at credential update time.

@@ -15,6 +15,15 @@ import (
 
 const providerPreparedRequestsMetadataKey = "provider_prepared_requests"
 
+// ChatGPTWebUploadRequiredMetadataKey is a preflight-derived capability flag,
+// not a client-supplied value. It does not affect other providers.
+const ChatGPTWebUploadRequiredMetadataKey = "chatgpt_web_upload_required"
+
+func ChatGPTWebUploadRequired(opts Options) bool {
+	required, _ := opts.Metadata[ChatGPTWebUploadRequiredMetadataKey].(bool)
+	return required
+}
+
 // RequestOperation identifies the Manager entrypoint preparing a provider request.
 type RequestOperation uint8
 

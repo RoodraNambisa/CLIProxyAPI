@@ -290,6 +290,9 @@ func clearFullAuthCooldownState(auth *coreauth.Auth, now time.Time) bool {
 		return false
 	}
 	changed := clearAuthCooldownFields(auth, now)
+	if coreauth.ClearChatGPTWebUploadCooldown(auth) {
+		changed = true
+	}
 	for _, state := range auth.ModelStates {
 		if clearModelCooldownFields(state, now) {
 			changed = true

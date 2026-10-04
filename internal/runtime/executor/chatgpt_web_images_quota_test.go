@@ -399,6 +399,42 @@ func TestChatGPTWebUploadLimitPreservesExplicitWaitAndNoCleanup(t *testing.T) {
 		if chatGPTWebImageResultSkipAuthResult(projected) {
 			t.Fatal("upload limit skipped cooldown")
 		}
+		var model interface{ ExecutionResultModel() string }
+		if errors.As(projected, &model) {
+			t.Fatal("upload limit must not project onto image model cooldown")
+		}
+		var code interface{ ExecutionResultErrorCode() string }
+		if !errors.As(projected, &code) || code.ExecutionResultErrorCode() != "chatgpt_web_upload_rate_limit" {
+			t.Fatal("upload limit lost classification")
+		}
+		committed := chatGPTWebCommittedRequestError(t.Context(), projected)
+		if chatGPTWebImageResultSkipAuthResult(committed) || chatGPTWebImageResultRetryOtherAuth(committed) {
+			t.Fatal("committed upload limit must cool down without replay")
+		}
+		var marker interface{ RequestCommitted() bool }
+		if !errors.As(committed, &marker) || !marker.RequestCommitted() {
+			t.Fatal("upload error lost commit guard")
+		}
+	}
+}
+
+func TestChatGPTWebImageUploadRequirement(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		image *helps.ChatGPTWebImageRequest
+		want  bool
+	}{
+		{"generation", &helps.ChatGPTWebImageRequest{Prompt: "draw"}, false},
+		{"edit", &helps.ChatGPTWebImageRequest{Images: []string{"data:image/png;base64,fixture"}}, true},
+		{"remote edit", &helps.ChatGPTWebImageRequest{Images: []string{"https://example.test/image.png"}}, true},
+		{"mask", &helps.ChatGPTWebImageRequest{MaskURL: "data:image/png;base64,fixture"}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			prepared := &chatGPTWebPreparedRequest{request: helps.ChatGPTWebRequest{Image: tc.image}}
+			if prepared.RequiresUpload() != tc.want {
+				t.Fatal("wrong upload capability")
+			}
+		})
 	}
 }
 

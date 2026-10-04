@@ -31,12 +31,19 @@ func ChatGPTWebImageRateLimit(message string) (bool, *time.Duration) {
 // ChatGPTWebUploadLimitRetryAfter extracts a wait only from the structured
 // upload-count rejection. Storage-full errors must not enter this path.
 func ChatGPTWebUploadLimitRetryAfter(status int, path string, body []byte) *time.Duration {
+	_, delay := ChatGPTWebUploadRateLimit(status, path, body)
+	return delay
+}
+
+// ChatGPTWebUploadRateLimit distinguishes upload throttling even when the
+// upstream response does not provide a recognizable recovery time.
+func ChatGPTWebUploadRateLimit(status int, path string, body []byte) (bool, *time.Duration) {
 	if status != http.StatusTooManyRequests || len(body) > 1<<20 {
-		return nil
+		return false, nil
 	}
 	if path != "/backend-api/files" && path != "/backend-api/files/process_upload_stream" &&
 		!(strings.HasPrefix(path, "/backend-api/files/") && strings.HasSuffix(path, "/uploaded")) {
-		return nil
+		return false, nil
 	}
 	type detail struct {
 		Code      string `json:"code"`
@@ -49,7 +56,7 @@ func ChatGPTWebUploadLimitRetryAfter(status int, path string, body []byte) *time
 		Error  detail `json:"error"`
 	}
 	if json.Unmarshal(body, &response) != nil {
-		return nil
+		return false, nil
 	}
 	for _, entry := range []detail{response.Detail, response.Error} {
 		if entry.Code != "throttled" && entry.ErrorCode != "throttled" && entry.Type != "throttled" {
@@ -60,9 +67,9 @@ func ChatGPTWebUploadLimitRetryAfter(status int, path string, body []byte) *time
 			!strings.HasPrefix(message, "you\u2019ve reached our limit of file uploads.") {
 			continue
 		}
-		return chatGPTWebRelativeWait(message)
+		return true, chatGPTWebRelativeWait(message)
 	}
-	return nil
+	return false, nil
 }
 
 func chatGPTWebRelativeWait(message string) *time.Duration {

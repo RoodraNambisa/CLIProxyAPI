@@ -236,6 +236,7 @@ type Auth struct {
 	requestRefreshFamilyID         string
 	requestScopedErrorRules        *authRequestScopedErrorSnapshot
 	codexQuotaObservation          *CodexQuotaObservation
+	selectionUploadRequired        bool
 }
 
 type authInstanceState struct {

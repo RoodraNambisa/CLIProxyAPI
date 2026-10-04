@@ -137,6 +137,9 @@ func TestChatGPTWebPreparedRequestNormalizesImageMIMEAcrossInputFormats(t *testi
 			if len(prepared.request.Messages) != 1 || len(prepared.request.Messages[0].Parts) == 0 {
 				t.Fatalf("prepared messages = %#v", prepared.request.Messages)
 			}
+			if !prepared.RequiresUpload() {
+				t.Fatal("multimodal preflight did not require upload capability")
+			}
 			got := prepared.request.Messages[0].Parts[len(prepared.request.Messages[0].Parts)-1].ImageURL
 			if got != "data:image/png;base64,"+pngPayload {
 				t.Fatalf("normalized image URL = %q", got)

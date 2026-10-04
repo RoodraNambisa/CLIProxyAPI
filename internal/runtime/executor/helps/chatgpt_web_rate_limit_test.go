@@ -44,6 +44,10 @@ func TestChatGPTWebUploadLimitWaitRequiresStructuredEvidence(t *testing.T) {
 		{"invalid JSON", 429, "/backend-api/files", `not JSON`, 0},
 	} {
 		t.Run(test.name, func(t *testing.T) {
+			limited, _ := ChatGPTWebUploadRateLimit(test.status, test.path, []byte(test.body))
+			if limited != (test.delay > 0 || test.name == "missing duration") {
+				t.Fatalf("classification limited=%v", limited)
+			}
 			delay := ChatGPTWebUploadLimitRetryAfter(test.status, test.path, []byte(test.body))
 			if (delay == nil) != (test.delay == 0) || delay != nil && *delay != test.delay {
 				t.Fatalf("delay=%v, want %s", delay, test.delay)

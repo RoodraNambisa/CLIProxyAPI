@@ -103,6 +103,11 @@ type chatGPTWebPreparedRequest struct {
 	phaseObserver          cliproxyexecutor.RequestPhaseObserver
 }
 
+// RequiresUpload is evaluated once during credential-independent preflight.
+func (prepared *chatGPTWebPreparedRequest) RequiresUpload() bool {
+	return len(chatGPTWebPreparedImageReferences(prepared)) > 0
+}
+
 type chatGPTWebRequirements struct {
 	Token          string
 	ProofToken     string
@@ -2668,7 +2673,18 @@ type chatGPTWebHTTPError struct {
 	sentinelFinalizeRejection  bool
 	libraryStorageRejected     bool
 	libraryUploadBytes         int64
+	uploadRateLimited          bool
+	requestCommitted           bool
 	diagnostic                 *cliproxyauth.ErrorDiagnostic
+}
+
+func (e chatGPTWebHTTPError) RequestCommitted() bool { return e.requestCommitted }
+
+func (e chatGPTWebHTTPError) ExecutionResultErrorCode() string {
+	if e.uploadRateLimited {
+		return "chatgpt_web_upload_rate_limit"
+	}
+	return ""
 }
 
 type chatGPTWebDiagnosticError struct {
@@ -2790,8 +2806,10 @@ func newChatGPTWebStatusError(code int, path string, body []byte, headers fhttp.
 		err.statusErr.retryAfter = parseXAIRetryAfterHeader(retryAfter, time.Now())
 		err.headers = http.Header{"Retry-After": []string{retryAfter}}
 	}
+	limited, delay := helps.ChatGPTWebUploadRateLimit(code, path, body)
+	err.uploadRateLimited = limited
 	if err.statusErr.retryAfter == nil {
-		if delay := helps.ChatGPTWebUploadLimitRetryAfter(code, path, body); delay != nil {
+		if delay != nil {
 			err.statusErr.retryAfter = delay
 			err.headers = err.statusErr.Headers()
 		}

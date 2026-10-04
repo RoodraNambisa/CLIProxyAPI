@@ -324,6 +324,11 @@ func applyChatGPTWebMetadataSummary(entry gin.H, metadata map[string]any, lifecy
 	entry["lifecycle_reason"] = reason
 	entry["reason"] = reason
 	entry["status_message"] = reason
+	until := coreauth.ChatGPTWebUploadCooldownUntil(&coreauth.Auth{Provider: "chatgpt-web", Metadata: metadata})
+	entry["upload_cooldown_active"] = until.After(now)
+	if !until.IsZero() {
+		entry["upload_cooldown_until"] = until
+	}
 
 	applyChatGPTWebSummaryTime(entry, metadata, "lifecycle_updated_at", "lifecycle_updated_at")
 	applyChatGPTWebSummaryTime(entry, metadata, "last_login_at", "last_login_at")
