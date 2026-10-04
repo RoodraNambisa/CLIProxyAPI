@@ -211,7 +211,7 @@ func (service *Service) loginOnce(acquisitionContext context.Context, input Logi
 	if selector != nil {
 		client, err = newLoginClient(credential.Persona, loginCookies, selector, acquisitionTimeout)
 	} else {
-		client, err = NewClient(credential.Persona, input.ProxyURL, loginCookies)
+		client, err = NewAcquisitionClient(credential.Persona, input.ProxyURL, loginCookies, acquisitionTimeout)
 		if err == nil {
 			client.loginRetry = &loginClientRetry{attempts: 1}
 		}
@@ -541,13 +541,14 @@ func (service *Service) Refresh(ctx context.Context, credential Credential, prox
 	}
 	acquisitionContext, cancel := service.acquisitionContext(ctx)
 	defer cancel()
-	client, err := NewClient(refreshed.Persona, proxyURL, refreshed.Cookies)
+	client, err := NewAcquisitionClient(refreshed.Persona, proxyURL, refreshed.Cookies, service.options.AcquisitionTimeout)
 	if err != nil {
 		authError := newAuthError("client_initialization_failed", LifecycleActive, 0, true, false, "initialize browser client", err)
 		service.applyFailure(refreshed, authError, false)
 		return refreshed, authError
 	}
 	defer client.CloseIdleConnections()
+	defer client.CloseActiveAcquisitionConnections()
 	if err := client.SetCookie(service.options.AuthBaseURL, "oai-did", refreshed.DeviceID); err != nil {
 		authError := newAuthError("cookie_initialization_failed", LifecycleActive, 0, false, true, "initialize device cookie", err)
 		service.applyFailure(refreshed, authError, false)
@@ -641,13 +642,14 @@ func (service *Service) RefreshSession(ctx context.Context, credential Credentia
 	}
 	acquisitionContext, cancel := service.acquisitionContext(ctx)
 	defer cancel()
-	client, err := NewClient(refreshed.Persona, proxyURL, refreshed.Cookies)
+	client, err := NewAcquisitionClient(refreshed.Persona, proxyURL, refreshed.Cookies, service.options.AcquisitionTimeout)
 	if err != nil {
 		authError := newAuthError("client_initialization_failed", LifecycleActive, 0, true, false, "initialize browser client", err)
 		service.applyFailure(refreshed, authError, false)
 		return refreshed, authError
 	}
 	defer client.CloseIdleConnections()
+	defer client.CloseActiveAcquisitionConnections()
 	if err = client.SetCookie(service.options.SessionBaseURL, "oai-did", refreshed.DeviceID); err != nil {
 		authError := newAuthError("cookie_initialization_failed", LifecycleActive, 0, false, true, "initialize device cookie", err)
 		service.applyFailure(refreshed, authError, false)
