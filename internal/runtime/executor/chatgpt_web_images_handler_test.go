@@ -8,7 +8,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	fhttp "github.com/bogdanfinn/fhttp"
 	"github.com/gin-gonic/gin"
@@ -57,7 +59,8 @@ func TestChatGPTWebGenerationFailureIs502UnlessConfiguredOtherwise(t *testing.T)
 }
 
 type chatGPTWebHandlerRateLimitExecutor struct {
-	err error
+	err   error
+	calls atomic.Int32
 }
 
 func (*chatGPTWebHandlerRateLimitExecutor) Identifier() string {
@@ -65,6 +68,7 @@ func (*chatGPTWebHandlerRateLimitExecutor) Identifier() string {
 }
 
 func (e *chatGPTWebHandlerRateLimitExecutor) Execute(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error) {
+	e.calls.Add(1)
 	return coreexecutor.Response{}, e.err
 }
 
@@ -275,4 +279,35 @@ func TestChatGPTWebImageErrorsReachHTTPHandlersAsRateLimits(t *testing.T) {
 		router.ServeHTTP(response, request)
 		assertChatGPTWebImageHandlerOpenAIRateLimit(t, response)
 	})
+}
+
+func TestChatGPTWebImageFrequencyLimitCoolsOnlyImageAndNeverReplays(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	failure := chatGPTWebCommittedRequestError(t.Context(), chatGPTWebImageFailureError("You're generating images too quickly. Please wait for an hour before generating more images."))
+	manager, authID := newChatGPTWebImageHandlerManager(t, failure, "gpt-image-2", "gpt-5.4-mini")
+	manager.SetRetryConfig(2, 0, 2)
+	executor := &chatGPTWebHandlerRateLimitExecutor{err: failure}
+	manager.RegisterExecutor(executor)
+	base := handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{Images: sdkconfig.ImagesConfig{CodexModel: "gpt-5.4-mini"}}, manager)
+	handler := openaihandlers.NewOpenAIImagesAPIHandler(base)
+	router := gin.New()
+	router.POST("/v1/images/generations", handler.Generations)
+	request := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(`{"model":"gpt-image-2","prompt":"fixture"}`))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != 429 || response.Header().Get("Retry-After") != "3600" || executor.calls.Load() != 1 {
+		t.Fatalf("status=%d retry-after=%s calls=%d", response.Code, response.Header().Get("Retry-After"), executor.calls.Load())
+	}
+	current, _ := manager.GetByID(authID)
+	state := current.ModelStates["gpt-image-2"]
+	if state == nil || !state.Unavailable || !state.NextRetryAfter.After(time.Now().Add(59*time.Minute)) || state.Quota.Reason != "quota" {
+		t.Fatalf("missing image-only cooldown: %+v", state)
+	}
+	if textState := current.ModelStates["gpt-5.4-mini"]; textState != nil && textState.Unavailable {
+		t.Fatal("text model was cooled down")
+	}
+	if current.Disabled || current.Metadata["quota_state"] == "exhausted" {
+		t.Fatal("frequency limit disabled credential or fabricated quota exhaustion")
+	}
 }

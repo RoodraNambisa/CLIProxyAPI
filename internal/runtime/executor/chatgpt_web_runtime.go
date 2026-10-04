@@ -2790,6 +2790,12 @@ func newChatGPTWebStatusError(code int, path string, body []byte, headers fhttp.
 		err.statusErr.retryAfter = parseXAIRetryAfterHeader(retryAfter, time.Now())
 		err.headers = http.Header{"Retry-After": []string{retryAfter}}
 	}
+	if err.statusErr.retryAfter == nil {
+		if delay := helps.ChatGPTWebUploadLimitRetryAfter(code, path, body); delay != nil {
+			err.statusErr.retryAfter = delay
+			err.headers = err.statusErr.Headers()
+		}
+	}
 	return err
 }
 

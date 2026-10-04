@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -64,6 +65,48 @@ func TestCloudflareEdgeHeadersAreNotChallengeEvidence(t *testing.T) {
 		if isCloudflareChallenge(response, []byte(body)) {
 			t.Fatalf("edge response %q was treated as a challenge", body)
 		}
+	}
+}
+
+func TestCloudflareDetectionAllowsBackgroundJavaScriptOnLoginPage(t *testing.T) {
+	for _, script := range []string{
+		`<script src="/cdn-cgi/challenge-platform/scripts/jsd/api.js"></script>`,
+		`<script>window.__CF$cv$params={r:'fixture'};var s=document.createElement('script');s.src='/cdn-cgi/challenge-platform/h/g/scripts/jsd/fixture/main.js';</script>`,
+	} {
+		response := &fhttp.Response{StatusCode: http.StatusOK, Header: fhttp.Header{}}
+		response.Header.Set("Content-Type", "text/html; charset=utf-8")
+		response.Header.Set("Server", "cloudflare")
+		response.Header.Set("CF-Ray", "normal-page-ray")
+		body := []byte(`<html><title>Log in - OpenAI</title><form><input name="username" type="email"></form>` + script + `</html>`)
+		if isCloudflareChallenge(response, body) {
+			t.Error("normal login page with background JS detection was rejected")
+		}
+		response.Header.Set("CF-Mitigated", "challenge")
+		if !isCloudflareChallenge(response, body) {
+			t.Error("explicit challenge header must remain authoritative")
+		}
+	}
+}
+
+func TestLoginChallengePreservesSafeResponseMetadata(t *testing.T) {
+	target, _ := url.Parse("https://auth.openai.com/log-in?state=secret-state")
+	response := &fhttp.Response{StatusCode: 403, Header: fhttp.Header{}, Request: &fhttp.Request{URL: target}}
+	response.Header.Set("CF-Mitigated", "challenge")
+	response.Header.Set("CF-Ray", "fixture-ray")
+	response.Header.Set("Content-Type", "text/html; charset=utf-8")
+	body := []byte(`<html><script>window._cf_chl_opt={state:'secret-state'}</script></html>`)
+	failure := newLoginChallengeError(target.String(), "authorize", 2, response, body, nil)
+	classified := networkAuthError("authorize_network_error", LifecycleReloginPending, failure)
+	if classified.Code != "cloudflare_challenge" || classified.Terminal || !classified.Retryable ||
+		classified.State != LifecycleReloginPending || classified.Attempts != 2 || classified.FailureStage != "authorize" {
+		t.Fatalf("wrong lifecycle: %+v", classified)
+	}
+	if classified.ResponseType != "html" || classified.ContentType != "text/html" || classified.CFRay != "fixture-ray" ||
+		classified.TargetHost != "auth.openai.com" || classified.TargetPath != "/log-in" || classified.ResponseBytes != int64(len(body)) {
+		t.Fatalf("metadata was lost: %+v", classified)
+	}
+	if classified.ResponseBody != "" || failure.diagnostic.ResponseBody != "" || strings.Contains(classified.Error(), "secret-state") {
+		t.Fatal("login challenge retained a live authorization page")
 	}
 }
 
@@ -148,7 +191,7 @@ func TestLoginClientDoesNotReplayOneTimeRequest(t *testing.T) {
 		response.Header().Set("CF-Ray", "challenge-ray")
 		response.Header().Set("Content-Type", "text/html")
 		response.WriteHeader(http.StatusForbidden)
-		_, _ = io.WriteString(response, `<html><script src="/cdn-cgi/challenge-platform/x"></script></html>`)
+		_, _ = io.WriteString(response, `<html><script src="/cdn-cgi/challenge-platform/h/g/orchestrate/chl_page/v1"></script></html>`)
 	}))
 	defer upstream.Close()
 	proxy := newLoginConnectProxy(t, nil)

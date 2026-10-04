@@ -1721,7 +1721,7 @@ func (h *BaseAPIHandler) getRequestDetails(ctx context.Context, modelName string
 
 	if h.isConfiguredImageModel(baseModel) {
 		return nil, "", &interfaces.ErrorMessage{
-			StatusCode: http.StatusServiceUnavailable,
+			StatusCode: http.StatusBadRequest,
 			Error:      fmt.Errorf("model %s is only supported on /v1/images/generations and /v1/images/edits", baseModel),
 		}
 	}

@@ -88,6 +88,22 @@ func newLoginFixture(t *testing.T, passwordStatus int, passwordBody string) *log
 }
 
 func (fixture *loginFixture) serveHTTP(response http.ResponseWriter, request *http.Request) {
+	if request.Method == http.MethodGet {
+		switch request.URL.Path {
+		case "/password-page", "/password-redirect", "/authorize-follow", "/authorize-follow-final", "/log-in-or-create-account":
+			if values := request.Header.Values("Accept"); len(values) != 1 || !strings.HasPrefix(values[0], "text/html") {
+				fixture.t.Errorf("navigation %s Accept=%q", request.URL.Path, values)
+			}
+			if request.Header.Get("Sec-Fetch-Dest") != "document" || request.Header.Get("Sec-Fetch-Mode") != "navigate" {
+				fixture.t.Errorf("navigation %s has no document headers", request.URL.Path)
+			}
+			for _, key := range []string{"Authorization", "Origin", "Content-Type", "Oai-Device-Id", "OpenAI-Sentinel-Token"} {
+				if request.Header.Get(key) != "" {
+					fixture.t.Errorf("navigation %s leaked %s", request.URL.Path, key)
+				}
+			}
+		}
+	}
 	switch request.URL.Path {
 	case "/api/accounts/authorize":
 		fixture.handleAuthorize(response, request)
@@ -98,6 +114,10 @@ func (fixture *loginFixture) serveHTTP(response http.ResponseWriter, request *ht
 	case "/log-in", "/log-in/password":
 		response.Header().Set("Content-Type", "text/html")
 		_, _ = io.WriteString(response, "login")
+	case "/log-in-or-create-account":
+		response.Header().Set("Content-Type", "text/html; charset=utf-8")
+		response.Header().Set("Server", "cloudflare")
+		_, _ = io.WriteString(response, `<html><title>Log in or sign up - OpenAI</title><form><input name="username" type="email"></form><script>window.__CF$cv$params={};</script><script src="/cdn-cgi/challenge-platform/scripts/jsd/main.js"></script></html>`)
 	case "/api/accounts/email-otp/send":
 		fixture.handleEmailOTPSend(response, request)
 	case "/email-verification":
@@ -247,7 +267,7 @@ func (fixture *loginFixture) handleSentinel(response http.ResponseWriter, reques
 		response.Header().Set("CF-Ray", "challenge-ray")
 		response.Header().Set("Content-Type", "text/html")
 		response.WriteHeader(http.StatusServiceUnavailable)
-		_, _ = io.WriteString(response, `<html><script src="/cdn-cgi/challenge-platform/x"></script></html>`)
+		_, _ = io.WriteString(response, `<html><script src="/cdn-cgi/challenge-platform/h/g/orchestrate/chl_page/v1"></script></html>`)
 		return
 	}
 	var body map[string]any
@@ -441,6 +461,9 @@ func (fixture *loginFixture) handleAuthorizeContinue(response http.ResponseWrite
 }
 
 func (fixture *loginFixture) handlePassword(response http.ResponseWriter, request *http.Request) {
+	if values := request.Header.Values("Accept"); len(values) != 1 || values[0] != "application/json" || request.Header.Get("Sec-Fetch-Mode") != "cors" {
+		fixture.t.Errorf("password API inherited navigation headers: accept=%q", values)
+	}
 	fixture.mu.Lock()
 	fixture.passwordCalls++
 	fixture.mu.Unlock()
@@ -547,7 +570,7 @@ func (fixture *loginFixture) handleTokenExchange(response http.ResponseWriter, r
 		response.Header().Set("CF-Ray", "challenge-ray")
 		response.Header().Set("Content-Type", "text/html")
 		response.WriteHeader(http.StatusForbidden)
-		_, _ = io.WriteString(response, `<html><script src="/cdn-cgi/challenge-platform/x"></script></html>`)
+		_, _ = io.WriteString(response, `<html><script src="/cdn-cgi/challenge-platform/h/g/orchestrate/chl_page/v1"></script></html>`)
 		return
 	}
 	var body struct {
@@ -612,6 +635,24 @@ func TestServiceLogin(t *testing.T) {
 	if len(credential.Cookies) == 0 || credential.Persona.Profile != "chrome_146" ||
 		chromeMajor(credential.Persona.UserAgent) != "146" {
 		t.Fatal("login did not persist cookies and persona")
+	}
+}
+
+func TestServiceLoginAcceptsCurrentCombinedLoginPage(t *testing.T) {
+	fixture := newLoginFixture(t, http.StatusOK, "")
+	fixture.authorizePath = "/log-in-or-create-account"
+	service := NewService(fixture.options(time.Now()))
+	credential, err := service.Login(t.Context(), LoginInput{
+		Email: "person@example.com", Password: "correct-password",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.mu.Lock()
+	tokenCalls, passwordCalls := fixture.tokenCalls, fixture.passwordCalls
+	fixture.mu.Unlock()
+	if credential.LifecycleState != LifecycleActive || tokenCalls != 1 || passwordCalls != 1 {
+		t.Fatalf("login did not finish exactly once: state=%s token=%d password=%d", credential.LifecycleState, tokenCalls, passwordCalls)
 	}
 }
 

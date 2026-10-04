@@ -1305,7 +1305,7 @@ func TestChatGPTWebJSONDoesNotTreatSuccessfulCloudflareHTMLAsChallenge(t *testin
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Header().Set("Server", "cloudflare")
 		w.Header().Set("cf-ray", "safe-ray")
-		_, _ = io.WriteString(w, `<!doctype html><title>ChatGPT</title><main>ok</main>`)
+		_, _ = io.WriteString(w, `<!doctype html><title>ChatGPT</title><main>ok</main><script src="/cdn-cgi/challenge-platform/scripts/jsd/main.js"></script>`)
 	}))
 	defer origin.Close()
 

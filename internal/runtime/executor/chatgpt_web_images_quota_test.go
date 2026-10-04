@@ -348,6 +348,60 @@ func TestChatGPTWebTerminalImageFailureProjectsExplicitQuotaEvidence(t *testing.
 	}
 }
 
+func TestChatGPTWebImageTooQuicklyFailureHasCooldown(t *testing.T) {
+	message := "You're generating images too quickly. To ensure the best experience for everyone, we have rate limits in place. Please wait for an hour before generating more images."
+	projected := chatGPTWebImageRequestError(chatGPTWebImageFailureError(message))
+	var status interface{ StatusCode() int }
+	if !errors.As(projected, &status) || status.StatusCode() != http.StatusTooManyRequests {
+		t.Fatalf("explicit image rate limit = %v, want 429", projected)
+	}
+	var skip interface{ SkipAuthResult() bool }
+	if !errors.As(projected, &skip) || skip.SkipAuthResult() {
+		t.Fatal("explicit image rate limit must update scheduler cooldown")
+	}
+	var retry interface{ RetryAfter() *time.Duration }
+	if !errors.As(projected, &retry) || retry.RetryAfter() == nil || *retry.RetryAfter() != time.Hour {
+		t.Fatalf("explicit hour cooldown was lost: %v", projected)
+	}
+	committed := chatGPTWebCommittedRequestError(t.Context(), projected)
+	var submitted interface{ RequestCommitted() bool }
+	if !errors.As(committed, &submitted) || !submitted.RequestCommitted() || chatGPTWebImageResultRetryOtherAuth(committed) {
+		t.Fatal("submitted image failure must not replay generation")
+	}
+	if chatGPTWebImageResultSkipAuthResult(committed) {
+		t.Fatal("committed rate limit must still update the cooldown")
+	}
+}
+
+func TestChatGPTWebUploadLimitPreservesExplicitWaitAndNoCleanup(t *testing.T) {
+	body := []byte(`{"detail":{"code":"throttled","error_code":"throttled","message":"You've reached our limit of file uploads. Please try again in 22 hours.","type":"throttled"}}`)
+	for _, test := range []struct {
+		header string
+		want   time.Duration
+	}{
+		{"", 22 * time.Hour},
+		{"45", 45 * time.Second},
+		{"invalid", 22 * time.Hour},
+	} {
+		upstream := newChatGPTWebStatusError(429, "/backend-api/files", body, fhttp.Header{"Retry-After": {test.header}})
+		if upstream.libraryStorageRejected || upstream.lifecycleError != nil {
+			t.Fatal("upload count limit must not trigger library cleanup or credential death")
+		}
+		projected := chatGPTWebImageRequestError(upstream)
+		var retry interface{ RetryAfter() *time.Duration }
+		if !errors.As(projected, &retry) || retry.RetryAfter() == nil || *retry.RetryAfter() != test.want {
+			t.Fatalf("header=%q wait=%v", test.header, retry)
+		}
+		var quota *chatGPTWebImageQuotaResultError
+		if errors.As(projected, &quota) {
+			t.Fatal("upload limit is not image quota exhaustion")
+		}
+		if chatGPTWebImageResultSkipAuthResult(projected) {
+			t.Fatal("upload limit skipped cooldown")
+		}
+	}
+}
+
 func TestChatGPTWebStructuredToolRateLimitReturnsQuotaError(t *testing.T) {
 	executor := &ChatGPTWebExecutor{}
 	prepared := &chatGPTWebPreparedRequest{

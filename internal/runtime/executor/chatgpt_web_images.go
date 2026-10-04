@@ -1548,6 +1548,16 @@ func chatGPTWebImageFailureError(status string) error {
 	if chatGPTWebImageModerationFailure(status) {
 		return newChatGPTWebImageModerationResultError()
 	}
+	if limited, retryAfter := helps.ChatGPTWebImageRateLimit(status); limited {
+		return &chatGPTWebImageRateLimitResultError{cause: chatGPTWebImageSettleStatusError{
+			statusErr: statusErr{
+				code:       http.StatusTooManyRequests,
+				msg:        "chatgpt web image rate limit: " + strings.TrimSpace(status),
+				retryAfter: retryAfter,
+			},
+			errorCode: "chatgpt_web_image_rate_limit",
+		}}
+	}
 	if chatGPTWebImageQuotaTextEvidence(status) {
 		return statusErr{
 			code:           http.StatusTooManyRequests,

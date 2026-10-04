@@ -674,21 +674,10 @@ func (client *Client) do(ctx context.Context, followRedirect, replayable bool, m
 				if errRetry := client.prepareLoginRequestRetry(ctx, attempt); errRetry == nil {
 					continue
 				} else {
-					return response, payload, &loginRequestError{
-						stage:      stage,
-						status:     response.StatusCode,
-						attempts:   attempt,
-						cloudflare: true,
-						cause:      errRetry,
-					}
+					return response, payload, newLoginChallengeError(targetURL, stage, attempt, response, payload, errRetry)
 				}
 			}
-			return response, payload, &loginRequestError{
-				stage:      stage,
-				status:     response.StatusCode,
-				attempts:   attempt,
-				cloudflare: true,
-			}
+			return response, payload, newLoginChallengeError(targetURL, stage, attempt, response, payload, nil)
 		}
 		return response, payload, nil
 	}

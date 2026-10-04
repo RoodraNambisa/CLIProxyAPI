@@ -23,7 +23,7 @@ func TestChatGPTWebSessionForbiddenLifecycleEndToEnd(t *testing.T) {
 		code     string
 		wantDead bool
 	}{
-		{"CF challenge", `<html><script src="/cdn-cgi/challenge-platform/x"></script></html>`, "cloudflare_challenge", false},
+		{"CF challenge", `<html><script src="/cdn-cgi/challenge-platform/h/g/orchestrate/chl_page/v1"></script></html>`, "cloudflare_challenge", false},
 		{"unknown HTML", `<html>Request denied</html>`, "session_refresh_forbidden", false},
 		{"empty", "", "session_refresh_forbidden", false},
 		{"unknown JSON", `{"error":"forbidden"}`, "session_refresh_forbidden", false},
@@ -106,7 +106,7 @@ func TestChatGPTWebSessionPromotionRejectsConflictingDiagnostics(t *testing.T) {
 
 func TestChatGPTWebBackgroundForbiddenExhaustionKeepsQuarantine(t *testing.T) {
 	for _, tc := range []struct{ name, body, code string }{
-		{"CF", `<html><script src="/cdn-cgi/challenge-platform/x"></script></html>`, "cloudflare_challenge"},
+		{"CF", `<html><script src="/cdn-cgi/challenge-platform/h/g/orchestrate/chl_page/v1"></script></html>`, "cloudflare_challenge"},
 		{"unknown HTML", `<html>Access denied</html>`, "authentication_forbidden"},
 		{"empty", "", "authentication_forbidden"},
 		{"network", "", "authentication_network_error"},

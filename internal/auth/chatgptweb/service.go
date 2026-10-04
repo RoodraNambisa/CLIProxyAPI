@@ -914,7 +914,7 @@ func (service *Service) followOAuthCode(ctx context.Context, client *Client, sta
 			return "", authError
 		}
 		response, payload, err := client.DoNoRedirect(ctx, http.MethodGet, currentURL,
-			map[string]string{"referer": service.options.AuthBaseURL + "/log-in/password"}, nil)
+			authorizationNavigationHeaders(service.options.AuthBaseURL+"/log-in/password"), nil)
 		if err != nil {
 			return "", networkAuthError("oauth_redirect_network_error", transientState, err)
 		}
@@ -952,9 +952,8 @@ func (service *Service) openAuthorizationPage(ctx context.Context, client *Clien
 	if authError := validateOAuthContinuationOrigin(targetURL, service.options.AuthBaseURL); authError != nil {
 		return nil, nil, "", authError
 	}
-	response, payload, err := client.DoNoRedirect(ctx, http.MethodGet, targetURL, map[string]string{
-		"referer": service.options.AuthBaseURL + "/sign-in",
-	}, nil)
+	response, payload, err := client.DoNoRedirect(ctx, http.MethodGet, targetURL,
+		authorizationNavigationHeaders(service.options.AuthBaseURL+"/sign-in"), nil)
 	if err != nil {
 		return nil, nil, "", networkAuthError("authorize_redirect_network_error", transientState, err)
 	}
@@ -984,7 +983,7 @@ func (service *Service) followAuthorizationRedirects(ctx context.Context, client
 			return response, payload, "", authError
 		}
 		method := http.MethodGet
-		headers := map[string]string{"referer": currentURL}
+		headers := authorizationNavigationHeaders(currentURL)
 		var body io.Reader
 		if response.StatusCode == http.StatusTemporaryRedirect || response.StatusCode == http.StatusPermanentRedirect {
 			request := response.Request
@@ -1079,7 +1078,7 @@ func (service *Service) followPasswordRedirects(
 				map[string]string{"password": password})
 		} else {
 			response, payload, err = client.DoNoRedirect(ctx, http.MethodGet, nextURL,
-				map[string]string{"referer": currentURL}, nil)
+				authorizationNavigationHeaders(currentURL), nil)
 		}
 		if err != nil {
 			return response, payload, "", networkAuthError("oauth_redirect_network_error", transientState, err)
@@ -1266,6 +1265,15 @@ func networkAuthError(code string, state LifecycleState, err error) *AuthError {
 			)
 			authError.FailureStage = requestError.stage
 			authError.Attempts = requestError.attempts
+			if diagnostic := requestError.diagnostic; diagnostic != nil {
+				authError.DiagnosticCode = diagnostic.DiagnosticCode
+				authError.ResponseType = diagnostic.ResponseType
+				authError.ContentType = diagnostic.ContentType
+				authError.CFRay = diagnostic.CFRay
+				authError.TargetHost = diagnostic.TargetHost
+				authError.TargetPath = diagnostic.TargetPath
+				authError.ResponseBytes = diagnostic.ResponseBytes
+			}
 			return authError
 		}
 		authError := newAuthError(code, state, requestError.status, true, false, "network request failed", err)
@@ -1441,7 +1449,7 @@ func (service *Service) ensureAPI798EmailOTPChallenge(
 		return issuedAt, false, authError
 	}
 	referer = service.api798ChallengeReferer(envelope, referer)
-	headers := api798NavigationHeaders(referer)
+	headers := authorizationNavigationHeaders(referer)
 	issuedAt = service.options.Now().Add(-api798MailClockSkew)
 	response, payload, errRequest := client.DoFollow(
 		ctx,
@@ -1556,7 +1564,7 @@ func shouldStartAPI798EmailOTP(pageType, continueURL string) bool {
 		strings.Contains(normalizedURL, "/passkey") || strings.Contains(normalizedURL, "/webauthn")
 }
 
-func api798NavigationHeaders(referer string) map[string]string {
+func authorizationNavigationHeaders(referer string) map[string]string {
 	return map[string]string{
 		"accept":                    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
 		"cache-control":             "no-cache",
@@ -2608,7 +2616,7 @@ func classifyAuthorizeNavigation(rawURL string) (bool, *AuthError) {
 	switch path {
 	case "/log-in/password":
 		return false, nil
-	case "/log-in", "/sign-in":
+	case "/log-in", "/sign-in", "/log-in-or-create-account":
 		return true, nil
 	}
 	if authError := classifyPageType(path); authError != nil {

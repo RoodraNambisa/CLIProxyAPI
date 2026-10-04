@@ -2,11 +2,9 @@ package chatgptweb
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"net/http"
 	"net/url"
 	"strings"
 	"time"
@@ -101,6 +99,19 @@ type loginRequestError struct {
 	attempts   int
 	cloudflare bool
 	cause      error
+	diagnostic *AuthError
+}
+
+func newLoginChallengeError(targetURL, stage string, attempt int, response *fhttp.Response, payload []byte, cause error) *loginRequestError {
+	diagnostic := attachPasskeyHTTPDiagnostic(&AuthError{Code: "cloudflare_challenge"}, response, payload, targetURL)
+	// Login HTML can contain live OAuth state. Retain metadata, never the page
+	// or redirect query, when reporting a failed background login.
+	diagnostic.ResponseBody = ""
+	diagnostic.ResponseBodyTruncated = false
+	return &loginRequestError{
+		stage: stage, status: response.StatusCode, attempts: attempt,
+		cloudflare: true, cause: cause, diagnostic: diagnostic,
+	}
 }
 
 func (requestError *loginRequestError) Error() string {
@@ -200,37 +211,5 @@ func isCloudflareChallenge(response *fhttp.Response, payload []byte) bool {
 	if response == nil {
 		return false
 	}
-	if strings.EqualFold(strings.TrimSpace(response.Header.Get("CF-Mitigated")), "challenge") {
-		return true
-	}
-	if json.Valid(payload) {
-		return false
-	}
-	statusCandidate := response.StatusCode == http.StatusForbidden ||
-		response.StatusCode == http.StatusTooManyRequests ||
-		response.StatusCode == http.StatusServiceUnavailable
-	server := strings.ToLower(strings.TrimSpace(response.Header.Get("Server")))
-	headerSignal := strings.TrimSpace(response.Header.Get("CF-Ray")) != "" ||
-		strings.TrimSpace(response.Header.Get("CF-Cache-Status")) != "" ||
-		strings.Contains(server, "cloudflare")
-	pathSignal := false
-	if response.Request != nil && response.Request.URL != nil {
-		pathSignal = strings.Contains(strings.ToLower(response.Request.URL.Path), "/cdn-cgi/challenge-platform/")
-	}
-	body := strings.ToLower(string(payload))
-	bodySignal := strings.Contains(body, "/cdn-cgi/challenge-platform") ||
-		strings.Contains(body, "cf-chl-") ||
-		strings.Contains(body, "challenge-platform") ||
-		strings.Contains(body, "attention required! | cloudflare") ||
-		strings.Contains(body, "just a moment") && (headerSignal || strings.Contains(body, "cloudflare"))
-	if pathSignal {
-		return true
-	}
-	if statusCandidate && bodySignal {
-		return true
-	}
-	if bodySignal && response.StatusCode >= 200 && response.StatusCode < 300 {
-		return true
-	}
-	return false
+	return IsCloudflareChallengePage(response.Header.Get("CF-Mitigated"), response.Header.Get("Server"), response.Header.Get("CF-Ray"), payload)
 }
