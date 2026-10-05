@@ -754,23 +754,8 @@ func (h *Handler) executeChatGPTWebManualRelogin(ctx context.Context, auth *core
 		return http.StatusConflict, response
 	}
 	if errRelogin != nil {
-		if outcome, explicit := coreauth.SaveOutcomeFromError(errRelogin); explicit {
-			switch outcome {
-			case coreauth.SaveOutcomeCommitted:
-				response["status"] = "ok"
-				response["warning"] = "credential was saved with a cleanup warning"
-				return http.StatusOK, response
-			case coreauth.SaveOutcomeUncertain:
-				response["status"] = "failed"
-				response["error_category"] = "persist_uncertain"
-				response["error"] = "credential persistence outcome is uncertain"
-				return http.StatusServiceUnavailable, response
-			case coreauth.SaveOutcomeRolledBack:
-				response["status"] = "failed"
-				response["error_category"] = "persist_failed"
-				response["error"] = "failed to save chatgpt web credential"
-				return http.StatusInternalServerError, response
-			}
+		if status, handled := chatGPTWebManualReloginPersistenceResponse(auth, current, errRelogin, response); handled {
+			return status, response
 		}
 		category, message, status, _ := classifyChatGPTWebManagementError(errRelogin)
 		response["status"] = "failed"

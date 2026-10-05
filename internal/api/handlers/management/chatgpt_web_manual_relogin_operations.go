@@ -53,9 +53,12 @@ type chatGPTWebManualReloginOperationSnapshot struct {
 	Error               string     `json:"error,omitempty"`
 	HTTPStatus          int        `json:"http_status,omitempty"`
 	FailureStage        string     `json:"failure_stage,omitempty"`
+	PersistenceOutcome  string     `json:"persistence_outcome,omitempty"`
+	PersistenceReason   string     `json:"persistence_reason,omitempty"`
 	Attempts            int        `json:"attempts,omitempty"`
 	LifecycleState      string     `json:"lifecycle_state,omitempty"`
-	ResultDurable       bool       `json:"result_durable"`
+	// ResultDurable describes the operation journal, not credential persistence.
+	ResultDurable bool `json:"result_durable"`
 }
 
 type chatGPTWebManualReloginOperationRecord struct {
@@ -474,14 +477,16 @@ func (m *chatGPTWebLoginTaskManager) markManualReloginOperationRunning(operation
 }
 
 type chatGPTWebManualReloginCompletion struct {
-	Status         string
-	Outcome        string
-	ErrorCategory  string
-	Error          string
-	HTTPStatus     int
-	FailureStage   string
-	Attempts       int
-	LifecycleState string
+	Status             string
+	Outcome            string
+	ErrorCategory      string
+	Error              string
+	HTTPStatus         int
+	FailureStage       string
+	PersistenceOutcome string
+	PersistenceReason  string
+	Attempts           int
+	LifecycleState     string
 }
 
 func (m *chatGPTWebLoginTaskManager) completeManualReloginOperation(operationID string, completion chatGPTWebManualReloginCompletion) error {
@@ -505,6 +510,8 @@ func (m *chatGPTWebLoginTaskManager) completeManualReloginOperationLocked(operat
 	record.Snapshot.Error = completion.Error
 	record.Snapshot.HTTPStatus = completion.HTTPStatus
 	record.Snapshot.FailureStage = completion.FailureStage
+	record.Snapshot.PersistenceOutcome = completion.PersistenceOutcome
+	record.Snapshot.PersistenceReason = completion.PersistenceReason
 	record.Snapshot.Attempts = completion.Attempts
 	record.Snapshot.LifecycleState = completion.LifecycleState
 	record.Snapshot.ResultDurable = false
@@ -830,6 +837,8 @@ func chatGPTWebManualReloginCompletionFromResponse(status int, response gin.H, a
 		Attempts:       attempts,
 		LifecycleState: lifecycleState,
 	}
+	completion.PersistenceOutcome, _ = response["persistence_outcome"].(string)
+	completion.PersistenceReason, _ = response["persistence_reason"].(string)
 	if status >= 200 && status < 300 && strings.TrimSpace(fmt.Sprint(response["status"])) == "ok" {
 		completion.Status = chatGPTWebManualReloginOperationCompleted
 		completion.Outcome = "succeeded"

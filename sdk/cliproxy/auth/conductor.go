@@ -4924,6 +4924,13 @@ func (e requestAuthPersistenceError) Error() string      { return e.err.Error() 
 func (e requestAuthPersistenceError) Unwrap() error      { return e.err }
 func (requestAuthPersistenceError) SkipAuthResult() bool { return true }
 
+// IsRequestAuthPersistenceError distinguishes local credential commits from
+// provider authentication failures without exposing the underlying store error.
+func IsRequestAuthPersistenceError(err error) bool {
+	var target requestAuthPersistenceError
+	return errors.As(err, &target)
+}
+
 func (m *Manager) prepareRequestAuth(ctx context.Context, executor ProviderExecutor, auth *Auth, options ...cliproxyexecutor.Options) (*Auth, error) {
 	if m == nil || executor == nil || auth == nil {
 		return auth, nil
