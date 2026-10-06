@@ -31,18 +31,23 @@ func cloneCodexQuotaAutoDisable(value config.CodexQuotaAutoDisableConfig) config
 			threshold := *rule.FiveHourRemainingPercent
 			rule.FiveHourRemainingPercent = &threshold
 		}
+		if rule.Credits.MinimumBalance != nil {
+			threshold := *rule.Credits.MinimumBalance
+			rule.Credits.MinimumBalance = &threshold
+		}
 	}
 	return value
 }
 
 type codexQuotaDisableMatch struct {
-	rule      int
-	minutes   int
-	remaining float64
-	threshold float64
+	rule          int
+	minutes       int
+	remaining     float64
+	threshold     float64
+	creditsReason string
 }
 
-func codexQuotaDisableMatchForAuth(policy config.CodexQuotaAutoDisableConfig, auth *Auth, pool CodexQuotaPool) *codexQuotaDisableMatch {
+func codexQuotaDisableMatchForAuth(policy config.CodexQuotaAutoDisableConfig, auth *Auth, pool CodexQuotaPool, signals map[string]string) *codexQuotaDisableMatch {
 	if !policy.Enabled || auth == nil || auth.Disabled || auth.Status == StatusDisabled ||
 		!strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") || pool.ID != "codex" {
 		return nil
@@ -73,11 +78,45 @@ func codexQuotaDisableMatchForAuth(policy config.CodexQuotaAutoDisableConfig, au
 				continue
 			}
 			if remaining := 100 - used; used > 100-*threshold {
-				return &codexQuotaDisableMatch{rule: index + 1, minutes: minutes, remaining: remaining, threshold: *threshold}
+				creditsReason := ""
+				if rule.Credits.Enabled {
+					allowed, reason := codexCreditsPermitAutoDisable(rule.Credits, signals)
+					if !allowed {
+						break
+					}
+					creditsReason = reason
+				}
+				return &codexQuotaDisableMatch{rule: index + 1, minutes: minutes, remaining: remaining, threshold: *threshold, creditsReason: creditsReason}
 			}
 		}
 	}
 	return nil
+}
+
+// Use credit evidence from this response only; an earlier balance can already
+// have been spent or replenished. Unknown credit data does not prove exhaustion.
+func codexCreditsPermitAutoDisable(policy config.CodexQuotaAutoDisableCredits, signals map[string]string) (bool, string) {
+	get := func(field string) string {
+		return strings.TrimSpace(signals[http.CanonicalHeaderKey("x-codex-credits-"+field)])
+	}
+	unlimited, _ := strconv.ParseBool(get("unlimited"))
+	if unlimited {
+		return false, ""
+	}
+	hasCredits, errHasCredits := strconv.ParseBool(get("has-credits"))
+	if errHasCredits == nil && !hasCredits {
+		return true, "no usable credits"
+	}
+	balance, errBalance := strconv.ParseFloat(get("balance"), 64)
+	if errBalance == nil && !math.IsNaN(balance) && !math.IsInf(balance, 0) && balance >= 0 {
+		if balance == 0 {
+			return true, "credits balance = 0"
+		}
+		if policy.MinimumBalance != nil && balance < *policy.MinimumBalance {
+			return true, fmt.Sprintf("credits balance %.6g < %.6g", balance, *policy.MinimumBalance)
+		}
+	}
+	return false, ""
 }
 
 // applyCodexQuotaAutoDisable never retires the instance: the admitted request
@@ -100,7 +139,7 @@ func (m *Manager) applyCodexQuotaAutoDisable(ctx context.Context, policy config.
 	}
 	// Most observations do not cross a threshold and need no persistence lock.
 	m.mu.RLock()
-	match := codexQuotaDisableMatchForAuth(policy, m.auths[authID], *main)
+	match := codexQuotaDisableMatchForAuth(policy, m.auths[authID], *main, observation.Signals)
 	m.mu.RUnlock()
 	if match == nil {
 		return
@@ -129,8 +168,16 @@ func (m *Manager) applyCodexQuotaAutoDisable(ctx context.Context, policy config.
 				return
 			}
 		}
+		if match.creditsReason != "" && previous.ObservedAt.After(observation.ObservedAt) {
+			for _, key := range []string{"X-Codex-Credits-Has-Credits", "X-Codex-Credits-Unlimited", "X-Codex-Credits-Balance"} {
+				if previous.Signals[key] != "" {
+					m.mu.Unlock()
+					return
+				}
+			}
+		}
 	}
-	match = codexQuotaDisableMatchForAuth(policy, auth, *main)
+	match = codexQuotaDisableMatchForAuth(policy, auth, *main, observation.Signals)
 	if match == nil {
 		m.mu.Unlock()
 		return
@@ -140,6 +187,9 @@ func (m *Manager) applyCodexQuotaAutoDisable(ctx context.Context, policy config.
 		window = "5-hour"
 	}
 	reason := fmt.Sprintf("Codex quota auto-disable: %s remaining %.6g%% < %.6g%% (rule %d)", window, match.remaining, match.threshold, match.rule)
+	if match.creditsReason != "" {
+		reason += "; " + match.creditsReason
+	}
 	auth.Disabled = true
 	auth.Status = StatusDisabled
 	auth.StatusMessage = reason

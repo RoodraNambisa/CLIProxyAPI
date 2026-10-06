@@ -100,13 +100,13 @@ func TestCodexQuotaAutoDisableFilters(t *testing.T) {
 	} {
 		test.rule.WeeklyRemainingPercent = quotaThreshold(10)
 		p := config.CodexQuotaAutoDisableConfig{Enabled: true, Rules: []config.CodexQuotaAutoDisableRule{test.rule}}
-		if got := codexQuotaDisableMatchForAuth(p, a, pool) != nil; got != test.want {
+		if got := codexQuotaDisableMatchForAuth(p, a, pool, nil) != nil; got != test.want {
 			t.Fatalf("match=%t for %+v", got, test.rule)
 		}
 	}
 	for _, provider := range []string{"xai", "chatgpt-web", "claude"} {
 		a.Provider = provider
-		if codexQuotaDisableMatchForAuth(quotaDisableConfig().Codex.QuotaAutoDisable, a, pool) != nil {
+		if codexQuotaDisableMatchForAuth(quotaDisableConfig().Codex.QuotaAutoDisable, a, pool, nil) != nil {
 			t.Fatal("non-Codex credential disabled")
 		}
 	}

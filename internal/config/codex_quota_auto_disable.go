@@ -15,11 +15,35 @@ type CodexQuotaAutoDisableConfig struct {
 }
 
 type CodexQuotaAutoDisableRule struct {
-	Providers                []string           `yaml:"providers" json:"providers,omitempty"`
-	AuthPriorities           APIKeyPriorityList `yaml:"auth-priorities" json:"auth-priorities,omitempty"`
-	CredentialIDs            []string           `yaml:"credential-ids" json:"credential-ids,omitempty"`
-	WeeklyRemainingPercent   *float64           `yaml:"weekly-remaining-percent" json:"weekly-remaining-percent"`
-	FiveHourRemainingPercent *float64           `yaml:"five-hour-remaining-percent" json:"five-hour-remaining-percent"`
+	Providers                []string                     `yaml:"providers" json:"providers,omitempty"`
+	AuthPriorities           APIKeyPriorityList           `yaml:"auth-priorities" json:"auth-priorities,omitempty"`
+	CredentialIDs            []string                     `yaml:"credential-ids" json:"credential-ids,omitempty"`
+	WeeklyRemainingPercent   *float64                     `yaml:"weekly-remaining-percent" json:"weekly-remaining-percent"`
+	FiveHourRemainingPercent *float64                     `yaml:"five-hour-remaining-percent" json:"five-hour-remaining-percent"`
+	Credits                  CodexQuotaAutoDisableCredits `yaml:"credits,omitempty" json:"credits,omitempty"`
+}
+
+// CodexQuotaAutoDisableCredits is evaluated only after a main quota threshold is crossed.
+type CodexQuotaAutoDisableCredits struct {
+	Enabled        bool     `yaml:"enabled" json:"enabled"`
+	MinimumBalance *float64 `yaml:"minimum-balance,omitempty" json:"minimum-balance,omitempty"`
+}
+
+func (cfg *CodexQuotaAutoDisableCredits) UnmarshalYAML(node *yaml.Node) error {
+	value, err := credentialYAMLField(node, "enabled", make(map[*yaml.Node]bool))
+	if err != nil {
+		return err
+	}
+	if value != nil && value.Tag != "!!null" && (value.Kind != yaml.ScalarNode || value.Tag != "!!bool") {
+		return fmt.Errorf("codex.quota-auto-disable.rules.credits.enabled must be a boolean")
+	}
+	type plain CodexQuotaAutoDisableCredits
+	var decoded plain
+	if err := node.Decode(&decoded); err != nil {
+		return err
+	}
+	*cfg = CodexQuotaAutoDisableCredits(decoded)
+	return nil
 }
 
 func (cfg *CodexQuotaAutoDisableConfig) UnmarshalYAML(node *yaml.Node) error {
@@ -57,6 +81,9 @@ func (cfg *Config) ValidateCodexQuotaAutoDisable() error {
 			if threshold != nil && (math.IsNaN(*threshold) || math.IsInf(*threshold, 0) || *threshold < 0 || *threshold > 100) {
 				return invalid("remaining-percent must be between 0 and 100")
 			}
+		}
+		if threshold := rule.Credits.MinimumBalance; threshold != nil && (math.IsNaN(*threshold) || math.IsInf(*threshold, 0) || *threshold < 0) {
+			return invalid("credits.minimum-balance must be a finite non-negative number")
 		}
 		for _, list := range [][]string{rule.Providers, rule.CredentialIDs} {
 			if len(list) > 128 {

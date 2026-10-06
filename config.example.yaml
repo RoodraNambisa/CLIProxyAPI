@@ -998,6 +998,13 @@ xai:
 #     #   credential-ids: []
 #     #   weekly-remaining-percent: 10
 #     #   five-hour-remaining-percent: null
+#     #   # Optional secondary condition; it never disables on credits alone.
+#     #   credits:
+#     #     enabled: false
+#     #     # Raw credit units, not a percentage. Null/0 means exhausted or unavailable.
+#     #     # Unlimited or sufficient credits prevent this rule from disabling.
+#     #     # Unknown credit data postpones this rule; no historical balance is reused.
+#     #     minimum-balance: null
 #   # Convert unpaired Codex app delegation results to user messages only for
 #   # X-Openai-Subagent: collab_spawn. Paired calls and other tools are unchanged.
 #   orphan-delegation-compatibility: false

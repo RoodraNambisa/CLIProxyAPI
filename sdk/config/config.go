@@ -53,6 +53,7 @@ type CodexStatePlanLengths = internalconfig.CodexStatePlanLengths
 
 type CodexQuotaAutoDisableConfig = internalconfig.CodexQuotaAutoDisableConfig
 type CodexQuotaAutoDisableRule = internalconfig.CodexQuotaAutoDisableRule
+type CodexQuotaAutoDisableCredits = internalconfig.CodexQuotaAutoDisableCredits
 type CodexLiveMediaRelayConfig = internalconfig.CodexLiveMediaRelayConfig
 type CodexLiveICEServer = internalconfig.CodexLiveICEServer
 
