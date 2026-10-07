@@ -729,48 +729,52 @@ func TestServiceAuthMaintenanceWorkerRetainsUncertainDeleteQuarantineWithoutRese
 }
 
 func TestServiceChatGPTWebDeadDeleteDoesNotDeleteReplacementGeneration(t *testing.T) {
-	authDir := t.TempDir()
-	store := sdkauth.NewFileTokenStore()
-	store.SetBaseDir(authDir)
-	cfg := &config.Config{AuthDir: authDir}
-	cfg.ChatGPTWeb.AutoDeleteDeadAuths = true
-	cfg.ChatGPTWeb.AutoDeleteDeadPriorities = []int{-1}
-	service := &Service{
-		cfg:         cfg,
-		coreManager: coreauth.NewManager(store, nil, nil),
-	}
-	dead := chatGPTWebAutoDeleteTestAuth("replacement.json", -1, coreauth.LifecycleStateDead)
-	dead.FileName = filepath.Join(authDir, dead.ID)
-	dead.Attributes["path"] = dead.FileName
-	if _, err := service.coreManager.Register(context.Background(), dead); err != nil {
-		t.Fatalf("register dead auth: %v", err)
-	}
-	candidate, ok := service.authMaintenanceCandidateForAuth(dead, authDir, "chatgpt_web_dead_account_deactivated")
-	if !ok || !service.disableAuthMaintenanceCandidate(context.Background(), candidate, true) {
-		t.Fatal("failed to stage dead auth candidate")
-	}
-	candidate = snapshotChatGPTWebAutoDeleteCandidate(t, service, candidate, authDir)
+	for _, lifecycle := range []string{coreauth.LifecycleStateActive, coreauth.LifecycleStateReloginPending, coreauth.LifecycleStateRefreshing} {
+		t.Run(lifecycle, func(t *testing.T) {
+			authDir := t.TempDir()
+			store := sdkauth.NewFileTokenStore()
+			store.SetBaseDir(authDir)
+			cfg := &config.Config{AuthDir: authDir}
+			cfg.ChatGPTWeb.AutoDeleteDeadAuths = true
+			cfg.ChatGPTWeb.AutoDeleteDeadPriorities = []int{-1}
+			service := &Service{
+				cfg:         cfg,
+				coreManager: coreauth.NewManager(store, nil, nil),
+			}
+			dead := chatGPTWebAutoDeleteTestAuth("replacement.json", -1, coreauth.LifecycleStateDead)
+			dead.FileName = filepath.Join(authDir, dead.ID)
+			dead.Attributes["path"] = dead.FileName
+			if _, err := service.coreManager.Register(context.Background(), dead); err != nil {
+				t.Fatalf("register dead auth: %v", err)
+			}
+			candidate, ok := service.authMaintenanceCandidateForAuth(dead, authDir, "chatgpt_web_dead_account_deactivated")
+			if !ok || !service.disableAuthMaintenanceCandidate(context.Background(), candidate, true) {
+				t.Fatal("failed to stage dead auth candidate")
+			}
+			candidate = snapshotChatGPTWebAutoDeleteCandidate(t, service, candidate, authDir)
 
-	replacement := chatGPTWebAutoDeleteTestAuth(dead.ID, -1, coreauth.LifecycleStateActive)
-	replacement.FileName = dead.FileName
-	replacement.Attributes["path"] = dead.FileName
-	if _, err := service.coreManager.Update(context.Background(), replacement); err != nil {
-		t.Fatalf("install replacement auth: %v", err)
-	}
+			replacement := chatGPTWebAutoDeleteTestAuth(dead.ID, -1, lifecycle)
+			replacement.FileName = dead.FileName
+			replacement.Attributes["path"] = dead.FileName
+			if _, err := service.coreManager.Update(context.Background(), replacement); err != nil {
+				t.Fatalf("install replacement auth: %v", err)
+			}
 
-	deleted, err := service.deleteAuthMaintenanceCandidate(context.Background(), candidate)
-	if err != nil {
-		t.Fatalf("deleteAuthMaintenanceCandidate() error = %v", err)
-	}
-	if deleted {
-		t.Fatal("stale candidate deleted replacement auth")
-	}
-	current, exists := service.coreManager.GetByID(dead.ID)
-	if !exists || current == nil || current.LifecycleState() != coreauth.LifecycleStateActive {
-		t.Fatalf("current auth = %#v, want active replacement", current)
-	}
-	if _, err = os.Stat(dead.FileName); err != nil {
-		t.Fatalf("replacement auth file was removed: %v", err)
+			deleted, err := service.deleteAuthMaintenanceCandidate(context.Background(), candidate)
+			if err != nil {
+				t.Fatalf("deleteAuthMaintenanceCandidate() error = %v", err)
+			}
+			if deleted {
+				t.Fatal("stale candidate deleted replacement auth")
+			}
+			current, exists := service.coreManager.GetByID(dead.ID)
+			if !exists || current == nil || current.LifecycleState() != lifecycle {
+				t.Fatalf("replacement lifecycle was not preserved: want %s", lifecycle)
+			}
+			if _, err = os.Stat(dead.FileName); err != nil {
+				t.Fatalf("replacement auth file was removed: %v", err)
+			}
+		})
 	}
 }
 

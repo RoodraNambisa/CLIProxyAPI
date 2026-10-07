@@ -935,6 +935,23 @@ func (runtime *chatGPTWebAccountInfoRuntime) targetRequiresManualLifecycleBypass
 	return instanceID == "" || instanceID == strings.TrimSpace(auth.RuntimeInstanceID())
 }
 
+func (runtime *chatGPTWebAccountInfoRuntime) unavailableTargetOutcome(target chatgptwebauth.AccountInfoRefreshTarget) chatGPTWebAccountInfoOutcome {
+	outcome := chatGPTWebAccountInfoOutcome{status: chatgptwebauth.AccountInfoResultFailed, errorCode: "credential_unavailable"}
+	if runtime == nil || runtime.executor == nil || runtime.executor.manager == nil || target.AuthInstanceID == "" {
+		return outcome
+	}
+	auth, ok := runtime.executor.manager.GetByID(target.AuthID)
+	if ok && auth != nil && auth.RuntimeInstanceID() == target.AuthInstanceID &&
+		strings.EqualFold(strings.TrimSpace(auth.Provider), chatgptwebauth.Provider) &&
+		!auth.Disabled && auth.Status != cliproxyauth.StatusDisabled &&
+		auth.LifecycleState() == cliproxyauth.LifecycleStateReloginPending {
+		// Lifecycle cleanup invalidates work epochs even when the credential
+		// still exists. Do not confuse that with replacement by a new instance.
+		outcome.errorCode = "relogin_pending"
+	}
+	return outcome
+}
+
 func (runtime *chatGPTWebAccountInfoRuntime) bindCurrentTargetLocked(
 	target chatgptwebauth.AccountInfoRefreshTarget,
 ) chatgptwebauth.AccountInfoRefreshTarget {
@@ -2255,10 +2272,7 @@ func (runtime *chatGPTWebAccountInfoRuntime) finishWorkLocked(work chatGPTWebAcc
 	runtime.assignWorkSequenceLocked(&work)
 	runtime.assignWorkEpochLocked(&work)
 	if !runtime.workEpochCurrentLocked(work) {
-		runtime.completeTaskWorkLocked(work, chatGPTWebAccountInfoOutcome{
-			status:    chatgptwebauth.AccountInfoResultFailed,
-			errorCode: "credential_unavailable",
-		})
+		runtime.completeTaskWorkLocked(work, runtime.unavailableTargetOutcome(work.target))
 		runtime.releaseWorkEpochLocked(work)
 		return
 	}
@@ -3485,6 +3499,10 @@ func (runtime *chatGPTWebAccountInfoRuntime) removeAuthInstance(authID, authInst
 		}
 	}
 	for runtimeKey := range affectedRuntimeKeys {
+		_, instanceID, _ := strings.Cut(runtimeKey, "\x00")
+		unavailable := runtime.unavailableTargetOutcome(chatgptwebauth.AccountInfoRefreshTarget{
+			AuthID: authID, AuthInstanceID: instanceID,
+		})
 		epoch := runtime.authEpoch[runtimeKey]
 		if epoch == 0 {
 			epoch = 1
@@ -3499,10 +3517,7 @@ func (runtime *chatGPTWebAccountInfoRuntime) removeAuthInstance(authID, authInst
 			if chatGPTWebAccountInfoTargetKey(work.target) != runtimeKey {
 				continue
 			}
-			runtime.completeTaskWorkLocked(work, chatGPTWebAccountInfoOutcome{
-				status:    chatgptwebauth.AccountInfoResultFailed,
-				errorCode: "credential_unavailable",
-			})
+			runtime.completeTaskWorkLocked(work, unavailable)
 			runtime.releaseWorkEpochLocked(work)
 			runtime.queue[index] = chatGPTWebAccountInfoWork{}
 			runtime.removeQueuedTargetLocked(work, index)
@@ -3517,10 +3532,7 @@ func (runtime *chatGPTWebAccountInfoRuntime) removeAuthInstance(authID, authInst
 		for _, key := range scheduleKeys {
 			entry := runtime.removeScheduleLocked(key)
 			if entry != nil {
-				runtime.completeTaskWorkLocked(entry.work, chatGPTWebAccountInfoOutcome{
-					status:    chatgptwebauth.AccountInfoResultFailed,
-					errorCode: "credential_unavailable",
-				})
+				runtime.completeTaskWorkLocked(entry.work, unavailable)
 				runtime.releaseWorkEpochLocked(entry.work)
 			}
 		}
@@ -4749,6 +4761,11 @@ func (e *ChatGPTWebExecutor) refreshChatGPTWebAccountInfoForInstance(
 	if errCredential != nil ||
 		(!auth.LifecycleRefreshable() && !manualLifecycleBypass) {
 		outcome.errorCode = "credential_unavailable"
+		if errCredential == nil && lifecycleState == cliproxyauth.LifecycleStateReloginPending {
+			// An installed credential awaiting re-login is not a missing or
+			// replaced runtime. Keep it isolated and report the actual state.
+			outcome.errorCode = "relogin_pending"
+		}
 		return outcome
 	}
 	cfg := accountInfoConfigSnapshot(e.configSnapshot())

@@ -564,6 +564,52 @@ func TestChatGPTWebImportTaskRejectsDuplicateCustomNames(t *testing.T) {
 	}
 }
 
+func TestChatGPTWebSameNameImportKeepsCurrentRefreshTarget(t *testing.T) {
+	h, manager, authDir := newChatGPTWebManagementTestHandler(t, &chatGPTWebManagementTestExecutor{})
+	router := chatGPTWebManagementTestRouter(h)
+	var previous *coreauth.Auth
+	for _, token := range []string{"first-access", "second-access"} {
+		payload, errMarshal := json.Marshal(map[string]any{
+			"type": "chatgpt-web", "email": "named-import@example.com", "account_id": "same-account",
+			"access_token": token, "login_method": "api798",
+			"api798_url": "https://api798.com/get_code?email=named-import%40example.com&auth_code=fixture",
+			"cookies": []chatgptwebauth.Cookie{{
+				Name: "__Secure-next-auth.session-token", Value: "session-" + token, Domain: "chatgpt.com", Path: "/", Secure: true,
+			}},
+		})
+		if errMarshal != nil {
+			t.Fatal(errMarshal)
+		}
+		task := startChatGPTWebImportTaskWithNames(t, router, []chatGPTWebImportTestFile{{
+			field: "files", name: "upload.json", data: string(payload),
+		}}, []string{"same-name.json"})
+		completed := waitForChatGPTWebMutationTask(t, router, chatGPTWebMutationTaskImport, task.ID)
+		if completed.Succeeded != 1 || completed.Results[0].Name != "same-name.json" {
+			t.Fatalf("named import = %+v", completed)
+		}
+		current, exists := manager.GetByID("same-name.json")
+		if !exists || !current.LifecycleRefreshable() {
+			t.Fatal("import did not install an active credential")
+		}
+		targets, errTargets := h.resolveChatGPTWebAccountInfoTargets([]string{"same-name.json"}, manager)
+		if errTargets != nil || len(targets) != 1 || targets[0].AuthID != current.ID || targets[0].AuthInstanceID != current.RuntimeInstanceID() {
+			t.Fatalf("refresh target did not identify the imported runtime: %v", errTargets)
+		}
+		if previous != nil && (current.RuntimeInstanceID() != previous.RuntimeInstanceID() || current.RuntimeInstallationID() == previous.RuntimeInstallationID()) {
+			t.Fatal("same-identity import should advance installation without rotating the runtime")
+		}
+		data, errRead := os.ReadFile(filepath.Join(authDir, "same-name.json"))
+		if errRead != nil {
+			t.Fatal(errRead)
+		}
+		stored, errDecode := chatgptwebauth.DecodeCredential(data)
+		if errDecode != nil || stored.AccessToken != token || stored.LifecycleState != chatgptwebauth.LifecycleActive {
+			t.Fatal("named import did not persist the latest active credential")
+		}
+		previous = current
+	}
+}
+
 func TestChatGPTWebImportTaskRejectsSessionOnlyCredentialWithoutLocalIdentity(t *testing.T) {
 	var normalizeCalls atomic.Int32
 	executor := &chatGPTWebManagementTestExecutor{}
