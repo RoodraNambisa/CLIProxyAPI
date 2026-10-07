@@ -409,6 +409,15 @@ func (service *Service) loginOnce(acquisitionContext context.Context, input Logi
 		if result, errComplete, handled := completeAPI798FromEnvelope(authorizeEnvelope, responseRequestURL(response), api798IssuedAt); handled {
 			return result, errComplete
 		}
+		response, payload, authorizeEnvelope, passwordAuthorizationCode, err = service.selectPasswordLoginPage(
+			acquisitionContext, client, loginMethod, response, payload, authorizeEnvelope, state, pendingState,
+		)
+		if err != nil {
+			return service.loginFailure(credential, input.Relogin, ensureAuthError(err, pendingState))
+		}
+		if passwordAuthorizationCode != "" {
+			return service.finishLogin(acquisitionContext, client, credential, input.Relogin, passwordAuthorizationCode, pkce.CodeVerifier)
+		}
 		if !isMFAChallenge(authorizeEnvelope.PageType, authorizeEnvelope.ContinueURL) {
 			if authError := classifyPageType(authorizeEnvelope.PageType); authError != nil {
 				if loginMethod == LoginMethodAPI798 && authError.Code == "passkey_required" {
@@ -435,6 +444,15 @@ func (service *Service) loginOnce(acquisitionContext context.Context, input Logi
 				authorizeEnvelope = parseAuthorizationEnvelope(response, followPayload)
 				if result, errComplete, handled := completeAPI798FromEnvelope(authorizeEnvelope, responseRequestURL(response), api798IssuedAt); handled {
 					return result, errComplete
+				}
+				response, followPayload, authorizeEnvelope, passwordAuthorizationCode, err = service.selectPasswordLoginPage(
+					acquisitionContext, client, loginMethod, response, followPayload, authorizeEnvelope, state, pendingState,
+				)
+				if err != nil {
+					return service.loginFailure(credential, input.Relogin, ensureAuthError(err, pendingState))
+				}
+				if passwordAuthorizationCode != "" {
+					return service.finishLogin(acquisitionContext, client, credential, input.Relogin, passwordAuthorizationCode, pkce.CodeVerifier)
 				}
 				if authError := classifyPageType(authorizeEnvelope.PageType); authError != nil && !isMFAChallenge(authorizeEnvelope.PageType, authorizeEnvelope.ContinueURL) {
 					if loginMethod == LoginMethodAPI798 && authError.Code == "passkey_required" {
@@ -981,42 +999,93 @@ func (service *Service) selectPasswordLoginPage(
 	envelope apiEnvelope,
 	expectedState string,
 	transientState LifecycleState,
-) (*fhttp.Response, []byte, apiEnvelope, string, error) {
-	if loginMethod != LoginMethodPasswordTOTP || !isEmailOTPChallenge(envelope.PageType, envelope.ContinueURL) {
+) (selectedResponse *fhttp.Response, selectedPayload []byte, selectedEnvelope apiEnvelope, authorizationCode string, errSelection error) {
+	if loginMethod != LoginMethodPasswordTOTP || !isEmailOTPChallenge(envelope.PageType, envelope.ContinueURL) ||
+		isMFAChallenge(envelope.PageType, envelope.ContinueURL) {
 		return response, payload, envelope, "", nil
 	}
+	if authError := classifyPageType(envelope.PageType); authError != nil && authError.Code != "email_otp_required" {
+		return response, payload, envelope, "", nil
+	}
+	defer func() {
+		if authError, ok := AsAuthError(errSelection); ok && authError != nil && authError.FailureStage == "" {
+			authError.FailureStage = "authorize_redirect"
+		}
+	}()
 
 	referer := responseRequestURL(response)
+	if referer != "" {
+		if authError := validateOAuthContinuationOrigin(referer, service.options.AuthBaseURL); authError != nil {
+			return response, payload, envelope, "", authError
+		}
+	}
 	if strings.TrimSpace(envelope.ContinueURL) != "" {
 		challengeURL := resolveURL(service.options.AuthBaseURL, envelope.ContinueURL)
-		if validateOAuthContinuationOrigin(challengeURL, service.options.AuthBaseURL) == nil {
-			referer = challengeURL
+		if authError := validateOAuthContinuationOrigin(challengeURL, service.options.AuthBaseURL); authError != nil {
+			return response, payload, envelope, "", authError
 		}
+		referer = challengeURL
 	}
 	if strings.TrimSpace(referer) == "" {
 		referer = service.options.AuthBaseURL + "/email-verification"
 	}
 
 	passwordURL := service.options.AuthBaseURL + "/log-in/password"
-	selectedResponse, selectedPayload, err := client.DoNoRedirect(
+	selectedResponse, selectedPayload, errSelection = client.DoNoRedirect(
 		ctx, http.MethodGet, passwordURL, authorizationNavigationHeaders(referer), nil,
 	)
-	if err != nil {
-		return response, payload, envelope, "", networkAuthError("authorize_redirect_network_error", transientState, err)
+	if errSelection != nil {
+		return response, payload, envelope, "", networkAuthError("authorize_redirect_network_error", transientState, errSelection)
 	}
-	selectedResponse, selectedPayload, authorizationCode, err := service.followAuthorizationRedirects(
+	selectedResponse, selectedPayload, authorizationCode, errSelection = service.followAuthorizationRedirects(
 		ctx, client, selectedResponse, selectedPayload, expectedState, transientState,
 	)
-	if err != nil || authorizationCode != "" {
-		return selectedResponse, selectedPayload, apiEnvelope{}, authorizationCode, err
+	if errSelection != nil || authorizationCode != "" {
+		return selectedResponse, selectedPayload, apiEnvelope{}, authorizationCode, errSelection
 	}
-	if authError := classifyHTTPResponse("authorize", responseStatusCode(selectedResponse), selectedPayload, transientState); authError != nil {
+	if authError := classifyHTTPResponse("authorize_redirect", responseStatusCode(selectedResponse), selectedPayload, transientState); authError != nil {
 		return selectedResponse, selectedPayload, apiEnvelope{}, "", authError
 	}
 	if authError := classifyPermanentAccountPayload(selectedPayload); authError != nil {
 		return selectedResponse, selectedPayload, apiEnvelope{}, "", authError
 	}
-	return selectedResponse, selectedPayload, parseAuthorizationEnvelope(selectedResponse, selectedPayload), "", nil
+	selectedEnvelope = parseAuthorizationEnvelope(selectedResponse, selectedPayload)
+	if selectedEnvelope.ContinueURL != "" {
+		continueURL := resolveURL(service.options.AuthBaseURL, selectedEnvelope.ContinueURL)
+		if code, matched, authError := parseOAuthCallback(continueURL, service.options.RedirectURL, expectedState); matched {
+			if authError != nil {
+				return selectedResponse, selectedPayload, selectedEnvelope, "", authError
+			}
+			return selectedResponse, selectedPayload, selectedEnvelope, code, nil
+		}
+		if authError := validateOAuthContinuationOrigin(continueURL, service.options.AuthBaseURL); authError != nil {
+			return selectedResponse, selectedPayload, selectedEnvelope, "", authError
+		}
+	}
+	if isMFAChallenge(selectedEnvelope.PageType, selectedEnvelope.ContinueURL) {
+		return selectedResponse, selectedPayload, selectedEnvelope, "", nil
+	}
+	if selectedEnvelope.ContinueURL != "" {
+		if authError := classifyOAuthContinuationURL(resolveURL(service.options.AuthBaseURL, selectedEnvelope.ContinueURL), service.options.AuthBaseURL); authError != nil {
+			return selectedResponse, selectedPayload, selectedEnvelope, "", authError
+		}
+	}
+	if authError := classifyPageType(selectedEnvelope.PageType); authError != nil {
+		return selectedResponse, selectedPayload, selectedEnvelope, "", authError
+	}
+	selectedURL := responseRequestURL(selectedResponse)
+	pageType := normalizeCode(selectedEnvelope.PageType)
+	if (pageType != "" && pageType != "password" && pageType != "login_password") ||
+		!isPasswordChallenge(pageType, firstNonEmptyString(selectedEnvelope.ContinueURL, selectedURL)) {
+		return selectedResponse, selectedPayload, selectedEnvelope, "", authorizationCompletionError(
+			"authorize_redirect", responseStatusCode(selectedResponse), "password selection did not reach a recognized password page",
+		)
+	}
+	// The selected document is already open; avoid fetching its own continuation again.
+	if resolveURL(service.options.AuthBaseURL, selectedEnvelope.ContinueURL) == selectedURL {
+		selectedEnvelope.ContinueURL = ""
+	}
+	return selectedResponse, selectedPayload, selectedEnvelope, "", nil
 }
 
 func (service *Service) followAuthorizationRedirects(ctx context.Context, client *Client, response *fhttp.Response, payload []byte, expectedState string, transientState LifecycleState) (*fhttp.Response, []byte, string, error) {

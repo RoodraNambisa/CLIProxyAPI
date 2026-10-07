@@ -25,6 +25,8 @@ type loginFixture struct {
 	passwordBody                string
 	passwordCalls               int
 	passwordPageCalls           int
+	passwordPageHandler         http.HandlerFunc
+	requirePasswordSelection    bool
 	authorizePath               string
 	authorizeCalls              int
 	authorizeResponseBody       string
@@ -117,6 +119,10 @@ func (fixture *loginFixture) serveHTTP(response http.ResponseWriter, request *ht
 			fixture.mu.Lock()
 			fixture.passwordPageCalls++
 			fixture.mu.Unlock()
+			if fixture.passwordPageHandler != nil {
+				fixture.passwordPageHandler(response, request)
+				return
+			}
 		}
 		response.Header().Set("Content-Type", "text/html")
 		_, _ = io.WriteString(response, "login")
@@ -472,7 +478,14 @@ func (fixture *loginFixture) handlePassword(response http.ResponseWriter, reques
 	}
 	fixture.mu.Lock()
 	fixture.passwordCalls++
+	passwordPageCalls := fixture.passwordPageCalls
 	fixture.mu.Unlock()
+	if fixture.requirePasswordSelection {
+		cookie, errCookie := request.Cookie("password-selected")
+		if passwordPageCalls != 1 || errCookie != nil || cookie.Value != "selected" {
+			fixture.t.Error("password verification did not reuse the selected password session")
+		}
+	}
 	if request.Header.Get("OpenAI-Sentinel-Token") == "" {
 		fixture.t.Error("password request did not include a sentinel token")
 	}
@@ -1447,22 +1460,22 @@ func TestServiceLoginAuthorizeContinueDoesNotFollowCrossOriginRedirect(t *testin
 	}
 }
 
-func TestServiceLoginClassifiesRedirectedInteractionHTMLBeforePassword(t *testing.T) {
+func TestServiceLoginKeepsEmailVerificationAfterPasswordInteractive(t *testing.T) {
 	for _, test := range []struct {
 		name  string
 		setup func(*loginFixture)
 	}{
 		{
-			name: "authorize continue redirect",
+			name: "password verification redirect",
 			setup: func(fixture *loginFixture) {
-				fixture.authorizeRedirectURL = "/email-verification"
+				fixture.passwordRedirectURL = "/email-verification"
+				fixture.passwordRedirectStatus = http.StatusFound
 			},
 		},
 		{
-			name: "followed continuation redirect",
+			name: "password verification envelope",
 			setup: func(fixture *loginFixture) {
-				fixture.authorizeBody = `{"continue_url":"/authorize-follow","page":{"type":"password"}}`
-				fixture.authorizeFollowURL = "/email-verification"
+				fixture.passwordBody = `{"continue_url":"/email-verification","page":{"type":"email_otp_verification"}}`
 			},
 		},
 	} {
@@ -1486,9 +1499,10 @@ func TestServiceLoginClassifiesRedirectedInteractionHTMLBeforePassword(t *testin
 			}
 			fixture.mu.Lock()
 			passwordCalls := fixture.passwordCalls
+			passwordPageCalls := fixture.passwordPageCalls
 			fixture.mu.Unlock()
-			if passwordCalls != 0 {
-				t.Fatalf("password calls = %d, want 0", passwordCalls)
+			if passwordCalls != 1 || passwordPageCalls != 0 {
+				t.Fatalf("password/password selection calls = %d/%d, want 1/0", passwordCalls, passwordPageCalls)
 			}
 		})
 	}
