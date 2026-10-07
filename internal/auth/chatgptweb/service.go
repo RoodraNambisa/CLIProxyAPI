@@ -320,6 +320,16 @@ func (service *Service) loginOnce(acquisitionContext context.Context, input Logi
 	if result, errComplete, handled := completeAPI798FromEnvelope(authorizeEnvelope, authorizeRequestURL, api798IssuedAt); handled {
 		return result, errComplete
 	}
+	response, payload, authorizeEnvelope, passwordAuthorizationCode, err := service.selectPasswordLoginPage(
+		acquisitionContext, client, loginMethod, response, payload, authorizeEnvelope, state, pendingState,
+	)
+	if err != nil {
+		return service.loginFailure(credential, input.Relogin, ensureAuthError(err, pendingState))
+	}
+	if passwordAuthorizationCode != "" {
+		return service.finishLogin(acquisitionContext, client, credential, input.Relogin, passwordAuthorizationCode, pkce.CodeVerifier)
+	}
+	authorizeRequestURL = responseRequestURL(response)
 	if authError := classifyPageType(authorizeEnvelope.PageType); authError != nil && !isMFAChallenge(authorizeEnvelope.PageType, authorizeEnvelope.ContinueURL) {
 		if loginMethod == LoginMethodAPI798 && authError.Code == "passkey_required" {
 			authError = api798AuthError("api798_email_otp_unavailable", response.StatusCode, false, true, "authorize", nil)
@@ -960,6 +970,53 @@ func (service *Service) openAuthorizationPage(ctx context.Context, client *Clien
 		return nil, nil, "", networkAuthError("authorize_redirect_network_error", transientState, err)
 	}
 	return service.followAuthorizationRedirects(ctx, client, response, payload, expectedState, transientState)
+}
+
+func (service *Service) selectPasswordLoginPage(
+	ctx context.Context,
+	client *Client,
+	loginMethod LoginMethod,
+	response *fhttp.Response,
+	payload []byte,
+	envelope apiEnvelope,
+	expectedState string,
+	transientState LifecycleState,
+) (*fhttp.Response, []byte, apiEnvelope, string, error) {
+	if loginMethod != LoginMethodPasswordTOTP || !isEmailOTPChallenge(envelope.PageType, envelope.ContinueURL) {
+		return response, payload, envelope, "", nil
+	}
+
+	referer := responseRequestURL(response)
+	if strings.TrimSpace(envelope.ContinueURL) != "" {
+		challengeURL := resolveURL(service.options.AuthBaseURL, envelope.ContinueURL)
+		if validateOAuthContinuationOrigin(challengeURL, service.options.AuthBaseURL) == nil {
+			referer = challengeURL
+		}
+	}
+	if strings.TrimSpace(referer) == "" {
+		referer = service.options.AuthBaseURL + "/email-verification"
+	}
+
+	passwordURL := service.options.AuthBaseURL + "/log-in/password"
+	selectedResponse, selectedPayload, err := client.DoNoRedirect(
+		ctx, http.MethodGet, passwordURL, authorizationNavigationHeaders(referer), nil,
+	)
+	if err != nil {
+		return response, payload, envelope, "", networkAuthError("authorize_redirect_network_error", transientState, err)
+	}
+	selectedResponse, selectedPayload, authorizationCode, err := service.followAuthorizationRedirects(
+		ctx, client, selectedResponse, selectedPayload, expectedState, transientState,
+	)
+	if err != nil || authorizationCode != "" {
+		return selectedResponse, selectedPayload, apiEnvelope{}, authorizationCode, err
+	}
+	if authError := classifyHTTPResponse("authorize", responseStatusCode(selectedResponse), selectedPayload, transientState); authError != nil {
+		return selectedResponse, selectedPayload, apiEnvelope{}, "", authError
+	}
+	if authError := classifyPermanentAccountPayload(selectedPayload); authError != nil {
+		return selectedResponse, selectedPayload, apiEnvelope{}, "", authError
+	}
+	return selectedResponse, selectedPayload, parseAuthorizationEnvelope(selectedResponse, selectedPayload), "", nil
 }
 
 func (service *Service) followAuthorizationRedirects(ctx context.Context, client *Client, response *fhttp.Response, payload []byte, expectedState string, transientState LifecycleState) (*fhttp.Response, []byte, string, error) {

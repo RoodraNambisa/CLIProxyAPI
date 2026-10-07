@@ -24,6 +24,7 @@ type loginFixture struct {
 	passwordStatus              int
 	passwordBody                string
 	passwordCalls               int
+	passwordPageCalls           int
 	authorizePath               string
 	authorizeCalls              int
 	authorizeResponseBody       string
@@ -90,7 +91,7 @@ func newLoginFixture(t *testing.T, passwordStatus int, passwordBody string) *log
 func (fixture *loginFixture) serveHTTP(response http.ResponseWriter, request *http.Request) {
 	if request.Method == http.MethodGet {
 		switch request.URL.Path {
-		case "/password-page", "/password-redirect", "/authorize-follow", "/authorize-follow-final", "/log-in-or-create-account":
+		case "/password-page", "/password-redirect", "/authorize-follow", "/authorize-follow-final", "/log-in-or-create-account", "/log-in/password":
 			if values := request.Header.Values("Accept"); len(values) != 1 || !strings.HasPrefix(values[0], "text/html") {
 				fixture.t.Errorf("navigation %s Accept=%q", request.URL.Path, values)
 			}
@@ -112,6 +113,11 @@ func (fixture *loginFixture) serveHTTP(response http.ResponseWriter, request *ht
 	case "/api/accounts/authorize/continue":
 		fixture.handleAuthorizeContinue(response, request)
 	case "/log-in", "/log-in/password":
+		if request.URL.Path == "/log-in/password" {
+			fixture.mu.Lock()
+			fixture.passwordPageCalls++
+			fixture.mu.Unlock()
+		}
 		response.Header().Set("Content-Type", "text/html")
 		_, _ = io.WriteString(response, "login")
 	case "/log-in-or-create-account":
@@ -691,20 +697,27 @@ func TestServiceLoginConsumesAuthorizeJSONCallback(t *testing.T) {
 	}
 }
 
-func TestServiceLoginClassifiesInitialEmailVerificationContinuation(t *testing.T) {
+func TestServicePasswordTOTPSelectsPasswordFromInitialEmailVerificationEnvelope(t *testing.T) {
 	fixture := newLoginFixture(t, http.StatusOK, "")
 	fixture.authorizeResponseBody = `{"continue_url":"/email-verification","page":{"type":"passwordless_login"}}`
 	service := NewService(fixture.options(time.Date(2026, time.July, 16, 12, 0, 0, 0, time.UTC)))
-	credential, errLogin := service.Login(t.Context(), LoginInput{
-		Email:    "person@example.com",
-		Password: "correct-password",
-	})
-	authError, ok := AsAuthError(errLogin)
-	if !ok || authError.Code != "email_otp_required" || authError.FailureStage != "authorize" {
-		t.Fatalf("Login() error = %#v", errLogin)
+	credential, errLogin := service.Login(t.Context(), LoginInput{Credential: &Credential{
+		Email:       "person@example.com",
+		Password:    "correct-password",
+		LoginMethod: LoginMethodPasswordTOTP,
+	}})
+	if errLogin != nil {
+		t.Fatal(errLogin)
 	}
-	if credential == nil || credential.LifecycleState != LifecycleInteractionRequired {
-		t.Fatalf("credential = %#v", credential)
+	if credential.LifecycleState != LifecycleActive || credential.RefreshToken != "refresh-token" {
+		t.Fatalf("credential = state %q refresh token %q", credential.LifecycleState, credential.RefreshToken)
+	}
+	fixture.mu.Lock()
+	passwordPageCalls := fixture.passwordPageCalls
+	passwordCalls := fixture.passwordCalls
+	fixture.mu.Unlock()
+	if passwordPageCalls != 1 || passwordCalls != 1 {
+		t.Fatalf("password page/verify calls = %d/%d, want 1/1", passwordPageCalls, passwordCalls)
 	}
 }
 
@@ -1232,30 +1245,48 @@ func TestServiceLoginAcceptsPasswordEnvelopeFromAuthorizeAPI(t *testing.T) {
 	}
 }
 
-func TestServiceLoginRequiresInteractionForAuthorizeVerificationPage(t *testing.T) {
-	fixture := newLoginFixture(t, http.StatusOK, "")
+func TestServicePasswordTOTPSelectsPasswordFromAuthorizeVerificationPage(t *testing.T) {
+	fixedNow := time.Date(2026, time.July, 16, 12, 0, 0, 0, time.UTC)
+	const secret = "JBSWY3DPEHPK3PXP"
+	wantTOTP, errTOTP := GenerateTOTP(secret, fixedNow)
+	if errTOTP != nil {
+		t.Fatal(errTOTP)
+	}
+	fixture := newLoginFixture(t, http.StatusOK, `{
+		"continue_url":"/mfa-challenge/totp-factor",
+		"page":{"type":"mfa_challenge","payload":{
+			"mfa_request_id":"mfa-request",
+			"mfa_factors":[{"type":"totp","id":"totp-factor"}]
+		}}
+	}`)
 	fixture.authorizePath = "/email-verification"
-	service := NewService(fixture.options(time.Date(2026, time.July, 16, 12, 0, 0, 0, time.UTC)))
+	fixture.wantTOTP = wantTOTP
+	service := NewService(fixture.options(fixedNow))
 	credential, err := service.Login(t.Context(), LoginInput{
-		Email:    "person@example.com",
-		Password: "correct-password",
+		Credential: &Credential{
+			Email:       "person@example.com",
+			Password:    "correct-password",
+			TOTPSecret:  secret,
+			LoginMethod: LoginMethodPasswordTOTP,
+		},
 	})
-	if err == nil {
-		t.Fatal("Login() succeeded, want interaction requirement")
+	if err != nil {
+		t.Fatal(err)
 	}
-	authError, ok := AsAuthError(err)
-	if !ok || authError.Code != "email_otp_required" || authError.State != LifecycleInteractionRequired {
-		t.Fatalf("Login() error = %#v", err)
-	}
-	if credential.LifecycleState != LifecycleInteractionRequired {
-		t.Fatalf("credential lifecycle = %q", credential.LifecycleState)
+	if credential.LifecycleState != LifecycleActive || credential.RefreshToken != "refresh-token" {
+		t.Fatalf("credential = state %q refresh token %q", credential.LifecycleState, credential.RefreshToken)
 	}
 	fixture.mu.Lock()
 	authorizeContinueCalls := fixture.authorizeContinueCalls
+	passwordPageCalls := fixture.passwordPageCalls
 	passwordCalls := fixture.passwordCalls
+	mfaVerifyCalls := fixture.mfaVerifyCalls
 	fixture.mu.Unlock()
-	if authorizeContinueCalls != 0 || passwordCalls != 0 {
-		t.Fatalf("authorize continue/password calls = %d/%d, want 0/0", authorizeContinueCalls, passwordCalls)
+	if authorizeContinueCalls != 0 || passwordPageCalls != 1 || passwordCalls != 1 || mfaVerifyCalls != 1 {
+		t.Fatalf(
+			"calls = authorize_continue:%d password_page:%d password_verify:%d mfa_verify:%d, want 0/1/1/1",
+			authorizeContinueCalls, passwordPageCalls, passwordCalls, mfaVerifyCalls,
+		)
 	}
 }
 
