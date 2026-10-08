@@ -83,6 +83,9 @@ func TestImageBootstrapRetryUsesFreshConnectionAndSharesCookies(t *testing.T) {
 	var mu sync.Mutex
 	var addresses []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if values := r.Header.Values("DNT"); len(values) != 1 || values[0] != "1" {
+			t.Errorf("bootstrap retry DNT = %q, want exactly one default value", values)
+		}
 		if values := r.Header.Values("Accept"); len(values) != 1 || !strings.HasPrefix(values[0], "text/html") {
 			t.Errorf("retry Accept = %q, want one document value", values)
 		}

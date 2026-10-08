@@ -1455,6 +1455,9 @@ func newChatGPTWebImageFixture(t *testing.T) *httptest.Server {
 	var mu sync.Mutex
 	turnMessageID := ""
 	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if values := request.Header.Values("DNT"); len(values) != 1 || values[0] != "1" {
+			t.Errorf("image generation %s DNT = %q, want exactly one default value", request.URL.Path, values)
+		}
 		switch request.URL.Path {
 		case "/":
 			_, _ = io.WriteString(w, `<html><script src="/c/build/_next/a.js"></script></html>`)

@@ -91,6 +91,9 @@ func newLoginFixture(t *testing.T, passwordStatus int, passwordBody string) *log
 }
 
 func (fixture *loginFixture) serveHTTP(response http.ResponseWriter, request *http.Request) {
+	if values := request.Header.Values("DNT"); len(values) != 1 || values[0] != "1" {
+		fixture.t.Errorf("login %s DNT = %q, want exactly one default value", request.URL.Path, values)
+	}
 	if request.Method == http.MethodGet {
 		switch request.URL.Path {
 		case "/password-page", "/password-redirect", "/authorize-follow", "/authorize-follow-final", "/log-in-or-create-account", "/log-in/password":

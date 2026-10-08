@@ -38,6 +38,9 @@ func TestChatGPTWebHomepageRedirectPreservesCookiesWithoutAPIHeaders(t *testing.
 	var requests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests.Add(1)
+		if values := r.Header.Values("DNT"); len(values) != 1 || values[0] != "1" {
+			t.Errorf("navigation %s DNT = %q, want exactly one default value", r.URL.Path, values)
+		}
 		for key := range r.Header {
 			lower := strings.ToLower(key)
 			if lower == "authorization" || lower == "origin" || lower == "referer" || strings.HasPrefix(lower, "oai-") || strings.HasPrefix(lower, "x-openai-") {

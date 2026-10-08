@@ -62,6 +62,9 @@ func TestClientHeaderOverridesReplaceDefaultsOnWire(t *testing.T) {
 			_, _ = io.Copy(io.Discard, response.Body)
 			_ = response.Body.Close()
 			headers := <-observed
+			if values := headers.Values("DNT"); !reflect.DeepEqual(values, []string{"1"}) {
+				t.Errorf("navigation DNT = %q, want exactly one default value", values)
+			}
 			for key, value := range overrides {
 				if values := headers.Values(key); !reflect.DeepEqual(values, []string{value}) {
 					t.Errorf("wire %s = %q, want only %q", key, values, value)
@@ -83,6 +86,7 @@ func TestClientHeaderOverridesReplaceDefaultsOnWire(t *testing.T) {
 				headers = <-observed
 				apiHeaders["User-Agent"] = client.persona.UserAgent
 				apiHeaders["Accept-Language"] = client.persona.AcceptLanguage
+				apiHeaders["DNT"] = "1"
 				for key, value := range apiHeaders {
 					if values := headers.Values(key); !reflect.DeepEqual(values, []string{value}) {
 						t.Errorf("API %s = %q, want only %q", key, values, value)
