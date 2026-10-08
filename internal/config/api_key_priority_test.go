@@ -74,3 +74,50 @@ func TestAPIKeyPrioritySaveClearsInheritedListsAndPreservesExtensions(t *testing
 		t.Fatal("saving priority restrictions dropped unrelated YAML extensions")
 	}
 }
+
+func TestAPIKeyPriorityZeroSurvivesSaveAndReload(t *testing.T) {
+	for _, original := range []struct{ name, body string }{
+		{"new groups", ""},
+		{"empty groups", "api-key-groups: []\n"},
+		{"existing group", "api-key-groups: [{api-key: fixture, name: codex-0, providers: [codex], future: keep}]\n"},
+		{"inherited group", "defaults: &defaults {providers: [codex], future: keep}\napi-key-groups: [{api-key: fixture, <<: *defaults}]\n"},
+	} {
+		for _, rule := range []struct {
+			name              string
+			allowed, excluded APIKeyPriorityList
+		}{
+			{"allow zero exclude three", APIKeyPriorityList{0}, APIKeyPriorityList{3}},
+			{"exclude zero", nil, APIKeyPriorityList{0}},
+			{"allow only zero", APIKeyPriorityList{0}, nil},
+			{"mixed priorities", APIKeyPriorityList{-1, 0, 3}, APIKeyPriorityList{2}},
+		} {
+			t.Run(original.name+"/"+rule.name, func(t *testing.T) {
+				path := filepath.Join(t.TempDir(), "config.yaml")
+				if err := os.WriteFile(path, []byte("api-keys: [fixture]\n"+original.body), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				cfg, err := LoadConfig(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(cfg.APIKeyGroups) == 0 {
+					cfg.APIKeyGroups = []APIKeyGroup{{APIKey: "fixture"}}
+				}
+				cfg.APIKeyGroups[0].AllowedPriorities, cfg.APIKeyGroups[0].ExcludedPriorities = rule.allowed, rule.excluded
+				for range 2 {
+					if err = SaveConfigPreserveComments(path, cfg); err != nil {
+						t.Fatal(err)
+					}
+					cfg, err = LoadConfig(path)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if len(cfg.APIKeyGroups) != 1 || !reflect.DeepEqual(cfg.APIKeyGroups[0].AllowedPriorities, rule.allowed) || !reflect.DeepEqual(cfg.APIKeyGroups[0].ExcludedPriorities, rule.excluded) {
+						t.Fatalf("priority restriction lost after save/reload: %+v", cfg.APIKeyGroups)
+					}
+					cfg.Debug = !cfg.Debug
+				}
+			})
+		}
+	}
+}

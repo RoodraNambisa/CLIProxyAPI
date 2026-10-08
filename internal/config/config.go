@@ -4488,6 +4488,13 @@ func isKnownDefaultValue(path []string, node *yaml.Node) bool {
 	if fullPath == "routing.priority-overrides" && node != nil && node.Kind == yaml.SequenceNode && len(node.Content) > 0 {
 		return false
 	}
+	if node != nil && node.Kind == yaml.SequenceNode && len(node.Content) > 0 {
+		switch fullPath {
+		case "api-key-groups.allowed-priorities", "api-key-groups.excluded-priorities":
+			// A list containing only priority zero is still an access restriction.
+			return false
+		}
+	}
 	if fullPath == "routing" && node != nil && node.Kind == yaml.MappingNode {
 		if index := findMapKeyIndex(node, "session-affinity-use-history"); index >= 0 {
 			value := node.Content[index+1]

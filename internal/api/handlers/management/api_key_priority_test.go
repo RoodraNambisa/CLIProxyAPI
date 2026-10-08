@@ -55,3 +55,33 @@ func TestAPIKeyPriorityPatchPreservesOtherRestrictionsAndRename(t *testing.T) {
 		t.Fatal("clearing priority restrictions erased provider access")
 	}
 }
+
+func TestAPIKeyPriorityZeroPatchPersistsAcrossReload(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte("api-keys: [fixture]\napi-key-groups: [{api-key: fixture, providers: [codex], excluded-priorities: [3]}]\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := NewHandler(cfg, path, nil)
+	response := performAPIKeyConfigRequest(t, h.PatchAPIKeyGroups, http.MethodPatch, "/api-key-groups", `{"api-key":"fixture","allowed-priorities":[0]}`)
+	if response.Code != http.StatusOK {
+		t.Fatal(response.Body.String())
+	}
+	for round := range 2 {
+		if round == 1 {
+			cfg, err = config.LoadConfig(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			h = NewHandler(cfg, path, nil)
+		}
+		list := performAPIKeyConfigRequest(t, h.GetAPIKeyGroups, http.MethodGet, "/api-key-groups", "")
+		group := gjson.GetBytes(list.Body.Bytes(), "api-key-groups.0")
+		if group.Get("allowed-priorities").Raw != "[0]" || group.Get("excluded-priorities").Raw != "[3]" {
+			t.Fatalf("round %d lost the zero-only restriction: %s", round, list.Body.String())
+		}
+	}
+}
