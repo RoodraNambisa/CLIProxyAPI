@@ -52,6 +52,7 @@ type chatGPTWebManualReloginOperationSnapshot struct {
 	ErrorCategory       string     `json:"error_category,omitempty"`
 	Error               string     `json:"error,omitempty"`
 	HTTPStatus          int        `json:"http_status,omitempty"`
+	UpstreamHTTPStatus  int        `json:"upstream_http_status,omitempty"`
 	FailureStage        string     `json:"failure_stage,omitempty"`
 	PersistenceOutcome  string     `json:"persistence_outcome,omitempty"`
 	PersistenceReason   string     `json:"persistence_reason,omitempty"`
@@ -482,6 +483,7 @@ type chatGPTWebManualReloginCompletion struct {
 	ErrorCategory      string
 	Error              string
 	HTTPStatus         int
+	UpstreamHTTPStatus int
 	FailureStage       string
 	PersistenceOutcome string
 	PersistenceReason  string
@@ -509,6 +511,7 @@ func (m *chatGPTWebLoginTaskManager) completeManualReloginOperationLocked(operat
 	record.Snapshot.ErrorCategory = completion.ErrorCategory
 	record.Snapshot.Error = completion.Error
 	record.Snapshot.HTTPStatus = completion.HTTPStatus
+	record.Snapshot.UpstreamHTTPStatus = completion.UpstreamHTTPStatus
 	record.Snapshot.FailureStage = completion.FailureStage
 	record.Snapshot.PersistenceOutcome = completion.PersistenceOutcome
 	record.Snapshot.PersistenceReason = completion.PersistenceReason
@@ -838,6 +841,7 @@ func chatGPTWebManualReloginCompletionFromResponse(status int, response gin.H, a
 		LifecycleState: lifecycleState,
 	}
 	completion.PersistenceOutcome, _ = response["persistence_outcome"].(string)
+	completion.UpstreamHTTPStatus, _ = response["upstream_http_status"].(int)
 	completion.PersistenceReason, _ = response["persistence_reason"].(string)
 	if status >= 200 && status < 300 && strings.TrimSpace(fmt.Sprint(response["status"])) == "ok" {
 		completion.Status = chatGPTWebManualReloginOperationCompleted

@@ -537,6 +537,7 @@ func (service *Service) loginOnce(acquisitionContext context.Context, input Logi
 			return service.loginFailure(credential, input.Relogin, ensureAuthError(err, pendingState))
 		}
 	} else if authError := classifyPageType(passwordEnvelope.PageType); authError != nil {
+		authError.FailureStage = "password_verify"
 		return service.loginFailure(credential, input.Relogin, authError)
 	}
 	if passwordEnvelope.ContinueURL == "" {
@@ -2572,6 +2573,12 @@ func classifyHTTPResponse(stage string, status int, payload []byte, defaultState
 	}
 	if status == http.StatusRequestTimeout || status == http.StatusTooEarly || status == http.StatusTooManyRequests || status >= http.StatusInternalServerError {
 		return newAuthError(normalized, defaultState, status, true, false, "upstream authentication service is temporarily unavailable", nil)
+	}
+	if normalized == "password_reset_required" {
+		return newAuthError(normalized, LifecycleInteractionRequired, status, false, true, "upstream requires a password reset; the current password cannot complete login", nil)
+	}
+	if stage == "mfa_verify" && normalized == "incorrect_code" {
+		return newAuthError(normalized, LifecycleReauthRequired, status, false, true, "authenticator verification code was rejected", nil)
 	}
 	if normalized == "invalid_grant" || normalized == "app_session_terminated" {
 		return newAuthError(normalized, LifecycleReauthRequired, status, false, true, "authentication must be renewed", nil)

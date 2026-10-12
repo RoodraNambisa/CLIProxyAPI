@@ -86,17 +86,18 @@ type chatGPTWebLoginInput struct {
 }
 
 type chatGPTWebLoginTaskResult struct {
-	Line           int    `json:"line"`
-	Email          string `json:"email"`
-	Status         string `json:"status"`
-	Name           string `json:"name,omitempty"`
-	AuthIndex      string `json:"auth_index,omitempty"`
-	LifecycleState string `json:"lifecycle_state,omitempty"`
-	ErrorCategory  string `json:"error_category,omitempty"`
-	Error          string `json:"error,omitempty"`
-	HTTPStatus     int    `json:"http_status,omitempty"`
-	FailureStage   string `json:"failure_stage,omitempty"`
-	Attempts       int    `json:"attempts,omitempty"`
+	Line               int    `json:"line"`
+	Email              string `json:"email"`
+	Status             string `json:"status"`
+	Name               string `json:"name,omitempty"`
+	AuthIndex          string `json:"auth_index,omitempty"`
+	LifecycleState     string `json:"lifecycle_state,omitempty"`
+	ErrorCategory      string `json:"error_category,omitempty"`
+	Error              string `json:"error,omitempty"`
+	HTTPStatus         int    `json:"http_status,omitempty"`
+	UpstreamHTTPStatus int    `json:"upstream_http_status,omitempty"`
+	FailureStage       string `json:"failure_stage,omitempty"`
+	Attempts           int    `json:"attempts,omitempty"`
 }
 
 type chatGPTWebLoginTask struct {
@@ -761,6 +762,9 @@ func (h *Handler) executeChatGPTWebManualRelogin(ctx context.Context, auth *core
 		response["status"] = "failed"
 		response["error_category"] = category
 		response["error"] = message
+		if upstreamStatus := chatGPTWebManagementUpstreamHTTPStatus(errRelogin); upstreamStatus != 0 {
+			response["upstream_http_status"] = upstreamStatus
+		}
 		if failureStage, attempts := chatGPTWebManagementErrorDiagnostics(errRelogin); failureStage != "" || attempts > 0 {
 			if failureStage != "" {
 				response["failure_stage"] = failureStage
@@ -1054,6 +1058,7 @@ func (h *Handler) executeChatGPTWebLogin(ctx context.Context, input chatGPTWebLo
 	if errLogin != nil {
 		result.ErrorCategory, result.Error, result.HTTPStatus, result.LifecycleState = classifyChatGPTWebManagementError(errLogin)
 		result.FailureStage, result.Attempts = chatGPTWebManagementErrorDiagnostics(errLogin)
+		result.UpstreamHTTPStatus = chatGPTWebManagementUpstreamHTTPStatus(errLogin)
 		if result.ErrorCategory == "canceled" {
 			result.Status = chatGPTWebLoginResultCanceled
 		}
@@ -1089,6 +1094,21 @@ func chatGPTWebManagementErrorDiagnostics(err error) (string, int) {
 		return "", 0
 	}
 	return strings.TrimSpace(authError.FailureStage), max(0, authError.Attempts)
+}
+
+func chatGPTWebManagementUpstreamHTTPStatus(err error) int {
+	authError, ok := chatgptwebauth.AsAuthError(err)
+	if !ok {
+		return 0
+	}
+	status := authError.StatusCode
+	if status == 0 {
+		status = authError.Status
+	}
+	if status < 400 || status > 599 {
+		return 0
+	}
+	return status
 }
 
 func (h *Handler) persistChatGPTWebLoginCredential(ctx context.Context, manager *coreauth.Manager, fileName string, credential *chatgptwebauth.Credential, existing *coreauth.Auth, loginErr error) (*coreauth.Auth, error) {
@@ -1420,6 +1440,7 @@ func chatGPTWebManagementAuthStatus(authError *chatgptwebauth.AuthError, categor
 	case "account_deleted", "account_deactivated":
 		return http.StatusGone
 	case "email_otp_required",
+		"password_reset_required",
 		"sms_otp_required",
 		"passkey_required",
 		"browser_confirmation_required",
@@ -1429,6 +1450,7 @@ func chatGPTWebManagementAuthStatus(authError *chatgptwebauth.AuthError, categor
 		"access_denied":
 		return http.StatusConflict
 	case "invalid_password",
+		"incorrect_code",
 		"invalid_totp",
 		"invalid_totp_secret",
 		"totp_required",
@@ -1494,6 +1516,10 @@ func safeChatGPTWebErrorMessage(category string) string {
 		return "account is deactivated"
 	case "invalid_password":
 		return "password was rejected"
+	case "password_reset_required":
+		return "upstream requires a password reset; the current password cannot complete login"
+	case "incorrect_code":
+		return "authenticator verification code was rejected"
 	case "invalid_totp", "invalid_totp_secret":
 		return "TOTP verification failed"
 	case "totp_required":

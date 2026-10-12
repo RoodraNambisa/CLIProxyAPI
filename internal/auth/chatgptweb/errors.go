@@ -151,6 +151,8 @@ func SafeLifecycleReason(value string) string {
 		"account_deleted",
 		"account_deactivated",
 		"invalid_password",
+		"password_reset_required",
+		"incorrect_code",
 		"invalid_totp",
 		"invalid_totp_secret",
 		"totp_required",

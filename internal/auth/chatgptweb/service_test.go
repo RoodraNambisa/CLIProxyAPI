@@ -26,6 +26,7 @@ type loginFixture struct {
 	passwordCalls               int
 	passwordPageCalls           int
 	passwordPageHandler         http.HandlerFunc
+	passwordVerifyHandler       http.HandlerFunc
 	requirePasswordSelection    bool
 	authorizePath               string
 	authorizeCalls              int
@@ -476,6 +477,10 @@ func (fixture *loginFixture) handleAuthorizeContinue(response http.ResponseWrite
 }
 
 func (fixture *loginFixture) handlePassword(response http.ResponseWriter, request *http.Request) {
+	if fixture.passwordVerifyHandler != nil {
+		fixture.passwordVerifyHandler(response, request)
+		return
+	}
 	if values := request.Header.Values("Accept"); len(values) != 1 || values[0] != "application/json" || request.Header.Get("Sec-Fetch-Mode") != "cors" {
 		fixture.t.Errorf("password API inherited navigation headers: accept=%q", values)
 	}
