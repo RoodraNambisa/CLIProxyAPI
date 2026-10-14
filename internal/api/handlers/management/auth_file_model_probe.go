@@ -38,6 +38,7 @@ type modelProbeRequest struct {
 }
 
 type modelProbeResult struct {
+	XAIDiagnostics      []helps.XAITransmission   `json:"xai_diagnostics,omitempty"`
 	CodexResponseGuard  *core.ResponseGuardRecord `json:"codex_response_guard,omitempty"`
 	CodexCookie         *modelProbeCookieResult   `json:"codex_cookie,omitempty"`
 	Success             bool                      `json:"success"`
@@ -215,6 +216,9 @@ func (h *Handler) ProbeAuthFileModel(c *gin.Context) {
 			return fmt.Errorf("this probe supports text models; image and video generation are not tested")
 		}
 		execCtx = helps.WithRequestTrace(execCtx, trace.request, trace.response)
+		if provider == "xai" {
+			execCtx = helps.WithXAIDiagnostics(execCtx, false, trace.xaiTransmission)
+		}
 		if provider == "codex" {
 			execCtx = helps.WithCodexStateDiagnostic(execCtx, stateMode, stateValue, trace.stateApplied)
 			execCtx = helps.WithCodexCookieDiagnostic(execCtx, cookieMode, trace.cookieApplied)

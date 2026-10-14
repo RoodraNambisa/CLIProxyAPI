@@ -214,16 +214,31 @@ func (o *modelProbeObserver) fill(result *modelProbeResult) {
 // A shared executor can report from its streaming goroutine. Retain bounded
 // diagnostic fields, including Codex State when requested, never authorization headers.
 type modelProbeTrace struct {
-	mu          sync.Mutex
-	url         string
-	body        string
-	model       string
-	requestID   string
-	status      int
-	truncated   bool
-	codexState  *modelProbeStateResult
-	codexCookie *modelProbeCookieResult
-	stateSent   string
+	mu             sync.Mutex
+	url            string
+	body           string
+	model          string
+	requestID      string
+	status         int
+	truncated      bool
+	codexState     *modelProbeStateResult
+	codexCookie    *modelProbeCookieResult
+	stateSent      string
+	xaiDiagnostics []helps.XAITransmission
+}
+
+func (t *modelProbeTrace) xaiTransmission(value helps.XAITransmission) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for i := range t.xaiDiagnostics {
+		if t.xaiDiagnostics[i].ID == value.ID {
+			t.xaiDiagnostics[i] = value
+			return
+		}
+	}
+	if len(t.xaiDiagnostics) < 32 {
+		t.xaiDiagnostics = append(t.xaiDiagnostics, value)
+	}
 }
 
 func (t *modelProbeTrace) request(url string, body []byte) {
@@ -254,6 +269,7 @@ func (t *modelProbeTrace) fill(result *modelProbeResult) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	result.UpstreamURL, result.UpstreamRequestBody = t.url, t.body
+	result.XAIDiagnostics = append([]helps.XAITransmission(nil), t.xaiDiagnostics...)
 	if t.model != "" {
 		result.UpstreamModel = t.model
 	}

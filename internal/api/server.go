@@ -967,6 +967,8 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/auth-files/selection", s.mgmt.ListAuthFileSelection)
 		mgmt.GET("/auth-files/models", s.mgmt.GetAuthFileModels)
 		mgmt.POST("/auth-files/xai/models/refresh", s.mgmt.RefreshXAIModels)
+		mgmt.GET("/auth-files/xai/options", s.mgmt.GetXAIOptions)
+		mgmt.POST("/auth-files/xai/headers/preview", s.mgmt.PreviewXAIHeaders)
 		mgmt.POST("/auth-files/models/probe", s.mgmt.ProbeAuthFileModel)
 		mgmt.POST("/auth-files/proxy/check", s.mgmt.CheckAuthFileProxy)
 		mgmt.POST("/auth-files/codex/state", s.mgmt.CodexStateAction)
