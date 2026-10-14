@@ -53,12 +53,17 @@ func NormalizeXAIBaseURL(raw string) (string, error) {
 }
 
 type XAIHeaderDefaults struct {
+	OfficialBuild    bool   `yaml:"official-build,omitempty" json:"official-build,omitempty"`
+	ClientMode       string `yaml:"client-mode,omitempty" json:"client-mode,omitempty"`
 	UserAgent        string `yaml:"user-agent" json:"user-agent"`
 	ClientVersion    string `yaml:"client-version" json:"client-version"`
 	ClientIdentifier string `yaml:"client-identifier" json:"client-identifier"`
 }
 
 type XAIConfig struct {
+	// ResolvedClientVersion is a request-local snapshot, never persisted.
+	ResolvedClientVersion      string            `yaml:"-" json:"-"`
+	RequestCompression         string            `yaml:"request-compression,omitempty" json:"request-compression,omitempty"`
 	ImageGenerationToolPolicy  string            `yaml:"image-generation-tool-policy,omitempty" json:"image-generation-tool-policy,omitempty"`
 	DynamicHeaders             bool              `yaml:"dynamic-headers,omitempty" json:"dynamic-headers,omitempty"`
 	ChatCompletionsMode        string            `yaml:"chat-completions-mode,omitempty" json:"chat-completions-mode,omitempty"`
@@ -112,6 +117,14 @@ func (c *XAIConfig) Validate() error {
 		default:
 			return fmt.Errorf("xai.image-generation-tool-policy must be remove, error or allow")
 		}
+	}
+	c.RequestCompression = strings.ToLower(strings.TrimSpace(c.RequestCompression))
+	if c.RequestCompression != "" && c.RequestCompression != "none" && c.RequestCompression != "auto" {
+		return fmt.Errorf("xai.request-compression must be none or auto")
+	}
+	c.HeaderDefaults.ClientMode = strings.TrimSpace(c.HeaderDefaults.ClientMode)
+	if mode := c.HeaderDefaults.ClientMode; mode != "" && mode != "headless" && mode != "interactive" {
+		return fmt.Errorf("xai.header-defaults.client-mode must be headless or interactive")
 	}
 	c.ChatCompletionsMode = strings.ToLower(strings.TrimSpace(c.ChatCompletionsMode))
 	if c.ChatCompletionsMode != "" && c.ChatCompletionsMode != "responses" && c.ChatCompletionsMode != "direct" {
@@ -185,6 +198,10 @@ func (c *XAIConfig) Validate() error {
 			var fields map[string]string
 			if json.Unmarshal(data, &fields) != nil || len(fields) != 1 || fields["effort"] == "" {
 				return fmt.Errorf("xai.request-defaults.reasoning must contain only effort")
+			}
+		case "service_tier":
+			if text, ok := value.(string); !ok || (text != "default" && text != "priority") {
+				return fmt.Errorf("xai.request-defaults.service_tier is invalid")
 			}
 		case "tool_choice":
 			data, _ := json.Marshal(value)

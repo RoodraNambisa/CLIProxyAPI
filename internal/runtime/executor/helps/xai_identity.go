@@ -9,6 +9,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	xaiauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/xai"
 	"net/http"
 	"strconv"
 	"strings"
@@ -43,6 +44,9 @@ func NewXAIRequestPlan(ctx context.Context, cfg *config.Config, req core.Request
 	if cfg != nil {
 		*owned = *cfg
 		owned.XAI = cfg.XAI.Clone()
+	}
+	if owned.XAI.HeaderDefaults.ClientVersion == "" {
+		owned.XAI.ResolvedClientVersion = xaiauth.ClientVersion()
 	}
 	p := &XAIRequestPlan{Config: owned}
 	if !owned.XAI.IdentityEnabled() && !owned.XAI.DynamicHeaders {

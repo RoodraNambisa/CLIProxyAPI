@@ -26,8 +26,11 @@ func TestXAIPKCEChallengeAndBoundExchange(t *testing.T) {
 			submitted = r.PostForm
 			body = `{"access_token":"fixture","refresh_token":"refresh-fixture","expires_in":3600}`
 		}
-		if r.Header.Get("x-grok-agent-id") != "" || r.Header.Get("x-grok-client-version") != "" {
+		if r.Header.Get("x-grok-agent-id") != "" {
 			t.Error("inference identity leaked to OAuth")
+		}
+		if r.URL.Path == "/token" && r.Header.Get("x-grok-client-version") != ClientVersion() {
+			t.Error("OAuth exchange omitted the shared client version")
 		}
 		return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body))}, nil
 	})

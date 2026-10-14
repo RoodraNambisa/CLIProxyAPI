@@ -765,6 +765,7 @@ nonstream-keepalive-interval: 0
 # OAuth acquisition uses separate login headers. Model override and identity
 # headers are controlled by the final model and the policies below.
 xai:
+  request-compression: "none" # Opt-in: auto negotiates Zstd with this exact upstream settings endpoint.
   # Preserve literal custom header values by default. When enabled, $HeaderName
   # reads a captured client header and $CPA-SESSION-ID uses the shared session
   # fingerprint. Missing sources are omitted; identity policies still take priority.
@@ -802,8 +803,10 @@ xai:
   #   - models: ["*"]
   #     upstream: api
   header-defaults:
-    user-agent: "" # Built-in: xai-grok-workspace/0.2.120
-    client-version: "" # Built-in: 0.2.120
+    official-build: false # Use Grok Build platform user-agent and CLI client mode defaults.
+    client-mode: "headless" # headless or interactive; explicit custom headers still win.
+    user-agent: "" # Generated from the resolved client version.
+    client-version: "" # Automatic stable npm version; cached fallback on lookup failure.
     client-identifier: "" # Built-in: grok-shell
   headers: {}
   passthrough-client-identity: false
@@ -814,7 +817,7 @@ xai:
   # Only fills omitted client parameters; payload override rules still apply.
   # Empty defaults do not add reasoning effort or parallel tool calls.
   # Supported: max_output_tokens, reasoning.effort, temperature, top_p,
-  # tool_choice, parallel_tool_calls and stream_tool_calls.
+  # tool_choice, parallel_tool_calls, stream_tool_calls and service_tier (default/priority).
   request-defaults: {}
   # Hosted search injection applies to Responses, not direct Chat Completions.
   inject-web-search: false

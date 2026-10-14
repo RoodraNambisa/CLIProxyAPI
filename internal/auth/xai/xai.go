@@ -23,6 +23,7 @@ type XAIAuth struct {
 	httpClient            *http.Client
 	validateOAuthEndpoint func(string, string) (string, error)
 	refreshScope          string
+	clientVersion         string
 }
 
 var xaiRefreshGroup singleflight.Group
@@ -47,6 +48,7 @@ func NewXAIAuthWithProxyURL(cfg *config.Config, proxyURL string) *XAIAuth {
 		httpClient:            util.SetProxy(&sdkCfg, &http.Client{Timeout: httpClientTimeout}),
 		validateOAuthEndpoint: ValidateOAuthEndpoint,
 		refreshScope:          xaiRefreshScope(effectiveProxyURL),
+		clientVersion:         configuredClientVersion(cfg),
 	}
 }
 
@@ -152,6 +154,8 @@ func (a *XAIAuth) RequestDeviceCode(ctx context.Context, deviceAuthorizationEndp
 		return nil, fmt.Errorf("xai device code: create request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("x-grok-client-version", a.requestClientVersion())
+	req.Header.Set("x-grok-client-surface", "ui")
 	req.Header.Set("Accept", "application/json")
 
 	resp, err := a.httpClient.Do(req)
@@ -277,6 +281,7 @@ func (a *XAIAuth) exchangeDeviceCode(ctx context.Context, tokenEndpoint, deviceC
 		return nil, fmt.Errorf("xai device token: create request: %w", err), interval, false
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("x-grok-client-version", a.requestClientVersion())
 	req.Header.Set("Accept", "application/json")
 
 	resp, err := a.httpClient.Do(req)
@@ -396,6 +401,7 @@ func (a *XAIAuth) postTokenForm(ctx context.Context, tokenEndpoint string, form 
 		return nil, fmt.Errorf("xai token request: create request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("x-grok-client-version", a.requestClientVersion())
 	req.Header.Set("Accept", "application/json")
 	resp, err := a.httpClient.Do(req)
 	if err != nil {
@@ -502,4 +508,17 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func configuredClientVersion(cfg *config.Config) string {
+	if cfg != nil {
+		return strings.TrimSpace(cfg.XAI.HeaderDefaults.ClientVersion)
+	}
+	return ""
+}
+func (a *XAIAuth) requestClientVersion() string {
+	if a.clientVersion != "" {
+		return a.clientVersion
+	}
+	return ClientVersion()
 }

@@ -26,6 +26,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/api"
 	chatgptwebauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/chatgptweb"
 	internalcodex "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
+	xaiauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/xai"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/authfileguard"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/codexcookie"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/proxypool"
@@ -51,6 +52,8 @@ type Service struct {
 	// cfg holds the current application configuration.
 	cfg *config.Config
 
+	xaiVersionCancel  context.CancelFunc
+	xaiVersionWG      sync.WaitGroup
 	codexStateCancel  context.CancelFunc
 	codexStateWG      sync.WaitGroup
 	codexStateStopped bool
@@ -5375,6 +5378,7 @@ func (s *Service) Run(ctx context.Context) error {
 		log.Infof("core auth auto-refresh started (interval=%s)", interval)
 	}
 	finishRouting(authCount, "")
+	s.startXAIVersionUpdater(ctx)
 	s.startCodexState(ctx)
 	s.startupState.MarkReady()
 	s.startUsageRestore()
@@ -5461,9 +5465,15 @@ func (s *Service) runShutdown() {
 	var shutdownErr error
 	s.cfgMu.Lock()
 	s.codexStateStopped = true
+	stopVersion := s.xaiVersionCancel
+	s.xaiVersionCancel = nil
 	stopState := s.codexStateCancel
 	s.codexStateCancel = nil
 	s.cfgMu.Unlock()
+	if stopVersion != nil {
+		stopVersion()
+	}
+	s.xaiVersionWG.Wait()
 	if stopState != nil {
 		stopState()
 	}
@@ -6900,4 +6910,27 @@ func (s *Service) resolveConfigXAIKey(auth *coreauth.Auth) *config.XAIKey {
 		}
 	}
 	return nil
+}
+
+func (s *Service) startXAIVersionUpdater(ctx context.Context) {
+	s.cfgMu.Lock()
+	if s.codexStateStopped || s.xaiVersionCancel != nil {
+		s.cfgMu.Unlock()
+		return
+	}
+	versionCtx, cancel := context.WithCancel(ctx)
+	s.xaiVersionCancel = cancel
+	s.xaiVersionWG.Add(1)
+	s.cfgMu.Unlock()
+	go func() {
+		defer s.xaiVersionWG.Done()
+		xaiauth.RunClientVersionUpdater(versionCtx, func() string {
+			s.cfgMu.RLock()
+			defer s.cfgMu.RUnlock()
+			if s.cfg == nil {
+				return ""
+			}
+			return s.cfg.ProxyURL
+		})
+	}()
 }

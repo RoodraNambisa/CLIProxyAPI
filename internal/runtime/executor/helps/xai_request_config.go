@@ -2,7 +2,9 @@ package helps
 
 import (
 	"encoding/json"
+	xaiauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/xai"
 	"net/http"
+	"runtime"
 	"sort"
 	"strings"
 
@@ -13,7 +15,7 @@ import (
 	"github.com/tidwall/sjson"
 )
 
-const XAIClientVersion = "0.2.120"
+const XAIClientVersion = xaiauth.FallbackClientVersion
 
 // ApplyXAIRequestParameters restores Grok-supported client parameters which a
 // shared Codex translator may discard. Defaults never override explicit values.
@@ -22,7 +24,8 @@ func ApplyXAIRequestParameters(body, original []byte, defaults map[string]any, s
 		"max_output_tokens": {"max_output_tokens", "max_completion_tokens", "max_tokens"},
 		"temperature":       {"temperature"}, "top_p": {"top_p"}, "top_k": {"top_k"},
 		"parallel_tool_calls": {"parallel_tool_calls"}, "stream_tool_calls": {"stream_tool_calls"},
-		"reasoning.effort": {"reasoning.effort", "reasoning_effort"},
+		"reasoning.effort":  {"reasoning.effort", "reasoning_effort"},
+		"reasoning.summary": {"reasoning.summary"}, "service_tier": {"service_tier"}, "safety_identifier": {"safety_identifier"}, "include": {"include"}, "text.format": {"text.format"},
 	}
 	for destination, sources := range paths {
 		var explicit gjson.Result
@@ -136,20 +139,61 @@ func ApplyXAIResourceHeaders(req *http.Request, auth *coreauth.Auth, cfg *config
 	}
 	version := strings.TrimSpace(settings.HeaderDefaults.ClientVersion)
 	if version == "" {
-		version = XAIClientVersion
+		version = settings.ResolvedClientVersion
+		if version == "" {
+			version = xaiauth.ClientVersion()
+		}
 	}
 	userAgent := strings.TrimSpace(settings.HeaderDefaults.UserAgent)
 	if userAgent == "" {
 		userAgent = "xai-grok-workspace/" + version
+		if settings.HeaderDefaults.OfficialBuild {
+			userAgent = XAIOfficialBuildUserAgent(version)
+		}
 	}
 	identifier := strings.TrimSpace(settings.HeaderDefaults.ClientIdentifier)
 	if identifier == "" {
 		identifier = "grok-shell"
 	}
-	req.Header.Set("User-Agent", userAgent)
-	req.Header.Set("x-grok-client-version", version)
-	req.Header.Set("x-grok-client-identifier", identifier)
+	officialCLI := req.URL == nil || strings.EqualFold(req.URL.Hostname(), "cli-chat-proxy.grok.com")
+	if !settings.HeaderDefaults.OfficialBuild || officialCLI {
+		req.Header.Set("User-Agent", userAgent)
+		req.Header.Set("x-grok-client-version", version)
+		req.Header.Set("x-grok-client-identifier", identifier)
+		if settings.HeaderDefaults.OfficialBuild {
+			mode := settings.HeaderDefaults.ClientMode
+			if mode == "" {
+				mode = "headless"
+			}
+			req.Header.Set("x-grok-client-mode", mode)
+		}
+	}
+	if settings.HeaderDefaults.OfficialBuild && !officialCLI {
+		if settings.HeaderDefaults.UserAgent != "" {
+			req.Header.Set("User-Agent", settings.HeaderDefaults.UserAgent)
+		}
+
+		if settings.HeaderDefaults.ClientVersion != "" {
+			req.Header.Set("x-grok-client-version", settings.HeaderDefaults.ClientVersion)
+		}
+		if settings.HeaderDefaults.ClientIdentifier != "" {
+			req.Header.Set("x-grok-client-identifier", settings.HeaderDefaults.ClientIdentifier)
+		}
+	}
 	if req.URL != nil && strings.EqualFold(req.URL.Hostname(), "cli-chat-proxy.grok.com") {
+		mode := settings.HeaderDefaults.ClientMode
+		if mode == "" {
+			mode = "headless"
+		}
+		req.Header.Set("x-grok-client-mode", mode)
+		if settings.HeaderDefaults.OfficialBuild && auth != nil && (strings.HasSuffix(req.URL.Path, "/responses") || strings.HasSuffix(req.URL.Path, "/chat/completions")) {
+			for _, key := range []string{"sub", "user_id"} {
+				if id, ok := auth.Metadata[key].(string); ok && id != "" {
+					req.Header.Set("x-grok-user-id", id)
+					break
+				}
+			}
+		}
 		req.Header.Set("X-XAI-Token-Auth", "xai-grok-cli")
 		req.Header.Set("x-authenticateresponse", "authenticate-response")
 	}
@@ -221,4 +265,19 @@ func InjectXAISearchTools(body []byte, web, x bool) []byte {
 		}
 	}
 	return body
+}
+
+// XAIOfficialBuildUserAgent uses Rust's platform spelling from Grok Build.
+func XAIOfficialBuildUserAgent(version string) string {
+	osName, arch := runtime.GOOS, runtime.GOARCH
+	if osName == "darwin" {
+		osName = "macos"
+	}
+	switch arch {
+	case "amd64":
+		arch = "x86_64"
+	case "arm64":
+		arch = "aarch64"
+	}
+	return "grok-shell/" + version + " (" + osName + "; " + arch + ")"
 }
