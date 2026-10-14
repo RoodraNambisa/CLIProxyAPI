@@ -181,10 +181,10 @@ func (e *XAIExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth, 
 		return nil, errPrepare
 	}
 	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
-	return executeXAIHTTPRequest(httpClient, httpReq, auth, cliproxyexecutor.Options{})
+	return executeXAIHTTPRequest(httpClient, httpReq, auth, cliproxyexecutor.Options{}, e.cfg)
 }
 
-func executeXAIHTTPRequest(httpClient *http.Client, req *http.Request, auth *cliproxyauth.Auth, opts cliproxyexecutor.Options) (*http.Response, error) {
+func executeXAIHTTPRequest(httpClient *http.Client, req *http.Request, auth *cliproxyauth.Auth, opts cliproxyexecutor.Options, configurations ...*config.Config) (*http.Response, error) {
 	if req == nil {
 		return nil, fmt.Errorf("xai executor: request is nil")
 	}
@@ -198,7 +198,22 @@ func executeXAIHTTPRequest(httpClient *http.Client, req *http.Request, auth *cli
 	if !active {
 		return nil, errXAIWebsocketSessionTerminated
 	}
-	resp, errRequest := helps.DoUpstreamHTTPRequest(httpClient, req.WithContext(runtimeCtx))
+	upstreamReq := req.WithContext(runtimeCtx)
+	var cfg *config.Config
+	if len(configurations) > 0 {
+		cfg = configurations[0]
+	}
+	originalReq := upstreamReq
+	upstreamReq = helps.PrepareXAICompressedRequest(runtimeCtx, httpClient, upstreamReq, auth, cfg)
+	if upstreamReq != originalReq {
+		httpClient = helps.XAICompressedHTTPClient(httpClient, originalReq)
+		if originalReq.Body != nil {
+			if errClose := originalReq.Body.Close(); errClose != nil {
+				log.WithError(errClose).Debug("close Grok uncompressed request body")
+			}
+		}
+	}
+	resp, errRequest := helps.DoUpstreamHTTPRequest(httpClient, upstreamReq)
 	if errRequest != nil || resp == nil || resp.Body == nil {
 		if releaseExecution() {
 			return nil, errXAIWebsocketSessionTerminated
@@ -220,6 +235,12 @@ func (e *XAIExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req 
 func (e *XAIExecutor) executeWithPolicy(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
 	if selectedAuthInstanceRetired(opts) {
 		return resp, errXAIWebsocketSessionTerminated
+	}
+	if opts.SourceFormat.String() == "openai-speech" {
+		return e.executeSpeech(ctx, auth, req, opts)
+	}
+	if helps.IsXAISpeechModel(req.Model) {
+		return resp, statusErr{code: http.StatusBadRequest, skipAuthResult: true, msg: "Grok speech models require /v1/audio/speech"}
 	}
 	if opts.Alt == "responses/compact" {
 		return e.executeCompact(ctx, auth, req, opts)
@@ -262,7 +283,7 @@ func (e *XAIExecutor) executeWithPolicy(ctx context.Context, auth *cliproxyauth.
 
 	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
 	httpClient = reporter.TrackHTTPClient(httpClient)
-	httpResp, err := executeXAIHTTPRequest(httpClient, httpReq, auth, opts)
+	httpResp, err := executeXAIHTTPRequest(httpClient, httpReq, auth, opts, e.cfg)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return resp, err
@@ -383,7 +404,7 @@ func (e *XAIExecutor) executeCompactRequest(ctx context.Context, auth *cliproxya
 
 	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
 	httpClient = reporter.TrackHTTPClient(httpClient)
-	httpResp, err := executeXAIHTTPRequest(httpClient, httpReq, auth, opts)
+	httpResp, err := executeXAIHTTPRequest(httpClient, httpReq, auth, opts, e.cfg)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return nil, nil, nil, err
@@ -641,7 +662,7 @@ func (e *XAIExecutor) executeImages(ctx context.Context, auth *cliproxyauth.Auth
 	e.recordXAIRequest(ctx, auth, url, httpReq.Method, httpReq.Header.Clone(), req.Payload)
 
 	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
-	httpResp, err := executeXAIHTTPRequest(httpClient, httpReq, auth, opts)
+	httpResp, err := executeXAIHTTPRequest(httpClient, httpReq, auth, opts, e.cfg)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return resp, err
@@ -720,7 +741,7 @@ func (e *XAIExecutor) executeVideos(ctx context.Context, auth *cliproxyauth.Auth
 	e.recordXAIRequest(ctx, auth, requestURL, httpReq.Method, httpReq.Header.Clone(), loggedBody)
 
 	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
-	httpResp, err := executeXAIHTTPRequest(httpClient, httpReq, auth, opts)
+	httpResp, err := executeXAIHTTPRequest(httpClient, httpReq, auth, opts, e.cfg)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return resp, err
@@ -761,6 +782,9 @@ func (e *XAIExecutor) executeStreamWithPolicy(ctx context.Context, auth *cliprox
 	if selectedAuthInstanceRetired(opts) {
 		return nil, errXAIWebsocketSessionTerminated
 	}
+	if helps.IsXAISpeechModel(req.Model) || opts.SourceFormat.String() == "openai-speech" {
+		return nil, statusErr{code: http.StatusBadRequest, skipAuthResult: true, msg: "Grok speech requires a non-streaming /v1/audio/speech request"}
+	}
 	if opts.Alt == "responses/compact" {
 		return nil, statusErr{code: http.StatusBadRequest, msg: "streaming not supported for /responses/compact"}
 	}
@@ -799,7 +823,7 @@ func (e *XAIExecutor) executeStreamWithPolicy(ctx context.Context, auth *cliprox
 
 	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
 	httpClient = reporter.TrackHTTPClient(httpClient)
-	httpResp, err := executeXAIHTTPRequest(httpClient, httpReq, auth, opts)
+	httpResp, err := executeXAIHTTPRequest(httpClient, httpReq, auth, opts, e.cfg)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return nil, err
@@ -1099,9 +1123,9 @@ func (e *XAIExecutor) prepareResponsesRequestTo(ctx context.Context, auth *clipr
 	body, _ = sjson.SetBytes(body, "stream", stream)
 	body, _ = sjson.DeleteBytes(body, "previous_response_id")
 	body, _ = sjson.DeleteBytes(body, "prompt_cache_retention")
-	body, _ = sjson.DeleteBytes(body, "safety_identifier")
 	body, _ = sjson.DeleteBytes(body, "stream_options")
 	beforeToolNormalization := helps.PromoteXAIAdditionalTools(body)
+	beforeToolNormalization, webSearchAlias := helps.AliasXAIClientWebSearch(beforeToolNormalization, beforeToolNormalization)
 	imagePolicy := "remove"
 	if e.cfg != nil && e.cfg.XAI.ImageGenerationToolPolicy != "" {
 		imagePolicy = e.cfg.XAI.ImageGenerationToolPolicy
@@ -1138,7 +1162,7 @@ func (e *XAIExecutor) prepareResponsesRequestTo(ctx context.Context, auth *clipr
 	body = normalizeXAIInputReasoningItems(body)
 	body = sanitizeXAIInputEncryptedContent(body)
 	body = normalizeCodexInstructions(body)
-	body = sanitizeXAIResponsesBody(body, baseModel)
+	body = sanitizeXAIResponsesBody(body, baseModel, req)
 
 	sessionID, errSession := xaiResolveComposerSessionID(ctx, req, opts, baseModel)
 	if errSession != nil {
@@ -1158,7 +1182,7 @@ func (e *XAIExecutor) prepareResponsesRequestTo(ctx context.Context, auth *clipr
 	}
 
 	return &xaiPreparedRequest{
-		outputPolicy:    helps.NewXAIResponsesOutputPolicy(originalPayload, body, responseFormat, multiAgentResponse, toolFold),
+		outputPolicy:    helps.NewXAIResponsesOutputPolicy(originalPayload, body, responseFormat, multiAgentResponse, toolFold).WithClientWebSearchAlias(webSearchAlias),
 		baseModel:       baseModel,
 		from:            from,
 		responseFormat:  responseFormat,
@@ -1427,9 +1451,15 @@ func xaiMetadataString(meta map[string]any, key string) string {
 	}
 }
 
-func sanitizeXAIResponsesBody(body []byte, model string) []byte {
+func sanitizeXAIResponsesBody(body []byte, model string, requests ...cliproxyexecutor.Request) []byte {
 	body = removeXAIEncryptedReasoningInclude(body)
-	if !xaiSupportsReasoningEffort(model) {
+	supports := xaiSupportsReasoningEffort(model)
+	if len(requests) > 0 {
+		if info, ok := cliproxyauth.ResolvedAPIKeyModelInfo(requests[0]); ok && info != nil {
+			supports = info.Thinking != nil && len(info.Thinking.Levels) > 0
+		}
+	}
+	if !supports {
 		if gjson.GetBytes(body, "reasoning.effort").Exists() {
 			log.Debugf("xai: stripping reasoning.effort for model %s (no thinking levels in model registry)", model)
 		}

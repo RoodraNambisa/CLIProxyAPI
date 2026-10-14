@@ -87,7 +87,7 @@ func GetXAIModels() []*ModelInfo {
 // WithXAIBuiltins injects hard-coded xAI image/video model definitions that should
 // not depend on remote models.json updates.
 func WithXAIBuiltins(models []*ModelInfo) []*ModelInfo {
-	return upsertModelInfos(models, xaiBuiltinImageModelInfo(), xaiBuiltinImageQualityModelInfo(), xaiBuiltinVideoModelInfo(), xaiBuiltinVideo15PreviewModelInfo())
+	return upsertModelInfos(models, xaiBuiltinImageModelInfo(), xaiBuiltinImageQualityModelInfo(), xaiBuiltinVideoModelInfo(), xaiBuiltinVideo15PreviewModelInfo(), xaiExtraModel("grok-imagine-image-2.0", "Grok Imagine Image 2.0", "image"), xaiExtraModel("grok-tts", "Grok TTS", "audio"), xaiExtraModel("grok-voice-tts-1.0", "Grok Voice TTS 1.0", "audio"))
 }
 
 func xaiBuiltinImageModelInfo() *ModelInfo {
@@ -112,7 +112,7 @@ func xaiBuiltinImageQualityModelInfo() *ModelInfo {
 		Type:        "xai",
 		DisplayName: "Grok Imagine Image Quality",
 		Name:        xaiBuiltinImageQualityModelID,
-		Description: "xAI Grok higher-fidelity image generation model.",
+		Description: "xAI Grok higher-fidelity image model; scheduled retirement on 2026-11-02. Use grok-imagine-image-2.0 with quality medium for migration.",
 	}
 }
 
@@ -294,4 +294,8 @@ func LookupStaticModelInfo(modelID string) *ModelInfo {
 	}
 
 	return nil
+}
+
+func xaiExtraModel(id, name, modality string) *ModelInfo {
+	return &ModelInfo{ID: id, Object: "model", OwnedBy: "xai", Type: "xai", Name: id, DisplayName: name, SupportedInputModalities: []string{"text"}, SupportedOutputModalities: []string{modality}}
 }

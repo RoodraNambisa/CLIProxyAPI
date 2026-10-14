@@ -9,9 +9,10 @@ import (
 // XAIResponsesOutputPolicy keeps output identities and the caller policy local
 // to the prepared request. Tool schemas and request bodies are not retained.
 type XAIResponsesOutputPolicy struct {
-	fold       *XAIToolFold
-	namespaces XAIResponseToolNamespaces
-	codex      CodexMultiAgentResponsePolicy
+	webSearchAlias string
+	fold           *XAIToolFold
+	namespaces     XAIResponseToolNamespaces
+	codex          CodexMultiAgentResponsePolicy
 }
 
 func NewXAIResponsesOutputPolicy(original, translated []byte, responseFormat sdktranslator.Format, codex CodexMultiAgentResponsePolicy, folds ...*XAIToolFold) XAIResponsesOutputPolicy {
@@ -25,7 +26,13 @@ func NewXAIResponsesOutputPolicy(original, translated []byte, responseFormat sdk
 	return XAIResponsesOutputPolicy{namespaces: NewXAIResponseToolNamespaces(original, translated), codex: codex, fold: fold}
 }
 
+func (policy XAIResponsesOutputPolicy) WithClientWebSearchAlias(alias string) XAIResponsesOutputPolicy {
+	policy.webSearchAlias = alias
+	return policy
+}
+
 func (policy XAIResponsesOutputPolicy) Rewrite(payload []byte) []byte {
+	payload = RestoreXAIClientWebSearch(payload, policy.webSearchAlias)
 	return policy.codex.Rewrite(policy.namespaces.Restore(policy.fold.Restore(payload)))
 }
 
@@ -46,7 +53,7 @@ func (policy XAIResponsesOutputPolicy) RewriteWebsocket(payload []byte) [][]byte
 }
 
 func (policy XAIResponsesOutputPolicy) TranslateNonStream(ctx context.Context, from, to sdktranslator.Format, model string, original, request, response []byte, param *any) []byte {
-	output := policy.Rewrite(sdktranslator.TranslateNonStream(ctx, from, to, model, original, request, policy.fold.Restore(response), param))
+	output := policy.Rewrite(sdktranslator.TranslateNonStream(ctx, from, to, model, original, request, RestoreXAIClientWebSearch(policy.fold.Restore(response), policy.webSearchAlias), param))
 	if to == sdktranslator.FormatOpenAIResponse || to == sdktranslator.FormatCodex {
 		output = EnsureResponsesUsageDetails(output)
 	}
@@ -56,7 +63,7 @@ func (policy XAIResponsesOutputPolicy) TranslateNonStream(ctx context.Context, f
 func (policy XAIResponsesOutputPolicy) TranslateStream(ctx context.Context, from, to sdktranslator.Format, model string, original, request, response []byte, param *any) [][]byte {
 	var chunks [][]byte
 	for _, frame := range policy.fold.StreamFrames(response) {
-		chunks = append(chunks, sdktranslator.TranslateStream(ctx, from, to, model, original, request, frame, param)...)
+		chunks = append(chunks, sdktranslator.TranslateStream(ctx, from, to, model, original, request, restoreXAIClientWebSearchFrame(frame, policy.webSearchAlias), param)...)
 	}
 	normalizeUsage := to == sdktranslator.FormatOpenAIResponse || to == sdktranslator.FormatCodex
 	if !normalizeUsage && len(policy.namespaces) == 0 && !policy.codex.PlaintextCalls && !policy.codex.NamespaceOptimized {

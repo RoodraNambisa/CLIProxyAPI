@@ -559,6 +559,9 @@ func (e *XAIWebsocketsExecutor) executeStream(ctx context.Context, auth *cliprox
 	if selectedAuthInstanceRetired(opts) {
 		return nil, errXAIWebsocketSessionTerminated
 	}
+	if helps.IsXAISpeechModel(req.Model) || opts.SourceFormat.String() == "openai-speech" {
+		return nil, statusErr{code: http.StatusBadRequest, skipAuthResult: true, msg: "Grok speech requires /v1/audio/speech"}
+	}
 	if opts.Alt == "responses/compact" {
 		return nil, statusErr{code: http.StatusBadRequest, msg: "streaming not supported for /responses/compact"}
 	}

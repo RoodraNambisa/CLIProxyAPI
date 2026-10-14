@@ -129,7 +129,29 @@ func XAIMergedModelsForAuth(auth *coreauth.Auth, cfg *config.Config) []*registry
 			models = append(models, model)
 		}
 	}
-	return models
+	// Build-fast is a CLI product; register it only for a CLI route or a
+	// catalog which explicitly advertises that model on another endpoint.
+	filtered := models[:0]
+	for _, model := range models {
+		if model.ID == "grok-4.7-build-fast" {
+			route, err := ResolveXAIModelUpstream(auth, cfg, model.ID)
+			advertised := false
+			if err == nil {
+				if catalog := catalogs[route.BaseURL+"/models"]; catalog != nil {
+					for _, entry := range catalog.Models {
+						if entry.ID == model.ID {
+							advertised = true
+						}
+					}
+				}
+			}
+			if err != nil || (route.Mode != "cli" && !advertised) {
+				continue
+			}
+		}
+		filtered = append(filtered, model)
+	}
+	return filtered
 }
 
 func XAIModelCatalogProvenance(auth *coreauth.Auth, cfg *config.Config) map[string][]string {

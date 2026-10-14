@@ -10512,7 +10512,7 @@ func requestHasImageGenerationToolForFallback(req cliproxyexecutor.Request, opts
 	if opts.SourceFormat == sdktranslator.FormatCodexAlphaSearch {
 		return false
 	}
-	if strings.EqualFold(strings.TrimSpace(opts.SourceFormat.String()), "openai-image") {
+	if strings.EqualFold(strings.TrimSpace(opts.SourceFormat.String()), "openai-image") || opts.SourceFormat.String() == "openai-speech" {
 		return false
 	}
 	if executionModelOverrideFromMetadata(opts.Metadata) != "" {

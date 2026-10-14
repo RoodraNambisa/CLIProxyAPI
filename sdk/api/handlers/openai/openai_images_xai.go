@@ -19,6 +19,7 @@ import (
 const (
 	xaiProvider                 = "xai"
 	defaultXAIImagesModel       = "grok-imagine-image"
+	xaiImagesV2Model            = "grok-imagine-image-2.0"
 	xaiImagesQualityModel       = "grok-imagine-image-quality"
 	xaiImagesHandlerType        = "openai-image"
 	xaiImagesDefaultAspectRatio = "1:1"
@@ -43,11 +44,14 @@ func imagesModelParts(model string) (prefix string, baseModel string) {
 func isXAIImagesModel(model string) bool {
 	_, baseModel := imagesModelParts(model)
 	baseModel = strings.ToLower(strings.TrimSpace(baseModel))
-	return baseModel == defaultXAIImagesModel || baseModel == xaiImagesQualityModel
+	return baseModel == defaultXAIImagesModel || baseModel == xaiImagesQualityModel || baseModel == xaiImagesV2Model
 }
 
 func canonicalXAIImagesModel(model string) string {
 	_, baseModel := imagesModelParts(model)
+	if strings.EqualFold(strings.TrimSpace(baseModel), xaiImagesV2Model) {
+		return xaiImagesV2Model
+	}
 	if strings.EqualFold(strings.TrimSpace(baseModel), xaiImagesQualityModel) {
 		return xaiImagesQualityModel
 	}
@@ -77,6 +81,8 @@ func xaiImagesAspectRatio(raw, fallback string) string {
 		return "3:2"
 	case "2:3":
 		return "2:3"
+	case "2:1", "1:2", "19.5:9", "9:19.5", "20:9", "9:20", "21:9", "5:2", "auto":
+		return strings.ToLower(strings.TrimSpace(raw))
 	default:
 		return fallback
 	}
@@ -145,7 +151,7 @@ func buildXAIImagesGenerationsRequest(rawJSON []byte, model, responseFormat stri
 	if value := gjson.GetBytes(rawJSON, "n"); value.Exists() && value.Type == gjson.Number {
 		n = value.Int()
 	}
-	return buildXAIImagesBaseRequest(model, gjson.GetBytes(rawJSON, "prompt").String(), responseFormat, aspectRatio, resolution, n)
+	return applyXAIImagesOptions(buildXAIImagesBaseRequest(model, gjson.GetBytes(rawJSON, "prompt").String(), responseFormat, aspectRatio, resolution, n), rawJSON)
 }
 
 func buildXAIImagesEditRequest(model, prompt string, images []string, responseFormat, aspectRatio, resolution string, n int64) []byte {
@@ -258,8 +264,8 @@ func (h *OpenAIImagesAPIHandler) handleXAIEditIfRequested(c *gin.Context, rawJSO
 			}
 			images = append(images, imageURL)
 		}
-		if len(images) == 0 {
-			h.writeImagesRequestError(c, fmt.Errorf("image is required"))
+		if len(images) == 0 || len(images) > 5 {
+			h.writeImagesRequestError(c, fmt.Errorf("one to five images are required"))
 			return true
 		}
 		responseFormat := normalizeXAIImagesResponseFormat(req.ResponseFormat)
@@ -271,6 +277,8 @@ func (h *OpenAIImagesAPIHandler) handleXAIEditIfRequested(c *gin.Context, rawJSO
 			n = int64(*req.N)
 		}
 		xaiReq := buildXAIImagesEditRequest(model, req.Prompt, images, responseFormat, aspectRatio, resolution, n)
+		options, _ := json.Marshal(map[string]any{"quality": req.Quality})
+		xaiReq = applyXAIImagesOptions(xaiReq, options)
 		h.handleXAIImages(c, model, xaiReq, responseFormat, "image_edit", req.Stream)
 		return true
 	}
@@ -284,14 +292,22 @@ func (h *OpenAIImagesAPIHandler) handleXAIEditIfRequested(c *gin.Context, rawJSO
 		return true
 	}
 	prompt := strings.TrimSpace(gjson.GetBytes(rawJSON, "prompt").String())
-	images := collectXAIImagesFromJSON(rawJSON)
-	if prompt == "" || len(images) == 0 {
-		h.writeImagesRequestError(c, fmt.Errorf("prompt and image are required"))
+	refs := collectXAIImageRefs(rawJSON)
+	if prompt == "" || len(refs) == 0 || len(refs) > 5 {
+		h.writeImagesRequestError(c, fmt.Errorf("prompt and one to five images are required"))
 		return true
 	}
 	responseFormat := normalizeXAIImagesResponseFormat(gjson.GetBytes(rawJSON, "response_format").String())
 	aspectRatio, resolution, n := xaiImagesEditOptions(rawJSON)
-	h.handleXAIImages(c, model, buildXAIImagesEditRequest(model, prompt, images, responseFormat, aspectRatio, resolution, n), responseFormat, "image_edit", gjson.GetBytes(rawJSON, "stream").Bool())
+	request := buildXAIImagesBaseRequest(model, prompt, responseFormat, aspectRatio, resolution, n)
+	if len(refs) == 1 {
+		request, _ = sjson.SetRawBytes(request, "image", refs[0])
+	} else {
+		for _, ref := range refs {
+			request, _ = sjson.SetRawBytes(request, "images.-1", ref)
+		}
+	}
+	h.handleXAIImages(c, model, applyXAIImagesOptions(request, rawJSON), responseFormat, "image_edit", gjson.GetBytes(rawJSON, "stream").Bool())
 	return true
 }
 
@@ -424,4 +440,46 @@ func (h *OpenAIImagesAPIHandler) handleXAIImages(c *gin.Context, routeModel stri
 		flusher.Flush()
 	}
 	cliCancel(nil)
+}
+
+func applyXAIImagesOptions(request, original []byte) []byte {
+	if canonicalXAIImagesModel(gjson.GetBytes(request, "model").String()) == xaiImagesV2Model {
+		if quality := gjson.GetBytes(original, "quality"); quality.Exists() {
+			request, _ = sjson.SetRawBytes(request, "quality", []byte(quality.Raw))
+		}
+	}
+	for _, path := range []string{"storage_options", "output_format"} {
+		if value := gjson.GetBytes(original, path); value.Exists() {
+			request, _ = sjson.SetRawBytes(request, path, []byte(value.Raw))
+		}
+	}
+	return request
+}
+
+func collectXAIImageRefs(raw []byte) [][]byte {
+	var refs [][]byte
+	collect := func(value gjson.Result) {
+		if id := strings.TrimSpace(value.Get("file_id").String()); id != "" {
+			ref, _ := json.Marshal(map[string]string{"file_id": id})
+			refs = append(refs, ref)
+			return
+		}
+		if value.Type == gjson.String {
+			refs = append(refs, xaiImagesRef(value.String()))
+			return
+		}
+		for _, path := range []string{"url", "image_url.url", "image_url"} {
+			if url := value.Get(path); url.Type == gjson.String && strings.TrimSpace(url.String()) != "" {
+				refs = append(refs, xaiImagesRef(url.String()))
+				return
+			}
+		}
+	}
+	if image := gjson.GetBytes(raw, "image"); image.Exists() {
+		collect(image)
+	}
+	for _, image := range gjson.GetBytes(raw, "images").Array() {
+		collect(image)
+	}
+	return refs
 }

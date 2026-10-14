@@ -11,6 +11,9 @@ const CodexAlphaSearchAttributeKey = "codex_alpha_search"
 // Protocol capabilities are pool membership constraints, evaluated before
 // priority, affinity, cooldown waiting and request-capacity reservations.
 func credentialSupportsExecutionFormat(auth *Auth, format translator.Format) bool {
+	if format.String() == "openai-speech" {
+		return auth != nil && auth.Provider == "xai"
+	}
 	switch format {
 	case translator.FormatCodexAlphaSearch:
 		return SupportsCodexAlphaSearch(auth)

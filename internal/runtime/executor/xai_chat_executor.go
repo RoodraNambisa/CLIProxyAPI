@@ -108,7 +108,7 @@ func (e *XAIExecutor) sendChatRequest(ctx context.Context, auth *coreauth.Auth, 
 	e.applyPreparedXAIHeaders(ctx, auth, httpReq.Header, prepared, opts)
 	e.recordXAIRequest(ctx, auth, requestURL, http.MethodPost, httpReq.Header.Clone(), prepared.body)
 	client := reporter.TrackHTTPClient(helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0))
-	resp, err := executeXAIHTTPRequest(client, httpReq, auth, opts)
+	resp, err := executeXAIHTTPRequest(client, httpReq, auth, opts, e.cfg)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return nil, err

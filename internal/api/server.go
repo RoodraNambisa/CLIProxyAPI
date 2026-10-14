@@ -539,6 +539,8 @@ func (s *Server) setupRoutes() {
 		v1.POST("/responses", openaiResponsesHandlers.Responses)
 		v1.POST("/responses/compact", openaiResponsesHandlers.Compact)
 		v1.POST("/alpha/search", codexSearchHandlers.Search)
+		v1.POST("/audio/speech", openaiHandlers.AudioSpeech)
+		v1.POST("/tts", openaiHandlers.XAITTS)
 		v1.POST("/images/generations", openaiImagesHandlers.Generations)
 		v1.POST("/images/edits", openaiImagesHandlers.Edits)
 		v1.POST("/videos", openaiHandlers.XAIVideosGenerations)
