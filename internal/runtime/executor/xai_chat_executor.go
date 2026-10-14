@@ -30,6 +30,8 @@ func (e *XAIExecutor) usesDirectChat(opts core.Options) bool {
 // prepareChatRequest keeps Chat messages and tool structures intact. It shares
 // routing and the request identity snapshot with the Responses executor.
 func (e *XAIExecutor) prepareChatRequest(ctx context.Context, auth *coreauth.Auth, req core.Request, opts core.Options, stream bool) (*xaiPreparedRequest, error) {
+	req, caps := helps.BindXAIRequestCapabilities(req, auth, e.cfg)
+	helps.NoteXAICapabilities(ctx, caps)
 	original := req.Payload
 	if len(opts.OriginalRequest) > 0 {
 		original = opts.OriginalRequest
@@ -43,7 +45,7 @@ func (e *XAIExecutor) prepareChatRequest(ctx context.Context, auth *coreauth.Aut
 		body = helps.ApplyXAIChatDefaults(body, e.cfg.XAI.RequestDefaults)
 	}
 	var err error
-	body, err = helps.ApplyRequestThinking(body, req, opts, "openai", "openai", "xai")
+	body, err = caps.ApplyThinking(body, req, opts, "openai", "openai")
 	if err != nil {
 		return nil, err
 	}
@@ -86,7 +88,8 @@ func (e *XAIExecutor) prepareChatRequest(ctx context.Context, auth *coreauth.Aut
 		}
 	}
 	return &xaiPreparedRequest{
-		baseModel: baseModel, from: opts.SourceFormat, to: sdktranslator.FormatOpenAI,
+		capabilities: caps,
+		baseModel:    baseModel, from: opts.SourceFormat, to: sdktranslator.FormatOpenAI,
 		responseFormat: core.ResponseFormatOrSource(opts), originalPayload: original,
 		body: body, sessionID: sessionID, identity: identity,
 	}, nil

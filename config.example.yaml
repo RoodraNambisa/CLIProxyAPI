@@ -757,6 +757,14 @@ nonstream-keepalive-interval: 0
 #     models:
 #       - name: "grok-4.6"
 #         alias: "grok"
+#       - name: "grok-imagine-image-2.0"
+#         alias: "grok-image"
+#         # Optional explicit capabilities for this key and upstream model.
+#         # Omitted fields inherit the selected node's catalog, then built-ins.
+#         image-capabilities:
+#           max-edit-images: 5
+#           quality-values: ["low", "medium", "auto"]
+#           file-id-inputs: true
 #     excluded-models: []
 # With identity policies enabled, config keys keep random identity seeds under
 # auth-dir/.xai-identities. Preserve this directory across server restarts.

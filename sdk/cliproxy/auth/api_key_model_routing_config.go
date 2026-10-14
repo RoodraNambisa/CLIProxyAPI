@@ -29,6 +29,7 @@ func copyAPIKeyModelRoutingConfig(source *config.Config) *config.Config {
 		entry := config.XAIKey{APIKey: key.APIKey, BaseURL: key.BaseURL, Models: append([]config.CodexModel(nil), key.Models...)}
 		for i := range entry.Models {
 			entry.Models[i].Thinking = config.NormalizeModelThinkingSupport(entry.Models[i].Thinking)
+			entry.Models[i].ImageCapabilities = entry.Models[i].ImageCapabilities.Clone()
 		}
 		next.XAIKey = append(next.XAIKey, entry)
 	}

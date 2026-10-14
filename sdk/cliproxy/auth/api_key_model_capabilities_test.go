@@ -11,6 +11,31 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 )
 
+func TestXAIImageDeclarationsAreBoundAndRemainPrivate(t *testing.T) {
+	n, no, values := 2, false, []string{"medium"}
+	models := []config.CodexModel{{Name: "grok-imagine-image-2.0", Alias: "image", ImageCapabilities: &config.XAIImageCapabilities{MaxEditImages: &n, FileIDInputs: &no, QualityValues: &values}}}
+	byRoute := make(map[string][]apiKeyModelCapabilityRoute)
+	compileConfiguredModelCapabilities(byRoute, models, "xai")
+	auth := &Auth{ID: "one", Provider: "xai", Attributes: map[string]string{"api_key": "fixture"}}
+	snapshot := &apiKeyModelRoutingSnapshot{capabilities: apiKeyModelCapabilityTable{"one": byRoute}}
+	req := attachResolvedAPIKeyModelInfo(snapshot, cliproxyexecutor.Request{Model: models[0].Name}, auth, "image", models[0].Name)
+	values[0] = "changed"
+	n = 9
+	got := ResolvedXAIImageCapabilities(req)
+	if got == nil || *got.MaxEditImages != 2 || (*got.QualityValues)[0] != "medium" || *got.FileIDInputs {
+		t.Fatal("declaration not frozen")
+	}
+	*got.MaxEditImages = 8
+	(*got.QualityValues)[0] = "mutated"
+	if *ResolvedXAIImageCapabilities(req).MaxEditImages != 2 || (*ResolvedXAIImageCapabilities(req).QualityValues)[0] != "medium" {
+		t.Fatal("mutable snapshot leaked")
+	}
+	other := attachResolvedAPIKeyModelInfo(snapshot, req, &Auth{ID: "two", Provider: "xai", Attributes: map[string]string{"api_key": "other"}}, "image", models[0].Name)
+	if ResolvedXAIImageCapabilities(other) != nil {
+		t.Fatal("another credential borrowed declaration")
+	}
+}
+
 func TestConfiguredModelCapabilityRoutesAreExactAndPrivate(t *testing.T) {
 	models := []config.CodexModel{
 		{Name: "upstream", Alias: "shared", IsCompat: true, Thinking: &registry.ThinkingSupport{Levels: []string{" LOW ", "none", "none"}}},

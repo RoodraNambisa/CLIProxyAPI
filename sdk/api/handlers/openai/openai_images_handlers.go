@@ -1288,6 +1288,17 @@ func parseMultipartImageEditRequest(c *gin.Context) (openAIImageRequest, error) 
 		}
 		req.Images = append(req.Images, imageReference{ImageURL: dataURL})
 	}
+	if isXAIImagesModel(req.Model) {
+		for _, key := range []string{"image", "image[]", "images", "images[]"} {
+			for _, value := range form.Value[key] {
+				refs, err := parseXAIMultipartReferences(value)
+				if err != nil {
+					return req, err
+				}
+				req.Images = append(req.Images, refs...)
+			}
+		}
+	}
 	if masks := multipartFiles(form, "mask"); len(masks) > 0 {
 		if len(masks) > 1 {
 			return req, errors.New("only one mask file is supported")

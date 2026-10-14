@@ -255,17 +255,22 @@ func (h *OpenAIImagesAPIHandler) handleXAIEditIfRequested(c *gin.Context, rawJSO
 			h.writeImagesRequestError(c, fmt.Errorf("prompt is required"))
 			return true
 		}
-		images := make([]string, 0, len(req.Images))
+		refs := make([]json.RawMessage, 0, len(req.Images))
 		for _, image := range req.Images {
+			if image.FileID != "" {
+				raw, _ := json.Marshal(map[string]string{"file_id": image.FileID})
+				refs = append(refs, raw)
+				continue
+			}
 			imageURL, errURL := imageURLFromReference(image)
 			if errURL != nil {
 				h.writeImagesRequestError(c, errURL)
 				return true
 			}
-			images = append(images, imageURL)
+			refs = append(refs, xaiImagesRef(imageURL))
 		}
-		if len(images) == 0 || len(images) > 5 {
-			h.writeImagesRequestError(c, fmt.Errorf("one to five images are required"))
+		if len(refs) == 0 {
+			h.writeImagesRequestError(c, fmt.Errorf("at least one image is required"))
 			return true
 		}
 		responseFormat := normalizeXAIImagesResponseFormat(req.ResponseFormat)
@@ -276,8 +281,17 @@ func (h *OpenAIImagesAPIHandler) handleXAIEditIfRequested(c *gin.Context, rawJSO
 		if req.N != nil {
 			n = int64(*req.N)
 		}
-		xaiReq := buildXAIImagesEditRequest(model, req.Prompt, images, responseFormat, aspectRatio, resolution, n)
-		options, _ := json.Marshal(map[string]any{"quality": req.Quality})
+		xaiReq := buildXAIImagesBaseRequest(model, req.Prompt, responseFormat, aspectRatio, resolution, n)
+		if len(refs) == 1 {
+			xaiReq, _ = sjson.SetRawBytes(xaiReq, "image", refs[0])
+		} else {
+			raw, _ := json.Marshal(refs)
+			xaiReq, _ = sjson.SetRawBytes(xaiReq, "images", raw)
+		}
+		options := []byte(`{}`)
+		if req.Quality != "" {
+			options, _ = json.Marshal(map[string]any{"quality": req.Quality})
+		}
 		xaiReq = applyXAIImagesOptions(xaiReq, options)
 		h.handleXAIImages(c, model, xaiReq, responseFormat, "image_edit", req.Stream)
 		return true
@@ -293,7 +307,7 @@ func (h *OpenAIImagesAPIHandler) handleXAIEditIfRequested(c *gin.Context, rawJSO
 	}
 	prompt := strings.TrimSpace(gjson.GetBytes(rawJSON, "prompt").String())
 	refs := collectXAIImageRefs(rawJSON)
-	if prompt == "" || len(refs) == 0 || len(refs) > 5 {
+	if prompt == "" || len(refs) == 0 {
 		h.writeImagesRequestError(c, fmt.Errorf("prompt and one to five images are required"))
 		return true
 	}
@@ -443,10 +457,8 @@ func (h *OpenAIImagesAPIHandler) handleXAIImages(c *gin.Context, routeModel stri
 }
 
 func applyXAIImagesOptions(request, original []byte) []byte {
-	if canonicalXAIImagesModel(gjson.GetBytes(request, "model").String()) == xaiImagesV2Model {
-		if quality := gjson.GetBytes(original, "quality"); quality.Exists() {
-			request, _ = sjson.SetRawBytes(request, "quality", []byte(quality.Raw))
-		}
+	if quality := gjson.GetBytes(original, "quality"); quality.Exists() {
+		request, _ = sjson.SetRawBytes(request, "quality", []byte(quality.Raw))
 	}
 	for _, path := range []string{"storage_options", "output_format"} {
 		if value := gjson.GetBytes(original, path); value.Exists() {
@@ -482,4 +494,32 @@ func collectXAIImageRefs(raw []byte) [][]byte {
 		collect(image)
 	}
 	return refs
+}
+
+func parseXAIMultipartReferences(value string) ([]imageReference, error) {
+	root := gjson.Parse(value)
+	items := []gjson.Result{root}
+	if root.IsArray() {
+		items = root.Array()
+	}
+	if !gjson.Valid(value) {
+		if strings.HasPrefix(strings.TrimSpace(value), "[") || strings.HasPrefix(strings.TrimSpace(value), "{") {
+			return nil, fmt.Errorf("invalid Grok image references")
+		}
+		return []imageReference{{ImageURL: value}}, nil
+	}
+	var result []imageReference
+	for _, item := range items {
+		raw, _ := json.Marshal(map[string]json.RawMessage{"image": json.RawMessage(item.Raw)})
+		refs := collectXAIImageRefs(raw)
+		if len(refs) != 1 {
+			return nil, fmt.Errorf("invalid Grok image reference")
+		}
+		if id := gjson.GetBytes(refs[0], "file_id").String(); id != "" {
+			result = append(result, imageReference{FileID: id})
+		} else {
+			result = append(result, imageReference{ImageURL: gjson.GetBytes(refs[0], "url").String()})
+		}
+	}
+	return result, nil
 }

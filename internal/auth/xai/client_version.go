@@ -20,7 +20,8 @@ const FallbackClientVersion = "1.0.52"
 
 var clientVersion = struct {
 	sync.RWMutex
-	value string
+	value     string
+	updatedAt time.Time
 }{value: FallbackClientVersion}
 
 // ClientVersion is shared by OAuth, resource queries and inference.
@@ -28,6 +29,16 @@ func ClientVersion() string {
 	clientVersion.RLock()
 	defer clientVersion.RUnlock()
 	return clientVersion.value
+}
+
+func ClientVersionStatus() (string, string, time.Time) {
+	clientVersion.RLock()
+	defer clientVersion.RUnlock()
+	source := "builtin"
+	if !clientVersion.updatedAt.IsZero() {
+		source = "version-cache"
+	}
+	return clientVersion.value, source, clientVersion.updatedAt
 }
 
 func ValidClientVersion(value string) bool {
@@ -68,6 +79,7 @@ func RunClientVersionUpdater(ctx context.Context, proxyURL func() string) {
 		if err == nil {
 			clientVersion.Lock()
 			clientVersion.value = version
+			clientVersion.updatedAt = time.Now().UTC()
 			clientVersion.Unlock()
 		} else if ctx.Err() == nil {
 			log.WithError(err).Warn("Grok version refresh failed; keeping cached version")

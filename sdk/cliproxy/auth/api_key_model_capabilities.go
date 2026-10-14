@@ -15,6 +15,7 @@ const resolvedAPIKeyModelInfoMetadataKey = "cliproxy.resolved_api_key_model_info
 type apiKeyModelCapabilityRoute struct {
 	upstreamModel string
 	modelInfo     *registry.ModelInfo
+	xaiImages     *config.XAIImageCapabilities
 }
 
 type apiKeyModelCapabilityTable map[string]map[string][]apiKeyModelCapabilityRoute
@@ -26,7 +27,15 @@ type apiKeyModelRoutingSnapshot struct {
 	capabilities apiKeyModelCapabilityTable
 }
 
-type resolvedAPIKeyModelInfo struct{ info *registry.ModelInfo }
+type resolvedAPIKeyModelInfo struct {
+	info      *registry.ModelInfo
+	xaiImages *config.XAIImageCapabilities
+}
+
+func ResolvedXAIImageCapabilities(req cliproxyexecutor.Request) *config.XAIImageCapabilities {
+	bound, _ := req.Metadata[resolvedAPIKeyModelInfoMetadataKey].(resolvedAPIKeyModelInfo)
+	return bound.xaiImages.Clone()
+}
 
 func (m *Manager) loadAPIKeyModelRouting() *apiKeyModelRoutingSnapshot {
 	if m != nil {
@@ -96,7 +105,18 @@ func attachResolvedAPIKeyModelInfo(routing *apiKeyModelRoutingSnapshot, req clip
 	maps.Copy(metadata, req.Metadata)
 	delete(metadata, resolvedAPIKeyModelInfoMetadataKey)
 	if ok || compatAttempt {
-		metadata[resolvedAPIKeyModelInfoMetadataKey] = resolvedAPIKeyModelInfo{info: info}
+		var images *config.XAIImageCapabilities
+		if auth != nil && auth.Provider == "xai" && routing != nil && info != nil {
+			for _, routes := range routing.capabilities[auth.ID] {
+				for _, route := range routes {
+					if route.modelInfo == info {
+						images = route.xaiImages.Clone()
+						break
+					}
+				}
+			}
+		}
+		metadata[resolvedAPIKeyModelInfoMetadataKey] = resolvedAPIKeyModelInfo{info: info, xaiImages: images}
 	}
 	req.Metadata = metadata
 	return req
@@ -202,6 +222,13 @@ func compileConfiguredModelCapabilities[T interface {
 			info.UserDefined = false
 		}
 		route := apiKeyModelCapabilityRoute{upstreamModel: name, modelInfo: info}
+		if modelType == "xai" {
+			if declared, ok := any(model).(interface {
+				GetXAIImageCapabilities() *config.XAIImageCapabilities
+			}); ok {
+				route.xaiImages = declared.GetXAIImageCapabilities().Clone()
+			}
+		}
 		for _, routeModel := range []string{alias, name} {
 			_, candidates := modelAliasLookupCandidates(routeModel)
 			for _, candidate := range candidates {

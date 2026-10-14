@@ -91,3 +91,19 @@ func (m *Manager) ProbeCredential(ctx context.Context, expected *Auth, executor 
 	opts = m.withResponseGuardAttempt(ctx, auth, req, opts)
 	return probe(core.WithResponseGuardAttempt(ctx, opts.ResponseGuard), auth, req, opts)
 }
+
+// PreviewCredentialRequest resolves the same model mapping and capability
+// snapshot as a probe, without preparing credentials or executing a request.
+func (m *Manager) PreviewCredentialRequest(auth *Auth, req core.Request) (core.Request, error) {
+	if m == nil || auth == nil {
+		return req, fmt.Errorf("credential preview unavailable")
+	}
+	routing := m.loadAPIKeyModelRouting()
+	models := m.executionModelCandidates(auth, req.Model, routing)
+	if len(models) == 0 {
+		return req, fmt.Errorf("credential has no upstream model mapping")
+	}
+	requested := req.Model
+	req.Model = models[0]
+	return attachResolvedAPIKeyModelInfo(routing, req, auth, requested, req.Model), nil
+}

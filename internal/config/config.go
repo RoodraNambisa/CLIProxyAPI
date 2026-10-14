@@ -2053,6 +2053,8 @@ func (k CodexKey) GetBaseURL() string { return k.BaseURL }
 
 // CodexModel describes a mapping between an alias and the actual upstream model name.
 type CodexModel struct {
+	// ImageCapabilities is used by Grok keys after the upstream model is selected.
+	ImageCapabilities *XAIImageCapabilities `yaml:"image-capabilities,omitempty" json:"image-capabilities,omitempty"`
 	// IsCompat preserves compatibility-only thinking blocks; false keeps native validation.
 	IsCompat bool `yaml:"is-compat,omitempty" json:"is-compat,omitempty"`
 	// Thinking overrides the model's declared reasoning capability; nil inherits.
@@ -2071,13 +2073,14 @@ type CodexModel struct {
 	ForceMapping bool `yaml:"force-mapping,omitempty" json:"force-mapping,omitempty"`
 }
 
-func (m CodexModel) GetName() string                        { return m.Name }
-func (m CodexModel) GetIsCompat() bool                      { return m.IsCompat }
-func (m CodexModel) GetDisplayName() string                 { return m.DisplayName }
-func (m CodexModel) GetMaxContextLength() int               { return m.MaxContextLength }
-func (m CodexModel) GetAlias() string                       { return m.Alias }
-func (m CodexModel) GetForceMapping() bool                  { return m.ForceMapping }
-func (m CodexModel) GetThinking() *registry.ThinkingSupport { return m.Thinking }
+func (m CodexModel) GetName() string                                { return m.Name }
+func (m CodexModel) GetIsCompat() bool                              { return m.IsCompat }
+func (m CodexModel) GetDisplayName() string                         { return m.DisplayName }
+func (m CodexModel) GetMaxContextLength() int                       { return m.MaxContextLength }
+func (m CodexModel) GetAlias() string                               { return m.Alias }
+func (m CodexModel) GetForceMapping() bool                          { return m.ForceMapping }
+func (m CodexModel) GetThinking() *registry.ThinkingSupport         { return m.Thinking }
+func (m CodexModel) GetXAIImageCapabilities() *XAIImageCapabilities { return m.ImageCapabilities }
 
 // GeminiKey represents the configuration for a Gemini API key,
 // including optional overrides for upstream base URL, proxy routing, and headers.

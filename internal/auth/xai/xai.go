@@ -153,10 +153,7 @@ func (a *XAIAuth) RequestDeviceCode(ctx context.Context, deviceAuthorizationEndp
 	if err != nil {
 		return nil, fmt.Errorf("xai device code: create request: %w", err)
 	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("x-grok-client-version", a.requestClientVersion())
-	req.Header.Set("x-grok-client-surface", "ui")
-	req.Header.Set("Accept", "application/json")
+	ApplyLoginHeaders(req, a.requestClientVersion(), true)
 
 	resp, err := a.httpClient.Do(req)
 	if err != nil {
@@ -280,9 +277,7 @@ func (a *XAIAuth) exchangeDeviceCode(ctx context.Context, tokenEndpoint, deviceC
 	if err != nil {
 		return nil, fmt.Errorf("xai device token: create request: %w", err), interval, false
 	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("x-grok-client-version", a.requestClientVersion())
-	req.Header.Set("Accept", "application/json")
+	ApplyLoginHeaders(req, a.requestClientVersion(), false)
 
 	resp, err := a.httpClient.Do(req)
 	if err != nil {
@@ -400,9 +395,7 @@ func (a *XAIAuth) postTokenForm(ctx context.Context, tokenEndpoint string, form 
 	if err != nil {
 		return nil, fmt.Errorf("xai token request: create request: %w", err)
 	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("x-grok-client-version", a.requestClientVersion())
-	req.Header.Set("Accept", "application/json")
+	ApplyLoginHeaders(req, a.requestClientVersion(), false)
 	resp, err := a.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("xai token request failed: %w", err)

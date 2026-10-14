@@ -8,15 +8,17 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
+	"github.com/tidwall/gjson"
 )
 
 const XAIModelCatalogKey = "xai_model_catalog"
 
 // XAIModelCatalog belongs to one credential and survives provider outages.
 type XAIModelCatalog struct {
-	Models    []*registry.ModelInfo `json:"models"`
-	UpdatedAt time.Time             `json:"updated_at"`
-	Source    string                `json:"source"`
+	Models               []*registry.ModelInfo              `json:"models"`
+	DeclaredCapabilities map[string]XAIDeclaredCapabilities `json:"declared_capabilities,omitempty"`
+	UpdatedAt            time.Time                          `json:"updated_at"`
+	Source               string                             `json:"source"`
 }
 
 func ParseXAIModels(raw []byte, source string) (*XAIModelCatalog, error) {
@@ -36,6 +38,14 @@ func ParseXAIModels(raw []byte, source string) (*XAIModelCatalog, error) {
 	known := make(map[string]*registry.ModelInfo)
 	for _, model := range registry.GetXAIModels() {
 		known[model.ID] = model
+	}
+	declarations := make(map[string]XAIDeclaredCapabilities)
+	rawEntries := make(map[string]gjson.Result)
+	for _, entry := range gjson.GetBytes(raw, "data").Array() {
+		id := entry.Get("id").String()
+		if _, exists := rawEntries[id]; !exists {
+			rawEntries[id] = entry
+		}
 	}
 	seen := make(map[string]bool)
 	models := make([]*registry.ModelInfo, 0, len(envelope.Data))
@@ -68,9 +78,45 @@ func ParseXAIModels(raw []byte, source string) (*XAIModelCatalog, error) {
 				model.Thinking = &registry.ThinkingSupport{Levels: levels}
 			}
 		}
+		declared := XAIDeclaredCapabilities{}
+		rawEntry := rawEntries[model.ID]
+		declared.ThinkingKnown = rawEntry.Get("thinking").Exists() || rawEntry.Get("supports_reasoning_effort").Exists() || rawEntry.Get("reasoning_efforts").Exists()
+		if reasoningDisabled {
+			model.Thinking = nil
+		}
+		declared.Thinking = model.Thinking
+		if value := rawEntry.Get("image_capabilities.max_edit_images"); value.Type == gjson.Number {
+			n := value.Int()
+			if n < 1 || n > 64 || value.Float() != float64(n) {
+				return nil, fmt.Errorf("invalid Grok image capability limit")
+			}
+			v := int(n)
+			declared.MaxEditImages = &v
+		}
+		if value := rawEntry.Get("image_capabilities.quality_values"); value.Exists() {
+			if !value.IsArray() {
+				return nil, fmt.Errorf("invalid Grok quality capabilities")
+			}
+			levels := []string{}
+			for _, entry := range value.Array() {
+				if entry.Type != gjson.String {
+					return nil, fmt.Errorf("invalid Grok quality capability")
+				}
+				levels = append(levels, entry.String())
+			}
+			declared.QualityValues = &levels
+		}
+		if value := rawEntry.Get("image_capabilities.file_id_inputs"); value.Exists() {
+			if value.Type != gjson.True && value.Type != gjson.False {
+				return nil, fmt.Errorf("invalid Grok file_id capability")
+			}
+			v := value.Bool()
+			declared.FileIDInputs = &v
+		}
+		declarations[model.ID] = declared
 		// Keep known capabilities when the directory only returns an ID.
 		if baseline := known[model.ID]; baseline != nil {
-			if model.Thinking == nil && !reasoningDisabled {
+			if model.Thinking == nil && !declared.ThinkingKnown {
 				model.Thinking = baseline.Thinking
 			}
 			if model.ContextLength == 0 {
@@ -95,7 +141,7 @@ func ParseXAIModels(raw []byte, source string) (*XAIModelCatalog, error) {
 		}
 		models = append(models, model)
 	}
-	catalog := &XAIModelCatalog{Models: models, Source: source, UpdatedAt: time.Now().UTC()}
+	catalog := &XAIModelCatalog{Models: models, DeclaredCapabilities: declarations, Source: source, UpdatedAt: time.Now().UTC()}
 	if serialized, err := json.Marshal(catalog); err != nil || len(serialized) > 1024*1024 {
 		return nil, fmt.Errorf("Grok model catalog exceeds the storage limit")
 	}
@@ -120,5 +166,33 @@ func XAIModelsForAuth(auth *coreauth.Auth) *XAIModelCatalog {
 		}
 		model.UpstreamID = model.ID
 	}
+	if !validXAIDeclarations(catalog.DeclaredCapabilities) {
+		return nil
+	}
 	return &catalog
+}
+
+func validXAIDeclarations(values map[string]XAIDeclaredCapabilities) bool {
+	if len(values) > 256 {
+		return false
+	}
+	for id, value := range values {
+		if id == "" || len(id) > 256 || strings.ContainsAny(id, "\r\n\x00") {
+			return false
+		}
+		if value.MaxEditImages != nil && (*value.MaxEditImages < 1 || *value.MaxEditImages > 64) {
+			return false
+		}
+		if value.QualityValues != nil {
+			if len(*value.QualityValues) > 32 {
+				return false
+			}
+			for _, quality := range *value.QualityValues {
+				if len(quality) > 64 || strings.ContainsAny(quality, "\r\n\x00") {
+					return false
+				}
+			}
+		}
+	}
+	return true
 }

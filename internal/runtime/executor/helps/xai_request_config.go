@@ -2,12 +2,12 @@ package helps
 
 import (
 	"encoding/json"
-	xaiauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/xai"
 	"net/http"
 	"runtime"
 	"sort"
 	"strings"
 
+	xaiauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/xai"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
@@ -57,6 +57,9 @@ func ApplyXAIRequestParameters(body, original []byte, defaults map[string]any, s
 		if _, configured := defaults["tool_choice"]; configured {
 			body, _ = sjson.DeleteBytes(body, "tool_choice")
 		}
+	}
+	if sourceFormat == "openai" && !gjson.GetBytes(original, "text.format").Exists() && gjson.GetBytes(original, "response_format.type").String() == "json_object" {
+		body, _ = sjson.SetBytes(body, "text.format", map[string]string{"type": "json_object"})
 	}
 	body = ApplyXAIDefaults(body, defaults)
 	if reasoning := gjson.GetBytes(body, "reasoning"); reasoning.IsObject() && len(reasoning.Map()) == 0 {
@@ -197,6 +200,27 @@ func ApplyXAIResourceHeaders(req *http.Request, auth *coreauth.Auth, cfg *config
 		req.Header.Set("X-XAI-Token-Auth", "xai-grok-cli")
 		req.Header.Set("x-authenticateresponse", "authenticate-response")
 	}
+	NoteXAIHeaderMap(req.Context(), "builtin", req.Header)
+	if req.Header.Get("Authorization") != "" {
+		NoteXAIHeaderSources(req.Context(), "credential-auth", "Authorization")
+	}
+	for _, name := range []string{"Accept", "Content-Type", "Connection"} {
+		if req.Header.Get(name) != "" {
+			NoteXAIHeaderSources(req.Context(), "protocol", name)
+		}
+	}
+	if req.Header.Get("x-grok-client-version") != "" {
+		_, source, _ := xaiauth.ClientVersionStatus()
+		if settings.HeaderDefaults.ClientVersion != "" {
+			source = "global-default"
+		}
+		NoteXAIHeaderSources(req.Context(), source, "x-grok-client-version")
+	}
+	for name, value := range map[string]string{"User-Agent": settings.HeaderDefaults.UserAgent, "x-grok-client-identifier": settings.HeaderDefaults.ClientIdentifier, "x-grok-client-mode": settings.HeaderDefaults.ClientMode} {
+		if value != "" && req.Header.Get(name) != "" {
+			NoteXAIHeaderSources(req.Context(), "global-default", name)
+		}
+	}
 	attrs := make(map[string]string, len(settings.Headers))
 	for key, value := range settings.Headers {
 		attrs["header:"+key] = value
@@ -206,6 +230,7 @@ func ApplyXAIResourceHeaders(req *http.Request, auth *coreauth.Auth, cfg *config
 		util.ApplyCustomHeadersFromAttrs(req, auth.Attributes)
 	}
 	ApplyXAIDynamicHeaders(req.Header, auth, cfg, nil, "")
+	NoteXAIConfiguredHeaderSources(req.Context(), cfg, auth, req.Header)
 	if settings.DynamicHeaders {
 		req.Host = req.Header.Get("Host")
 	}

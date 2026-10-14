@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -102,6 +103,139 @@ type XAIExecutor struct {
 // NewXAIExecutor creates a new xAI executor.
 func NewXAIExecutor(cfg *config.Config) *XAIExecutor {
 	return &XAIExecutor{cfg: cfg}
+}
+
+// PreviewHeaders runs the normal request composer without acquiring credentials
+// or issuing network requests. Its identity seed belongs only to this copy.
+func (e *XAIExecutor) PreviewHeaders(ctx context.Context, auth *cliproxyauth.Auth, input helps.XAIHeaderPreviewInput, resolved ...cliproxyexecutor.Request) (*helps.XAITransmission, error) {
+	auth = auth.Clone()
+	if auth.Metadata == nil {
+		auth.Metadata = make(map[string]any)
+	}
+	auth.Metadata[helps.XAIIdentitySeedKey] = base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{0x5a}, 32))
+	payload := []byte(input.RequestBody)
+	format := sdktranslator.FormatOpenAIResponse
+	if input.Protocol == "chat" {
+		format = sdktranslator.FormatOpenAI
+	}
+	if len(payload) == 0 {
+		payload = []byte(`{"input":"Preview only"}`)
+		if input.Protocol == "chat" {
+			payload = []byte(`{"messages":[{"role":"user","content":"Preview only"}]}`)
+		}
+	}
+	req := cliproxyexecutor.Request{Model: input.Model, Payload: payload}
+	if len(resolved) > 0 {
+		req.Model = resolved[0].Model
+		req.Metadata = resolved[0].Metadata
+		input.Model = req.Model
+	}
+	opts := cliproxyexecutor.Options{SourceFormat: format, OriginalRequest: payload, Headers: input.ClientHeaders,
+		Metadata: map[string]any{cliproxyexecutor.ExecutionSessionMetadataKey: "preview-session"}}
+	runner, scoped, err := e.requestExecutor(ctx, req, opts)
+	if err != nil {
+		return nil, err
+	}
+	token, _ := xaiCreds(auth)
+	var out *http.Request
+	stage := "http"
+	urlSource := ""
+	if input.Purpose == "device-login" || input.Purpose == "token-exchange" {
+		endpoint := xaiauth.Issuer
+		urlSource = "missing-source"
+		if value, ok := auth.Metadata["token_endpoint"].(string); ok && value != "" {
+			endpoint = value
+			urlSource = "credential-config"
+		}
+		if input.Purpose == "device-login" {
+			endpoint = xaiauth.Issuer
+			urlSource = "missing-source"
+			if value, ok := auth.Metadata["device_authorization_endpoint"].(string); ok && value != "" {
+				endpoint = value
+				urlSource = "credential-config"
+			}
+		}
+		out, err = http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader("preview=true"))
+		if err != nil {
+			return nil, err
+		}
+		version := runner.cfg.XAI.HeaderDefaults.ClientVersion
+		if version == "" {
+			version = runner.cfg.XAI.ResolvedClientVersion
+		}
+		xaiauth.ApplyLoginHeaders(out, version, input.Purpose == "device-login")
+		helps.NoteXAIHeaderMap(ctx, "login-protocol", out.Header)
+		source := "version-cache"
+		if runner.cfg.XAI.HeaderDefaults.ClientVersion != "" {
+			source = "global-default"
+		}
+		helps.NoteXAIHeaderSources(ctx, source, "x-grok-client-version")
+	} else if input.Purpose == "models" || input.Purpose == "quota" {
+		address := XAIModelsURL(auth, runner.cfg)
+		if input.Purpose == "quota" {
+			address = "https://cli-chat-proxy.grok.com/v1/billing?format=credits"
+		}
+		out, err = http.NewRequestWithContext(ctx, http.MethodGet, address, nil)
+		if err != nil {
+			return nil, err
+		}
+		out.Header.Set("Accept", "application/json")
+		out.Header.Set("Authorization", "Bearer "+token)
+		if input.Purpose == "quota" {
+			if value, ok := auth.Metadata["sub"].(string); ok {
+				out.Header.Set("x-userid", value)
+			}
+		}
+		if err = runner.PrepareRequest(out, auth); err != nil {
+			return nil, err
+		}
+	} else {
+		route, errRoute := helps.ResolveXAIModelUpstream(auth, runner.cfg, input.Model)
+		if errRoute != nil {
+			return nil, errRoute
+		}
+		baseURL := route.BaseURL
+		upstreamStream := input.Stream || !runner.usesDirectChat(scoped)
+		var prepared *xaiPreparedRequest
+		path := "/responses"
+		if input.Protocol == "websocket" {
+			baseURL, err = helps.XAIModelAPIOnlyBaseURL(auth, runner.cfg, input.Model)
+			if err != nil {
+				return nil, err
+			}
+			prepared, err = runner.prepareResponsesRequestTo(ctx, auth, req, scoped, true, sdktranslator.FormatCodex, baseURL)
+			stage = "websocket_handshake"
+		} else if runner.usesDirectChat(scoped) {
+			prepared, err = runner.prepareChatRequest(ctx, auth, req, scoped, input.Stream)
+			path = "/chat/completions"
+		} else {
+			prepared, err = runner.prepareResponsesRequest(ctx, auth, req, scoped, upstreamStream)
+		}
+		if err != nil {
+			return nil, err
+		}
+		out, err = http.NewRequestWithContext(ctx, http.MethodPost, baseURL+path, bytes.NewReader(prepared.body))
+		if err != nil {
+			return nil, err
+		}
+		if stage == "websocket_handshake" {
+			out.Header = applyXAIWebsocketRequestHeaders(ctx, out.URL.String(), http.Header{}, auth, token, prepared.sessionID, runner.cfg)
+		} else {
+			applyXAIChatHeaders(out, auth, token, upstreamStream, prepared.sessionID, runner.cfg)
+		}
+		runner.applyPreparedXAIHeaders(ctx, auth, out.Header, prepared, scoped)
+		if stage == "websocket_handshake" {
+			out.URL.Scheme = strings.Replace(out.URL.Scheme, "http", "ws", 1)
+			out.Method = http.MethodGet
+			out.Body = nil
+			out.ContentLength = 0
+			return helps.CaptureXAIWebsocketHandshake(ctx, out.URL.String(), out.Header, auth), nil
+		}
+	}
+	helps.NoteXAIPreviewCompression(ctx, out, auth, runner.cfg)
+	result := helps.EmitXAITransmission(ctx, out, auth, stage)
+	result.URLSource = urlSource
+	return result, nil
 }
 
 func (*XAIExecutor) DeferAuthRequestCommitUntilUpstream() bool { return true }
@@ -213,6 +347,7 @@ func executeXAIHTTPRequest(httpClient *http.Client, req *http.Request, auth *cli
 			}
 		}
 	}
+	httpClient = helps.XAIObserveHTTPClient(runtimeCtx, httpClient, auth)
 	resp, errRequest := helps.DoUpstreamHTTPRequest(httpClient, upstreamReq)
 	if errRequest != nil || resp == nil || resp.Body == nil {
 		if releaseExecution() {
@@ -372,7 +507,7 @@ func (e *XAIExecutor) executeCompactRequest(ctx context.Context, auth *cliproxya
 		return nil, nil, nil, statusErr{code: http.StatusBadRequest, msg: err.Error()}
 	}
 
-	prepared, err := e.prepareResponsesRequestTo(ctx, auth, req, opts, false, sdktranslator.FormatOpenAIResponse)
+	prepared, err := e.prepareResponsesRequestTo(ctx, auth, req, opts, false, sdktranslator.FormatOpenAIResponse, baseURL)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -635,6 +770,14 @@ func xaiBuildSSEFrame(eventName string, data []byte) []byte {
 }
 
 func (e *XAIExecutor) executeImages(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, endpointPath string) (resp cliproxyexecutor.Response, err error) {
+	req, caps := helps.BindXAIRequestCapabilities(req, auth, e.cfg)
+	helps.NoteXAICapabilities(ctx, caps)
+	if errValidate := caps.ValidateImages(req.Payload); errValidate != nil {
+		return resp, statusErr{code: 400, skipAuthResult: true, msg: errValidate.Error()}
+	}
+	if !caps.QualityKnown {
+		req.Payload, _ = sjson.DeleteBytes(req.Payload, "quality")
+	}
 	if req.Model != "" {
 		req.Payload, _ = sjson.SetBytes(req.Payload, "model", thinking.ParseSuffix(req.Model).ModelName)
 	}
@@ -1059,6 +1202,7 @@ func (e *XAIExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*cl
 }
 
 type xaiPreparedRequest struct {
+	capabilities    helps.XAIRequestCapabilities
 	outputPolicy    helps.XAIResponsesOutputPolicy
 	baseModel       string
 	from            sdktranslator.Format
@@ -1075,12 +1219,14 @@ func (e *XAIExecutor) prepareResponsesRequest(ctx context.Context, auth *cliprox
 	return e.prepareResponsesRequestTo(ctx, auth, req, opts, stream, sdktranslator.FormatCodex)
 }
 
-func (e *XAIExecutor) prepareResponsesRequestTo(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, stream bool, to sdktranslator.Format) (*xaiPreparedRequest, error) {
+func (e *XAIExecutor) prepareResponsesRequestTo(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, stream bool, to sdktranslator.Format, nodes ...string) (*xaiPreparedRequest, error) {
 	if plan := helps.XAIPlanFromOptions(opts); plan != nil && plan.Config != e.cfg {
 		runner := *e
 		runner.cfg = plan.Config
-		return runner.prepareResponsesRequestTo(ctx, auth, req, opts, stream, to)
+		return runner.prepareResponsesRequestTo(ctx, auth, req, opts, stream, to, nodes...)
 	}
+	req, caps := helps.BindXAIRequestCapabilities(req, auth, e.cfg, nodes...)
+	helps.NoteXAICapabilities(ctx, caps)
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 	from := opts.SourceFormat
 	responseFormat := cliproxyexecutor.ResponseFormatOrSource(opts)
@@ -1105,10 +1251,21 @@ func (e *XAIExecutor) prepareResponsesRequestTo(ctx context.Context, auth *clipr
 	if e.cfg != nil {
 		requestDefaults = e.cfg.XAI.RequestDefaults
 	}
+	if !gjson.GetBytes(originalPayload, "include").Exists() {
+		body = removeXAIEncryptedReasoningInclude(body)
+		originalTranslated = removeXAIEncryptedReasoningInclude(originalTranslated)
+		if include := gjson.GetBytes(originalTranslated, "include"); include.IsArray() && len(include.Array()) == 0 {
+			originalTranslated, _ = sjson.DeleteBytes(originalTranslated, "include")
+		}
+		if include := gjson.GetBytes(body, "include"); include.IsArray() && len(include.Array()) == 0 {
+			body, _ = sjson.DeleteBytes(body, "include")
+		}
+	}
 	body = helps.ApplyXAIRequestParameters(body, originalPayload, requestDefaults, from.String())
+	originalTranslated = helps.ApplyXAIRequestParameters(originalTranslated, originalPayload, nil, from.String())
 
 	var err error
-	body, err = helps.ApplyRequestThinking(body, req, opts, from.String(), e.Identifier(), e.Identifier())
+	body, err = caps.ApplyThinking(body, req, opts, from.String(), to.String())
 	if err != nil {
 		return nil, err
 	}
@@ -1162,6 +1319,9 @@ func (e *XAIExecutor) prepareResponsesRequestTo(ctx context.Context, auth *clipr
 	body = normalizeXAIInputReasoningItems(body)
 	body = sanitizeXAIInputEncryptedContent(body)
 	body = normalizeCodexInstructions(body)
+	if caps.ThinkingKnown && caps.Thinking == nil {
+		body, _ = sjson.DeleteBytes(body, "reasoning.effort")
+	}
 	body = sanitizeXAIResponsesBody(body, baseModel, req)
 
 	sessionID, errSession := xaiResolveComposerSessionID(ctx, req, opts, baseModel)
@@ -1182,6 +1342,7 @@ func (e *XAIExecutor) prepareResponsesRequestTo(ctx context.Context, auth *clipr
 	}
 
 	return &xaiPreparedRequest{
+		capabilities:    caps,
 		outputPolicy:    helps.NewXAIResponsesOutputPolicy(originalPayload, body, responseFormat, multiAgentResponse, toolFold).WithClientWebSearchAlias(webSearchAlias),
 		baseModel:       baseModel,
 		from:            from,
@@ -1204,6 +1365,19 @@ func (e *XAIExecutor) applyPreparedXAIHeaders(ctx context.Context, auth *cliprox
 		headers.Set("x-grok-model-override", prepared.baseModel)
 	}
 	prepared.identity.ApplyHeaders(headers)
+	helps.NoteXAIConfiguredHeaderSources(ctx, e.cfg, auth, headers)
+	helps.NoteXAIHeaderSources(ctx, "model-route", "x-grok-model-override")
+	if plan != nil && plan.Config.XAI.IdentityEnabled() {
+		for _, name := range []string{"x-grok-session-id", "x-grok-conv-id", "x-grok-agent-id", "x-grok-req-id", "x-grok-turn-idx", "x-grok-transient-retry"} {
+			if headers.Get(name) != "" {
+				source := "identity-policy"
+				if plan.Config.XAI.PassthroughClientIdentity && opts.Headers.Get(name) != "" && headers.Get(name) == opts.Headers.Get(name) {
+					source = "client-passthrough"
+				}
+				helps.NoteXAIHeaderSources(ctx, source, name)
+			}
+		}
+	}
 	if plan == nil || !plan.Config.XAI.IdentityEnabled() {
 		return
 	}
@@ -1452,10 +1626,11 @@ func xaiMetadataString(meta map[string]any, key string) string {
 }
 
 func sanitizeXAIResponsesBody(body []byte, model string, requests ...cliproxyexecutor.Request) []byte {
-	body = removeXAIEncryptedReasoningInclude(body)
 	supports := xaiSupportsReasoningEffort(model)
 	if len(requests) > 0 {
-		if info, ok := cliproxyauth.ResolvedAPIKeyModelInfo(requests[0]); ok && info != nil {
+		if caps, ok := helps.XAIRequestCapabilitySnapshot(requests[0]); ok {
+			supports = !caps.ThinkingKnown || (caps.Thinking != nil && len(caps.Thinking.Levels) > 0)
+		} else if info, ok := cliproxyauth.ResolvedAPIKeyModelInfo(requests[0]); ok && info != nil {
 			supports = info.Thinking != nil && len(info.Thinking.Levels) > 0
 		}
 	}

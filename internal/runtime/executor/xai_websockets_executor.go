@@ -20,6 +20,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -597,7 +598,8 @@ func (e *XAIWebsocketsExecutor) executeStream(ctx context.Context, auth *cliprox
 	if err != nil {
 		return nil, err
 	}
-	wsHeaders := applyXAIWebsocketHeaders(http.Header{}, auth, token, prepared.sessionID, e.cfg)
+	wsHeaders := applyXAIWebsocketRequestHeaders(ctx, httpURL, http.Header{}, auth, token, prepared.sessionID, e.cfg)
+	helps.NoteXAICompression(ctx, helps.XAICompressionDiagnostic{Enabled: e.cfg != nil && e.cfg.XAI.RequestCompression == "auto", Reason: "websocket"})
 	wsHeaders.Set("x-grok-model-override", prepared.baseModel)
 	e.applyPreparedXAIHeaders(ctx, auth, wsHeaders, prepared, opts)
 
@@ -1159,7 +1161,11 @@ func xaiBareWebsocketErrorStatus(payload []byte) int {
 }
 
 func (e *XAIWebsocketsExecutor) prepareResponsesWebsocketRequest(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*xaiPreparedRequest, error) {
-	prepared, err := e.prepareResponsesRequest(ctx, auth, req, opts, true)
+	baseURL, err := helps.XAIModelAPIOnlyBaseURL(auth, e.cfg, req.Model)
+	if err != nil {
+		return nil, statusErr{code: http.StatusBadRequest, msg: err.Error()}
+	}
+	prepared, err := e.prepareResponsesRequestTo(ctx, auth, req, opts, true, sdktranslator.FormatCodex, baseURL)
 	if err != nil {
 		return nil, err
 	}
@@ -1169,20 +1175,27 @@ func (e *XAIWebsocketsExecutor) prepareResponsesWebsocketRequest(ctx context.Con
 	return prepared, nil
 }
 
-func (e *XAIWebsocketsExecutor) dialXAIWebsocket(ctx context.Context, auth *cliproxyauth.Auth, wsURL string, headers http.Header) (*websocket.Conn, *http.Response, error) {
+func (e *XAIWebsocketsExecutor) dialXAIWebsocket(ctx context.Context, auth *cliproxyauth.Auth, wsURL string, headers http.Header) (*websocket.Conn, *http.Response, *helps.XAITransmission, error) {
 	dialer := newProxyAwareWebsocketDialer(ctx, e.cfg, auth)
 	dialer.HandshakeTimeout = codexResponsesWebsocketHandshakeTO
 	dialer.EnableCompression = true
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	handshake := helps.CaptureXAIWebsocketHandshake(ctx, wsURL, headers, auth, e.cfg)
 	conn, resp, err := dialer.DialContext(ctx, wsURL, headers)
+	if resp != nil {
+		helps.CompleteXAITransmission(ctx, handshake, resp.StatusCode)
+		if handshake != nil {
+			handshake.Status = resp.StatusCode
+		}
+	}
 	helps.ObserveUpstreamWebsocketDial(ctx, resp, err)
 	if conn != nil {
 		// Avoid gorilla/websocket flate tail validation issues on some upstreams/Go versions.
 		conn.EnableWriteCompression(false)
 	}
-	return conn, resp, err
+	return conn, resp, handshake, err
 }
 
 func (e *XAIWebsocketsExecutor) getOrCreateSession(sessionID string) *codexWebsocketSession {
@@ -1223,7 +1236,7 @@ func (e *XAIWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *cl
 		return nil, nil, errXAIWebsocketSessionTerminated
 	}
 	if sess == nil {
-		conn, resp, errDial := e.dialXAIWebsocket(ctx, auth, wsURL, headers)
+		conn, resp, _, errDial := e.dialXAIWebsocket(ctx, auth, wsURL, headers)
 		if errDial != nil || xaiAuthExecutionCurrent(auth) {
 			return conn, resp, errDial
 		}
@@ -1249,6 +1262,7 @@ func (e *XAIWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *cl
 	currentProxyIdentity := sess.proxyIdentity
 	currentWSURL := sess.wsURL
 	currentHeaderDigest := sess.xaiHeaderDigest
+	currentHandshake := sess.xaiHandshake
 	sess.connMu.Unlock()
 	requestedAuthID := strings.TrimSpace(authID)
 	requestedAuthInstanceID := auth.RuntimeInstanceID()
@@ -1269,6 +1283,7 @@ func (e *XAIWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *cl
 		readerConn = nil
 	}
 	if conn != nil {
+		helps.EmitXAIWebsocketReuse(ctx, currentHandshake)
 		if readerConn != conn {
 			sess.connMu.Lock()
 			sess.readerConn = conn
@@ -1286,7 +1301,9 @@ func (e *XAIWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *cl
 	}
 	if sess.conn != nil {
 		previous := sess.conn
+		handshake := sess.xaiHandshake
 		sess.connMu.Unlock()
+		helps.EmitXAIWebsocketReuse(ctx, handshake)
 		return previous, nil, nil
 	}
 	sess.dialGeneration++
@@ -1297,7 +1314,7 @@ func (e *XAIWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *cl
 	sess.pendingProxyIdentity = requestedProxyIdentity
 	sess.connMu.Unlock()
 
-	conn, resp, errDial := e.dialXAIWebsocket(ctx, auth, wsURL, headers)
+	conn, resp, handshake, errDial := e.dialXAIWebsocket(ctx, auth, wsURL, headers)
 	if errDial != nil {
 		clearXAIPendingWebsocketDial(sess, dialGeneration)
 		return nil, resp, errDial
@@ -1318,15 +1335,18 @@ func (e *XAIWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *cl
 		sess.pendingAuthInstanceID = ""
 		sess.pendingProxyBindingID = ""
 		sess.pendingProxyIdentity = ""
+		previousHandshake := sess.xaiHandshake
 		sess.connMu.Unlock()
 		if errClose := conn.Close(); errClose != nil {
 			log.Errorf("xai websockets executor: close websocket error: %v", errClose)
 		}
+		helps.EmitXAIWebsocketReuse(ctx, previousHandshake)
 		return previous, nil, nil
 	}
 	sess.conn = conn
 	sess.wsURL = wsURL
 	sess.xaiHeaderDigest = requestedHeaderDigest
+	sess.xaiHandshake = handshake
 	sess.authID = authID
 	sess.authInstanceID = requestedAuthInstanceID
 	sess.proxyBindingID = requestedProxyBindingID
@@ -1635,6 +1655,10 @@ func buildXAIResponsesWebsocketURL(httpURL string) (string, error) {
 }
 
 func applyXAIWebsocketHeaders(headers http.Header, auth *cliproxyauth.Auth, token string, sessionID string, configs ...*config.Config) http.Header {
+	return applyXAIWebsocketRequestHeaders(context.Background(), "", headers, auth, token, sessionID, configs...)
+}
+
+func applyXAIWebsocketRequestHeaders(ctx context.Context, address string, headers http.Header, auth *cliproxyauth.Auth, token string, sessionID string, configs ...*config.Config) http.Header {
 	if headers == nil {
 		headers = http.Header{}
 	}
@@ -1649,7 +1673,11 @@ func applyXAIWebsocketHeaders(headers http.Header, auth *cliproxyauth.Auth, toke
 	if len(configs) > 0 {
 		cfg = configs[0]
 	}
-	helps.ApplyXAIResourceHeaders(&http.Request{Header: headers}, auth, cfg)
+	req := (&http.Request{Header: headers}).WithContext(ctx)
+	if address != "" {
+		req.URL, _ = url.Parse(address)
+	}
+	helps.ApplyXAIResourceHeaders(req, auth, cfg)
 	return headers
 }
 

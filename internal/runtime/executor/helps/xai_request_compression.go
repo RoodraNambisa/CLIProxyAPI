@@ -36,6 +36,20 @@ type xaiCompressionCapability struct {
 // PrepareXAICompressedRequest negotiates only with the exact selected base URL.
 // Failure preserves the caller's original request body and headers.
 func PrepareXAICompressedRequest(ctx context.Context, client *http.Client, req *http.Request, auth *coreauth.Auth, cfg *config.Config) *http.Request {
+	info := XAICompressionDiagnostic{Reason: "disabled"}
+	if req != nil && req.ContentLength >= 0 {
+		size := req.ContentLength
+		info.OriginalBytes = &size
+		info.SentBytes = &size
+	}
+	if cfg != nil && cfg.XAI.RequestCompression == "auto" {
+		info.Enabled = true
+		info.Reason = "ineligible"
+		if req != nil && req.ContentLength < XAICompressionMinimum {
+			info.Reason = "below_threshold"
+		}
+	}
+	NoteXAICompression(ctx, info)
 	if cfg == nil || cfg.XAI.RequestCompression != "auto" || req == nil || req.URL == nil || req.Method != http.MethodPost || req.ContentLength < XAICompressionMinimum || req.GetBody == nil || req.Header.Get("Content-Encoding") != "" || !strings.HasPrefix(req.Header.Get("Content-Type"), "application/json") {
 		return req
 	}
@@ -59,13 +73,10 @@ func PrepareXAICompressedRequest(ctx context.Context, client *http.Client, req *
 	query.Header.Del("Content-Length")
 	query.Header.Del("Content-Encoding")
 	query.Header.Set("Accept", "application/json")
-	identity := base.BaseURL + "\x00" + cfg.ProxyURL + "\x00" + query.Header.Get("Authorization")
-	if auth != nil {
-		identity += "\x00" + auth.ID + "\x00" + auth.RuntimeInstallationID() + "\x00" + auth.ProxyURL + "\x00" + auth.EffectiveProxyBindingID()
-	}
-	profile, _ := jsonCompressionProfile(cfg)
-	sum := sha256.Sum256([]byte(identity + profile))
-	key := fmt.Sprintf("%x", sum)
+	key := xaiCompressionCacheKey(base.BaseURL, query.Header, auth, cfg)
+	info.SettingsURL = query.URL.String()
+	info.Reason = "unknown_support"
+	NoteXAICompression(ctx, info)
 	if !xaiSupportsCompression(ctx, client, query, key, auth) {
 		return req
 	}
@@ -73,6 +84,9 @@ func PrepareXAICompressedRequest(ctx context.Context, client *http.Client, req *
 	if err != nil {
 		return req
 	}
+	info.Reason = "compressed"
+	support := true
+	info.Supported = &support
 	compressed := encoder.EncodeAll(source, nil)
 	encoder.Close()
 	clone := req.Clone(req.Context())
@@ -81,8 +95,68 @@ func PrepareXAICompressedRequest(ctx context.Context, client *http.Client, req *
 	clone.ContentLength = int64(len(compressed))
 	clone.Header.Set("Content-Encoding", "zstd")
 	clone.Header.Del("Content-Length")
+	size := int64(len(compressed))
+	info.SentBytes = &size
+	NoteXAICompression(ctx, info)
 	log.WithFields(log.Fields{"original_bytes": len(source), "compressed_bytes": len(compressed)}).Debug("Grok HTTP request compressed")
 	return clone
+}
+
+func xaiCompressionCacheKey(base string, headers http.Header, auth *coreauth.Auth, cfg *config.Config) string {
+	identity := base + "\x00" + cfg.ProxyURL + "\x00" + headers.Get("Authorization")
+	if auth != nil {
+		identity += "\x00" + auth.ID + "\x00" + auth.RuntimeInstallationID() + "\x00" + auth.ProxyURL + "\x00" + auth.EffectiveProxyBindingID()
+	}
+	profile, _ := jsonCompressionProfile(cfg)
+	sum := sha256.Sum256([]byte(identity + profile))
+	return fmt.Sprintf("%x", sum)
+}
+
+// Preview uses only a previously negotiated capability; it never queries settings.
+func NoteXAIPreviewCompression(ctx context.Context, req *http.Request, auth *coreauth.Auth, cfg *config.Config) {
+	info := XAICompressionDiagnostic{Reason: "disabled", Enabled: cfg.XAI.RequestCompression == "auto"}
+	if req.Body != nil {
+		n := req.ContentLength
+		info.OriginalBytes = &n
+		info.SentBytes = &n
+	}
+	if info.Enabled {
+		info.Reason = "ineligible"
+		if req.Method == http.MethodPost && strings.HasPrefix(req.Header.Get("Content-Type"), "application/json") && req.Header.Get("Content-Encoding") == "" {
+			info.Reason = "below_threshold"
+			if req.ContentLength >= XAICompressionMinimum {
+				source := requestBodyForCompression(req)
+				route, err := ResolveXAIModelUpstream(auth, cfg, gjson.GetBytes(source, "model").String())
+				if err == nil {
+					info.SettingsURL = strings.TrimRight(route.BaseURL, "/") + "/settings"
+					info.Reason = "preview_support_unknown"
+					xaiCompressionCache.Lock()
+					cached, ok := xaiCompressionCache.entries[xaiCompressionCacheKey(route.BaseURL, req.Header, auth, cfg)]
+					xaiCompressionCache.Unlock()
+					if ok && time.Now().Before(cached.until) {
+						info.Supported = &cached.enabled
+						info.Reason = "unsupported"
+						if cached.enabled {
+							encoder, err := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.EncoderLevelFromZstd(3)), zstd.WithEncoderConcurrency(1))
+							if err == nil {
+								compressed := encoder.EncodeAll(source, nil)
+								encoder.Close()
+								req.Body = io.NopCloser(bytes.NewReader(compressed))
+								req.ContentLength = int64(len(compressed))
+								req.Header.Set("Content-Encoding", "zstd")
+								info.Reason = "compressed"
+								n := req.ContentLength
+								info.SentBytes = &n
+							} else {
+								info.Reason = "compression_failed"
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	NoteXAICompression(ctx, info)
 }
 
 func requestBodyForCompression(req *http.Request) []byte {
@@ -118,6 +192,7 @@ func xaiSupportsCompression(ctx context.Context, client *http.Client, query *htt
 		return entry.enabled, ok && time.Now().Before(entry.until)
 	}
 	if enabled, ok := cached(); ok {
+		noteXAICompressionSupport(ctx, enabled)
 		return enabled
 	}
 	result := xaiCompressionQueries.DoChan(key, func() (any, error) {
@@ -130,7 +205,11 @@ func xaiSupportsCompression(ctx context.Context, client *http.Client, query *htt
 			isolated.Transport = timed.base
 		}
 		isolated.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+		queryTrace := EmitXAITransmission(ctx, query, auth, "settings")
 		resp, err := isolated.Do(query)
+		if resp != nil {
+			CompleteXAITransmission(ctx, queryTrace, resp.StatusCode)
+		}
 		if err != nil {
 			return false, err
 		}
@@ -140,11 +219,14 @@ func xaiSupportsCompression(ctx context.Context, client *http.Client, query *htt
 			}
 		}()
 		if resp.StatusCode != http.StatusOK {
-			return false, nil
+			return false, fmt.Errorf("settings query returned HTTP %d", resp.StatusCode)
 		}
 		data, err := io.ReadAll(io.LimitReader(resp.Body, (1<<20)+1))
-		if err != nil || len(data) > 1<<20 {
+		if err != nil {
 			return false, err
+		}
+		if len(data) > 1<<20 || !gjson.ValidBytes(data) || !gjson.GetBytes(data, "accept_request_encodings").IsArray() {
+			return false, fmt.Errorf("invalid compression settings")
 		}
 		enabled := false
 		for _, value := range gjson.GetBytes(data, "accept_request_encodings").Array() {
@@ -175,10 +257,24 @@ func xaiSupportsCompression(ctx context.Context, client *http.Client, query *htt
 	})
 	select {
 	case <-ctx.Done():
+		noteXAICompressionFailure(ctx, "canceled")
 		return false
 	case value := <-result:
 		enabled, _ := value.Val.(bool)
+		if value.Err == nil {
+			noteXAICompressionSupport(ctx, enabled)
+		} else {
+			noteXAICompressionFailure(ctx, "negotiation_failed")
+		}
 		return value.Err == nil && enabled
+	}
+}
+
+func noteXAICompressionFailure(ctx context.Context, reason string) {
+	if state := xaiDiagnostics(ctx); state != nil {
+		state.Lock()
+		state.compression.Reason = reason
+		state.Unlock()
 	}
 }
 
@@ -215,4 +311,15 @@ func XAICompressedHTTPClient(client *http.Client, original *http.Request) *http.
 		return nil
 	}
 	return &owned
+}
+
+func noteXAICompressionSupport(ctx context.Context, supported bool) {
+	if state := xaiDiagnostics(ctx); state != nil {
+		state.Lock()
+		defer state.Unlock()
+		state.compression.Supported = &supported
+		if !supported {
+			state.compression.Reason = "unsupported"
+		}
+	}
 }
