@@ -803,7 +803,7 @@ func (client *Client) applyHeaders(request *fhttp.Request, overrides map[string]
 	for key, value := range overrides {
 		request.Header.Set(key, value)
 	}
-	if locale := client.browserLocale.Load(); locale != nil {
+	if locale := client.browserLocale.Load(); locale != nil && locale.Language != "" {
 		request.Header.Set("Accept-Language", locale.AcceptLanguage())
 		if request.Header.Get("Oai-Language") != "" {
 			request.Header.Set("Oai-Language", locale.Language)

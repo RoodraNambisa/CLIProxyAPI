@@ -62,7 +62,8 @@ func (locale BrowserLocale) AcceptLanguage() string {
 	return values[0] + "," + values[1] + ";q=0.9"
 }
 func (client *Client) SetBrowserRegion(snapshot BrowserRegionSnapshot) error {
-	var locale *BrowserLocale
+	// An empty locale pins the credential fallback without changing its encoding.
+	locale := &BrowserLocale{}
 	if snapshot.OverrideLanguage {
 		value, err := (BrowserLocale{Language: snapshot.Language}).normalized()
 		if err != nil {
@@ -73,7 +74,7 @@ func (client *Client) SetBrowserRegion(snapshot BrowserRegionSnapshot) error {
 	if err := client.SetBrowserTimezone(BrowserTimezone{Name: snapshot.Timezone, OffsetMinutes: snapshot.OffsetMinutes}); err != nil {
 		return err
 	}
-	if locale != nil && !client.browserLocale.CompareAndSwap(nil, locale) {
+	if !client.browserLocale.CompareAndSwap(nil, locale) {
 		if previous := client.browserLocale.Load(); previous == nil || *previous != *locale {
 			return fmt.Errorf("browser locale is already pinned")
 		}
@@ -82,7 +83,7 @@ func (client *Client) SetBrowserRegion(snapshot BrowserRegionSnapshot) error {
 }
 func (client *Client) BrowserLocale() *BrowserLocale {
 	if client != nil {
-		if locale := client.browserLocale.Load(); locale != nil {
+		if locale := client.browserLocale.Load(); locale != nil && locale.Language != "" {
 			copy := *locale
 			return &copy
 		}

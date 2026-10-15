@@ -40,6 +40,7 @@ type browserRegionGeo struct {
 type browserRegionEntry struct {
 	Geo                browserRegionGeo
 	ObservedIP         string
+	ObservedAt         time.Time
 	RefreshAt, RetryAt time.Time
 	Failures           int
 	Reason             string
@@ -135,6 +136,18 @@ func (r *BrowserRegionResolver) Close() {
 	r.generationCancel()
 	r.mu.Unlock()
 	r.wg.Wait()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	clear(r.pending)
+	r.routes = newRegionLRU[browserRegionEntry]()
+	r.ips = newRegionLRU[browserRegionEntry]()
+	for {
+		select {
+		case <-r.queue:
+		default:
+			return
+		}
+	}
 }
 func (r *BrowserRegionResolver) UpdateConfig(cfg config.ChatGPTWebConfig) {
 	if cfg.BrowserRegion.Validate() != nil {
@@ -156,6 +169,19 @@ func (r *BrowserRegionResolver) UpdateConfig(cfg config.ChatGPTWebConfig) {
 	if p.settings.LookupURL != r.policy.settings.LookupURL {
 		r.routes = newRegionLRU[browserRegionEntry]()
 		r.ips = newRegionLRU[browserRegionEntry]()
+	} else if p.settings.CacheTTLSeconds != r.policy.settings.CacheTTLSeconds {
+		// Recompute eligibility only. Changing the TTL never schedules a sweep.
+		for _, element := range r.routes.items {
+			item := element.Value.(regionLRUItem[browserRegionEntry])
+			if item.value.Geo.IP != "" && item.value.Reason == "" {
+				at := item.value.ObservedAt
+				if at.IsZero() {
+					at = item.value.Geo.At
+				}
+				item.value.RefreshAt = at.Add(regionJitter(time.Duration(p.settings.CacheTTLSeconds) * time.Second))
+				element.Value = item
+			}
+		}
 	}
 	r.policy = p
 	r.pending = make(map[string]*browserRegionJob)
@@ -309,7 +335,7 @@ func (r *BrowserRegionResolver) worker() {
 					entry.Geo = geo
 				}
 				if reason == "" {
-					entry = browserRegionEntry{Geo: geo, ObservedIP: geo.IP, RefreshAt: now.Add(regionJitter(time.Duration(job.settings.CacheTTLSeconds) * time.Second))}
+					entry = browserRegionEntry{Geo: geo, ObservedIP: geo.IP, ObservedAt: now, RefreshAt: now.Add(regionJitter(time.Duration(job.settings.CacheTTLSeconds) * time.Second))}
 				} else {
 					entry.Failures++
 					entry.Reason = reason

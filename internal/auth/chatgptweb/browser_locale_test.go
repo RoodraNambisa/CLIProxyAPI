@@ -95,6 +95,22 @@ func TestBrowserRegionLoginFlowFrozen(t *testing.T) {
 		t.Fatal("login retries re-resolved environment")
 	}
 }
+
+func TestBrowserRegionFallbackLanguageCannotChangeMidFlow(t *testing.T) {
+	client := &Client{persona: DefaultPersona()}
+	if err := client.SetBrowserRegion(BrowserRegionSnapshot{Timezone: "UTC"}); err != nil {
+		t.Fatal(err)
+	}
+	if client.BrowserLocale() != nil {
+		t.Fatal("fallback changed legacy locale encoding")
+	}
+	if err := client.SetBrowserRegion(BrowserRegionSnapshot{Timezone: "UTC", OverrideLanguage: true, Language: "ja-JP"}); err == nil {
+		t.Fatal("late locale result changed a frozen fallback")
+	}
+	if client.BrowserLocale() != nil {
+		t.Fatal("failed repin changed locale")
+	}
+}
 func TestBrowserRegionSDKLanguage(t *testing.T) {
 	manager := newSentinelRuntimeTestManager()
 	defer manager.Close()
