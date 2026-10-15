@@ -2380,14 +2380,14 @@ func (manager *SentinelRuntimeManager) runtimeBootstrap(request SentinelSDKReque
 	if _, err := io.ReadFull(reader, randomBytes); err != nil {
 		return "", fmt.Errorf("read Sentinel SDK random pool: %w", err)
 	}
-	languages := personaNavigatorLanguages(persona)
+	browserLanguage, languages := request.Environment.browserLanguage()
 	payload, err := json.Marshal(map[string]any{
 		"compatibility_properties": request.Environment.Compatibility.Properties(),
 		"sdk_url":                  source.url,
 		"location":                 strings.TrimSpace(request.Environment.Location),
 		"device_id":                effectiveDeviceID,
 		"user_agent":               persona.UserAgent,
-		"language":                 persona.Language,
+		"language":                 browserLanguage,
 		"languages":                languages,
 		"platform":                 persona.Platform,
 		"hardware_concurrency":     profile.hardwareConcurrency,

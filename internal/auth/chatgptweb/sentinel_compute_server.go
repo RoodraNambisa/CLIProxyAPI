@@ -56,6 +56,7 @@ type computeServerSession struct {
 }
 
 type SentinelComputeServerSnapshot struct {
+	Capabilities  []string                `json:"capabilities"`
 	Enabled       bool                    `json:"enabled"`
 	Draining      bool                    `json:"draining"`
 	Instance      string                  `json:"instance"`
@@ -201,6 +202,7 @@ func (s *SentinelComputeServer) ServeHTTP(w http.ResponseWriter, r *http.Request
 
 func (s *SentinelComputeServer) health(w http.ResponseWriter, r *http.Request) {
 	snapshot := s.Snapshot()
+	snapshot.Capabilities = []string{sentinelBrowserRegionCapability}
 	status := http.StatusOK
 	if !snapshot.Enabled || snapshot.Draining {
 		status = http.StatusServiceUnavailable
@@ -210,6 +212,7 @@ func (s *SentinelComputeServer) health(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *SentinelComputeServer) write(w http.ResponseWriter, status int, out sentinelComputeResponse) {
+	out.Capabilities = []string{sentinelBrowserRegionCapability}
 	out.Version = SentinelComputeProtocol
 	out.Instance = s.instance
 	w.WriteHeader(status)

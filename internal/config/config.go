@@ -660,7 +660,8 @@ type ChatGPTWebConfig struct {
 	// Timezone is the browser IANA timezone sent to ChatGPT Web.
 	Timezone string `yaml:"timezone,omitempty" json:"timezone,omitempty"`
 	// TimezoneOffsetMinutes overrides the browser offset. Omitted values follow Timezone and DST.
-	TimezoneOffsetMinutes *int `yaml:"timezone-offset-minutes,omitempty" json:"timezone-offset-minutes,omitempty"`
+	TimezoneOffsetMinutes *int                          `yaml:"timezone-offset-minutes,omitempty" json:"timezone-offset-minutes,omitempty"`
+	BrowserRegion         ChatGPTWebBrowserRegionConfig `yaml:"browser-region,omitempty" json:"browser-region,omitempty"`
 	// EstimateTokenUsage controls local tiktoken usage estimation for Web responses.
 	// An omitted value remains enabled for backward compatibility.
 	EstimateTokenUsage *bool                       `yaml:"estimate-token-usage,omitempty" json:"estimate-token-usage,omitempty"`
@@ -1079,6 +1080,9 @@ func (cfg ChatGPTWebLoginProxyConfig) Validate() error {
 
 // Validate checks all ChatGPT Web runtime configuration.
 func (cfg ChatGPTWebConfig) Validate() error {
+	if err := cfg.BrowserRegion.Validate(); err != nil {
+		return err
+	}
 	relogin := cfg.ResolvedAutoRelogin()
 	if relogin.MaxRetries < 0 || relogin.MaxRetries > MaxChatGPTWebAutoReloginRetries {
 		return fmt.Errorf("chatgpt-web.auto-relogin-max-retries must be between 0 and %d", MaxChatGPTWebAutoReloginRetries)

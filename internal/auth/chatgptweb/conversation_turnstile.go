@@ -149,6 +149,7 @@ type conversationTurnstileLocationRef struct {
 // compact Sentinel challenge. ScriptSources should come from the same bootstrap
 // document used to create the requirements token.
 type ConversationTurnstileEnvironment struct {
+	Locale                *BrowserLocale
 	Compatibility         *sentinelcompat.Policy
 	compatibilityUsage    *atomic.Bool
 	Persona               Persona
@@ -729,7 +730,7 @@ func normalizeConversationTurnstileEnvironment(environment ConversationTurnstile
 	if len(storageKeys) == 0 {
 		storageKeys = append([]string(nil), conversationTurnstileLocalStorageKeys...)
 	}
-	navigatorLanguages := personaNavigatorLanguages(persona)
+	navigatorLanguage, navigatorLanguages := environment.browserLanguage()
 	languageValues := make([]any, len(navigatorLanguages))
 	for index := range navigatorLanguages {
 		languageValues[index] = navigatorLanguages[index]
@@ -737,7 +738,7 @@ func normalizeConversationTurnstileEnvironment(environment ConversationTurnstile
 	languages := conversationTurnstileArrayValue(languageValues)
 	values := map[string]any{
 		"window.navigator.userAgent":                 persona.UserAgent,
-		"window.navigator.language":                  persona.Language,
+		"window.navigator.language":                  navigatorLanguage,
 		"window.navigator.languages":                 languages,
 		"window.navigator.hardwareConcurrency":       profile.hardwareConcurrency,
 		"window.navigator.platform":                  persona.Platform,

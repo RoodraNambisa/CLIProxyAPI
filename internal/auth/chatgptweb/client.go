@@ -43,6 +43,7 @@ type Client struct {
 	requestCancelStop  func() bool
 	accessTokenGuard   atomic.Pointer[accessTokenExpiryGuard]
 	browserTimezone    atomic.Pointer[BrowserTimezone]
+	browserLocale      atomic.Pointer[BrowserLocale]
 }
 
 const defaultPollCancellationGrace = 2 * time.Second
@@ -802,6 +803,12 @@ func (client *Client) applyHeaders(request *fhttp.Request, overrides map[string]
 	for key, value := range overrides {
 		request.Header.Set(key, value)
 	}
+	if locale := client.browserLocale.Load(); locale != nil {
+		request.Header.Set("Accept-Language", locale.AcceptLanguage())
+		if request.Header.Get("Oai-Language") != "" {
+			request.Header.Set("Oai-Language", locale.Language)
+		}
+	}
 }
 
 func chromeMajor(userAgent string) string {
@@ -994,6 +1001,7 @@ func (client *Client) CloneWithProxy(proxyURL string) (*Client, error) {
 	if err == nil {
 		cloned.accessTokenGuard.Store(client.accessTokenGuard.Load())
 		cloned.browserTimezone.Store(client.browserTimezone.Load())
+		cloned.browserLocale.Store(client.browserLocale.Load())
 	}
 	return cloned, err
 }

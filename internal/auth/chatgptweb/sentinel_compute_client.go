@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -352,6 +353,10 @@ func (s *SentinelComputeSession) rpc(ctx context.Context, operation string, inpu
 		}
 		if s.instance != "" && s.instance != out.Instance {
 			last = computeError("session_unavailable", true, nil)
+			break
+		}
+		if operation == "create" && (s.input.Environment.Locale != nil || (s.input.Format == "auth" && ((s.input.Environment.Timezone != "" && s.input.Environment.Timezone != "UTC") || s.input.Environment.TimezoneOffsetMinutes != 0))) && !slices.Contains(out.Capabilities, sentinelBrowserRegionCapability) {
+			last = computeError("unsupported_browser_region", true, nil)
 			break
 		}
 		if out.Error != nil {

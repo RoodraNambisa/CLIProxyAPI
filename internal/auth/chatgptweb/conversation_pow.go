@@ -294,6 +294,11 @@ func buildConversationPoWConfig(environment ConversationTurnstileEnvironment, sc
 		return nil, err
 	}
 	persona := canonicalPersona(environment.Persona)
+	browserLanguage, languages := environment.browserLanguage()
+	proofLanguages := persona.AcceptLanguage
+	if environment.Locale != nil {
+		proofLanguages = strings.Join(languages, ",")
+	}
 	profile := resolveSentinelBrowserProfile(environment)
 	reader = randomReader(reader)
 	if now == nil {
@@ -311,7 +316,7 @@ func buildConversationPoWConfig(environment ConversationTurnstileEnvironment, sc
 		"webdriver−false",
 		"cookieEnabled−true",
 		fmt.Sprintf("hardwareConcurrency−%d", profile.hardwareConcurrency),
-		"language−" + persona.Language,
+		"language−" + browserLanguage,
 		"product−Gecko",
 	})
 	if err != nil {
@@ -358,8 +363,8 @@ func buildConversationPoWConfig(environment ConversationTurnstileEnvironment, sc
 		persona.UserAgent,
 		scriptSource,
 		strings.TrimSpace(dataBuild),
-		persona.Language,
-		persona.AcceptLanguage,
+		browserLanguage,
+		proofLanguages,
 		randomValue,
 		navigatorKey,
 		documentKey,

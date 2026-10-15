@@ -27,6 +27,8 @@ const (
 )
 
 type SentinelGenerator struct {
+	locale             *BrowserLocale
+	timezone           BrowserTimezone
 	deviceID           string
 	persona            Persona
 	browserEnvironment BrowserEnvironmentIdentity
@@ -175,17 +177,25 @@ func (generator *SentinelGenerator) configuration() ([]any, error) {
 	if hardware <= 0 {
 		hardware = randomHardware
 	}
-	now := generator.now().UTC()
+	now := generator.now()
+	zone, errZone := generator.timezone.normalized()
+	if errZone != nil {
+		return nil, errZone
+	}
+	lang := generator.persona.Language
+	if generator.locale != nil {
+		lang = generator.locale.Language
+	}
 	return []any{
 		fmt.Sprintf("%dx%d", profile.screenWidth, profile.screenHeight),
-		now.Format("Mon Jan 02 2006 15:04:05") + " GMT+0000 (Coordinated Universal Time)",
+		zone.dateString(now),
 		uint64(profile.jsHeapSizeLimit),
 		firstRandom,
 		generator.persona.UserAgent,
 		sentinelSDKURL,
 		nil,
 		nil,
-		generator.persona.Language,
+		lang,
 		secondRandom,
 		prototypeProbe,
 		documentProbe,
@@ -277,6 +287,8 @@ func NewSentinelWithEnvironment(client *Client, baseURL, authURL, deviceID strin
 	if err != nil {
 		return nil, err
 	}
+	generator.locale = client.BrowserLocale()
+	generator.timezone, _ = client.BrowserTimezone()
 	if strings.TrimSpace(baseURL) == "" {
 		baseURL = defaultSentinelBaseURL
 	}
@@ -470,12 +482,15 @@ func (sentinel *Sentinel) generateHeaders(
 
 func (sentinel *Sentinel) environment() ConversationTurnstileEnvironment {
 	return ConversationTurnstileEnvironment{
-		Persona:            sentinel.generator.persona,
-		BrowserEnvironment: sentinel.generator.browserEnvironment,
-		DeviceID:           sentinel.deviceID,
-		PageStartedAt:      sentinel.generator.now(),
-		ScriptSources:      []string{sentinelSDKURL},
-		Location:           sentinel.baseURL + "/backend-api/sentinel/frame.html?sv=" + sentinelSDKVersion,
+		Locale:                sentinel.generator.locale,
+		Timezone:              sentinel.generator.timezone.Name,
+		TimezoneOffsetMinutes: sentinel.generator.timezone.OffsetMinutes,
+		Persona:               sentinel.generator.persona,
+		BrowserEnvironment:    sentinel.generator.browserEnvironment,
+		DeviceID:              sentinel.deviceID,
+		PageStartedAt:         sentinel.generator.now(),
+		ScriptSources:         []string{sentinelSDKURL},
+		Location:              sentinel.baseURL + "/backend-api/sentinel/frame.html?sv=" + sentinelSDKVersion,
 	}
 }
 

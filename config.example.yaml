@@ -117,6 +117,17 @@ chatgpt-web:
   manual-relogin-concurrency: 4
   # Browser timezone shared by text, search, image, and account-info requests.
   timezone: "UTC"
+  # Optional request-only region overlay; metadata queries use the selected route.
+  browser-region:
+    auto-timezone: false
+    auto-language: false
+    language: ""
+    lookup-url: "https://ipwho.is/{ip}"
+    lookup-timeout-seconds: 8
+    # Soft refresh age. Failures preserve applicable last-known successful values.
+    cache-ttl-seconds: 21600
+    route-cache-size: 4096
+    ip-cache-size: 4096
   # Omit this field to derive the current offset, including DST, from timezone.
   # timezone-offset-minutes: 0
   # ChatGPT Web does not return API token usage. Estimate visible input/output

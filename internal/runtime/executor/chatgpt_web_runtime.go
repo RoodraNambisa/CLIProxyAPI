@@ -1354,7 +1354,12 @@ func (e *ChatGPTWebExecutor) newRuntimeClientForAcquisition(auth *cliproxyauth.A
 		client.SetAccessTokenExpiry(credential.AccessToken, expiresAt, e.currentTime)
 	}
 	timezone := e.chatGPTWebTimezone()
-	if err = client.SetBrowserTimezone(chatgptwebauth.BrowserTimezone{Name: timezone.Timezone, OffsetMinutes: timezone.OffsetMinutes}); err != nil {
+	if e.browserRegion != nil {
+		err = client.SetBrowserRegion(e.browserRegion.Resolve(client.ProxyURL(), credential.Persona))
+	} else {
+		err = client.SetBrowserTimezone(chatgptwebauth.BrowserTimezone{Name: timezone.Timezone, OffsetMinutes: timezone.OffsetMinutes})
+	}
+	if err != nil {
 		client.CloseIdleConnections()
 		return nil, nil, err
 	}
@@ -1611,6 +1616,7 @@ func (e *ChatGPTWebExecutor) chatGPTWebRequirements(ctx context.Context, client 
 	}
 	timezone := e.chatGPTWebTimezoneForClient(client)
 	sentinelEnvironment := chatgptwebauth.ConversationTurnstileEnvironment{
+		Locale:                client.BrowserLocale(),
 		Compatibility:         policy,
 		Persona:               credential.Persona,
 		BrowserEnvironment:    chatgptwebauth.ResolveCredentialBrowserEnvironment(credential, ""),

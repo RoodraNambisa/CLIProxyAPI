@@ -101,6 +101,7 @@ type ChatGPTWebExecutor struct {
 	loginWG                   sync.WaitGroup
 	sentinelRuntime           helps.ChatGPTWebSentinelRuntime
 	sentinelCompute           *chatgptwebauth.SentinelComputePool
+	browserRegion             *chatgptwebauth.BrowserRegionResolver
 	personaOutcomeMu          sync.Mutex
 	personaOutcomes           map[string]chatgptwebauth.PersonaOutcomeSnapshot
 	usageCache                *helps.ChatGPTWebUsageCache
@@ -128,9 +129,11 @@ func NewChatGPTWebExecutorWithLoginCoordinator(cfg *config.Config, manager *clip
 		coordinator = NewChatGPTWebLoginCoordinator()
 	}
 	lifecycleCtx, lifecycleCancel := context.WithCancel(context.Background())
+	browserRegion := chatgptwebauth.NewBrowserRegionResolver(lifecycleCtx)
 	executor := &ChatGPTWebExecutor{
 		manager:            manager,
-		authService:        chatgptwebauth.NewService(chatgptwebauth.Options{}),
+		authService:        chatgptwebauth.NewService(chatgptwebauth.Options{ResolveBrowserRegion: browserRegion.Resolve}),
+		browserRegion:      browserRegion,
 		runtimeBaseURL:     "https://chatgpt.com",
 		runtimeRand:        rand.Reader,
 		imageInitialWait:   10 * time.Second,
@@ -179,6 +182,9 @@ func (e *ChatGPTWebExecutor) Close() error {
 		}
 	}
 	e.backgroundMu.Unlock()
+	if e.browserRegion != nil {
+		e.browserRegion.Close()
+	}
 	if e.accountInfo != nil {
 		e.accountInfo.close()
 	}
@@ -245,6 +251,9 @@ func (e *ChatGPTWebExecutor) UpdateConfig(cfg *config.Config) {
 	defer e.configUpdateMu.Unlock()
 	if cfg == nil {
 		e.cfg.Store(nil)
+		if e.browserRegion != nil {
+			e.browserRegion.UpdateConfig(config.ChatGPTWebConfig{})
+		}
 		configureChatGPTWebImageAdmissions(config.ChatGPTWebImageConfig{}.Resolved())
 		if e.backgroundQueue != nil {
 			policy := config.ChatGPTWebConfig{}.ResolvedAutoRelogin()
@@ -280,7 +289,14 @@ func (e *ChatGPTWebExecutor) UpdateConfig(cfg *config.Config) {
 		return
 	}
 	snapshot.ChatGPTWeb.Sentinel.GoVMPolicy = policy
+	if err := snapshot.ChatGPTWeb.BrowserRegion.Validate(); err != nil {
+		log.WithError(err).Error("chatgpt web executor: retain previous browser region configuration")
+		return
+	}
 	e.cfg.Store(snapshot)
+	if e.browserRegion != nil {
+		e.browserRegion.UpdateConfig(snapshot.ChatGPTWeb)
+	}
 	configureChatGPTWebImageAdmissions(snapshot.Images.ChatGPTWeb.Resolved())
 	if e.backgroundQueue != nil {
 		policy := snapshot.ChatGPTWeb.ResolvedAutoRelogin()

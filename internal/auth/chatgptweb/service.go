@@ -75,6 +75,7 @@ func NewLoginService(options Options) *LoginService {
 }
 
 func (service *Service) Login(ctx context.Context, input LoginInput) (*Credential, error) {
+	ctx = withBrowserRegionFlow(ctx)
 	loginProxy := input.LoginProxy
 	flowAttempts := 1
 	acquisitionTimeout := service.LoginAcquisitionTimeout(input)
@@ -223,6 +224,9 @@ func (service *Service) loginOnce(acquisitionContext context.Context, input Logi
 	}
 	defer client.CloseIdleConnections()
 	defer client.CloseActiveAcquisitionConnections()
+	if err := service.prepareBrowserRegionClient(acquisitionContext, client); err != nil {
+		return credential, err
+	}
 
 	deviceID := strings.TrimSpace(credential.DeviceID)
 	if err := client.SetCookie(service.options.AuthBaseURL, "oai-did", deviceID); err != nil {
@@ -584,6 +588,9 @@ func (service *Service) Refresh(ctx context.Context, credential Credential, prox
 		return refreshed, authError
 	}
 
+	if err := service.prepareBrowserRegionClient(acquisitionContext, client); err != nil {
+		return refreshed, err
+	}
 	form := url.Values{
 		"grant_type":    {"refresh_token"},
 		"refresh_token": {refreshed.RefreshToken},
@@ -679,6 +686,9 @@ func (service *Service) RefreshSession(ctx context.Context, credential Credentia
 	}
 	defer client.CloseIdleConnections()
 	defer client.CloseActiveAcquisitionConnections()
+	if err := service.prepareBrowserRegionClient(acquisitionContext, client); err != nil {
+		return refreshed, err
+	}
 	if err = client.SetCookie(service.options.SessionBaseURL, "oai-did", refreshed.DeviceID); err != nil {
 		authError := newAuthError("cookie_initialization_failed", LifecycleActive, 0, false, true, "initialize device cookie", err)
 		service.applyFailure(refreshed, authError, false)

@@ -56,6 +56,8 @@ func newComputeState(ctx context.Context, input SentinelComputeInput, policy *se
 			gen.sid = input.GeneratorSID
 		}
 		s.generator = gen
+		gen.locale = input.Environment.Locale
+		gen.timezone, _ = s.env.browserTimezone()
 	}
 	return s, nil
 }

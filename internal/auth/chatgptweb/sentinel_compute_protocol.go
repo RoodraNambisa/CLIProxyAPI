@@ -13,10 +13,12 @@ import (
 )
 
 const SentinelComputeProtocol = 1
+const sentinelBrowserRegionCapability = "browser-region-v1"
 const sentinelComputeMaxBody = 32 << 20
 
 // SentinelComputeEnvironment is a data-only snapshot; no transport or credentials cross RPC.
 type SentinelComputeEnvironment struct {
+	Locale                *BrowserLocale             `json:"locale,omitempty"`
 	Persona               Persona                    `json:"persona"`
 	BrowserEnvironment    BrowserEnvironmentIdentity `json:"browser_environment"`
 	DeviceID              string                     `json:"device_id"`
@@ -29,11 +31,11 @@ type SentinelComputeEnvironment struct {
 }
 
 func ComputeEnvironment(env ConversationTurnstileEnvironment) SentinelComputeEnvironment {
-	return SentinelComputeEnvironment{Persona: env.Persona, BrowserEnvironment: env.BrowserEnvironment, DeviceID: env.DeviceID, PageStartedAt: env.PageStartedAt, ScriptSources: append([]string{}, env.ScriptSources...), Location: env.Location, LocalStorageKeys: append([]string{}, env.LocalStorageKeys...), Timezone: env.Timezone, TimezoneOffsetMinutes: env.TimezoneOffsetMinutes}
+	return SentinelComputeEnvironment{Locale: env.Locale, Persona: env.Persona, BrowserEnvironment: env.BrowserEnvironment, DeviceID: env.DeviceID, PageStartedAt: env.PageStartedAt, ScriptSources: append([]string{}, env.ScriptSources...), Location: env.Location, LocalStorageKeys: append([]string{}, env.LocalStorageKeys...), Timezone: env.Timezone, TimezoneOffsetMinutes: env.TimezoneOffsetMinutes}
 }
 
 func (env SentinelComputeEnvironment) native(policy *sentinelcompat.Policy) ConversationTurnstileEnvironment {
-	return ConversationTurnstileEnvironment{Persona: env.Persona, BrowserEnvironment: env.BrowserEnvironment, DeviceID: env.DeviceID, PageStartedAt: env.PageStartedAt, ScriptSources: env.ScriptSources, Location: env.Location, LocalStorageKeys: env.LocalStorageKeys, Compatibility: policy, Timezone: env.Timezone, TimezoneOffsetMinutes: env.TimezoneOffsetMinutes}
+	return ConversationTurnstileEnvironment{Locale: env.Locale, Persona: env.Persona, BrowserEnvironment: env.BrowserEnvironment, DeviceID: env.DeviceID, PageStartedAt: env.PageStartedAt, ScriptSources: env.ScriptSources, Location: env.Location, LocalStorageKeys: env.LocalStorageKeys, Compatibility: policy, Timezone: env.Timezone, TimezoneOffsetMinutes: env.TimezoneOffsetMinutes}
 }
 
 type SentinelComputeInput struct {
@@ -76,6 +78,12 @@ func (in SentinelComputeInput) normalized() (SentinelComputeInput, error) {
 }
 
 func (in SentinelComputeInput) validate() error {
+	if in.Environment.Locale != nil {
+		normalized, err := in.Environment.Locale.normalized()
+		if err != nil || normalized != *in.Environment.Locale {
+			return computeError("invalid_input", false, nil)
+		}
+	}
 	if in.Format != "conversation" && in.Format != "auth" {
 		return computeError("invalid_input", false, nil)
 	}
@@ -171,15 +179,16 @@ type sentinelComputeRequest struct {
 }
 
 type sentinelComputeResponse struct {
-	Version   int                   `json:"version"`
-	Instance  string                `json:"instance"`
-	SessionID string                `json:"session_id,omitempty"`
-	Result    SentinelComputeResult `json:"result"`
-	Rules     sentinelcompat.Config `json:"rules"`
-	RulesHash string                `json:"rules_hash"`
-	SDKURL    string                `json:"sdk_url,omitempty"`
-	SDKSHA256 string                `json:"sdk_sha256,omitempty"`
-	Error     *SentinelComputeError `json:"error,omitempty"`
+	Capabilities []string              `json:"capabilities,omitempty"`
+	Version      int                   `json:"version"`
+	Instance     string                `json:"instance"`
+	SessionID    string                `json:"session_id,omitempty"`
+	Result       SentinelComputeResult `json:"result"`
+	Rules        sentinelcompat.Config `json:"rules"`
+	RulesHash    string                `json:"rules_hash"`
+	SDKURL       string                `json:"sdk_url,omitempty"`
+	SDKSHA256    string                `json:"sdk_sha256,omitempty"`
+	Error        *SentinelComputeError `json:"error,omitempty"`
 }
 
 // SentinelComputeError is infrastructure-local, never an upstream credential status.

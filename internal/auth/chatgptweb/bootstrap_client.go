@@ -28,6 +28,8 @@ func (client *Client) NewBootstrapAttempt(ctx context.Context) (*Client, error) 
 		acquisitionTracker: tracker, beforeRequest: client.runBeforeRequest,
 	}
 	attempt.accessTokenGuard.Store(client.accessTokenGuard.Load())
+	attempt.browserTimezone.Store(client.browserTimezone.Load())
+	attempt.browserLocale.Store(client.browserLocale.Load())
 	attempt.requestCancelStop = context.AfterFunc(ctx, tracker.closeAll)
 	return attempt, nil
 }
