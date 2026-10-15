@@ -220,7 +220,7 @@ func (jar *accessTokenCookieJar) GetAllCookies() map[string][]*fhttp.Cookie {
 
 func findTLSProfile(name string) (profiles.ClientProfile, bool) {
 	if strings.EqualFold(strings.TrimSpace(name), "chrome_146") {
-		return profiles.Chrome_146, true
+		return chatGPTWebChrome146Profile(), true
 	}
 	return profiles.ClientProfile{}, false
 }
