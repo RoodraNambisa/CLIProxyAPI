@@ -125,13 +125,17 @@ func (e *XAIExecutor) PreviewHeaders(ctx context.Context, auth *cliproxyauth.Aut
 		}
 	}
 	req := cliproxyexecutor.Request{Model: input.Model, Payload: payload}
+	requestedModel := input.Model
 	if len(resolved) > 0 {
 		req.Model = resolved[0].Model
 		req.Metadata = resolved[0].Metadata
 		input.Model = req.Model
 	}
 	opts := cliproxyexecutor.Options{SourceFormat: format, OriginalRequest: payload, Headers: input.ClientHeaders,
-		Metadata: map[string]any{cliproxyexecutor.ExecutionSessionMetadataKey: "preview-session"}}
+		Metadata: map[string]any{
+			cliproxyexecutor.ExecutionSessionMetadataKey: "preview-session",
+			cliproxyexecutor.RequestedModelMetadataKey:   requestedModel,
+		}}
 	runner, scoped, err := e.requestExecutor(ctx, req, opts)
 	if err != nil {
 		return nil, err
@@ -181,11 +185,6 @@ func (e *XAIExecutor) PreviewHeaders(ctx context.Context, auth *cliproxyauth.Aut
 		}
 		out.Header.Set("Accept", "application/json")
 		out.Header.Set("Authorization", "Bearer "+token)
-		if input.Purpose == "quota" {
-			if value, ok := auth.Metadata["sub"].(string); ok {
-				out.Header.Set("x-userid", value)
-			}
-		}
 		if err = runner.PrepareRequest(out, auth); err != nil {
 			return nil, err
 		}

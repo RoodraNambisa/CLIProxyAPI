@@ -125,8 +125,8 @@ func TestXAIHeadersAndParametersUpgrade(t *testing.T) {
 			if !strings.HasPrefix(req.Header.Get("User-Agent"), "grok-shell/1.0.52 (") || req.Header.Get("x-grok-client-mode") != "headless" || req.Header.Get("X-XAI-Token-Auth") != "xai-grok-cli" {
 				t.Fatal(req.Header)
 			}
-		} else if req.Header.Get("x-grok-client-version") != "" || req.Header.Get("User-Agent") != "" {
-			t.Fatal("CLI identity leaked to API")
+		} else if req.Header.Get("X-XAI-Token-Auth") != "" || req.Header.Get("x-authenticateresponse") != "" || req.Header.Get("x-grok-client-mode") != "" {
+			t.Fatal("CLI proxy headers leaked to API")
 		}
 	}
 	original := []byte(`{"service_tier":"priority","safety_identifier":"fixture","reasoning":{"summary":"detailed"},"text":{"format":{"type":"json_object"}}}`)

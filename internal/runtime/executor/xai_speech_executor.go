@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
@@ -62,7 +63,7 @@ func (e *XAIExecutor) executeSpeech(ctx context.Context, auth *cliproxyauth.Auth
 
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
-		errStatus := xaiStatusErr(httpResp.StatusCode, data)
+		errStatus := xaiStatusErrFromResponse(httpResp.StatusCode, data, httpResp.Header, time.Now())
 		if httpResp.StatusCode == http.StatusNotFound && !helps.XAISpeechModelUnavailable(data) {
 			errStatus.skipAuthResult = true
 		}

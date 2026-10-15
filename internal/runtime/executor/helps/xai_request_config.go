@@ -158,31 +158,11 @@ func ApplyXAIResourceHeaders(req *http.Request, auth *coreauth.Auth, cfg *config
 	if identifier == "" {
 		identifier = "grok-shell"
 	}
-	officialCLI := req.URL == nil || strings.EqualFold(req.URL.Hostname(), "cli-chat-proxy.grok.com")
-	if !settings.HeaderDefaults.OfficialBuild || officialCLI {
-		req.Header.Set("User-Agent", userAgent)
-		req.Header.Set("x-grok-client-version", version)
-		req.Header.Set("x-grok-client-identifier", identifier)
-		if settings.HeaderDefaults.OfficialBuild {
-			mode := settings.HeaderDefaults.ClientMode
-			if mode == "" {
-				mode = "headless"
-			}
-			req.Header.Set("x-grok-client-mode", mode)
-		}
-	}
-	if settings.HeaderDefaults.OfficialBuild && !officialCLI {
-		if settings.HeaderDefaults.UserAgent != "" {
-			req.Header.Set("User-Agent", settings.HeaderDefaults.UserAgent)
-		}
-
-		if settings.HeaderDefaults.ClientVersion != "" {
-			req.Header.Set("x-grok-client-version", settings.HeaderDefaults.ClientVersion)
-		}
-		if settings.HeaderDefaults.ClientIdentifier != "" {
-			req.Header.Set("x-grok-client-identifier", settings.HeaderDefaults.ClientIdentifier)
-		}
-	}
+	// Build uses these client headers for both API-key and CLI inference.
+	// Proxy authentication and account attribution remain endpoint-specific.
+	req.Header.Set("User-Agent", userAgent)
+	req.Header.Set("x-grok-client-version", version)
+	req.Header.Set("x-grok-client-identifier", identifier)
 	if req.URL != nil && strings.EqualFold(req.URL.Hostname(), "cli-chat-proxy.grok.com") {
 		mode := settings.HeaderDefaults.ClientMode
 		if mode == "" {
@@ -201,6 +181,7 @@ func ApplyXAIResourceHeaders(req *http.Request, auth *coreauth.Auth, cfg *config
 		req.Header.Set("x-authenticateresponse", "authenticate-response")
 	}
 	NoteXAIHeaderMap(req.Context(), "builtin", req.Header)
+	applyXAIResourceIdentity(req, auth)
 	if req.Header.Get("Authorization") != "" {
 		NoteXAIHeaderSources(req.Context(), "credential-auth", "Authorization")
 	}
@@ -233,6 +214,27 @@ func ApplyXAIResourceHeaders(req *http.Request, auth *coreauth.Auth, cfg *config
 	NoteXAIConfiguredHeaderSources(req.Context(), cfg, auth, req.Header)
 	if settings.DynamicHeaders {
 		req.Host = req.Header.Get("Host")
+	}
+}
+
+func applyXAIResourceIdentity(req *http.Request, auth *coreauth.Auth) {
+	if req == nil || req.URL == nil || auth == nil || !strings.EqualFold(req.URL.Hostname(), "cli-chat-proxy.grok.com") || req.Header.Get("x-userid") != "" {
+		return
+	}
+	path := strings.TrimRight(req.URL.Path, "/")
+	if !strings.HasSuffix(path, "/models") && !strings.HasSuffix(path, "/billing") && !strings.HasSuffix(path, "/settings") {
+		return
+	}
+	for _, key := range []string{"sub", "user_id"} {
+		value, _ := auth.Metadata[key].(string)
+		if value == "" {
+			value = auth.Attributes[key]
+		}
+		if value != "" {
+			req.Header.Set("x-userid", value)
+			NoteXAIHeaderSources(req.Context(), "credential-auth", "x-userid")
+			return
+		}
 	}
 }
 
@@ -280,7 +282,7 @@ func InjectXAISearchTools(body []byte, web, x bool) []byte {
 		}
 		found := false
 		for _, tool := range gjson.GetBytes(body, "tools").Array() {
-			if tool.Get("type").String() == entry.kind || tool.Get("name").String() == entry.kind {
+			if tool.Get("type").String() == entry.kind || (entry.kind != "web_search" && tool.Get("name").String() == entry.kind) {
 				found = true
 				break
 			}

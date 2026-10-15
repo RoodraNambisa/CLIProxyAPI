@@ -78,9 +78,9 @@ func ParseXAIModels(raw []byte, source string) (*XAIModelCatalog, error) {
 				model.Thinking = &registry.ThinkingSupport{Levels: levels}
 			}
 		}
-		declared := XAIDeclaredCapabilities{}
+		declared := XAIDeclaredCapabilities{ReasoningEffortSupported: entry.SupportsReasoningEffort}
 		rawEntry := rawEntries[model.ID]
-		declared.ThinkingKnown = rawEntry.Get("thinking").Exists() || rawEntry.Get("supports_reasoning_effort").Exists() || rawEntry.Get("reasoning_efforts").Exists()
+		declared.ThinkingKnown = rawEntry.Get("thinking").Exists() || reasoningDisabled || rawEntry.Get("reasoning_efforts").Exists()
 		if reasoningDisabled {
 			model.Thinking = nil
 		}

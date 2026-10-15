@@ -14,11 +14,12 @@ import (
 
 // XAIDeclaredCapabilities keeps absent fields distinct from explicit denials.
 type XAIDeclaredCapabilities struct {
-	ThinkingKnown bool                      `json:"thinking_known,omitempty"`
-	Thinking      *registry.ThinkingSupport `json:"thinking,omitempty"`
-	MaxEditImages *int                      `json:"max_edit_images,omitempty"`
-	QualityValues *[]string                 `json:"quality_values,omitempty"`
-	FileIDInputs  *bool                     `json:"file_id_inputs,omitempty"`
+	ReasoningEffortSupported *bool                     `json:"reasoning_effort_supported,omitempty"`
+	ThinkingKnown            bool                      `json:"thinking_known,omitempty"`
+	Thinking                 *registry.ThinkingSupport `json:"thinking,omitempty"`
+	MaxEditImages            *int                      `json:"max_edit_images,omitempty"`
+	QualityValues            *[]string                 `json:"quality_values,omitempty"`
+	FileIDInputs             *bool                     `json:"file_id_inputs,omitempty"`
 }
 
 type XAIRequestCapabilities struct {
@@ -71,11 +72,16 @@ func ResolveXAIRequestCapabilities(req core.Request, auth *coreauth.Auth, cfg *c
 		caps.ThinkingSource = "api-key-declaration"
 	}
 	catalogs := XAIModelCatalogsForAuth(auth)
+	catalogSupportsEffort := false
 	if catalog := catalogs[node+"/models"]; catalog != nil {
 		if declared, ok := catalog.DeclaredCapabilities[model]; ok {
+			catalogSupportsEffort = declared.ReasoningEffortSupported != nil && *declared.ReasoningEffortSupported
 			if !caps.ThinkingKnown && declared.ThinkingKnown {
 				caps.ThinkingKnown = true
 				caps.Thinking = declared.Thinking
+				caps.ThinkingSource = "credential-catalog"
+			} else if !caps.ThinkingKnown && catalogSupportsEffort {
+				// A positive support flag does not define allowed effort levels.
 				caps.ThinkingSource = "credential-catalog"
 			}
 			if declared.MaxEditImages != nil {
@@ -96,7 +102,7 @@ func ResolveXAIRequestCapabilities(req core.Request, auth *coreauth.Auth, cfg *c
 	}
 	if !caps.ThinkingKnown {
 		for _, info := range registry.GetXAIModels() {
-			if info.ID == model {
+			if info.ID == model && (info.Thinking != nil || !catalogSupportsEffort) {
 				caps.ThinkingKnown = true
 				caps.Thinking = info.Thinking
 				caps.ThinkingSource = "builtin"

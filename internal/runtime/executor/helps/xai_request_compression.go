@@ -73,6 +73,7 @@ func PrepareXAICompressedRequest(ctx context.Context, client *http.Client, req *
 	query.Header.Del("Content-Length")
 	query.Header.Del("Content-Encoding")
 	query.Header.Set("Accept", "application/json")
+	applyXAIResourceIdentity(query, auth)
 	key := xaiCompressionCacheKey(base.BaseURL, query.Header, auth, cfg)
 	info.SettingsURL = query.URL.String()
 	info.Reason = "unknown_support"

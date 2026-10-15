@@ -138,6 +138,9 @@ func TestSpeechRoutingModel(t *testing.T) {
 }
 
 func TestSpeechResponseContentType(t *testing.T) {
+	if got := speechResponseContentType("mp3", "application/json", []byte(`{"audio":"SUQz","audio_timestamps":{},"duration":1}`)); got != "application/json" {
+		t.Fatalf("timestamp envelope mislabeled as audio: %q", got)
+	}
 	if got := speechResponseContentType("mp3", ""); got != "audio/mpeg" {
 		t.Fatalf("empty upstream = %q", got)
 	}
@@ -146,5 +149,24 @@ func TestSpeechResponseContentType(t *testing.T) {
 	}
 	if got := speechResponseContentType("pcm", "audio/L16; rate=24000"); got != "audio/L16; rate=24000" {
 		t.Fatalf("audio upstream = %q", got)
+	}
+}
+
+func TestXAISpeechNativeOptionsArePreserved(t *testing.T) {
+	body := []byte(`{"text":"hello","voice_id":"eve","output_format":{"codec":"mp3","sample_rate":44100,"bit_rate":192000},"with_timestamps":true,"text_normalization":false,"optimize_streaming_latency":1,"replace":{"CLI":"command line"}}`)
+	payload, format, err := buildXAISpeechPayload(body)
+	if err != nil || format != "mp3" {
+		t.Fatalf("native speech: %s, %v", format, err)
+	}
+	for _, path := range []string{"output_format.codec", "output_format.sample_rate", "output_format.bit_rate", "with_timestamps", "text_normalization", "optimize_streaming_latency", "replace.CLI"} {
+		if got, want := gjson.GetBytes(payload, path), gjson.GetBytes(body, path); got.Raw != want.Raw {
+			t.Errorf("native option %s lost: got %s, want %s", path, got.Raw, want.Raw)
+		}
+	}
+	for _, codec := range []string{"mulaw", "alaw"} {
+		_, format, err := buildXAISpeechPayload([]byte(`{"text":"hello","output_format":{"codec":"` + codec + `","sample_rate":8000}}`))
+		if err != nil || format != codec {
+			t.Errorf("official native codec %s rejected: %v", codec, err)
+		}
 	}
 }

@@ -85,7 +85,7 @@ func (h *OpenAIAPIHandler) handleXAISpeech(c *gin.Context) {
 		return
 	}
 
-	c.Header("Content-Type", speechResponseContentType(format, upstreamHeaders.Get("Content-Type")))
+	c.Header("Content-Type", speechResponseContentType(format, upstreamHeaders.Get("Content-Type"), resp))
 	handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
 	c.Writer.Header().Del("Content-Length")
 	_, _ = c.Writer.Write(resp)
@@ -158,6 +158,11 @@ func buildXAISpeechPayload(raw []byte) ([]byte, string, error) {
 	if speed := gjson.GetBytes(raw, "speed"); speed.Exists() && speed.Type == gjson.Number && speed.Float() > 0 {
 		body["speed"] = speed.Float()
 	}
+	for _, key := range []string{"with_timestamps", "text_normalization", "optimize_streaming_latency", "replace"} {
+		if value := gjson.GetBytes(raw, key); value.Exists() {
+			body[key] = value.Value()
+		}
+	}
 	format, output, err := speechOutputFormat(raw)
 	if err != nil {
 		return nil, "", err
@@ -201,20 +206,27 @@ func speechOutputFormat(raw []byte) (string, map[string]any, error) {
 	if rate := native.Get("sample_rate"); rate.Exists() && rate.Type == gjson.Number && rate.Float() > 0 {
 		sampleRate = int(rate.Float())
 	}
-	return speechCodecFormat(codec, sampleRate)
+	format, _, err := speechCodecFormat(codec, sampleRate)
+	if err != nil {
+		return "", nil, err
+	}
+	// Native format options belong to the caller, including MP3 bit/sample rates.
+	output := native.Value().(map[string]any)
+	output["codec"] = format
+	return format, output, nil
 }
 
 func speechCodecFormat(codec string, sampleRate int) (string, map[string]any, error) {
 	switch codec {
 	case "", "mp3":
 		return "mp3", nil, nil
-	case "wav", "pcm":
+	case "wav", "pcm", "mulaw", "alaw":
 		if sampleRate <= 0 {
 			sampleRate = defaultXAISpeechSampleRate
 		}
 		return codec, map[string]any{"codec": codec, "sample_rate": sampleRate}, nil
 	default:
-		return "", nil, errors.New("response_format must be mp3, wav, or pcm")
+		return "", nil, errors.New("response_format must be mp3, wav, pcm, mulaw, or alaw")
 	}
 }
 
@@ -224,6 +236,10 @@ func speechContentType(format string) string {
 		return "audio/wav"
 	case "pcm":
 		return "audio/pcm"
+	case "mulaw":
+		return "audio/basic"
+	case "alaw":
+		return "audio/alaw"
 	default:
 		return "audio/mpeg"
 	}
@@ -242,7 +258,10 @@ func speechContentTypeNeedsDefault(contentType string) bool {
 	}
 }
 
-func speechResponseContentType(format, upstream string) string {
+func speechResponseContentType(format, upstream string, bodies ...[]byte) string {
+	if len(bodies) > 0 && gjson.ValidBytes(bodies[0]) && gjson.GetBytes(bodies[0], "audio").Type == gjson.String {
+		return "application/json"
+	}
 	if !speechContentTypeNeedsDefault(upstream) {
 		return upstream
 	}
