@@ -3436,16 +3436,20 @@ func TestSentinelRuntimeBytecodeCompileUsesCallerPriority(t *testing.T) {
 		results <- result{priority: sentinelPriorityFallback, err: compileErr}
 	}()
 	waitForSentinelRuntimeState(t, manager, func(snapshot SentinelRuntimeSnapshot) bool { return snapshot.Queued == 2 })
+	manager.mu.Lock()
+	fallbackQueued := len(manager.queues[sentinelPriorityFallback])
+	precompileQueued := len(manager.queues[sentinelPriorityPrecompile])
+	manager.mu.Unlock()
 	active.release()
-	first := <-results
-	if first.err != nil {
-		t.Fatalf("first bytecode compile error = %v", first.err)
+	// Both callers share the compiled cache. After the prioritized worker finishes,
+	// their result goroutines may run in either order; admission is the contract.
+	if fallbackQueued != 1 || precompileQueued != 1 {
+		t.Fatalf("bytecode admission priorities: fallback=%d precompile=%d", fallbackQueued, precompileQueued)
 	}
-	if first.priority != sentinelPriorityFallback {
-		t.Fatalf("first bytecode compile priority = %d, want fallback", first.priority)
-	}
-	if second := <-results; second.err != nil {
-		t.Fatalf("second bytecode compile error = %v", second.err)
+	for range 2 {
+		if completed := <-results; completed.err != nil {
+			t.Fatalf("bytecode compile priority %d: %v", completed.priority, completed.err)
+		}
 	}
 }
 
