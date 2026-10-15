@@ -64,9 +64,23 @@ func (v *usageFailureCounts) add(model string, detail RequestDetail, delta int64
 	adjustFailureCount(v.hours, detail.Timestamp.UTC().Truncate(time.Hour).Unix(), delta)
 }
 
-func (v *usageFailureCounts) merge(other *usageFailureCounts) {
+func mergeFailureDimension[K comparable](ctx context.Context, target, source map[K]int64) error {
+	visited := 0
+	for key, count := range source {
+		if visited%usageQueryBatchSize == 0 {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+		}
+		visited++
+		target[key] += count
+	}
+	return ctx.Err()
+}
+
+func (v *usageFailureCounts) merge(ctx context.Context, other *usageFailureCounts) error {
 	if other == nil || other.total == 0 {
-		return
+		return ctx.Err()
 	}
 	v.init()
 	v.total += other.total
@@ -75,31 +89,60 @@ func (v *usageFailureCounts) merge(other *usageFailureCounts) {
 	v.boundaries.CredentialSelected += other.boundaries.CredentialSelected
 	v.boundaries.UpstreamCommitted += other.boundaries.UpstreamCommitted
 	v.boundaries.AuthRequestSlotConsumed += other.boundaries.AuthRequestSlotConsumed
-	for k, n := range other.codes {
-		v.codes[k] += n
+	for _, pair := range [][2]map[string]int64{{v.codes, other.codes}, {v.stages, other.stages}, {v.models, other.models}, {v.sources, other.sources}} {
+		if err := mergeFailureDimension(ctx, pair[0], pair[1]); err != nil {
+			return err
+		}
 	}
-	for k, n := range other.stages {
-		v.stages[k] += n
-	}
-	for k, n := range other.models {
-		v.models[k] += n
-	}
-	for k, n := range other.sources {
-		v.sources[k] += n
-	}
-	for k, n := range other.hours {
-		v.hours[k] += n
-	}
+	return mergeFailureDimension(ctx, v.hours, other.hours)
 }
 
 func (v *usageFailureCounts) snapshot() FailureSummary {
+	result, _ := v.snapshotContext(context.Background())
+	return result
+}
+
+func (v *usageFailureCounts) snapshotContext(ctx context.Context) (FailureSummary, error) {
 	hours := make(map[string]int64, len(v.hours))
 	for hour, n := range v.hours {
+		if len(hours)%usageQueryBatchSize == 0 {
+			if err := ctx.Err(); err != nil {
+				return FailureSummary{}, err
+			}
+		}
 		hours[time.Unix(hour, 0).UTC().Format(time.RFC3339)] = n
 	}
-	return FailureSummary{AsOf: time.Now().UTC(), Total: v.total, Main: v.main, Auxiliary: v.auxiliary, Boundaries: v.boundaries,
-		ByErrorCode: sortedFailureDimensionCounts(v.codes, v.total), ByFailureStage: sortedFailureDimensionCounts(v.stages, v.total),
-		ByModel: sortedFailureDimensionCounts(v.models, v.total), BySource: sortedFailureDimensionCounts(v.sources, v.total), ByHour: sortedFailureDimensionCounts(hours, v.total)}
+	result := FailureSummary{AsOf: time.Now().UTC(), Total: v.total, Main: v.main, Auxiliary: v.auxiliary, Boundaries: v.boundaries}
+	for _, dimension := range []struct {
+		values map[string]int64
+		output *[]FailureDimensionCount
+	}{
+		{v.codes, &result.ByErrorCode}, {v.stages, &result.ByFailureStage}, {v.models, &result.ByModel}, {v.sources, &result.BySource}, {hours, &result.ByHour},
+	} {
+		rows := make([]FailureDimensionCount, 0, len(dimension.values))
+		for value, count := range dimension.values {
+			if len(rows)%usageQueryBatchSize == 0 {
+				if err := ctx.Err(); err != nil {
+					return FailureSummary{}, err
+				}
+			}
+			percent := float64(0)
+			if v.total > 0 {
+				percent = float64(count) * 100 / float64(v.total)
+			}
+			rows = append(rows, FailureDimensionCount{Value: value, Count: count, Percent: percent})
+		}
+		if err := sortUsageQuerySlice(ctx, rows, func(a, b FailureDimensionCount) int {
+			if a.Count == b.Count {
+				return strings.Compare(a.Value, b.Value)
+			}
+			return -compareInt64(a.Count, b.Count)
+		}); err != nil {
+			return FailureSummary{}, err
+		}
+		*dimension.output = rows
+	}
+	return result, ctx.Err()
 }
 
 type failureQueryKey struct {
@@ -231,7 +274,9 @@ func (s *RequestStatistics) failureSummaryLocked(ctx context.Context, query Fail
 			continue
 		}
 		if unfiltered && (query.TimeRange.From.IsZero() || !start.Before(query.TimeRange.From)) && (query.TimeRange.To.IsZero() || !end.After(query.TimeRange.To)) {
-			counts.merge(&bucket.failures)
+			if err := counts.merge(ctx, &bucket.failures); err != nil {
+				return FailureSummary{}, err
+			}
 			continue
 		}
 		for _, id := range bucket.detailIDs {
@@ -248,5 +293,5 @@ func (s *RequestStatistics) failureSummaryLocked(ctx context.Context, query Fail
 			counts.add(location.Model, detail, 1)
 		}
 	}
-	return counts.snapshot(), ctx.Err()
+	return counts.snapshotContext(ctx)
 }

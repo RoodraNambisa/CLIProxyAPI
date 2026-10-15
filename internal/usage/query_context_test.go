@@ -3,6 +3,7 @@ package usage
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"slices"
 	"sync"
@@ -57,6 +58,29 @@ func legacyFailureSummary(s *RequestStatistics, query FailureSummaryQuery) Failu
 	result.BySource = sortedFailureDimensionCounts(sources, result.Total)
 	result.ByHour = sortedFailureDimensionCounts(hours, result.Total)
 	return result
+}
+
+func TestUsageFailureQueryCancelsDimensionMergeAndSort(t *testing.T) {
+	var counts usageFailureCounts
+	counts.init()
+	counts.total = 10000
+	for i := range 10000 {
+		counts.sources[fmt.Sprint(i)] = 1
+	}
+	ctx := &cancelQueryAfterChecks{Context: context.Background()}
+	ctx.remaining.Store(2)
+	var merged usageFailureCounts
+	if err := merged.merge(ctx, &counts); !errors.Is(err, context.Canceled) {
+		t.Fatalf("merge did not honor cancellation: %v", err)
+	}
+	ctx = &cancelQueryAfterChecks{Context: context.Background()}
+	ctx.remaining.Store(18)
+	if _, err := counts.snapshotContext(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("dimension projection did not honor cancellation: %v", err)
+	}
+	if got := counts.snapshot(); len(got.BySource) != 10000 || got.Total != 10000 {
+		t.Fatal("cancellation changed stored counts")
+	}
 }
 
 func assertFailureQueryParity(t *testing.T, s *RequestStatistics) {
@@ -219,4 +243,41 @@ func TestUsageQueriesConcurrentWithWriters(t *testing.T) {
 	})
 	wg.Wait()
 	assertFailureQueryParity(t, s)
+}
+
+func TestUsageQueriesConcurrentWithHistoryReplacement(t *testing.T) {
+	s := queryPerformanceFixture(200)
+	imported := queryPerformanceFixture(120).Snapshot()
+	var wg sync.WaitGroup
+	for range 3 {
+		wg.Go(func() {
+			for range 100 {
+				page, err := s.DetailsContext(t.Context(), DetailQuery{Limit: 50})
+				if err != nil || len(page.Items) != min(page.Total, 50) {
+					t.Error("count and page came from different history versions")
+				}
+				failures, err := s.FailureSummaryContext(t.Context(), FailureSummaryQuery{})
+				if err != nil || failures.Total != failures.Main+failures.Auxiliary {
+					t.Error("inconsistent failure summary during history replacement")
+				}
+			}
+		})
+	}
+	wg.Go(func() {
+		for range 20 {
+			s.PruneOldest(10)
+			s.Clear()
+			s.MergeSnapshot(imported)
+			generation := s.HistoryGeneration()
+			prepared := queryPerformanceFixture(60)
+			if _, applied := s.ApplyPreparedRestore(prepared, generation); !applied {
+				t.Error("read-only queries changed restore generation")
+			}
+		}
+	})
+	wg.Wait()
+	assertFailureQueryParity(t, s)
+	if got, want := s.Details(DetailQuery{Limit: 50}), legacyQueryDetails(s, DetailQuery{Limit: 50}); !reflect.DeepEqual(got, want) {
+		t.Fatal("history replacement lost index parity")
+	}
 }
