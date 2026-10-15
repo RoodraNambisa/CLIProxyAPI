@@ -12,6 +12,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/systemmetrics"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 )
 
@@ -22,6 +23,7 @@ type systemMetricsFilesystems struct {
 }
 
 type systemMetricsResponse struct {
+	CredentialSelection        coreauth.SelectionRuntimeSnapshot                      `json:"credential_selection"`
 	CollectedAt                time.Time                                              `json:"collected_at"`
 	Runtime                    systemmetrics.RuntimeSnapshot                          `json:"runtime"`
 	Filesystems                systemMetricsFilesystems                               `json:"filesystems"`
@@ -70,6 +72,7 @@ func (h *Handler) GetSystemMetrics(c *gin.Context) {
 	}
 	imageMemory := helps.ChatGPTWebImageMemorySnapshot()
 	c.JSON(http.StatusOK, systemMetricsResponse{
+		CredentialSelection:        coreauth.SelectionMetricsSnapshot(),
 		CollectedAt:                time.Now().UTC(),
 		Runtime:                    systemmetrics.CollectRuntime(),
 		RequestBodyAudit:           middleware.RequestBodyAuditSnapshot(),

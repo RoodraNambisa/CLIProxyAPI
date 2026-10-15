@@ -64,6 +64,10 @@ func TestGetSystemMetricsReturnsRuntimeAndConfiguredFilesystems(t *testing.T) {
 		t.Fatalf("status = %d, want 200: %s", recorder.Code, recorder.Body.String())
 	}
 	var response systemMetricsResponse
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(recorder.Body.Bytes(), &raw); err != nil || raw["credential_selection"] == nil {
+		t.Fatal("missing credential_selection metrics")
+	}
 	if errDecode := json.Unmarshal(recorder.Body.Bytes(), &response); errDecode != nil {
 		t.Fatalf("json.Unmarshal() error = %v", errDecode)
 	}

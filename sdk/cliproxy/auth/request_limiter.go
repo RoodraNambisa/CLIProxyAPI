@@ -158,11 +158,13 @@ type authRequestWindowCount struct {
 }
 
 type authRequestWindowLimiter struct {
-	mu          sync.Mutex
-	now         func() time.Time
-	generation  uint64
-	nextVersion uint64
-	counts      map[string]authRequestWindowCount
+	mu             sync.Mutex
+	now            func() time.Time
+	generation     uint64
+	nextVersion    uint64
+	counts         map[string]authRequestWindowCount
+	changeSequence uint64
+	changes        [requestLimitChangeHistory]requestLimitChange
 }
 
 type authRequestLimitUsage struct {
@@ -180,15 +182,16 @@ const (
 )
 
 type authRequestReservation struct {
-	limiter       *authRequestWindowLimiter
-	authID        string
-	generation    uint64
-	window        int64
-	windowMinutes int
-	limit         int
-	entryVersion  uint64
-	noOp          bool
-	state         atomic.Uint32
+	limiter        *authRequestWindowLimiter
+	authID         string
+	generation     uint64
+	window         int64
+	windowMinutes  int
+	limit          int
+	entryVersion   uint64
+	exhaustedUntil time.Time
+	noOp           bool
+	state          atomic.Uint32
 }
 
 func (r *authRequestReservation) Commit() bool {
@@ -210,6 +213,9 @@ func (r *authRequestReservation) Release() bool {
 	entry, ok := r.limiter.counts[r.authID]
 	if !ok || entry.window != r.window || entry.windowMinutes != r.windowMinutes || entry.limit != r.limit || entry.version != r.entryVersion {
 		return true
+	}
+	if entry.count >= entry.limit {
+		r.limiter.changedLocked(r.authID)
 	}
 	if entry.count <= 1 {
 		delete(r.limiter.counts, r.authID)
@@ -271,6 +277,7 @@ func (l *authRequestWindowLimiter) reset(generation uint64) {
 	l.mu.Lock()
 	l.generation = generation
 	clear(l.counts)
+	l.changedLocked("")
 	l.mu.Unlock()
 }
 
@@ -280,6 +287,7 @@ func (l *authRequestWindowLimiter) remove(authID string) {
 	}
 	l.mu.Lock()
 	delete(l.counts, authID)
+	l.changedLocked(authID)
 	l.mu.Unlock()
 }
 
@@ -346,20 +354,27 @@ func (l *authRequestWindowLimiter) usageAt(authID string, policy authRequestLimi
 }
 
 func (l *authRequestWindowLimiter) tryAcquireAt(authID string, policy authRequestLimitPolicy, now time.Time) (bool, authRequestLimitBlock) {
+	acquired, block, _ := l.tryAcquireIndexedAt(authID, policy, now)
+	return acquired, block
+}
+
+func (l *authRequestWindowLimiter) tryAcquireIndexedAt(authID string, policy authRequestLimitPolicy, now time.Time) (bool, authRequestLimitBlock, time.Time) {
 	started := time.Now()
+	selectionRuntime.reservations.Add(1)
+	defer observeSelectionTime(&selectionRuntime.reservationNanos, started)
 	reservation, acquired, block := l.reserveAt(authID, policy, now)
 	if policy.requestSlot != nil {
 		policy.requestSlot.RecordReservationDuration(time.Since(started))
 	}
 	if !acquired {
-		return false, block
+		return false, block, time.Time{}
 	}
 	if policy.requestSlot != nil {
 		policy.requestSlot.Bind(reservation)
-		return true, authRequestLimitBlock{}
+		return true, authRequestLimitBlock{}, reservation.exhaustedUntil
 	}
 	reservation.Commit()
-	return true, authRequestLimitBlock{}
+	return true, authRequestLimitBlock{}, reservation.exhaustedUntil
 }
 
 func (l *authRequestWindowLimiter) reserveAt(authID string, policy authRequestLimitPolicy, now time.Time) (*authRequestReservation, bool, authRequestLimitBlock) {
@@ -393,14 +408,19 @@ func (l *authRequestWindowLimiter) reserveAt(authID string, policy authRequestLi
 	}
 	entry.count++
 	l.counts[authID] = entry
+	var exhaustedUntil time.Time
+	if entry.count >= policy.limit {
+		exhaustedUntil = resetAt
+	}
 	return &authRequestReservation{
-		limiter:       l,
-		authID:        authID,
-		generation:    l.generation,
-		window:        window,
-		windowMinutes: policy.windowMinutes,
-		limit:         policy.limit,
-		entryVersion:  entry.version,
+		limiter:        l,
+		authID:         authID,
+		generation:     l.generation,
+		window:         window,
+		windowMinutes:  policy.windowMinutes,
+		limit:          policy.limit,
+		entryVersion:   entry.version,
+		exhaustedUntil: exhaustedUntil,
 	}, true, authRequestLimitBlock{}
 }
 

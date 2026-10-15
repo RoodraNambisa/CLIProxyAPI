@@ -55,6 +55,15 @@ func TestGetRoutingDiagnosticsReturnsRoutingAndExecutionMetrics(t *testing.T) {
 		t.Fatalf("json.Unmarshal(raw) error = %v", errDecode)
 	}
 	metrics, ok := raw["request_execution_metrics"].(map[string]any)
+	selection, selectionOK := raw["selection_metrics"].(map[string]any)
+	if !selectionOK {
+		t.Fatal("missing credential selection metrics")
+	}
+	for _, key := range []string{"scheduler_lock_wait_nanos", "provider_lock_wait_nanos", "candidate_check_nanos", "reservation_nanos", "clone_nanos", "request_limit_exclusions", "request_limit_index_rebuilds", "fast_paths", "compatibility_paths"} {
+		if _, exists := selection[key]; !exists {
+			t.Errorf("selection metrics missing %s", key)
+		}
+	}
 	if !ok {
 		t.Fatalf("request_execution_metrics = %#v", raw["request_execution_metrics"])
 	}

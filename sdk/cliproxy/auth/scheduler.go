@@ -160,6 +160,7 @@ type readyView struct {
 	flat       []*scheduledAuth
 	lastPicked string
 	weighted   smoothWeightedState
+	limited    *requestLimitReadyIndex
 }
 
 // cooldownQueue is the blocked auth collection ordered by next retry time during rebuilds.
@@ -792,7 +793,9 @@ func (s *authScheduler) pickSingle(ctx context.Context, provider, model string, 
 	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
 	preferWebsocket := shouldPreferCodexWebsocket(ctx, providerKey) && pinnedAuthID == ""
 	selectionAttempt := 0
+	lockStarted := time.Now()
 	s.mu.RLock()
+	observeSelectionTime(&selectionRuntime.schedulerLockWait, lockStarted)
 	defer s.mu.RUnlock()
 	providerState := s.providers[providerKey]
 	if err := schedulerContextError(ctx); err != nil {
@@ -818,7 +821,9 @@ func (s *authScheduler) pickSingle(ctx context.Context, provider, model string, 
 	if providerState == nil {
 		return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
+	lockStarted = time.Now()
 	providerState.mu.Lock()
+	observeSelectionTime(&selectionRuntime.providerLockWait, lockStarted)
 	defer providerState.mu.Unlock()
 	if err := schedulerContextError(ctx); err != nil {
 		return nil, err
@@ -892,7 +897,9 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
 	modelKey := canonicalModelKey(model)
 	selectionAttempt := 0
+	lockStarted := time.Now()
 	s.mu.RLock()
+	observeSelectionTime(&selectionRuntime.schedulerLockWait, lockStarted)
 	defer s.mu.RUnlock()
 	strategyForPriority := s.strategyForPriorityLocked
 	if err := schedulerContextError(ctx); err != nil {
@@ -923,7 +930,9 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 		if providerState == nil {
 			return nil, "", &Error{Code: "auth_not_found", Message: "no auth available"}
 		}
+		lockStarted = time.Now()
 		providerState.mu.Lock()
+		observeSelectionTime(&selectionRuntime.providerLockWait, lockStarted)
 		defer providerState.mu.Unlock()
 		if err := schedulerContextError(ctx); err != nil {
 			return nil, "", err
@@ -972,7 +981,9 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 	candidateShards := make([]*modelScheduler, len(normalized))
 	prioritySet := make(map[int]struct{})
 	now := time.Now()
+	lockStarted = time.Now()
 	lockedProviders := lockProviderSchedulers(providerStates)
+	observeSelectionTime(&selectionRuntime.providerLockWait, lockStarted)
 	defer unlockProviderSchedulers(lockedProviders)
 	if err := schedulerContextError(ctx); err != nil {
 		return nil, "", err
@@ -1007,10 +1018,6 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 		return nil, "", mixedUnavailableErrorFromShardsWithPredicate(normalized, candidateShards, model, pickPredicate)
 	}
 
-	type mixedCandidate struct {
-		auth        *Auth
-		providerKey string
-	}
 	cursorKey := strings.Join(normalized, ",") + ":" + modelKey
 	rpmLimited := false
 	requestLimited := authRequestLimitBlock{}
@@ -1059,34 +1066,21 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 				return picked, owners[picked.ID], nil
 			}
 		case schedulerStrategyRandom:
-			candidates := make([]mixedCandidate, 0)
+			views := make([]mixedRandomReadyView, 0, len(normalized))
 			for providerIndex, providerKey := range normalized {
 				shard := candidateShards[providerIndex]
 				if shard == nil {
 					continue
 				}
-				for _, entry := range shard.readyEntriesAtPriorityLocked(false, targetPriority, pickPredicate) {
-					if entry == nil || entry.auth == nil {
-						continue
-					}
-					candidates = append(candidates, mixedCandidate{
-						auth:        entry.auth,
-						providerKey: providerKey,
-					})
+				if bucket := shard.readyByPriority[targetPriority]; bucket != nil {
+					views = append(views, mixedRandomReadyView{provider: providerKey, view: &bucket.all})
 				}
 			}
-			for len(candidates) > 0 {
-				index := rand.IntN(len(candidates))
-				picked := candidates[index]
-				requestPolicy := requestLimitForAuth(picked.auth)
-				if acquired, block := requestLimiter.tryAcquireAt(picked.auth.ID, requestPolicy, requestLimiter.nowTime()); acquired {
-					return picked.auth, picked.providerKey, nil
-				} else {
-					requestLimited = earlierAuthRequestLimitBlock(requestLimited, block)
-				}
-				candidates[index] = candidates[len(candidates)-1]
-				candidates = candidates[:len(candidates)-1]
+			picked, providerKey, block := pickMixedRandomWithRequestLimits(views, pickPredicate, requestLimitForAuth, requestLimiter)
+			if picked != nil {
+				return picked, providerKey, nil
 			}
+			requestLimited = earlierAuthRequestLimitBlock(requestLimited, block)
 		case schedulerStrategyFillFirst:
 			fillFirstRPM := fillFirstPerAuthRPMForPriority(targetPriority)
 			picked, providerKey, limited, requestBlock := pickMixedFillFirstAtPriorityLocked(normalized, candidateShards, targetPriority, fillFirstRangeForPriority(targetPriority), fillFirstRPM, fillFirstLimiter, requestLimitForAuth, requestLimiter, priorityPredicate, pickPredicate)
@@ -1670,6 +1664,10 @@ func (m *modelScheduler) upsertEntryLocked(meta *scheduledAuthMeta, now time.Tim
 	entry.applyMeta(meta, m.modelKey, now, m.requiresUpload)
 
 	if ok && previousState == entry.state && previousNextRetryAt.Equal(entry.nextRetryAt) && previousPriority == meta.priority && previousWebsocketEnabled == meta.websocketEnabled {
+		if bucket := m.readyByPriority[meta.priority]; bucket != nil {
+			bucket.all.invalidateRequestLimit(meta.auth.ID)
+			bucket.ws.invalidateRequestLimit(meta.auth.ID)
+		}
 		if previousHasExpiry != meta.hasAccessTokenExpiry || !previousExpiry.Equal(meta.accessTokenExpiresAt) {
 			m.updateTokenExpiryLocked(entry)
 		}
@@ -2177,10 +2175,14 @@ func (m *modelScheduler) blockedEarliestAtPriorityLocked(preferWebsocket bool, p
 	if m == nil {
 		return time.Time{}, false
 	}
-	var earliest time.Time
-	for _, entry := range m.entries {
+	// The blocked queue is already ordered by retry time with permanent
+	// exclusions last. Ready credentials cannot contribute a recovery time.
+	for _, entry := range m.blocked {
 		if entry == nil || entry.auth == nil || entry.meta == nil {
 			continue
+		}
+		if entry.nextRetryAt.IsZero() {
+			break
 		}
 		if entry.meta.priority != priority {
 			continue
@@ -2194,15 +2196,7 @@ func (m *modelScheduler) blockedEarliestAtPriorityLocked(preferWebsocket bool, p
 		if entry.state != scheduledStateCooldown && entry.state != scheduledStateBlocked {
 			continue
 		}
-		if entry.nextRetryAt.IsZero() {
-			continue
-		}
-		if earliest.IsZero() || entry.nextRetryAt.Before(earliest) {
-			earliest = entry.nextRetryAt
-		}
-	}
-	if !earliest.IsZero() {
-		return earliest, true
+		return entry.nextRetryAt, true
 	}
 	return time.Time{}, false
 }
@@ -2395,8 +2389,15 @@ func (v *readyView) pickWithRequestLimit(strategy schedulerStrategy, predicate f
 		return nil, authRequestLimitBlock{}
 	}
 	now := limiter.nowTime()
+	started := time.Now()
+	defer observeSelectionTime(&selectionRuntime.candidateNanos, started)
 	requestLimited := authRequestLimitBlock{}
+	var index *requestLimitReadyIndex
+	if strategy == schedulerStrategyRandom && v.limited != nil {
+		index = v.requestLimitIndex(limiter, now)
+	}
 	tryEntry := func(entry *scheduledAuth) bool {
+		selectionRuntime.candidates.Add(1)
 		if entry == nil || entry.auth == nil || (predicate != nil && !predicate(entry)) {
 			return false
 		}
@@ -2404,9 +2405,20 @@ func (v *readyView) pickWithRequestLimit(strategy schedulerStrategy, predicate f
 		if requestLimitForAuth != nil {
 			policy = requestLimitForAuth(entry.auth)
 		}
-		acquired, block := limiter.tryAcquireAt(entry.auth.ID, policy, now)
+		acquired, block, exhaustedUntil := limiter.tryAcquireIndexedAt(entry.auth.ID, policy, now)
 		if !acquired {
 			requestLimited = earlierAuthRequestLimitBlock(requestLimited, block)
+			if strategy == schedulerStrategyRandom && block.limited() {
+				if index == nil {
+					index = v.requestLimitIndex(limiter, now)
+				}
+				index.exclude(entry, block, now)
+			}
+		} else if strategy == schedulerStrategyRandom && !exhaustedUntil.IsZero() {
+			if index == nil {
+				index = v.requestLimitIndex(limiter, now)
+			}
+			index.exclude(entry, newAuthRequestLimitBlock(policy, exhaustedUntil.Sub(now)), now)
 		}
 		return acquired
 	}
@@ -2432,14 +2444,30 @@ func (v *readyView) pickWithRequestLimit(strategy schedulerStrategy, predicate f
 	case schedulerStrategyRandom:
 		// Rejection sampling stays uniform and avoids copying a large ready
 		// pool for the common case. The bounded fallback handles sparse pools.
-		for attempt := 0; attempt < 8; attempt++ {
-			entry := v.flat[rand.IntN(len(v.flat))]
+		for attemptsWithoutExclusion := 0; attemptsWithoutExclusion < 8; {
+			available := v.flat
+			if index != nil {
+				available = index.available
+			}
+			if len(available) == 0 {
+				break
+			}
+			entry := available[rand.IntN(len(available))]
 			if tryEntry(entry) {
 				return entry, authRequestLimitBlock{}
 			}
+			// An authoritative exclusion makes progress without copying the
+			// remaining pool. Only request-local rejection needs a fallback.
+			if index == nil || len(index.available) >= len(available) {
+				attemptsWithoutExclusion++
+			}
 		}
-		candidates := make([]*scheduledAuth, 0, len(v.flat))
-		for _, entry := range v.flat {
+		available := v.flat
+		if index != nil {
+			available = index.available
+		}
+		candidates := make([]*scheduledAuth, 0, len(available))
+		for _, entry := range available {
 			if entry != nil && entry.auth != nil && (predicate == nil || predicate(entry)) {
 				candidates = append(candidates, entry)
 			}
@@ -2453,6 +2481,7 @@ func (v *readyView) pickWithRequestLimit(strategy schedulerStrategy, predicate f
 			candidates[index] = candidates[len(candidates)-1]
 			candidates = candidates[:len(candidates)-1]
 		}
+		requestLimited = earlierAuthRequestLimitBlock(requestLimited, index.earliestBlock(predicate, now))
 	default:
 		start := scheduledSuccessorIndex(v.flat, v.lastPicked)
 		for offset := 0; offset < len(v.flat); offset++ {

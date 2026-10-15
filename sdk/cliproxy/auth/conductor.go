@@ -9963,6 +9963,7 @@ func (m *Manager) routeAwareSelectionRequiredForProviders(providers []string, ro
 }
 
 func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, error) {
+	selectionRuntime.compatibilityPaths.Add(1)
 	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
 	registryRef := registry.GetGlobalRegistry()
 
@@ -10155,6 +10156,7 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 	if !okExecutor {
 		return nil, nil, &Error{Code: "executor_not_found", Message: "executor not registered"}
 	}
+	selectionRuntime.fastPaths.Add(1)
 	selected, errPick := m.scheduler.pickSingle(ctx, provider, model, opts, tried)
 	if errPick != nil && model != "" && shouldRetrySchedulerPick(errPick) {
 		m.refreshSchedulerRoute([]string{provider}, model)
@@ -10179,6 +10181,7 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 }
 
 func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}, pickAllowed func(*Auth) bool) (*Auth, ProviderExecutor, string, error) {
+	selectionRuntime.compatibilityPaths.Add(1)
 	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
 
 	providerSet := make(map[string]struct{}, len(providers))
@@ -10429,6 +10432,7 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 		return auth, executor, selectedProvider, errPick
 	}
 
+	selectionRuntime.fastPaths.Add(1)
 	selected, providerKey, errPick := m.scheduler.pickMixed(ctx, eligibleProviders, model, opts, tried, allowed)
 	if errPick != nil && model != "" && shouldRetrySchedulerPick(errPick) {
 		m.refreshSchedulerRoute(eligibleProviders, model)

@@ -13,6 +13,7 @@ import (
 type routingDiagnosticsResponse struct {
 	Routing                 coreauth.RoutingDiagnosticsSnapshot              `json:"routing"`
 	RequestExecutionMetrics cliproxyexecutor.RequestExecutionMetricsSnapshot `json:"request_execution_metrics"`
+	SelectionMetrics        coreauth.SelectionRuntimeSnapshot                `json:"selection_metrics"`
 }
 
 // GetRoutingDiagnostics returns low-overhead routing availability and request
@@ -31,5 +32,6 @@ func (h *Handler) GetRoutingDiagnostics(c *gin.Context) {
 	c.JSON(http.StatusOK, routingDiagnosticsResponse{
 		Routing:                 h.authManager.RoutingDiagnostics(provider, model, time.Now()),
 		RequestExecutionMetrics: h.authManager.RequestExecutionMetrics(),
+		SelectionMetrics:        coreauth.SelectionMetricsSnapshot(),
 	})
 }

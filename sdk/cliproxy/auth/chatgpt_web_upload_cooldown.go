@@ -91,6 +91,9 @@ func cloneAuthForRequestSelection(auth *Auth, opts core.Options) *Auth {
 }
 
 func cloneSelectedAuth(auth *Auth) *Auth {
+	started := time.Now()
+	selectionRuntime.clones.Add(1)
+	defer observeSelectionTime(&selectionRuntime.cloneNanos, started)
 	clone := auth.Clone()
 	clone.selectionUploadRequired = false
 	return clone
