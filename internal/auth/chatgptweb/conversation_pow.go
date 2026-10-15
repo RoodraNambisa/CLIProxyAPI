@@ -3,7 +3,6 @@ package chatgptweb
 import (
 	"bytes"
 	"context"
-	"crypto/sha3"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -22,7 +21,7 @@ import (
 const (
 	defaultConversationPoWScript      = "https://chatgpt.com/backend-api/sentinel/sdk.js"
 	defaultConversationPoWMaxAttempts = 500_000
-	conversationPoWDigestHexLength    = 128
+	conversationPoWDigestHexLength    = 8
 )
 
 var (
@@ -190,7 +189,7 @@ func BuildConversationRequirementsTokenWithEnvironment(environment ConversationT
 	return "gAAAAAC" + base64.StdEncoding.EncodeToString(payload), nil
 }
 
-// BuildConversationProofToken solves the SHA3-512 browser proof challenge.
+// BuildConversationProofToken solves the conversation browser proof challenge.
 func BuildConversationProofToken(ctx context.Context, seed, difficulty string, persona Persona, scriptSources []string, dataBuild string, reader io.Reader, now func() time.Time) (string, error) {
 	return buildConversationProofToken(ctx, seed, difficulty, persona, scriptSources, dataBuild, reader, now, time.Now)
 }
@@ -214,7 +213,7 @@ func buildConversationProofTokenWithEnvironment(ctx context.Context, seed, diffi
 		return "", fmt.Errorf("invalid conversation proof challenge")
 	}
 	if len(difficulty) > conversationPoWDigestHexLength {
-		return "", fmt.Errorf("conversation proof difficulty exceeds SHA3-512 digest length")
+		return "", fmt.Errorf("conversation proof difficulty exceeds 32-bit digest length")
 	}
 	if _, err := hex.DecodeString(difficulty + strings.Repeat("0", len(difficulty)%2)); err != nil {
 		return "", fmt.Errorf("decode conversation proof difficulty: %w", err)
@@ -251,13 +250,8 @@ func buildConversationProofTokenWithEnvironment(ctx context.Context, seed, diffi
 		return "", ctx.Err()
 	}
 	startedAt := monotonicNow()
-	targetHex := []byte(difficulty)
-	seedBytes := []byte(seed)
 	raw := make([]byte, 0, len(static1)+len(static2)+len(static3)+48)
 	encoded := make([]byte, 0, base64.StdEncoding.EncodedLen(cap(raw)))
-	hasher := sha3.New512()
-	digest := make([]byte, 0, hasher.Size())
-	digestHex := make([]byte, hasher.Size()*2)
 	for attempt := 0; attempt < defaultConversationPoWMaxAttempts; attempt++ {
 		if attempt&1023 == 0 {
 			select {
@@ -286,13 +280,9 @@ func buildConversationProofTokenWithEnvironment(ctx context.Context, seed, diffi
 			encoded = encoded[:encodedLength]
 		}
 		base64.StdEncoding.Encode(encoded, raw)
-		hasher.Reset()
-		_, _ = hasher.Write(seedBytes)
-		_, _ = hasher.Write(encoded)
-		digest = hasher.Sum(digest[:0])
-		hex.Encode(digestHex, digest)
-		if bytes.Compare(digestHex[:len(targetHex)], targetHex) <= 0 {
-			return "gAAAAAB" + string(encoded), nil
+		digest := fnv1a32(seed + string(encoded))
+		if digest[:len(difficulty)] <= difficulty {
+			return "gAAAAAB" + string(encoded) + "~S", nil
 		}
 	}
 	return "", fmt.Errorf("failed to solve conversation proof challenge")

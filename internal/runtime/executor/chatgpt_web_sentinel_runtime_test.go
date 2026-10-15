@@ -125,6 +125,45 @@ func (observer *fakeChatGPTWebSentinelObserver) Snapshot(_ context.Context) (str
 
 func (*fakeChatGPTWebSentinelObserver) Close() {}
 
+func TestChatGPTWebRequirementsUsesObservedFinalizeFieldNames(t *testing.T) {
+	var finalized map[string]any
+	server := newChatGPTWebSentinelRequirementsServer(t, chatGPTWebSentinelRuntimeTestSDK, func(pToken string) map[string]any {
+		return map[string]any{
+			"prepare_token": "prepared",
+			"proofofwork":   map[string]any{"required": true, "seed": "test-seed", "difficulty": "ff"},
+			"turnstile": map[string]any{
+				"required": true,
+				"dx":       chatGPTWebTurnstileTestDX(t, pToken, []any{[]any{2, 40, "turnstile-result"}, []any{7, 3, 40}}),
+			},
+		}
+	}, func(body map[string]any) map[string]any {
+		finalized = body
+		return map[string]any{"persona": "chatgpt-freeaccount", "token": "requirements", "expire_after": 600, "expire_at": 1792063200}
+	})
+	defer server.Close()
+	executor, _ := newChatGPTWebSentinelTestExecutor(server.URL, chatGPTWebSentinelRuntimeTestSDK)
+	defer func() { _ = executor.Close() }()
+	requirements := runChatGPTWebSentinelRequirements(t, executor)
+	if len(finalized) != 3 || finalized["prepare_token"] != "prepared" ||
+		finalized["proofofwork"] != requirements.ProofToken || finalized["turnstile"] != requirements.TurnstileToken {
+		t.Fatal("finalize must send prepare_token, proofofwork and turnstile under the observed protocol keys")
+	}
+	if !strings.HasPrefix(requirements.ProofToken, "gAAAAAB") || requirements.TurnstileToken == "" {
+		t.Fatal("finalize must carry both computed challenge results")
+	}
+	if requirements.Token != "requirements" {
+		t.Fatal("finalized requirements token was not retained")
+	}
+	encoded, err := json.Marshal(finalized)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logged := string(chatGPTWebRequestLogBody("/backend-api/sentinel/chat-requirements/finalize", encoded))
+	if strings.Contains(logged, requirements.ProofToken) || strings.Contains(logged, requirements.TurnstileToken) || strings.Contains(logged, "prepared") {
+		t.Fatal("finalize challenge results must remain redacted")
+	}
+}
+
 func TestChatGPTWebRequirementsUsesSentinelSDKCompatibilityFallback(t *testing.T) {
 	var finalized map[string]any
 	server := newChatGPTWebSentinelRequirementsServer(t, chatGPTWebSentinelRuntimeTestSDK, func(pToken string) map[string]any {
@@ -147,7 +186,7 @@ func TestChatGPTWebRequirementsUsesSentinelSDKCompatibilityFallback(t *testing.T
 	if requirements.TurnstileToken != "sdk-turnstile-token" {
 		t.Fatalf("Turnstile token = %q", requirements.TurnstileToken)
 	}
-	if got := chatGPTWebAnyString(finalized["turnstile_token"]); got != "sdk-turnstile-token" {
+	if got := chatGPTWebAnyString(finalized["turnstile"]); got != "sdk-turnstile-token" {
 		t.Fatalf("finalize Turnstile token = %q", got)
 	}
 	if fetches.Load() != 1 || executor.SentinelSnapshot().FallbackCount != 1 {
@@ -202,7 +241,7 @@ func TestChatGPTWebRequirementsUsesPinnedSDKWhenBootstrapOmitsSentinelScript(t *
 	if fetchedURL != resource.URL {
 		t.Fatalf("SDK URL = %q, want %q", fetchedURL, resource.URL)
 	}
-	if got := chatGPTWebAnyString(finalized["turnstile_token"]); got != "sdk-turnstile-token" {
+	if got := chatGPTWebAnyString(finalized["turnstile"]); got != "sdk-turnstile-token" {
 		t.Fatalf("finalize Turnstile token = %q", got)
 	}
 }

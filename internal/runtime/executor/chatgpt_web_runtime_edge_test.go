@@ -764,7 +764,7 @@ func TestChatGPTWebRequirementsSolvesTurnstileAndForwardsToken(t *testing.T) {
 				t.Fatalf("chatGPTWebRequirements() error = %v", err)
 			}
 			generatedToken := base64.StdEncoding.EncodeToString([]byte("turnstile-token"))
-			if got := chatGPTWebAnyString(finalized["turnstile_token"]); got != generatedToken {
+			if got := chatGPTWebAnyString(finalized["turnstile"]); got != generatedToken {
 				t.Fatalf("finalize turnstile token = %q, want %q", got, generatedToken)
 			}
 			wantRequirementsToken := test.wantRequirementsToken

@@ -1767,9 +1767,9 @@ func (e *ChatGPTWebExecutor) chatGPTWebRequirements(ctx context.Context, client 
 	finalizePath := "/backend-api/sentinel/chat-requirements/finalize"
 	setPhase(cliproxyexecutor.ImagePhaseRequirementsFinalize)
 	_, finalizeData, err := e.doChatGPTWebJSON(ctx, client, credential, finalizePath, map[string]any{
-		"prepare_token":   chatGPTWebAnyString(prepare["prepare_token"]),
-		"proof_token":     proofToken,
-		"turnstile_token": turnstileToken,
+		"prepare_token": chatGPTWebAnyString(prepare["prepare_token"]),
+		"proofofwork":   proofToken,
+		"turnstile":     turnstileToken,
 	})
 	if err != nil {
 		if turnstileToken != "" && chatGPTWebTurnstileFinalizeRejection(err) {
@@ -2511,6 +2511,7 @@ func chatGPTWebRequestLogBody(path string, body []byte) []byte {
 		return []byte("<redacted-non-json-body>")
 	}
 	redactPreparePayload := strings.Contains(strings.ToLower(path), "/chat-requirements/prepare")
+	redactFinalizePayload := strings.Contains(strings.ToLower(path), "/chat-requirements/finalize")
 	var redact func(any)
 	redact = func(value any) {
 		switch typed := value.(type) {
@@ -2528,6 +2529,11 @@ func chatGPTWebRequestLogBody(path string, body []byte) []byte {
 					continue
 				case "p":
 					if redactPreparePayload {
+						typed[key] = "<redacted>"
+						continue
+					}
+				case "proofofwork", "turnstile":
+					if redactFinalizePayload {
 						typed[key] = "<redacted>"
 						continue
 					}

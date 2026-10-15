@@ -162,7 +162,7 @@ func TestBuildConversationProofTokenSolvesEasyChallenge(t *testing.T) {
 	if !strings.HasPrefix(token, "gAAAAAB") {
 		t.Fatalf("token = %q", token)
 	}
-	payload, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(token, "gAAAAAB"))
+	payload, err := base64.StdEncoding.DecodeString(strings.TrimSuffix(strings.TrimPrefix(token, "gAAAAAB"), "~S"))
 	if err != nil {
 		t.Fatalf("decode proof token: %v", err)
 	}
@@ -172,6 +172,33 @@ func TestBuildConversationProofTokenSolvesEasyChallenge(t *testing.T) {
 	}
 	if len(config) != 25 {
 		t.Fatalf("proof config items = %d, want 25", len(config))
+	}
+}
+
+func TestConversationProofMatchesObservedWebHashAndSuffix(t *testing.T) {
+	for _, tc := range []struct{ input, digest string }{
+		{"", "ab3e7c0b"},
+		{"hello", "888d766e"},
+		{"seedWzEsMiwzXQ==", "ff68e72d"},
+		{"种子", "ad406102"},
+		{"seed😀", "86bab83e"},
+	} {
+		if got := fnv1a32(tc.input); got != tc.digest {
+			t.Fatalf("observed web hash for %q = %q, want %q", tc.input, got, tc.digest)
+		}
+	}
+	const seed, difficulty = "fixture-seed", "0f"
+	clock := func() time.Time { return time.Unix(1_700_000_000, 0) }
+	token, err := buildConversationProofToken(context.Background(), seed, difficulty, DefaultPersona(), []string{"/sdk.js"}, "build", zeroReader{}, clock, clock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(token, "gAAAAAB") || !strings.HasSuffix(token, "~S") {
+		t.Fatal("conversation proof must use the observed prefix and success suffix")
+	}
+	encoded := strings.TrimSuffix(strings.TrimPrefix(token, "gAAAAAB"), "~S")
+	if hash := fnv1a32(seed + encoded); hash[:len(difficulty)] > difficulty {
+		t.Fatal("conversation proof does not satisfy the observed web hash condition")
 	}
 }
 
@@ -204,7 +231,7 @@ func TestBuildConversationProofTokenRecordsElapsedSolveTime(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildConversationProofToken() error = %v", err)
 	}
-	payload, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(token, "gAAAAAB"))
+	payload, err := base64.StdEncoding.DecodeString(strings.TrimSuffix(strings.TrimPrefix(token, "gAAAAAB"), "~S"))
 	if err != nil {
 		t.Fatalf("decode proof token: %v", err)
 	}
@@ -221,7 +248,7 @@ func TestBuildConversationProofTokenRecordsElapsedSolveTime(t *testing.T) {
 }
 
 func TestBuildConversationProofTokenRejectsOversizedDifficulty(t *testing.T) {
-	_, err := BuildConversationProofToken(context.Background(), "seed", strings.Repeat("ff", 65), DefaultPersona(), nil, "", zeroReader{}, time.Now)
+	_, err := BuildConversationProofToken(context.Background(), "seed", strings.Repeat("f", 9), DefaultPersona(), nil, "", zeroReader{}, time.Now)
 	if err == nil || !strings.Contains(err.Error(), "digest length") {
 		t.Fatalf("BuildConversationProofToken() error = %v", err)
 	}
@@ -230,7 +257,7 @@ func TestBuildConversationProofTokenRejectsOversizedDifficulty(t *testing.T) {
 func TestBuildConversationProofTokenObservesCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	_, err := BuildConversationProofToken(ctx, "seed", strings.Repeat("00", 64), DefaultPersona(), nil, "", zeroReader{}, time.Now)
+	_, err := BuildConversationProofToken(ctx, "seed", strings.Repeat("0", 8), DefaultPersona(), nil, "", zeroReader{}, time.Now)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("BuildConversationProofToken() error = %v, want context.Canceled", err)
 	}

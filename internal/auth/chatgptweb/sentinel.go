@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"strings"
 	"time"
+	"unicode/utf16"
 )
 
 const (
@@ -228,6 +229,12 @@ func base64JSON(value any) (string, error) {
 func fnv1a32(value string) string {
 	hash := uint32(2_166_136_261)
 	for _, character := range value {
+		if character > 0xffff {
+			high, low := utf16.EncodeRune(character)
+			hash ^= uint32(high)
+			hash *= 16_777_619
+			character = low
+		}
 		hash ^= uint32(character)
 		hash *= 16_777_619
 	}
