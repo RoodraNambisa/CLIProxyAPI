@@ -241,6 +241,40 @@ func (e *ChatGPTWebExecutor) CloseAuthInstanceExecutionSessions(authID string, a
 // Identifier returns the provider identifier.
 func (e *ChatGPTWebExecutor) Identifier() string { return chatgptwebauth.Provider }
 
+// BrowserRegionPreview never allocates a proxy binding. Only explicit refresh
+// requests enqueue provider-owned metadata work after a route is available.
+func (e *ChatGPTWebExecutor) BrowserRegionPreview(auth *cliproxyauth.Auth, refresh bool) (chatgptwebauth.BrowserRegionSnapshot, string) {
+	if e == nil || e.browserRegion == nil {
+		return chatgptwebauth.BrowserRegionSnapshot{}, "unavailable"
+	}
+	if auth == nil || auth.Provider != chatgptwebauth.Provider {
+		return chatgptwebauth.BrowserRegionSnapshot{}, "invalid_provider"
+	}
+	credential, err := chatgptwebauth.ParseCredential(auth.Metadata)
+	if err != nil {
+		return chatgptwebauth.BrowserRegionSnapshot{}, "credential_invalid"
+	}
+	chatgptwebauth.ResolveCredentialPersona(credential, auth.ID)
+	routed := auth.Clone()
+	if e.manager != nil {
+		preview, errPreview := e.manager.PreviewProxyAuth(auth)
+		if errPreview != nil || preview.Pending {
+			s := e.browserRegion.Preview("unresolved:"+auth.ID, credential.Persona)
+			s.Reason = "route_unresolved"
+			return s, "route_unresolved"
+		}
+		routed.ProxyURL = preview.URL
+		routed.RuntimeProxyURL = ""
+	}
+	route := e.proxyURLForTarget(routed, e.chatGPTWebBaseURL())
+	code := ""
+	if refresh {
+		code = e.browserRegion.Refresh(route)
+	}
+	s := e.browserRegion.Preview(route, credential.Persona)
+	return s, code
+}
+
 // UpdateConfig replaces the immutable runtime configuration snapshot without
 // interrupting in-flight login or request operations.
 func (e *ChatGPTWebExecutor) UpdateConfig(cfg *config.Config) {

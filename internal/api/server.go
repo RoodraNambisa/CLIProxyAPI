@@ -1043,6 +1043,10 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.PUT("/chatgpt-web/usage-cache", s.mgmt.PutChatGPTWebUsageCache)
 		mgmt.PATCH("/chatgpt-web/usage-cache", s.mgmt.PatchChatGPTWebUsageCache)
 		mgmt.GET("/chatgpt-web/login-proxy", s.mgmt.GetChatGPTWebLoginProxy)
+		mgmt.GET("/chatgpt-web/browser-region", s.mgmt.GetChatGPTWebBrowserRegion)
+		mgmt.PATCH("/chatgpt-web/browser-region", s.mgmt.PatchChatGPTWebBrowserRegion)
+		mgmt.GET("/chatgpt-web/browser-region/preview", s.mgmt.GetChatGPTWebBrowserRegionPreview)
+		mgmt.POST("/chatgpt-web/browser-region/refresh", s.mgmt.RefreshChatGPTWebBrowserRegion)
 		mgmt.PUT("/chatgpt-web/login-proxy", s.mgmt.PutChatGPTWebLoginProxy)
 		mgmt.PATCH("/chatgpt-web/login-proxy", s.mgmt.PatchChatGPTWebLoginProxy)
 
@@ -1103,6 +1107,8 @@ func startupManagementPathAvailable(path string) bool {
 	}
 	for _, suffix := range []string{
 		"/startup/status",
+		"/chatgpt-web/browser-region",
+		"/chatgpt-web/browser-region/preview",
 		"/config",
 		"/config.yaml",
 		"/system/metrics",
