@@ -14,6 +14,9 @@ func TestChatGPTWebResolvedTimezoneDefaultsAndDST(t *testing.T) {
 		defaults.OffsetMinutes != DefaultChatGPTWebTimezoneOffsetMinutes {
 		t.Fatalf("default ResolvedTimezone() = %#v", defaults)
 	}
+	if defaults.Timezone != "UTC" || defaults.OffsetMinutes != 0 {
+		t.Fatalf("unconfigured browser timezone must use UTC: %#v", defaults)
+	}
 
 	cfg := ChatGPTWebConfig{Timezone: "America/New_York"}
 	winter := cfg.ResolvedTimezone(time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC))

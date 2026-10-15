@@ -133,7 +133,7 @@ func (e *ChatGPTWebExecutor) prepareChatGPTWebSearch(ctx context.Context, client
 		"content-type":    "application/json",
 		"x-conduit-token": "no-token",
 	})
-	timezone := e.chatGPTWebTimezone()
+	timezone := e.chatGPTWebTimezoneForClient(client)
 	body := map[string]any{
 		"action":                 "next",
 		"fork_from_shared_post":  false,
@@ -170,7 +170,7 @@ func (e *ChatGPTWebExecutor) startChatGPTWebSearch(ctx context.Context, client *
 	headers["content-type"] = "application/json"
 	headers["x-conduit-token"] = conduit
 	headers["x-oai-turn-trace-id"] = uuid.NewString()
-	timezone := e.chatGPTWebTimezone()
+	timezone := e.chatGPTWebTimezoneForClient(client)
 	body := map[string]any{
 		"action":                               "next",
 		"messages":                             messages,

@@ -1353,6 +1353,11 @@ func (e *ChatGPTWebExecutor) newRuntimeClientForAcquisition(auth *cliproxyauth.A
 	if hasExpiry {
 		client.SetAccessTokenExpiry(credential.AccessToken, expiresAt, e.currentTime)
 	}
+	timezone := e.chatGPTWebTimezone()
+	if err = client.SetBrowserTimezone(chatgptwebauth.BrowserTimezone{Name: timezone.Timezone, OffsetMinutes: timezone.OffsetMinutes}); err != nil {
+		client.CloseIdleConnections()
+		return nil, nil, err
+	}
 	baseURL := e.chatGPTWebBaseURL()
 	deviceID := strings.TrimSpace(credential.DeviceID)
 	if err = client.SetCookie(baseURL, "oai-did", deviceID); err != nil {
@@ -1508,7 +1513,7 @@ func (e *ChatGPTWebExecutor) openChatGPTWebConversation(ctx context.Context, cli
 		return nil, nil, err
 	}
 	path := "/backend-api/conversation"
-	timezone := e.chatGPTWebTimezone()
+	timezone := e.chatGPTWebTimezoneForClient(client)
 	body := map[string]any{
 		"action":                        "next",
 		"messages":                      messages,
@@ -1604,14 +1609,17 @@ func (e *ChatGPTWebExecutor) chatGPTWebRequirements(ctx context.Context, client 
 	if sdkResource.URL == "" {
 		sdkResource = chatgptwebauth.DefaultConversationSentinelSDKResource()
 	}
+	timezone := e.chatGPTWebTimezoneForClient(client)
 	sentinelEnvironment := chatgptwebauth.ConversationTurnstileEnvironment{
-		Compatibility:      policy,
-		Persona:            credential.Persona,
-		BrowserEnvironment: chatgptwebauth.ResolveCredentialBrowserEnvironment(credential, ""),
-		DeviceID:           credential.DeviceID,
-		PageStartedAt:      e.now(),
-		ScriptSources:      sources,
-		Location:           strings.TrimRight(baseURL, "/") + "/",
+		Compatibility:         policy,
+		Persona:               credential.Persona,
+		BrowserEnvironment:    chatgptwebauth.ResolveCredentialBrowserEnvironment(credential, ""),
+		DeviceID:              credential.DeviceID,
+		PageStartedAt:         e.now(),
+		ScriptSources:         sources,
+		Location:              strings.TrimRight(baseURL, "/") + "/",
+		Timezone:              timezone.Timezone,
+		TimezoneOffsetMinutes: timezone.OffsetMinutes,
 	}
 	var remoteCompute *chatgptwebauth.SentinelComputeSession
 	var pToken string

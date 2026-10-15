@@ -2354,6 +2354,10 @@ func patchSentinelSDK(source []byte, adapter sentinelSDKAdapter) ([]byte, error)
 }
 
 func (manager *SentinelRuntimeManager) runtimeBootstrap(request SentinelSDKRequest, source *sentinelSourceCacheEntry) (string, error) {
+	zone, errZone := request.Environment.browserTimezone()
+	if errZone != nil {
+		return "", errZone
+	}
 	persona := canonicalPersona(request.Environment.Persona)
 	profileEnvironment := request.Environment
 	if strings.TrimSpace(profileEnvironment.DeviceID) == "" {
@@ -2408,6 +2412,9 @@ func (manager *SentinelRuntimeManager) runtimeBootstrap(request SentinelSDKReque
 		"fingerprint_catalog":      profile.catalogID,
 		"fingerprint_slot":         profile.slot,
 		"page_started_at_ms":       float64(pageStartedAt.UnixNano()) / float64(time.Millisecond),
+		"timezone":                 zone.Name,
+		"timezone_offset_minutes":  zone.OffsetMinutes,
+		"timezone_display_name":    zone.displayName(),
 		"random_b64":               base64.StdEncoding.EncodeToString(randomBytes),
 		"script_sources":           append([]string(nil), request.Environment.ScriptSources...),
 		"local_storage_keys":       append([]string(nil), request.Environment.LocalStorageKeys...),

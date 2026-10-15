@@ -289,6 +289,10 @@ func buildConversationProofTokenWithEnvironment(ctx context.Context, seed, diffi
 }
 
 func buildConversationPoWConfig(environment ConversationTurnstileEnvironment, scriptSources []string, dataBuild string, reader io.Reader, now func() time.Time) ([]any, error) {
+	zone, err := environment.browserTimezone()
+	if err != nil {
+		return nil, err
+	}
 	persona := canonicalPersona(environment.Persona)
 	profile := resolveSentinelBrowserProfile(environment)
 	reader = randomReader(reader)
@@ -307,7 +311,7 @@ func buildConversationPoWConfig(environment ConversationTurnstileEnvironment, sc
 		"webdriver−false",
 		"cookieEnabled−true",
 		fmt.Sprintf("hardwareConcurrency−%d", profile.hardwareConcurrency),
-		"language−en-US",
+		"language−" + persona.Language,
 		"product−Gecko",
 	})
 	if err != nil {
@@ -336,16 +340,19 @@ func buildConversationPoWConfig(environment ConversationTurnstileEnvironment, sc
 		return nil, err
 	}
 	current := now()
-	eastern := current.In(time.FixedZone("EST", -5*60*60))
-	performanceNow := float64(current.UnixNano()%50_000_000) / float64(time.Microsecond)
-	timeOrigin := float64(current.UnixNano())/float64(time.Millisecond) - performanceNow
+	startedAt := environment.PageStartedAt
+	if startedAt.IsZero() || startedAt.After(current) {
+		startedAt = current
+	}
+	performanceNow := float64(current.Sub(startedAt)) / float64(time.Millisecond)
+	timeOrigin := float64(startedAt.UnixNano()) / float64(time.Millisecond)
 	hardware := profile.hardwareConcurrency
 	if hardware <= 0 {
 		hardware = 8
 	}
 	return []any{
 		profile.screenWidth + profile.screenHeight,
-		eastern.Format("Mon Jan 02 2006 15:04:05") + " GMT-0500 (Eastern Standard Time)",
+		zone.dateString(current),
 		uint64(profile.jsHeapSizeLimit),
 		1,
 		persona.UserAgent,

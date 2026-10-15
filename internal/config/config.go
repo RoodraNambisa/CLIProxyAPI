@@ -76,8 +76,8 @@ const (
 	MaxChatGPTWebManualReloginConcurrency      = RecommendedMaxChatGPTWebManualReloginConcurrency
 	DefaultChatGPTWebImportWorkers             = 4
 	MaxChatGPTWebImportWorkers                 = 32
-	DefaultChatGPTWebTimezone                  = "Asia/Shanghai"
-	DefaultChatGPTWebTimezoneOffsetMinutes     = -480
+	DefaultChatGPTWebTimezone                  = "UTC"
+	DefaultChatGPTWebTimezoneOffsetMinutes     = 0
 	MinChatGPTWebTimezoneOffsetMinutes         = -840
 	MaxChatGPTWebTimezoneOffsetMinutes         = 840
 	DefaultChatGPTWebAccountInfoWorkers        = 4

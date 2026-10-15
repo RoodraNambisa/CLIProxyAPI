@@ -41,6 +41,52 @@
 
   hideHostProperty(host, "__sentinelBootstrap");
 
+  // QuickJS/WASI does not inherit the host's TZ. Keep the absolute clock native
+  // and project local Date surfaces through the immutable request snapshot.
+  const NativeDate = host.Date;
+  const nativeGetTime = NativeDate.prototype.getTime;
+  const timezoneOffset = Number(config.timezone_offset_minutes) || 0;
+  const timezoneName = asString(config.timezone_display_name, "Coordinated Universal Time");
+  const offsetMillis = timezoneOffset * 60000;
+  const localDate = date => new NativeDate(nativeGetTime.call(date) - offsetMillis);
+  const padDate = (value, width = 2) => String(value).padStart(width, "0");
+  const days = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+  const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  const offsetText = "GMT" + (timezoneOffset <= 0 ? "+" : "-") + padDate(Math.floor(Math.abs(timezoneOffset) / 60)) + padDate(Math.abs(timezoneOffset) % 60);
+  function dateText(date) {
+    const local = localDate(date);
+    return days[local.getUTCDay()] + " " + months[local.getUTCMonth()] + " " + padDate(local.getUTCDate()) + " " + padDate(local.getUTCFullYear(), 4);
+  }
+  function timeText(date) {
+    const local = localDate(date);
+    return padDate(local.getUTCHours()) + ":" + padDate(local.getUTCMinutes()) + ":" + padDate(local.getUTCSeconds()) + " " + offsetText + " (" + timezoneName + ")";
+  }
+  function Date(...args) {
+    if (!new.target) return new NativeDate().toString();
+    const date = args.length >= 2 ? new NativeDate(NativeDate.UTC(...args) + offsetMillis) : new NativeDate(...args);
+    Object.setPrototypeOf(date, new.target.prototype);
+    return date;
+  }
+  Object.setPrototypeOf(Date, NativeDate);
+  Date.prototype = NativeDate.prototype;
+  defineValue(Date.prototype, "constructor", Date);
+  defineValue(Date.prototype, "getTimezoneOffset", function getTimezoneOffset() { return Number.isNaN(nativeGetTime.call(this)) ? NaN : timezoneOffset; });
+  defineValue(Date.prototype, "toString", function toString() { return Number.isNaN(nativeGetTime.call(this)) ? "Invalid Date" : dateText(this) + " " + timeText(this); });
+  defineValue(Date.prototype, "toDateString", function toDateString() { return Number.isNaN(nativeGetTime.call(this)) ? "Invalid Date" : dateText(this); });
+  defineValue(Date.prototype, "toTimeString", function toTimeString() { return Number.isNaN(nativeGetTime.call(this)) ? "Invalid Date" : timeText(this); });
+  for (const part of ["FullYear", "Month", "Date", "Day", "Hours", "Minutes", "Seconds", "Milliseconds"]) {
+    defineValue(Date.prototype, "get" + part, function () { return localDate(this)["getUTC" + part](); });
+  }
+  defineValue(Date.prototype, "getYear", function getYear() { return this.getFullYear() - 1900; });
+  for (const part of ["FullYear", "Month", "Date", "Hours", "Minutes", "Seconds", "Milliseconds"]) {
+    defineValue(Date.prototype, "set" + part, function (...args) {
+      const local = localDate(this);
+      const result = local["setUTC" + part](...args);
+      return this.setTime(result + offsetMillis);
+    });
+  }
+  defineValue(host, "Date", Date);
+
   function invalidBase64Error() {
     const error = new Error("The string to be decoded is not correctly encoded.");
     error.name = "InvalidCharacterError";

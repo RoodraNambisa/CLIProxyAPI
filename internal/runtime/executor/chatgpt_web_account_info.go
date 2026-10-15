@@ -5212,7 +5212,7 @@ func (e *ChatGPTWebExecutor) probeChatGPTWebUnauthorizedRefresh(
 	defer stopCancellation()
 
 	path := chatgptwebauth.AccountCheckPath
-	queryPath := fmt.Sprintf("%s?timezone_offset_min=%d", path, e.chatGPTWebTimezone().OffsetMinutes)
+	queryPath := fmt.Sprintf("%s?timezone_offset_min=%d", path, e.chatGPTWebTimezoneForClient(client).OffsetMinutes)
 	headers := e.chatGPTWebHeaders(credential, path, map[string]string{
 		"chatgpt-account-id": strings.TrimSpace(credential.AccountID),
 	})
@@ -5549,7 +5549,7 @@ func (e *ChatGPTWebExecutor) fetchChatGPTWebAccountInfoPair(
 	}
 	profileResults := make(chan profileResult, 1)
 	quotaResults := make(chan quotaResult, 1)
-	timezone := e.chatGPTWebTimezone()
+	timezone := e.chatGPTWebTimezoneForClient(profileClient)
 	accountID := credential.AccountID
 	if strings.TrimSpace(accountID) != accountID {
 		accountID = ""

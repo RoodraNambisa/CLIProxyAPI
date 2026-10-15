@@ -17,21 +17,23 @@ const sentinelComputeMaxBody = 32 << 20
 
 // SentinelComputeEnvironment is a data-only snapshot; no transport or credentials cross RPC.
 type SentinelComputeEnvironment struct {
-	Persona            Persona                    `json:"persona"`
-	BrowserEnvironment BrowserEnvironmentIdentity `json:"browser_environment"`
-	DeviceID           string                     `json:"device_id"`
-	PageStartedAt      time.Time                  `json:"page_started_at"`
-	ScriptSources      []string                   `json:"script_sources"`
-	Location           string                     `json:"location"`
-	LocalStorageKeys   []string                   `json:"local_storage_keys,omitempty"`
+	Persona               Persona                    `json:"persona"`
+	BrowserEnvironment    BrowserEnvironmentIdentity `json:"browser_environment"`
+	DeviceID              string                     `json:"device_id"`
+	PageStartedAt         time.Time                  `json:"page_started_at"`
+	ScriptSources         []string                   `json:"script_sources"`
+	Location              string                     `json:"location"`
+	LocalStorageKeys      []string                   `json:"local_storage_keys,omitempty"`
+	Timezone              string                     `json:"timezone,omitempty"`
+	TimezoneOffsetMinutes int                        `json:"timezone_offset_minutes"`
 }
 
 func ComputeEnvironment(env ConversationTurnstileEnvironment) SentinelComputeEnvironment {
-	return SentinelComputeEnvironment{env.Persona, env.BrowserEnvironment, env.DeviceID, env.PageStartedAt, append([]string{}, env.ScriptSources...), env.Location, append([]string{}, env.LocalStorageKeys...)}
+	return SentinelComputeEnvironment{Persona: env.Persona, BrowserEnvironment: env.BrowserEnvironment, DeviceID: env.DeviceID, PageStartedAt: env.PageStartedAt, ScriptSources: append([]string{}, env.ScriptSources...), Location: env.Location, LocalStorageKeys: append([]string{}, env.LocalStorageKeys...), Timezone: env.Timezone, TimezoneOffsetMinutes: env.TimezoneOffsetMinutes}
 }
 
 func (env SentinelComputeEnvironment) native(policy *sentinelcompat.Policy) ConversationTurnstileEnvironment {
-	return ConversationTurnstileEnvironment{Persona: env.Persona, BrowserEnvironment: env.BrowserEnvironment, DeviceID: env.DeviceID, PageStartedAt: env.PageStartedAt, ScriptSources: env.ScriptSources, Location: env.Location, LocalStorageKeys: env.LocalStorageKeys, Compatibility: policy}
+	return ConversationTurnstileEnvironment{Persona: env.Persona, BrowserEnvironment: env.BrowserEnvironment, DeviceID: env.DeviceID, PageStartedAt: env.PageStartedAt, ScriptSources: env.ScriptSources, Location: env.Location, LocalStorageKeys: env.LocalStorageKeys, Compatibility: policy, Timezone: env.Timezone, TimezoneOffsetMinutes: env.TimezoneOffsetMinutes}
 }
 
 type SentinelComputeInput struct {
@@ -89,6 +91,9 @@ func (in SentinelComputeInput) validate() error {
 	}
 	if len(in.Environment.ScriptSources) > 256 || len(in.Environment.LocalStorageKeys) > 256 || len(in.Environment.Location) > 4096 {
 		return computeError("invalid_input", false, nil)
+	}
+	if _, err := in.Environment.native(nil).browserTimezone(); err != nil {
+		return computeError("invalid_input", false, err)
 	}
 	for _, values := range [][]string{in.Environment.ScriptSources, in.Environment.LocalStorageKeys} {
 		for _, v := range values {

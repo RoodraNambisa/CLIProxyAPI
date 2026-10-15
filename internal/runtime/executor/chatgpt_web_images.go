@@ -1704,7 +1704,7 @@ func (e *ChatGPTWebExecutor) prepareChatGPTWebImageConversation(ctx context.Cont
 	headers := chatGPTWebRequirementsHeaders(e.chatGPTWebHeaders(credential, path, nil), prepareRequirements)
 	headers["accept"] = "*/*"
 	headers["content-type"] = "application/json"
-	timezone := e.chatGPTWebTimezone()
+	timezone := e.chatGPTWebTimezoneForClient(client)
 	prompt, metadata := helps.ChatGPTWebImageToolInput(prompt)
 	partialQuery := chatGPTWebUserTextMessage(prompt)
 	partialQuery["metadata"] = metadata
@@ -1775,7 +1775,7 @@ func (e *ChatGPTWebExecutor) openChatGPTWebImageConversation(ctx context.Context
 		MessageID: uuid.NewString(),
 		CreatedAt: float64(time.Now().UnixNano()) / 1e9,
 	}
-	timezone := e.chatGPTWebTimezone()
+	timezone := e.chatGPTWebTimezoneForClient(client)
 	body := map[string]any{
 		"action": "next",
 		"messages": []any{map[string]any{
@@ -1824,7 +1824,7 @@ func (e *ChatGPTWebExecutor) uploadChatGPTWebImage(ctx context.Context, client *
 		"height":                    config.Height,
 		"mime_type":                 mimeType,
 		"client_resolved_mime_type": mimeType,
-		"timezone_offset_min":       e.chatGPTWebTimezone().OffsetMinutes,
+		"timezone_offset_min":       e.chatGPTWebTimezoneForClient(client).OffsetMinutes,
 		"store_in_library":          false,
 	})
 	if err != nil {

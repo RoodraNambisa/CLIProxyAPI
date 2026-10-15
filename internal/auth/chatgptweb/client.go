@@ -42,6 +42,7 @@ type Client struct {
 	beforeRequestOnce  sync.Once
 	requestCancelStop  func() bool
 	accessTokenGuard   atomic.Pointer[accessTokenExpiryGuard]
+	browserTimezone    atomic.Pointer[BrowserTimezone]
 }
 
 const defaultPollCancellationGrace = 2 * time.Second
@@ -985,6 +986,7 @@ func (client *Client) CloneWithProxy(proxyURL string) (*Client, error) {
 	)
 	if err == nil {
 		cloned.accessTokenGuard.Store(client.accessTokenGuard.Load())
+		cloned.browserTimezone.Store(client.browserTimezone.Load())
 	}
 	return cloned, err
 }

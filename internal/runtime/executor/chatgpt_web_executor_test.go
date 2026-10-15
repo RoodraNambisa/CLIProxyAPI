@@ -2680,6 +2680,10 @@ func TestChatGPTWebExecutorTimezoneUsesCurrentConfigAndDST(t *testing.T) {
 	if resolved.Timezone != "America/New_York" || resolved.OffsetMinutes != 240 {
 		t.Fatalf("New York timezone = %#v", resolved)
 	}
+	client := &chatgptwebauth.Client{}
+	if err := client.SetBrowserTimezone(chatgptwebauth.BrowserTimezone{Name: resolved.Timezone, OffsetMinutes: resolved.OffsetMinutes}); err != nil {
+		t.Fatal(err)
+	}
 
 	zero := 0
 	executor.cfg.Store(&config.Config{ChatGPTWeb: config.ChatGPTWebConfig{
@@ -2689,6 +2693,9 @@ func TestChatGPTWebExecutorTimezoneUsesCurrentConfigAndDST(t *testing.T) {
 	resolved = executor.chatGPTWebTimezone()
 	if resolved.Timezone != "UTC" || resolved.OffsetMinutes != 0 {
 		t.Fatalf("updated UTC timezone = %#v", resolved)
+	}
+	if pinned := executor.chatGPTWebTimezoneForClient(client); pinned.Timezone != "America/New_York" || pinned.OffsetMinutes != 240 {
+		t.Fatalf("config update changed the in-flight request timezone: %#v", pinned)
 	}
 }
 

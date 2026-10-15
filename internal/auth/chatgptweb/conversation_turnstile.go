@@ -149,15 +149,17 @@ type conversationTurnstileLocationRef struct {
 // compact Sentinel challenge. ScriptSources should come from the same bootstrap
 // document used to create the requirements token.
 type ConversationTurnstileEnvironment struct {
-	Compatibility      *sentinelcompat.Policy
-	compatibilityUsage *atomic.Bool
-	Persona            Persona
-	BrowserEnvironment BrowserEnvironmentIdentity
-	DeviceID           string
-	PageStartedAt      time.Time
-	ScriptSources      []string
-	Location           string
-	LocalStorageKeys   []string
+	Compatibility         *sentinelcompat.Policy
+	compatibilityUsage    *atomic.Bool
+	Persona               Persona
+	BrowserEnvironment    BrowserEnvironmentIdentity
+	DeviceID              string
+	PageStartedAt         time.Time
+	ScriptSources         []string
+	Location              string
+	LocalStorageKeys      []string
+	Timezone              string
+	TimezoneOffsetMinutes int
 }
 
 type conversationTurnstileOrderedMap struct {
@@ -3917,11 +3919,11 @@ func (vm *conversationTurnstileVM) call(target any, args []any) (any, error) {
 			return args[0], nil
 		}
 	case "window.Date":
-		return nil, vm.compatibilityError(
-			SentinelCompatibilityUnsupportedValue,
-			"window.Date()",
-			conversationTurnstileTypeError("Date constructor is not modeled by the Go VM"),
-		)
+		zone, err := vm.challengeEnvironment.browserTimezone()
+		if err != nil {
+			return nil, err
+		}
+		return zone.dateString(vm.now()), nil
 	case "window.Date.now":
 		return float64(vm.now().UnixMilli()), nil
 	case "window.performance.now":

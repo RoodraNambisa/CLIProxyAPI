@@ -2444,6 +2444,13 @@ func (e *ChatGPTWebExecutor) chatGPTWebTimezone() config.ResolvedChatGPTWebTimez
 	return cfg.ResolvedTimezone(e.currentTime())
 }
 
+func (e *ChatGPTWebExecutor) chatGPTWebTimezoneForClient(client *chatgptwebauth.Client) config.ResolvedChatGPTWebTimezone {
+	if zone, ok := client.BrowserTimezone(); ok {
+		return config.ResolvedChatGPTWebTimezone{Timezone: zone.Name, OffsetMinutes: zone.OffsetMinutes}
+	}
+	return e.chatGPTWebTimezone()
+}
+
 func (e *ChatGPTWebExecutor) lifecycleContext() context.Context {
 	if e == nil {
 		return context.Background()

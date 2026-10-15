@@ -2,7 +2,7 @@ package chatgptweb
 
 import (
 	"encoding/base64"
-	"errors"
+	"strings"
 	"testing"
 	"time"
 )
@@ -151,9 +151,10 @@ func TestGoConversationTurnstileDocumentBodyAndDateNow(t *testing.T) {
 	}
 	vm.compatibilityErrors = true
 	vm.programKind = SentinelProgramObserverCollect
-	_, err = vm.call(conversationTurnstileObjectRef{path: "window.Date"}, nil)
-	var compatibility *SentinelCompatibilityError
-	if !errors.As(err, &compatibility) || compatibility.ProgramKind != SentinelProgramObserverCollect {
-		t.Fatalf("Date() compatibility error = %#v", err)
+	vm.challengeEnvironment.Timezone = "Asia/Tokyo"
+	vm.challengeEnvironment.TimezoneOffsetMinutes = -540
+	date, err := vm.call(conversationTurnstileObjectRef{path: "window.Date"}, nil)
+	if err != nil || !strings.Contains(date.(string), "GMT+0900 (Japan Standard Time)") {
+		t.Fatalf("Date() = %#v, %v", date, err)
 	}
 }
