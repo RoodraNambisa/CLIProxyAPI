@@ -102,6 +102,23 @@ func (vm *conversationTurnstileVM) newDOMElement(name string) (*conversationTurn
 
 func (vm *conversationTurnstileVM) callBrowserObjectRef(name string, args []any) (any, bool, error) {
 	switch name {
+	case "window.navigator.storage.estimate":
+		if err := vm.reserveRuntimeBytes(256); err != nil {
+			return nil, true, err
+		}
+		// The isolated solver has no persistent origin storage allocation.
+		// Each call returns a fresh, awaitable estimate of that empty allocation.
+		estimate := newConversationTurnstileOrderedMap()
+		estimate.set("quota", float64(0))
+		estimate.set("usage", float64(0))
+		promise := newConversationTurnstileOrderedMap()
+		promise.set("then", newConversationTurnstileCallable(func(callbacks []any) (any, error) {
+			if len(callbacks) > 0 {
+				return vm.call(callbacks[0], []any{estimate})
+			}
+			return conversationTurnstileUndefined, nil
+		}))
+		return promise, true, nil
 	case "window.addEventListener", "window.removeEventListener":
 		return conversationTurnstileUndefined, true, nil
 	case "window.dispatchEvent":
@@ -224,6 +241,12 @@ func (vm *conversationTurnstileVM) storageArgument(args []any, index int) (strin
 }
 
 func (vm *conversationTurnstileVM) browserObjectRefProperty(path, key string) (any, bool, error) {
+	if path == "window.navigator" && key == "storage" {
+		return conversationTurnstileObjectRef{path: "window.navigator.storage"}, true, nil
+	}
+	if path == "window.navigator.storage" && key == "estimate" {
+		return conversationTurnstileObjectRef{path: "window.navigator.storage.estimate"}, true, nil
+	}
 	if path != "window.localStorage" {
 		return nil, false, nil
 	}
@@ -524,6 +547,7 @@ func (vm *conversationTurnstileVM) knownEnvironmentProperty(object, propertyKey 
 func conversationTurnstileBrowserNativeObjectPath(path string) bool {
 	switch path {
 	case "window.addEventListener", "window.removeEventListener", "window.dispatchEvent",
+		"window.navigator.storage.estimate",
 		"window.document.createElement", "window.document.createElementNS",
 		"window.document.querySelector", "window.document.querySelectorAll",
 		"window.document.getElementById", "window.document.getElementsByTagName",
@@ -548,6 +572,8 @@ func conversationTurnstileBrowserObjectString(path string) (string, bool) {
 		return "[object Screen]", true
 	case "window.navigator":
 		return "[object Navigator]", true
+	case "window.navigator.storage":
+		return "[object StorageManager]", true
 	default:
 		return "", false
 	}

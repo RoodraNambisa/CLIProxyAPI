@@ -542,6 +542,13 @@
   defineReadonly(pluginArray, "length", 0, false);
   defineReadonly(mimeTypeArray, "length", 0, false);
   const userAgent = asString(config.user_agent, "Mozilla/5.0");
+  const storageManagerPrototype = {};
+  setObjectTag(storageManagerPrototype, "StorageManager");
+  // This isolated runtime does not allocate persistent browser-origin storage.
+  defineValue(storageManagerPrototype, "estimate", async function estimate() {
+    return { quota: 0, usage: 0 };
+  }, { enumerable: true });
+  const storageManager = Object.create(storageManagerPrototype);
   const navigatorValues = {
     userAgent,
     appVersion: userAgent.replace(/^Mozilla\//, ""),
@@ -563,6 +570,7 @@
     pdfViewerEnabled: true,
     plugins: pluginArray,
     mimeTypes: mimeTypeArray,
+    storage: storageManager,
   };
   for (const [key, value] of Object.entries(navigatorValues)) defineReadonly(navigatorPrototype, key, value);
   defineReadonly(host, "navigator", navigator, false);

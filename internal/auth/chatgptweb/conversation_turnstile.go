@@ -3477,6 +3477,15 @@ func (vm *conversationTurnstileVM) opCallResult(args []any) (any, error) {
 		return nil, err
 	}
 	value, err := vm.callReferenced(args[1], resolved)
+	if err == nil {
+		var settled bool
+		value, settled, err = vm.resolveThenable(value, 0)
+		if err == nil && !settled {
+			vm.deferred = true
+			vm.set(9, conversationTurnstileArrayValue(nil))
+			return nil, nil
+		}
+	}
 	if err != nil {
 		if fatalErr := conversationTurnstileFatalInstructionError(vm.ctx, err); fatalErr != nil {
 			return nil, fatalErr
