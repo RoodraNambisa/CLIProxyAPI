@@ -1,6 +1,7 @@
 package usage
 
 import (
+	"context"
 	"math"
 	"sort"
 	"strings"
@@ -38,6 +39,7 @@ type usageAggregateBucket struct {
 	AuthSources map[string]map[string]*aggregateStats
 	Sources     map[string]*aggregateStats
 	detailIDs   []uint64
+	failures    usageFailureCounts
 }
 
 type usageAggregateProjection struct {
@@ -205,6 +207,7 @@ func (b *usageAggregateBucket) add(apiName, modelName string, detail RequestDeta
 		modelName = "unknown"
 	}
 	b.Total.addDetail(detail)
+	b.failures.add(modelName, detail, 1)
 	ensureAggregate(b.APIs, apiName).addDetail(detail)
 	ensureAggregate(b.Models, modelName).addDetail(detail)
 	ensureNestedAggregate(b.APIModels, apiName, modelName).addDetail(detail)
@@ -253,6 +256,7 @@ func (b *usageAggregateBucket) remove(apiName, modelName string, detail RequestD
 		modelName = "unknown"
 	}
 	b.Total.removeDetail(detail)
+	b.failures.add(modelName, detail, -1)
 	removeAggregateDetail(b.APIs, apiName, detail)
 	removeAggregateDetail(b.Models, modelName, detail)
 	removeNestedAggregateDetail(b.APIModels, apiName, modelName, detail)
@@ -408,13 +412,19 @@ func (s *RequestStatistics) pruneExpiredBuckets(now time.Time) {
 }
 
 func (s *RequestStatistics) insertDetailRefLocked(ref usageDetailRef) {
-	if len(s.detailIndex) > 0 && ref.Timestamp.Before(s.detailIndex[len(s.detailIndex)-1].Timestamp) {
-		s.detailIndexDirty = true
+	if !s.detailIndexDirty {
+		s.detailIndexSorted = len(s.detailIndex)
+		if len(s.detailIndex) > 0 && detailRefCompare(ref, s.detailIndex[len(s.detailIndex)-1]) < 0 {
+			s.detailIndexDirty = true
+		} else {
+			s.detailIndexSorted++
+		}
 	}
 	s.detailIndex = append(s.detailIndex, ref)
 }
 
 func (s *RequestStatistics) rebuildDetailIndexLocked() {
+	s.detailIndexSorted = 0
 	s.detailIndex = make([]usageDetailRef, 0)
 	s.detailLocations = make(map[uint64]usageDetailLocation)
 	s.detailIndexTombstones = 0
@@ -489,20 +499,12 @@ func (s *RequestStatistics) compactDetailIndexLocked() {
 	clear(s.detailIndex[len(kept):])
 	s.detailIndex = kept
 	s.detailIndexTombstones = 0
+	s.detailIndexSorted = 0
+	s.detailIndexDirty = true
 }
 
 func (s *RequestStatistics) sortDetailIndexLocked() {
-	if !s.detailIndexDirty {
-		return
-	}
-	sort.Slice(s.detailIndex, func(i, j int) bool {
-		left, right := s.detailIndex[i], s.detailIndex[j]
-		if !left.Timestamp.Equal(right.Timestamp) {
-			return left.Timestamp.Before(right.Timestamp)
-		}
-		return left.ID < right.ID
-	})
-	s.detailIndexDirty = false
+	_ = s.sortDetailIndexContextLocked(context.Background())
 }
 
 func (s *RequestStatistics) aggregateRangeLocked(timeRange TimeRange) *usageAggregateBucket {

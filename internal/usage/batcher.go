@@ -1,6 +1,7 @@
 package usage
 
 import (
+	"context"
 	"sync/atomic"
 	"time"
 )
@@ -60,15 +61,28 @@ func (b *usageBatcher) enqueue(record preparedUsageRecord) {
 }
 
 func (b *usageBatcher) flush() {
+	_ = b.flushContext(context.Background())
+}
+
+func (b *usageBatcher) flushContext(ctx context.Context) error {
 	if b == nil {
-		return
+		return ctx.Err()
 	}
 	startedAt := time.Now()
 	done := make(chan struct{})
-	b.queue <- usageBatchItem{barrier: done}
-	<-done
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case b.queue <- usageBatchItem{barrier: done}:
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-done:
+	}
 	b.flushes.Add(1)
 	b.flushWaitNanos.Add(uint64(time.Since(startedAt)))
+	return ctx.Err()
 }
 
 func (b *usageBatcher) snapshot() UsageBatchRuntimeSnapshot {

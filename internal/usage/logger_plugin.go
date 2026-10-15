@@ -97,6 +97,9 @@ type RequestStatistics struct {
 	dayBuckets            map[int64]*usageAggregateBucket
 	detailIndex           []usageDetailRef
 	detailIndexDirty      bool
+	detailIndexSorted     int
+	queryGeneration       uint64
+	failureQueries        failureQueryCache
 	detailLocations       map[uint64]usageDetailLocation
 	detailIndexTombstones int
 	nextDetailID          uint64
@@ -763,6 +766,7 @@ func (s *RequestStatistics) ApplyPreparedRestore(prepared *RequestStatistics, ex
 }
 
 func (s *RequestStatistics) adoptPreparedLocked(prepared *RequestStatistics) {
+	s.queryGeneration++
 	s.totalRequests = prepared.totalRequests
 	s.successCount = prepared.successCount
 	s.failureCount = prepared.failureCount
@@ -789,6 +793,7 @@ func (s *RequestStatistics) adoptPreparedLocked(prepared *RequestStatistics) {
 	s.dayBuckets = prepared.dayBuckets
 	s.detailIndex = prepared.detailIndex
 	s.detailIndexDirty = prepared.detailIndexDirty
+	s.detailIndexSorted = prepared.detailIndexSorted
 	s.detailLocations = prepared.detailLocations
 	s.detailIndexTombstones = prepared.detailIndexTombstones
 	s.nextDetailID = prepared.nextDetailID
@@ -887,6 +892,7 @@ func (s *RequestStatistics) clearMetaWithState() (MetaSnapshot, uint64) {
 }
 
 func (s *RequestStatistics) resetLocked() {
+	s.queryGeneration++
 	s.totalRequests = 0
 	s.successCount = 0
 	s.failureCount = 0
@@ -912,6 +918,7 @@ func (s *RequestStatistics) resetLocked() {
 	s.legacyHourBuckets = make(map[legacyHourKey]*legacyHourStats)
 	s.detailIndex = nil
 	s.detailIndexDirty = false
+	s.detailIndexSorted = 0
 	s.detailLocations = make(map[uint64]usageDetailLocation)
 	s.detailIndexTombstones = 0
 	s.nextDetailID = 0
@@ -1471,6 +1478,7 @@ func (s *RequestStatistics) recordImported(apiName, modelName string, stats *api
 }
 
 func (s *RequestStatistics) rebuildLocked() {
+	s.queryGeneration++
 	s.totalRequests = 0
 	s.successCount = 0
 	s.failureCount = 0
@@ -1495,6 +1503,7 @@ func (s *RequestStatistics) rebuildLocked() {
 	s.legacyHourBuckets = make(map[legacyHourKey]*legacyHourStats)
 	s.detailIndex = nil
 	s.detailIndexDirty = false
+	s.detailIndexSorted = 0
 	s.detailLocations = make(map[uint64]usageDetailLocation)
 	s.detailIndexTombstones = 0
 	s.nextDetailID = 0

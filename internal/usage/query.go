@@ -1,6 +1,7 @@
 package usage
 
 import (
+	"context"
 	"sort"
 	"strings"
 	"time"
@@ -548,123 +549,13 @@ func (s *RequestStatistics) AuthModelSummaries(authIndex string) ([]AuthModelUsa
 
 // Details returns filtered request details in reverse chronological order.
 func (s *RequestStatistics) Details(query DetailQuery) DetailPage {
-	if s == nil {
-		query = normalizeDetailQuery(query)
-		return newDetailPage(nil, 0, query.Offset, query.Limit)
-	}
-	query = normalizeDetailQuery(query)
-	s.flushPending()
-
-	s.mu.RLock()
-	matches := make([]DetailEntry, 0)
-	for apiName, stats := range s.apis {
-		if stats == nil {
-			continue
-		}
-		if query.API != "" && apiName != query.API {
-			continue
-		}
-		for modelName, modelStatsValue := range stats.Models {
-			if modelStatsValue == nil {
-				continue
-			}
-			if query.Model != "" && modelName != query.Model {
-				continue
-			}
-			for _, detail := range modelStatsValue.Details {
-				if !detailMatchesQuery(detail, query) {
-					continue
-				}
-				matches = append(matches, DetailEntry{
-					API:           apiName,
-					Model:         modelName,
-					RequestDetail: publicRequestDetail(detail),
-				})
-			}
-		}
-	}
-	s.mu.RUnlock()
-
-	sortDetailEntries(matches, query.SortBy, query.SortOrder)
-
-	total := len(matches)
-	if query.Offset >= total {
-		return newDetailPage([]DetailEntry{}, total, query.Offset, query.Limit)
-	}
-	end := query.Offset + query.Limit
-	if end > total {
-		end = total
-	}
-	return newDetailPage(matches[query.Offset:end], total, query.Offset, query.Limit)
+	page, _ := s.DetailsContext(context.Background(), query)
+	return page
 }
 
 // FailureSummary returns failure-only aggregates for management diagnostics.
 func (s *RequestStatistics) FailureSummary(query FailureSummaryQuery) FailureSummary {
-	result := FailureSummary{
-		AsOf:           time.Now().UTC(),
-		ByErrorCode:    []FailureDimensionCount{},
-		ByFailureStage: []FailureDimensionCount{},
-		ByModel:        []FailureDimensionCount{},
-		BySource:       []FailureDimensionCount{},
-		ByHour:         []FailureDimensionCount{},
-	}
-	if s == nil {
-		return result
-	}
-	query.API = strings.TrimSpace(query.API)
-	query.Model = strings.TrimSpace(query.Model)
-	query.Source = strings.TrimSpace(query.Source)
-	s.flushPending()
-
-	errorCodes := map[string]int64{}
-	failureStages := map[string]int64{}
-	models := map[string]int64{}
-	sources := map[string]int64{}
-	hours := map[string]int64{}
-	s.mu.RLock()
-	for apiName, apiStatsValue := range s.apis {
-		if apiStatsValue == nil || (query.API != "" && apiName != query.API) {
-			continue
-		}
-		for modelName, modelStatsValue := range apiStatsValue.Models {
-			if modelStatsValue == nil || (query.Model != "" && modelName != query.Model) {
-				continue
-			}
-			for _, detail := range modelStatsValue.Details {
-				if !detail.Failed || !query.TimeRange.contains(detail.Timestamp) || (query.Source != "" && strings.TrimSpace(detail.Source) != query.Source) {
-					continue
-				}
-				result.Total++
-				if detail.Auxiliary {
-					result.Auxiliary++
-				} else {
-					result.Main++
-				}
-				if detail.CredentialSelected {
-					result.Boundaries.CredentialSelected++
-				}
-				if detail.UpstreamCommitted {
-					result.Boundaries.UpstreamCommitted++
-				}
-				if detail.AuthRequestSlotConsumed {
-					result.Boundaries.AuthRequestSlotConsumed++
-				}
-				incrementFailureDimension(errorCodes, detail.ErrorCode, "unknown")
-				incrementFailureDimension(failureStages, detail.FailureStage, "unknown")
-				incrementFailureDimension(models, modelName, "unknown")
-				incrementFailureDimension(sources, detail.Source, "unknown")
-				hour := detail.Timestamp.UTC().Truncate(time.Hour).Format(time.RFC3339)
-				incrementFailureDimension(hours, hour, "unknown")
-			}
-		}
-	}
-	s.mu.RUnlock()
-
-	result.ByErrorCode = sortedFailureDimensionCounts(errorCodes, result.Total)
-	result.ByFailureStage = sortedFailureDimensionCounts(failureStages, result.Total)
-	result.ByModel = sortedFailureDimensionCounts(models, result.Total)
-	result.BySource = sortedFailureDimensionCounts(sources, result.Total)
-	result.ByHour = sortedFailureDimensionCounts(hours, result.Total)
+	result, _ := s.FailureSummaryContext(context.Background(), query)
 	return result
 }
 

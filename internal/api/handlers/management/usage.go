@@ -174,7 +174,12 @@ func (h *Handler) GetUsageDetails(c *gin.Context) {
 	}
 	var page usage.DetailPage
 	if stats := h.usageStatisticsSnapshot(); stats != nil {
-		page = stats.Details(query)
+		var err error
+		page, err = stats.DetailsContext(c.Request.Context(), query)
+		if err != nil {
+			c.Status(http.StatusRequestTimeout)
+			return
+		}
 	} else {
 		page = usage.DetailPage{RequestPathSupported: true, Items: []usage.DetailEntry{}, Details: []usage.DetailEntry{}, Limit: query.Limit}
 	}
@@ -195,7 +200,12 @@ func (h *Handler) GetUsageFailureSummary(c *gin.Context) {
 	}
 	var summary usage.FailureSummary
 	if stats := h.usageStatisticsSnapshot(); stats != nil {
-		summary = stats.FailureSummary(query)
+		var err error
+		summary, err = stats.FailureSummaryContext(c.Request.Context(), query)
+		if err != nil {
+			c.Status(http.StatusRequestTimeout)
+			return
+		}
 	} else {
 		summary = (*usage.RequestStatistics)(nil).FailureSummary(query)
 	}
