@@ -38,6 +38,11 @@ func newConnectionTracker() *connectionTracker {
 }
 
 func (tracker *connectionTracker) dialerFactory(configuredProxyURL string) tls_client.ProxyDialerFactory {
+	return browserProxyDialerFactory(configuredProxyURL, tracker)
+}
+
+// browserProxyDialerFactory keeps CONNECT cancellation independent of timeouts.
+func browserProxyDialerFactory(configuredProxyURL string, tracker *connectionTracker) tls_client.ProxyDialerFactory {
 	configuredProxyURL = strings.TrimSpace(configuredProxyURL)
 	return func(
 		_ string,
@@ -53,6 +58,9 @@ func (tracker *connectionTracker) dialerFactory(configuredProxyURL string) tls_c
 		base, _, errBuild := proxyutil.BuildContextDialer(raw)
 		if errBuild != nil {
 			return nil, errBuild
+		}
+		if tracker == nil {
+			return base, nil
 		}
 		return &trackedConnectionDialer{base: base, tracker: tracker}, nil
 	}

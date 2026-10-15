@@ -254,7 +254,14 @@ func newBrowserHTTPClient(
 			options = append(options, tls_client.WithTransportOptions(&tls_client.TransportOptions{DisableKeepAlives: true}))
 		}
 	} else if proxyURL != "" {
-		options = append(options, tls_client.WithProxyUrl(proxyURL))
+		parsedProxy, errParse := url.Parse(proxyURL)
+		if errParse == nil && (strings.EqualFold(parsedProxy.Scheme, "http") || strings.EqualFold(parsedProxy.Scheme, "https")) {
+			// The dependency's CONNECT dialer treats a zero timeout as an
+			// immediate deadline. Our shared dialer uses request cancellation.
+			options = append(options, tls_client.WithProxyDialerFactory(browserProxyDialerFactory(proxyURL, nil)))
+		} else {
+			options = append(options, tls_client.WithProxyUrl(proxyURL))
+		}
 	}
 	httpClient, err := tls_client.NewHttpClient(tls_client.NewNoopLogger(), options...)
 	if err != nil {
