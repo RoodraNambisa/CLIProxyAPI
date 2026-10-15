@@ -137,6 +137,17 @@ func (index *requestLimitReadyIndex) exclude(entry *scheduledAuth, block authReq
 	if !exists {
 		return
 	}
+	// A release/reset may already have been consumed while creating or syncing
+	// this index after the failed reservation. Recheck before caching its result;
+	// a later release is covered by the next availability journal synchronization.
+	window, _ := authRequestWindowAt(now, block.windowMinutes)
+	index.limiter.mu.Lock()
+	current, present := index.limiter.counts[entry.auth.ID]
+	stillLimited := present && current.window == window && current.windowMinutes == block.windowMinutes && current.limit == block.limit && current.count >= current.limit
+	index.limiter.mu.Unlock()
+	if !stillLimited {
+		return
+	}
 	last := len(index.available) - 1
 	index.available[position] = index.available[last]
 	if index.available[position] != nil {

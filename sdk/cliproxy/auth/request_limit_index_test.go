@@ -145,6 +145,43 @@ func TestRequestLimitIndexRestoresReleasedReservationAcrossViews(t *testing.T) {
 	slot.Release()
 }
 
+func TestRequestLimitIndexDoesNotPublishStaleBlockAfterReleaseNotification(t *testing.T) {
+	for _, change := range []string{"release", "reset", "remove"} {
+		t.Run(change, func(t *testing.T) {
+			now := time.Now()
+			limiter := newAuthRequestWindowLimiter()
+			policy := authRequestLimitPolicy{limit: 1, windowMinutes: 1}
+			reservation, ok, _ := limiter.reserveAt("chosen", policy, now)
+			if !ok {
+				t.Fatal("reservation failed")
+			}
+			_, acquired, oldBlock := limiter.reserveAt("chosen", policy, now)
+			if acquired || !oldBlock.limited() {
+				t.Fatal("expected exhausted result")
+			}
+			switch change {
+			case "release":
+				reservation.Release()
+			case "reset":
+				limiter.reset(1)
+			case "remove":
+				limiter.remove("chosen")
+			}
+			view := buildReadyView([]*scheduledAuth{{auth: &Auth{ID: "chosen"}}})
+			index := view.requestLimitIndex(limiter, now)
+			// The availability notification is consumed before the old result
+			// reaches the view. It must not strand a newly available credential.
+			index.exclude(view.flat[0], oldBlock, now)
+			if len(index.excluded) != 0 || len(index.available) != 1 {
+				t.Fatal("published stale request-limit exclusion")
+			}
+			if picked, _ := view.pickWithRequestLimit(schedulerStrategyRandom, nil, func(*Auth) authRequestLimitPolicy { return policy }, limiter); picked == nil {
+				t.Fatal("lost released capacity")
+			}
+		})
+	}
+}
+
 func TestRequestLimitIndexExpiryResetAndMissedChanges(t *testing.T) {
 	for _, transition := range []string{"expiry", "reset", "remove", "journal_overflow"} {
 		t.Run(transition, func(t *testing.T) {
