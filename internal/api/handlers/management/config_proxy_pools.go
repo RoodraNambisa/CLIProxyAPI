@@ -70,13 +70,14 @@ func (h *Handler) PatchProxyPool(c *gin.Context) {
 		Ports       *string `json:"ports"`
 	}
 	var body struct {
-		Name                 *string       `json:"name"`
-		PlaceholderCharset   *string       `json:"placeholder-charset"`
-		CheckIntervalSeconds *int          `json:"check-interval-seconds"`
-		BindAttempts         *int          `json:"bind-attempts"`
-		SpreadBindings       *bool         `json:"spread-bindings"`
-		Entries              *[]entryPatch `json:"entries"`
-		DeleteEntryIDs       []string      `json:"delete-entry-ids"`
+		Name                 *string                   `json:"name"`
+		PlaceholderCharset   *string                   `json:"placeholder-charset"`
+		Region               *config.ProxyRegionConfig `json:"region"`
+		CheckIntervalSeconds *int                      `json:"check-interval-seconds"`
+		BindAttempts         *int                      `json:"bind-attempts"`
+		SpreadBindings       *bool                     `json:"spread-bindings"`
+		Entries              *[]entryPatch             `json:"entries"`
+		DeleteEntryIDs       []string                  `json:"delete-entry-ids"`
 	}
 	if errBind := c.ShouldBindJSON(&body); errBind != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
@@ -104,6 +105,9 @@ func (h *Handler) PatchProxyPool(c *gin.Context) {
 	}
 	if body.PlaceholderCharset != nil {
 		pools[index].PlaceholderCharset = *body.PlaceholderCharset
+	}
+	if body.Region != nil {
+		pools[index].Region = *body.Region
 	}
 	if body.CheckIntervalSeconds != nil {
 		pools[index].CheckIntervalSeconds = *body.CheckIntervalSeconds

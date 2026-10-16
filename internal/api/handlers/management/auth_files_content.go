@@ -154,7 +154,7 @@ func (h *Handler) validateAuthFileContent(current *coreauth.Auth, metadata map[s
 		return errors.New("invalid credential JSON: check credential fields, weight and error rules")
 	}
 	editableFields := make(map[string]any)
-	for _, field := range []string{"prefix", "proxy_url", "headers", "priority", "weight", "note", "base_url", "using_api", "websockets", "excluded_models", "disable_cooling", "login_method", "api798_url", "codex_fingerprint_mode", "request_scoped_errors", "xai_model_catalog_sources", "xai_model_routes"} {
+	for _, field := range []string{"prefix", "proxy_url", "proxy_region", "headers", "priority", "weight", "note", "base_url", "using_api", "websockets", "excluded_models", "disable_cooling", "login_method", "api798_url", "codex_fingerprint_mode", "request_scoped_errors", "xai_model_catalog_sources", "xai_model_routes"} {
 		if value, exists := metadata[field]; exists && !reflect.DeepEqual(current.Metadata[field], value) {
 			editableFields[field] = value
 		}

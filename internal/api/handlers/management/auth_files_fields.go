@@ -382,13 +382,17 @@ func decodeAuthFileFieldValues(raw json.RawMessage) (authFileFieldValues, error)
 				return authFileFieldValues{}, fmt.Errorf("invalid api798_url")
 			}
 			values.api798URL = &decoded
-		case config.CodexTimeContextMetadataKey, config.WebRegionMetadataKey:
+		case config.CodexTimeContextMetadataKey, config.WebRegionMetadataKey, config.ProxyRegionMetadataKey:
 			var policy any
 			if err := json.Unmarshal(value, &policy); err != nil {
 				return values, err
 			}
 			if policy != nil {
-				if name == config.CodexTimeContextMetadataKey {
+				if name == config.ProxyRegionMetadataKey {
+					if _, err := config.ReadProxyRegion(policy); err != nil {
+						return values, err
+					}
+				} else if name == config.CodexTimeContextMetadataKey {
 					if _, err := config.EffectiveCodexTimeContext(config.CodexTimeContextConfig{}, policy); err != nil {
 						return values, err
 					}

@@ -344,15 +344,22 @@ proxy-url: ""
 #       - id: "geo"
 #         url-template: "http://user-session-{9}:pass@geo.example:18080"
 
+# Manual values apply only while the global proxy is actually selected.
+# proxy-region: {timezone: "Asia/Tokyo", language: "ja-JP"}
+# Pools and pool entries accept region: {timezone: "Asia/Tokyo", language: "ja-JP"}.
+# Credential files use proxy_region; configured Codex keys use proxy-region.
+
 # Shared IP metadata. Exit detection is owned by proxy management below.
 # Saving these settings does not enable any provider's region overrides.
 proxy-ip:
   lookup-url: "https://ipwho.is/{ip}"
   lookup-timeout-seconds: 8
+  lookup-concurrency: 8
   ip-cache-ttl-seconds: 86400
-  ip-cache-size: 100000
+  ip-cache-size: 100000 # Idle records only; actively referenced IPs are protected.
   refresh-mode: "lazy" # lazy or scheduled; only metadata is refreshed.
-  cold-cache-mode: "fallback" # fallback immediately or wait within the lookup budget.
+  cold-cache-mode: "fallback" # lazy+wait prepares missing initial data; lazy+fallback fetches on use.
+  # Scheduled mode always prepares and refreshes; wait only controls cold requests.
   refresh-batch-size: 64
   refresh-interval-seconds: 5
 

@@ -25,7 +25,7 @@ func (h *Handler) GetProxyIP(c *gin.Context) {
 	health, _ := config.NormalizeProxyHealthCheckConfiguration(cfg.EffectiveProxyHealthCheck())
 	common["temporary-route-check-interval-seconds"] = *health.TemporaryRouteCheckIntervalSeconds
 	common["temporary-route-cache-size"] = *health.TemporaryRouteCacheSize
-	c.JSON(200, gin.H{"config": common, "legacy": cfg.ProxyIP == nil, "capabilities": gin.H{"proxy_ip": true, "scheduled_refresh": true, "cold_cache_wait": true, "codex_time_context": true, "credential_region": true}})
+	c.JSON(200, gin.H{"config": common, "proxy_region": cfg.ProxyRegion, "legacy": cfg.ProxyIP == nil, "capabilities": gin.H{"proxy_ip": true, "scheduled_refresh": true, "cold_cache_wait": true, "codex_time_context": true, "credential_region": true, "region_lifecycle": true, "proxy_region": true}})
 }
 func (h *Handler) PatchProxyIP(c *gin.Context) {
 	var fields map[string]json.RawMessage
@@ -40,6 +40,19 @@ func (h *Handler) PatchProxyIP(c *gin.Context) {
 		return
 	}
 	candidate := h.cfg.EffectiveProxyIP()
+	region := h.cfg.ProxyRegion
+	if raw, ok := fields["proxy-region"]; ok {
+		if err := strictRegionJSON(raw, &region); err != nil {
+			c.JSON(400, gin.H{"error": err.Error()})
+			return
+		}
+		if err := region.Validate(); err != nil {
+			c.JSON(400, gin.H{"error": err.Error()})
+			return
+		}
+		delete(fields, "proxy-region")
+	}
+
 	health := h.cfg.EffectiveProxyHealthCheck()
 	for _, key := range []string{"temporary-route-check-interval-seconds", "temporary-route-cache-size"} {
 		if raw, ok := fields[key]; ok {
@@ -72,12 +85,15 @@ func (h *Handler) PatchProxyIP(c *gin.Context) {
 		c.JSON(400, gin.H{"error": err.Error()})
 		return
 	}
+	previousRegion := h.cfg.ProxyRegion
+	h.cfg.ProxyRegion = region
 	previous := h.cfg.ProxyIP
 	previousHealth := h.cfg.ProxyHealthCheck
 	h.cfg.ProxyHealthCheck = health
 	h.cfg.ProxyIP = &candidate
 	if !h.persistLocked(c) {
 		h.cfg.ProxyIP = previous
+		h.cfg.ProxyRegion = previousRegion
 		h.cfg.ProxyHealthCheck = previousHealth
 	}
 }
@@ -93,7 +109,7 @@ func (h *Handler) GetProxyIPStatus(c *gin.Context) {
 	offset, _ := strconv.Atoi(c.Query("offset"))
 	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "50"))
 	entries, routes, ips := manager.IPRegions().Status(offset, limit)
-	c.JSON(200, gin.H{"entries": entries, "route_count": routes, "ip_count": ips, "offset": max(0, offset), "limit": min(200, max(1, limit))})
+	c.JSON(200, gin.H{"counts": manager.IPRegions().Counts(), "entries": entries, "route_count": routes, "ip_count": ips, "offset": max(0, offset), "limit": min(200, max(1, limit))})
 }
 func (h *Handler) PreviewProxyIP(c *gin.Context) { h.proxyIPLookup(c, false) }
 func (h *Handler) RefreshProxyIP(c *gin.Context) { h.proxyIPLookup(c, true) }
@@ -130,13 +146,27 @@ func (h *Handler) proxyIPLookup(c *gin.Context, refresh bool) {
 	if auth.Provider == "codex" {
 		target = helps.ResolveCodexUpstream(routed, h.currentConfig()).BaseURL
 	}
-	route := proxyregion.Route{ProxyURL: helps.ResolvedRequestProxy(h.currentConfig(), routed, target), BindingID: resolved.BindingID, Scope: proxyregion.ScopeForTarget(target)}
+	route := proxyregion.Route{ProxyURL: helps.ResolvedRequestProxy(h.currentConfig(), routed, target), BindingID: resolved.BindingID, OwnerID: auth.ID, Scope: proxyregion.ScopeForTarget(target)}
 	service := manager.IPRegions()
 	reason := ""
 	if refresh {
 		reason = service.Refresh(route)
 	}
 	snapshot := service.Preview(route)
+	manual, source := service.Manual(route)
+	if manual.Timezone != "" {
+		snapshot.Timezone = manual.Timezone
+		snapshot.TimezoneSource = source
+	}
+	if manual.Language != "" {
+		snapshot.SuggestedLanguage = manual.Language
+		snapshot.LanguageSource = source
+	}
+
+	if manual.Timezone != "" && (auth.Provider == "codex" || manual.Language != "") {
+		snapshot.CacheState = "manual"
+		snapshot.Reason = ""
+	}
 	status := 200
 	if refresh {
 		status = 202

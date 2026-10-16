@@ -1389,6 +1389,7 @@ func (h *Handler) PatchCodexKey(c *gin.Context) {
 		APIKey              *string                     `json:"api-key"`
 		Prefix              *string                     `json:"prefix"`
 		BaseURL             *string                     `json:"base-url"`
+		ProxyRegion         *config.ProxyRegionConfig   `json:"proxy-region"`
 		ProxyURL            *string                     `json:"proxy-url"`
 		Models              *[]config.CodexModel        `json:"models"`
 		AlphaSearch         *bool                       `json:"alpha-search"`
@@ -1458,6 +1459,13 @@ func (h *Handler) PatchCodexKey(c *gin.Context) {
 			return
 		}
 		entry.BaseURL = trimmed
+	}
+	if body.Value.ProxyRegion != nil {
+		if err := body.Value.ProxyRegion.Validate(); err != nil {
+			c.JSON(400, gin.H{"error": err.Error()})
+			return
+		}
+		entry.ProxyRegion = *body.Value.ProxyRegion
 	}
 	if body.Value.ProxyURL != nil {
 		proxyURL, errProxy := applyProxyURLPatch(entry.ProxyURL, body.Value.ProxyURL, replaceMaskedProxyRequested(c))
