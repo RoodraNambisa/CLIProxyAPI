@@ -629,7 +629,7 @@ type LoginProxyConfig struct {
 }
 
 type Options struct {
-	ResolveBrowserRegion     func(string, Persona) BrowserRegionSnapshot
+	ResolveBrowserRegion     func(context.Context, string, Persona) BrowserRegionSnapshot
 	AuthBaseURL              string
 	SessionBaseURL           string
 	SentinelBaseURL          string

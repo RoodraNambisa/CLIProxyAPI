@@ -90,10 +90,12 @@ type ProxyPoolEntryConfig struct {
 
 // ProxyHealthCheckConfig controls process-wide scheduled and management proxy probes.
 type ProxyHealthCheckConfig struct {
-	Concurrency            int                              `yaml:"concurrency,omitempty" json:"concurrency,omitempty"`
-	EndpointTimeoutSeconds int                              `yaml:"endpoint-timeout-seconds,omitempty" json:"endpoint-timeout-seconds,omitempty"`
-	FailureThreshold       int                              `yaml:"failure-threshold,omitempty" json:"failure-threshold,omitempty"`
-	Endpoints              []ProxyHealthCheckEndpointConfig `yaml:"endpoints,omitempty" json:"endpoints,omitempty"`
+	TemporaryRouteCheckIntervalSeconds *int                             `yaml:"temporary-route-check-interval-seconds,omitempty" json:"temporary-route-check-interval-seconds,omitempty"`
+	TemporaryRouteCacheSize            *int                             `yaml:"temporary-route-cache-size,omitempty" json:"temporary-route-cache-size,omitempty"`
+	Concurrency                        int                              `yaml:"concurrency,omitempty" json:"concurrency,omitempty"`
+	EndpointTimeoutSeconds             int                              `yaml:"endpoint-timeout-seconds,omitempty" json:"endpoint-timeout-seconds,omitempty"`
+	FailureThreshold                   int                              `yaml:"failure-threshold,omitempty" json:"failure-threshold,omitempty"`
+	Endpoints                          []ProxyHealthCheckEndpointConfig `yaml:"endpoints,omitempty" json:"endpoints,omitempty"`
 }
 
 // ProxyHealthCheckEndpointConfig defines one ordered health-check endpoint.

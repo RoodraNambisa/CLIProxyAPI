@@ -122,12 +122,6 @@ chatgpt-web:
     auto-timezone: false
     auto-language: false
     language: ""
-    lookup-url: "https://ipwho.is/{ip}"
-    lookup-timeout-seconds: 8
-    # Soft refresh age. Failures preserve applicable last-known successful values.
-    cache-ttl-seconds: 21600
-    route-cache-size: 4096
-    ip-cache-size: 4096
   # Omit this field to derive the current offset, including DST, from timezone.
   # timezone-offset-minutes: 0
   # ChatGPT Web does not return API token usage. Estimate visible input/output
@@ -347,8 +341,22 @@ proxy-url: ""
 #       - id: "geo"
 #         url-template: "http://user-session-{9}:pass@geo.example:18080"
 
+# Shared IP metadata. Exit detection is owned by proxy management below.
+# Saving these settings does not enable any provider's region overrides.
+proxy-ip:
+  lookup-url: "https://ipwho.is/{ip}"
+  lookup-timeout-seconds: 8
+  ip-cache-ttl-seconds: 86400
+  ip-cache-size: 100000
+  refresh-mode: "lazy" # lazy or scheduled; only metadata is refreshed.
+  cold-cache-mode: "fallback" # fallback immediately or wait within the lookup budget.
+  refresh-batch-size: 64
+  refresh-interval-seconds: 5
+
 # Shared settings for scheduled and management proxy health checks.
 # proxy-health-check:
+#   temporary-route-check-interval-seconds: 300 # Only explicit/global/environment proxies, not pool bindings.
+#   temporary-route-cache-size: 100000 # Bound observations never use this LRU limit.
 #   concurrency: 8 # Global limit shared by scheduled rounds and management checks.
 #   endpoint-timeout-seconds: 8 # Complete-request timeout for each endpoint attempt.
 #   failure-threshold: 1 # Consecutive failed probes before a previously usable node is isolated.
@@ -956,6 +964,12 @@ xai:
 # `same-account-only` keeps only states known to belong to the selected account, and `strip` removes all.
 # Upstream response states are always recorded and returned to the client. The default is `guard-cross-account`.
 # codex:
+#   time-context:
+#     enabled: false
+#     mode: "proxy" # proxy or manual. Credential overrides also allow inherit/off.
+#     timezone: "" # Manual IANA timezone.
+#     lookup-failure: "preserve" # preserve client context or use fallback.
+#     fallback-timezone: ""
 #   # OAuth model requests only: Responses (HTTP/SSE/WebSocket), compact, images and alpha/search.
 #   # Empty keeps https://chatgpt.com/backend-api/codex. A credential's base_url overrides this.
 #   # Supply a Codex-compatible base without /responses, query, fragment or URL credentials.

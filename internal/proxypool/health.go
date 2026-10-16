@@ -17,43 +17,40 @@ import (
 
 func (m *Manager) checkProxy(ctx context.Context, proxyURL string) TraceResult {
 	if m == nil {
-		return TraceResult{CheckedAt: time.Now().UTC(), Error: "manager_unavailable", Message: "proxy pool manager is unavailable"}
+		return TraceResult{Error: "manager_unavailable"}
 	}
-	if m.check != nil {
-		return m.check(ctx, proxyURL)
-	}
-	healthConfig, errConfig := internalconfig.NormalizeProxyHealthCheckConfiguration(internalconfig.ProxyHealthCheckConfig{})
-	if errConfig != nil {
-		return TraceResult{CheckedAt: time.Now().UTC(), Error: "invalid_health_config", Message: "proxy health configuration is invalid"}
-	}
-	if snapshot := m.snapshot(); snapshot != nil {
-		healthConfig = snapshot.health
+	snapshot := m.snapshot()
+	if snapshot == nil {
+		return TraceResult{Error: "invalid_health_config"}
 	}
 	var last TraceResult
-	for _, endpoint := range healthConfig.Endpoints {
-		result := proxyutil.CheckTrace(ctx, proxyURL, proxyutil.TraceOptions{
-			Endpoint: endpoint.URL,
-			Timeout:  time.Duration(healthConfig.EndpointTimeoutSeconds) * time.Second,
-			Mode:     endpoint.Mode,
-		})
-		last = TraceResult{
-			OK:        result.OK,
-			Endpoint:  endpoint.Name,
-			IP:        result.IP,
-			Location:  result.Location,
-			HTTP:      result.HTTP,
-			TLS:       result.TLS,
-			Colo:      result.Colo,
-			ElapsedMS: result.Elapsed.Milliseconds(),
-			CheckedAt: time.Now().UTC(),
-			Error:     result.Error,
-			Message:   result.Message,
-		}
-		if result.OK || (ctx != nil && ctx.Err() != nil) {
+	for _, endpoint := range snapshot.health.Endpoints {
+		last = m.checkProxyTarget(ctx, proxyURL, endpoint, snapshot)
+		if last.OK || ctx.Err() != nil {
 			return last
 		}
 	}
 	return last
+}
+
+// Every scheduled, manual and metadata-driven check shares this flight key.
+func (m *Manager) checkProxyTarget(ctx context.Context, proxy string, endpoint internalconfig.ProxyHealthCheckEndpointConfig, snapshot *configSnapshot) TraceResult {
+	key := proxy + "\n" + endpoint.URL + "\n" + endpoint.Mode + "\n" + snapshot.signature
+	value, _, _ := m.checkFlights.Do(key, func() (any, error) {
+		if m.check != nil {
+			result := m.check(ctx, proxy)
+			if result.Endpoint == "" {
+				result.Endpoint = endpoint.URL
+			}
+			if result.CheckedAt.IsZero() {
+				result.CheckedAt = m.now()
+			}
+			return result, nil
+		}
+		result := proxyutil.CheckTrace(ctx, proxy, proxyutil.TraceOptions{Endpoint: endpoint.URL, Mode: endpoint.Mode, Timeout: time.Duration(snapshot.health.EndpointTimeoutSeconds) * time.Second})
+		return TraceResult{OK: result.OK, Endpoint: endpoint.Name, IP: result.IP, Location: result.Location, HTTP: result.HTTP, TLS: result.TLS, Colo: result.Colo, ElapsedMS: result.Elapsed.Milliseconds(), CheckedAt: m.now(), Error: result.Error, Message: result.Message}, nil
+	})
+	return value.(TraceResult)
 }
 
 // Start launches health checks for currently bound nodes only.
@@ -68,6 +65,12 @@ func (m *Manager) Start(parent context.Context) {
 	if m.cancel != nil {
 		m.lifecycleMu.Unlock()
 		return
+	}
+	if m.regions != nil {
+		m.regions.Resume(parent)
+	}
+	if m.exits != nil {
+		m.exits.resume(parent)
 	}
 	ctx, cancel := context.WithCancel(parent)
 	done := make(chan struct{})
@@ -104,6 +107,12 @@ func (m *Manager) Stop() {
 		return
 	}
 	m.lifecycleMu.Lock()
+	if m.regions != nil {
+		m.regions.Close()
+	}
+	if m.exits != nil {
+		m.exits.close()
+	}
 	cancel := m.cancel
 	done := m.done
 	if cancel != nil {
@@ -217,6 +226,9 @@ func (m *Manager) checkBoundPool(ctx context.Context, poolKey string, bindings [
 		}
 		m.admission.recordResult(result.OK)
 		m.storeBoundHealthWithThreshold(snapshot, item.binding, item.url, result, item.epoch)
+		if m.exits != nil {
+			m.exits.refreshBound(ctx, snapshot, item.binding, item.url)
+		}
 		m.recordPoolRoundResult(poolKey, result.OK)
 	})
 	if ctx != nil && ctx.Err() != nil {
@@ -536,6 +548,14 @@ func (m *Manager) removeBindings(candidates []bindingRemovalCandidate) error {
 		delete(m.health, bindingID)
 	}
 	m.mu.Unlock()
+	for _, bindingID := range removedBindingIDs {
+		if m.exits != nil {
+			m.exits.forget(bindingID)
+		}
+		if m.regions != nil {
+			m.regions.ForgetBinding(bindingID)
+		}
+	}
 	return nil
 }
 

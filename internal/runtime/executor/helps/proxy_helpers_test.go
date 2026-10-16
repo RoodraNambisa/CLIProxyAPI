@@ -362,3 +362,14 @@ func TestEnvironmentTransportCacheReplacesChangedSignature(t *testing.T) {
 		t.Fatalf("environment cache = %q %p, want two %p", cache.signature, cache.transport, second)
 	}
 }
+
+func TestRegionProxyPinsEnvironmentAtBusinessTarget(t *testing.T) {
+	setEnvironmentProxy(t, "http://region-env-proxy.example:8080")
+	t.Setenv("NO_PROXY", "ipwho.is")
+	if got := ResolvedRequestProxy(nil, nil, "wss://chatgpt.com/backend-api/codex/responses"); got != "http://region-env-proxy.example:8080" {
+		t.Fatalf("WSS environment route = %q", got)
+	}
+	if got := ResolvedRequestProxy(nil, nil, "https://ipwho.is/8.8.8.8"); got != "direct" {
+		t.Fatalf("fixture NO_PROXY ignored = %q", got)
+	}
+}

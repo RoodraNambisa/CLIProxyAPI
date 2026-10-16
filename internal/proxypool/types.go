@@ -47,6 +47,7 @@ type TraceResult struct {
 }
 
 type nodeHealth struct {
+	LastSuccess *TraceResult
 	TraceResult
 	Pool          string
 	Entry         string

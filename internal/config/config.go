@@ -290,6 +290,7 @@ func mergedConfigContainsDeprecatedAmp(node *yaml.Node, visited map[*yaml.Node]s
 
 // Config represents the application's configuration, loaded from a YAML file.
 type Config struct {
+	ProxyIP   *ProxyIPConfig `yaml:"proxy-ip,omitempty" json:"proxy-ip,omitempty"`
 	SDKConfig `yaml:",inline"`
 	// Host is the network host/interface on which the API server will bind.
 	// Default is empty ("") to bind all interfaces (IPv4 + IPv6). Use "127.0.0.1" or "localhost" for local-only access.
@@ -554,6 +555,7 @@ type CodexHeaderDefaults struct {
 
 // CodexConfig configures provider-wide Codex request behavior.
 type CodexConfig struct {
+	TimeContext CodexTimeContextConfig `yaml:"time-context,omitempty" json:"time-context"`
 	// BaseURL overrides the default Codex OAuth model endpoint, not OAuth or quota endpoints.
 	BaseURL string `yaml:"base-url" json:"base-url"`
 	// AutoCookie passively stores allowlisted upstream cookies per credential.
@@ -2012,6 +2014,7 @@ func (m ClaudeModel) GetThinking() *registry.ThinkingSupport { return m.Thinking
 // CodexKey represents the configuration for a Codex API key,
 // including the API key itself and an optional base URL for the API endpoint.
 type CodexKey struct {
+	TimeContext         *CodexTimeContextConfig  `yaml:"time-context,omitempty" json:"time-context,omitempty"`
 	RequestScopedErrors []RequestScopedErrorRule `yaml:"request-scoped-errors,omitempty" json:"request-scoped-errors,omitempty"`
 	// RequestRetry overrides additional credential retry rounds. Nil inherits;
 	// negative values act as zero. Values above MaxCredentialRequestRetry are invalid.
@@ -2394,6 +2397,12 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	}
 	if errState := cfg.ValidateCodexStateOverride(); errState != nil {
 		return nil, errState
+	}
+	if errTime := cfg.ValidateTimeContext(); errTime != nil {
+		return nil, errTime
+	}
+	if errIP := cfg.ValidateProxyIP(); errIP != nil {
+		return nil, errIP
 	}
 	if errGuard := cfg.ValidateCodexResponseGuard(); errGuard != nil {
 		return nil, errGuard
@@ -4104,6 +4113,12 @@ func SaveConfigPreserveComments(configFile string, cfg *Config) error {
 	if errState := cfg.ValidateCodexStateOverride(); errState != nil {
 		return errState
 	}
+	if errTime := cfg.ValidateTimeContext(); errTime != nil {
+		return errTime
+	}
+	if errIP := cfg.ValidateProxyIP(); errIP != nil {
+		return errIP
+	}
 	if errGuard := cfg.ValidateCodexResponseGuard(); errGuard != nil {
 		return errGuard
 	}
@@ -4216,6 +4231,24 @@ func SaveConfigPreserveComments(configFile string, cfg *Config) error {
 
 	// Merge generated into original in-place, preserving comments/order of existing nodes.
 	mergeMappingPreserve(original.Content[0], generated.Content[0])
+	if persistCfg.ProxyIP != nil {
+		idx := findMapKeyIndex(original.Content[0], "chatgpt-web")
+		var web *yaml.Node
+		if idx >= 0 {
+			web = original.Content[0].Content[idx+1]
+		}
+		if web != nil && web.Kind == yaml.MappingNode {
+			i := findMapKeyIndex(web, "browser-region")
+			if i >= 0 {
+				region := web.Content[i+1]
+				if region.Kind == yaml.MappingNode {
+					for _, key := range []string{"lookup-url", "lookup-timeout-seconds", "cache-ttl-seconds", "route-cache-size", "ip-cache-size"} {
+						removeMapKey(region, key)
+					}
+				}
+			}
+		}
+	}
 	normalizeCollectionNodeStyles(original.Content[0])
 
 	// Write back.

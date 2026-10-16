@@ -1,13 +1,14 @@
 package config
 
 import (
-	"gopkg.in/yaml.v3"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 func TestChatGPTWebBrowserRegionConfiguration(t *testing.T) {
 	defaults := ChatGPTWebBrowserRegionConfig{}.Resolved()
-	if defaults.AutoTimezone || defaults.AutoLanguage || defaults.CacheTTLSeconds != 21600 || defaults.RouteCacheSize != 4096 || defaults.IPCacheSize != 4096 {
+	if defaults.AutoTimezone || defaults.AutoLanguage || defaults.CacheTTLSeconds != 21600 || defaults.RouteCacheSize != 100000 || defaults.IPCacheSize != 100000 {
 		t.Fatalf("unexpected defaults: %+v", defaults)
 	}
 	for _, raw := range []string{

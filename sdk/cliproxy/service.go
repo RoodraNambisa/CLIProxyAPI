@@ -4653,6 +4653,7 @@ func (s *Service) ensureExecutorsForAuthWithMode(a *coreauth.Auth, forceReplace 
 			}
 		}
 		next := executor.NewCodexAutoExecutor(cfg)
+		next.SetIPRegionService(s.coreManager.IPRegions())
 		if forceReplace {
 			s.coreManager.RegisterExecutor(next)
 		} else {

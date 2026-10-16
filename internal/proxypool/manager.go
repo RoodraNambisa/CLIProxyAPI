@@ -24,9 +24,11 @@ import (
 	"time"
 
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/proxyregion"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/proxyutil"
 	log "github.com/sirupsen/logrus"
+	"golang.org/x/sync/singleflight"
 )
 
 const (
@@ -76,9 +78,13 @@ type poolRoundState struct {
 // Manager owns immutable proxy configuration snapshots, stable credential
 // bindings, and runtime-only node health.
 type Manager struct {
-	config   atomic.Pointer[configSnapshot]
-	configMu sync.RWMutex
-	probeSeq atomic.Uint64
+	checkFlights singleflight.Group
+	exits        *exitObserver
+	regions      *proxyregion.Service
+	regionConfig atomic.Pointer[internalconfig.Config]
+	config       atomic.Pointer[configSnapshot]
+	configMu     sync.RWMutex
+	probeSeq     atomic.Uint64
 
 	mu             sync.RWMutex
 	bindings       map[string]Binding
@@ -117,6 +123,7 @@ type Manager struct {
 // NewManager creates a proxy-pool runtime and restores stable bindings.
 func NewManager(configPath string, cfg *internalconfig.Config) (*Manager, error) {
 	m := &Manager{
+		regions:        proxyregion.New(context.Background(), cfg.EffectiveProxyIP()),
 		bindings:       make(map[string]Binding),
 		health:         make(map[string]nodeHealth),
 		reserved:       make(map[string]Binding),
@@ -132,10 +139,16 @@ func NewManager(configPath string, cfg *internalconfig.Config) (*Manager, error)
 		checkTasks:     make(map[string]*checkTaskState),
 		taskByPool:     make(map[string]string),
 	}
+	m.exits = newExitObserver(m)
+	m.regions.SetOwnerValidator(m.regionOwnerActive)
+	m.regions.SetObservationSource(m.regionObservation, m.ensureRegionObservation)
+	m.regions.SetObservationDemand(m.demandRegionObservation)
 	if errLoad := m.loadBindings(); errLoad != nil {
+		m.regions.Close()
 		return nil, errLoad
 	}
 	if errConfig := m.UpdateConfig(cfg); errConfig != nil {
+		m.regions.Close()
 		return nil, errConfig
 	}
 	return m, nil
@@ -225,9 +238,12 @@ func (m *Manager) updateConfig(cfg *internalconfig.Config, oldPoolName, newPoolN
 	if errNormalize != nil {
 		return errNormalize
 	}
-	healthConfig, errHealth := internalconfig.NormalizeProxyHealthCheckConfiguration(cfg.ProxyHealthCheck)
+	healthConfig, errHealth := internalconfig.NormalizeProxyHealthCheckConfiguration(cfg.EffectiveProxyHealthCheck())
 	if errHealth != nil {
 		return errHealth
+	}
+	if err := cfg.ValidateProxyIP(); err != nil {
+		return err
 	}
 	globalURL := strings.TrimSpace(cfg.ProxyURL)
 	signature, errSignature := proxyConfigurationSignature(globalURL, pools, rules, healthConfig)
@@ -239,6 +255,11 @@ func (m *Manager) updateConfig(cfg *internalconfig.Config, oldPoolName, newPoolN
 	previous := m.config.Load()
 	renamePool := oldPoolName != "" && newPoolName != "" && !strings.EqualFold(oldPoolName, newPoolName)
 	if previous != nil && previous.signature == signature && !renamePool {
+		if m.regions != nil {
+			regionSnapshot := *cfg
+			m.regionConfig.Store(&regionSnapshot)
+			return m.regions.UpdateConfig(cfg.EffectiveProxyIP())
+		}
 		return nil
 	}
 	generation := uint64(1)
@@ -278,7 +299,17 @@ func (m *Manager) updateConfig(cfg *internalconfig.Config, oldPoolName, newPoolN
 			return errRename
 		}
 	}
+	if m.regions != nil {
+		if err := m.regions.UpdateConfig(cfg.EffectiveProxyIP()); err != nil {
+			return err
+		}
+	}
+	regionSnapshot := *cfg
+	m.regionConfig.Store(&regionSnapshot)
 	m.config.Store(snapshot)
+	if m.exits != nil {
+		m.exits.configure(snapshot)
+	}
 	m.rebaseCompatibleHealth(previous, snapshot)
 	m.admission.resize(healthConfig.Concurrency)
 	m.reconcilePoolRounds(snapshot)
@@ -1306,10 +1337,24 @@ func (m *Manager) storeHealth(snapshot *configSnapshot, binding Binding, resolve
 	health := m.newHealth(snapshot, binding, resolvedURL, result, probeEpoch)
 	m.mu.Lock()
 	previous := m.health[binding.ID]
+	stored := false
+	if result.OK {
+		copy := result
+		health.LastSuccess = &copy
+	} else {
+		health.LastSuccess = previous.LastSuccess
+	}
+
 	if current := m.config.Load(); current != nil && current.generation == snapshot.generation && previous.ProbeEpoch <= probeEpoch {
 		m.health[binding.ID] = health
+		stored = true
+
 	}
 	m.mu.Unlock()
+	if stored && m.exits != nil {
+		m.exits.importHealth(snapshot, binding, resolvedURL, health.TraceResult)
+	}
+
 	return health
 }
 
@@ -1327,6 +1372,12 @@ func (m *Manager) storeBoundHealthInternal(snapshot *configSnapshot, binding Bin
 	currentSnapshot := m.config.Load()
 	currentBinding, bound := m.bindings[binding.AuthID]
 	previous := m.health[binding.ID]
+	if result.OK {
+		copy := result
+		health.LastSuccess = &copy
+	} else {
+		health.LastSuccess = previous.LastSuccess
+	}
 	if currentSnapshot != nil && currentSnapshot.generation == snapshot.generation && bound && currentBinding.ID == binding.ID && previous.ProbeEpoch <= probeEpoch {
 		previousKnown := previous.Generation == snapshot.generation
 		if !previousKnown {
@@ -1349,6 +1400,10 @@ func (m *Manager) storeBoundHealthInternal(snapshot *configSnapshot, binding Bin
 		}
 		m.health[binding.ID] = health
 		m.mu.Unlock()
+		if m.exits != nil {
+			m.exits.importHealth(snapshot, binding, resolvedURL, result)
+		}
+
 		return health, true
 	}
 	m.mu.Unlock()
@@ -1383,6 +1438,9 @@ func (m *Manager) deleteHealth(bindingID string) {
 	m.mu.Lock()
 	delete(m.health, bindingID)
 	m.mu.Unlock()
+	if m.regions != nil {
+		m.regions.ForgetBinding(bindingID)
+	}
 }
 
 // ReportFailure implements coreauth.ProxyResolver. Only proxy infrastructure
@@ -1700,4 +1758,12 @@ func (m *Manager) SortedBindings() []Binding {
 	m.mu.RUnlock()
 	sort.Slice(bindings, func(i, j int) bool { return bindings[i].AuthID < bindings[j].AuthID })
 	return bindings
+}
+
+// IPRegions returns the shared, provider-independent metadata service.
+func (m *Manager) IPRegions() *proxyregion.Service {
+	if m == nil {
+		return nil
+	}
+	return m.regions
 }

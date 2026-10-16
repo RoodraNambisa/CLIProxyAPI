@@ -26,12 +26,12 @@ func (service *Service) prepareBrowserRegionClient(ctx context.Context, client *
 		flow.mu.Lock()
 		defer flow.mu.Unlock()
 		if flow.snapshot == nil {
-			value := service.options.ResolveBrowserRegion(client.ProxyURL(), client.Persona())
+			value := service.options.ResolveBrowserRegion(ctx, client.ProxyURL(), client.Persona())
 			flow.snapshot = &value
 		}
 		return client.SetBrowserRegion(*flow.snapshot)
 	}
-	return client.SetBrowserRegion(service.options.ResolveBrowserRegion(client.ProxyURL(), client.Persona()))
+	return client.SetBrowserRegion(service.options.ResolveBrowserRegion(ctx, client.ProxyURL(), client.Persona()))
 }
 
 // BrowserLocale is a transient overlay, separate from the canonical device Persona.

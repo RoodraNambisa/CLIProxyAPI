@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/proxyregion"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 )
 
@@ -266,4 +267,18 @@ func clearRuntimeProxy(auth *Auth) {
 	auth.RuntimeProxyBindingID = ""
 	auth.RuntimeProxyAuthID = ""
 	auth.runtimeProxyResolved = false
+}
+
+// IPRegions exposes metadata without allocating a proxy binding.
+func (m *Manager) IPRegions() *proxyregion.Service {
+	if m == nil {
+		return nil
+	}
+	m.mu.RLock()
+	r := m.proxyResolver
+	m.mu.RUnlock()
+	if owner, ok := r.(interface{ IPRegions() *proxyregion.Service }); ok {
+		return owner.IPRegions()
+	}
+	return nil
 }

@@ -420,3 +420,35 @@ func environmentProxyFunc() func(*http.Request) (*url.URL, error) {
 		return proxyFunc(req.URL)
 	}
 }
+
+// ResolvedRequestProxy pins environment proxy selection to the business target.
+// Metadata clients must not re-evaluate NO_PROXY for the lookup service host.
+func ResolvedRequestProxy(cfg *config.Config, auth *cliproxyauth.Auth, target string) string {
+	raw := ""
+	if auth != nil {
+		raw = auth.EffectiveProxyURL()
+	}
+	if raw == "" && cfg != nil {
+		raw = cfg.ProxyURL
+	}
+	setting, err := proxyutil.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	if setting.Mode == proxyutil.ModeDirect {
+		return "direct"
+	}
+	if setting.Mode == proxyutil.ModeProxy {
+		return raw
+	}
+	target = strings.Replace(strings.Replace(target, "wss://", "https://", 1), "ws://", "http://", 1)
+	req, err := http.NewRequest(http.MethodGet, target, nil)
+	if err != nil {
+		return ""
+	}
+	proxy, err := environmentProxyFunc()(req)
+	if err != nil || proxy == nil {
+		return "direct"
+	}
+	return proxy.String()
+}

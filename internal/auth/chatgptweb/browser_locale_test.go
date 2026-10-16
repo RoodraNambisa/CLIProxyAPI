@@ -80,7 +80,7 @@ func TestBrowserRegionSnapshotConsumersAndPersistence(t *testing.T) {
 }
 func TestBrowserRegionLoginFlowFrozen(t *testing.T) {
 	calls := 0
-	service := NewService(Options{ResolveBrowserRegion: func(string, Persona) BrowserRegionSnapshot {
+	service := NewService(Options{ResolveBrowserRegion: func(context.Context, string, Persona) BrowserRegionSnapshot {
 		calls++
 		return BrowserRegionSnapshot{Timezone: "Asia/Tokyo", OffsetMinutes: -540, Language: "ja-JP", OverrideLanguage: true}
 	}})

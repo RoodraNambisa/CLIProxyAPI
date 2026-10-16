@@ -36,7 +36,7 @@ type ResolvedChatGPTWebBrowserRegion struct {
 func (cfg ChatGPTWebBrowserRegionConfig) Resolved() ResolvedChatGPTWebBrowserRegion {
 	r := ResolvedChatGPTWebBrowserRegion{AutoTimezone: cfg.AutoTimezone, AutoLanguage: cfg.AutoLanguage,
 		Language: strings.TrimSpace(cfg.Language), LookupURL: strings.TrimSpace(cfg.LookupURL),
-		LookupTimeoutSeconds: 8, CacheTTLSeconds: 21600, RouteCacheSize: 4096, IPCacheSize: 4096}
+		LookupTimeoutSeconds: 8, CacheTTLSeconds: 21600, RouteCacheSize: 100000, IPCacheSize: 100000}
 	if r.LookupURL == "" {
 		r.LookupURL = "https://ipwho.is/{ip}"
 	}

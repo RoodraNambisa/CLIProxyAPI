@@ -179,7 +179,7 @@ func (cfg *Config) NormalizeProxyConfiguration() error {
 	}
 	cfg.ProxyPools = pools
 	cfg.ProxyRules = rules
-	health, errHealth := NormalizeProxyHealthCheckConfiguration(cfg.ProxyHealthCheck)
+	health, errHealth := NormalizeProxyHealthCheckConfiguration(cfg.EffectiveProxyHealthCheck())
 	if errHealth != nil {
 		return errHealth
 	}
@@ -190,6 +190,20 @@ func (cfg *Config) NormalizeProxyConfiguration() error {
 // NormalizeProxyHealthCheckConfiguration validates and fills compatible defaults.
 func NormalizeProxyHealthCheckConfiguration(raw ProxyHealthCheckConfig) (ProxyHealthCheckConfig, error) {
 	config := raw
+	if config.TemporaryRouteCheckIntervalSeconds == nil {
+		v := DefaultProxyPoolCheckIntervalSeconds
+		config.TemporaryRouteCheckIntervalSeconds = &v
+	}
+	if config.TemporaryRouteCacheSize == nil {
+		v := 100000
+		config.TemporaryRouteCacheSize = &v
+	}
+	if *config.TemporaryRouteCheckIntervalSeconds < 1 || int64(*config.TemporaryRouteCheckIntervalSeconds) > maxProxyHealthCheckTimeoutSeconds {
+		return ProxyHealthCheckConfig{}, fmt.Errorf("invalid temporary route check interval")
+	}
+	if *config.TemporaryRouteCacheSize < 1 || *config.TemporaryRouteCacheSize > 1000000 {
+		return ProxyHealthCheckConfig{}, fmt.Errorf("temporary route cache size must be 1..1000000")
+	}
 	if config.Concurrency < 0 {
 		return ProxyHealthCheckConfig{}, fmt.Errorf("proxy-health-check.concurrency cannot be negative")
 	}
@@ -330,4 +344,20 @@ func containsInt(values []int, target int) bool {
 		}
 	}
 	return false
+}
+
+// EffectiveProxyHealthCheck migrates legacy route settings only to temporary
+// routes. Pool-specific check intervals are deliberately untouched.
+func (c *Config) EffectiveProxyHealthCheck() ProxyHealthCheckConfig {
+	if c == nil {
+		return ProxyHealthCheckConfig{}
+	}
+	v := c.ProxyHealthCheck
+	if v.TemporaryRouteCheckIntervalSeconds == nil {
+		v.TemporaryRouteCheckIntervalSeconds = c.ChatGPTWeb.BrowserRegion.CacheTTLSeconds
+	}
+	if v.TemporaryRouteCacheSize == nil {
+		v.TemporaryRouteCacheSize = c.ChatGPTWeb.BrowserRegion.RouteCacheSize
+	}
+	return v
 }

@@ -218,6 +218,9 @@ func (s *ConfigSynthesizer) synthesizeCodexKeys(ctx *SynthesisContext) []*coreau
 			CreatedAt:  now,
 			UpdatedAt:  now,
 		}
+		if ck.TimeContext != nil {
+			a.Metadata = map[string]any{config.CodexTimeContextMetadataKey: *ck.TimeContext}
+		}
 		ApplyAuthExcludedModelsMeta(a, cfg, ck.ExcludedModels, "apikey")
 		applyConfigCredentialRequestRetry(a, ck.RequestRetry)
 		applyConfigRequestScopedErrors(a, ck.RequestScopedErrors)

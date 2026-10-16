@@ -23,6 +23,7 @@ import (
 	codexauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/proxyregion"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
@@ -63,7 +64,8 @@ var globalCodexWebsocketSessionStore = &codexWebsocketSessionStore{
 }
 
 type codexWebsocketSession struct {
-	sessionID string
+	timeContextRoute proxyregion.Route
+	sessionID        string
 
 	reqMu sync.Mutex
 
@@ -421,10 +423,10 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		AuthType:  authType,
 		AuthValue: authValue,
 	}
-	helps.RecordAPIWebsocketRequest(ctx, e.cfg, wsReqLog)
 
 	conn, respHS, errDial := e.ensureUpstreamConn(ctx, auth, sess, authID, wsURL, wsHeaders, req.Model)
 	if errDial != nil {
+		helps.RecordAPIWebsocketRequest(ctx, e.cfg, wsReqLog)
 		bodyErr := websocketHandshakeBody(respHS)
 		bodyErr = codexauth.SanitizeAgentIdentityErrorBody(authMetadata(auth), bodyErr)
 		if respHS != nil {
@@ -445,6 +447,9 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		helps.RecordAPIWebsocketError(ctx, e.cfg, "dial", errDial)
 		return resp, errDial
 	}
+	wsReqBody = helps.ApplyCodexTimeContext(ctx, e.regions, auth, e.websocketTimeRoute(sess, conn, auth, httpURL), wsReqBody, preparedIdentity.TimeContext, false)
+	wsReqLog.Body = wsReqBody
+	helps.RecordAPIWebsocketRequest(ctx, e.cfg, wsReqLog)
 	recordAPIWebsocketHandshake(ctx, e.cfg, respHS)
 	var upstreamHeaders http.Header
 	if respHS != nil {
@@ -502,6 +507,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 			if errDialRetry == nil && connRetry != nil {
 				readCh = sess.replaceActiveForConn(readCh, conn, connRetry)
 				wsReqBodyRetry := buildCodexWebsocketRequestBody(upstreamRef.Bytes())
+				wsReqBodyRetry = helps.ApplyCodexTimeContext(ctx, e.regions, auth, e.websocketTimeRoute(sess, connRetry, auth, httpURL), wsReqBodyRetry, preparedIdentity.TimeContext, false)
 				helps.RecordAPIWebsocketRequest(ctx, e.cfg, helps.UpstreamRequestLog{
 					URL:       wsURL,
 					Method:    "WEBSOCKET",
@@ -821,7 +827,6 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		AuthType:  authType,
 		AuthValue: authValue,
 	}
-	helps.RecordAPIWebsocketRequest(ctx, e.cfg, wsReqLog)
 
 	conn, respHS, errDial := e.ensureUpstreamConn(ctx, auth, sess, authID, wsURL, wsHeaders, req.Model)
 	var upstreamHeaders http.Header
@@ -829,6 +834,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		if sess != nil {
 			sess.reqMu.Unlock()
 		}
+		helps.RecordAPIWebsocketRequest(ctx, e.cfg, wsReqLog)
 		bodyErr := websocketHandshakeBody(respHS)
 		bodyErr = codexauth.SanitizeAgentIdentityErrorBody(authMetadata(auth), bodyErr)
 		if respHS != nil {
@@ -854,6 +860,9 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		cleanupBodies()
 		return nil, errDial
 	}
+	wsReqBody = helps.ApplyCodexTimeContext(ctx, e.regions, auth, e.websocketTimeRoute(sess, conn, auth, httpURL), wsReqBody, preparedIdentity.TimeContext, false)
+	wsReqLog.Body = wsReqBody
+	helps.RecordAPIWebsocketRequest(ctx, e.cfg, wsReqLog)
 	recordAPIWebsocketHandshake(ctx, e.cfg, respHS)
 	if respHS != nil {
 		upstreamHeaders = respHS.Header.Clone()
@@ -913,6 +922,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			}
 			readCh = sess.replaceActiveForConn(readCh, conn, connRetry)
 			wsReqBodyRetry := buildCodexWebsocketRequestBody(upstreamRef.Bytes())
+			wsReqBodyRetry = helps.ApplyCodexTimeContext(ctx, e.regions, auth, e.websocketTimeRoute(sess, connRetry, auth, httpURL), wsReqBodyRetry, preparedIdentity.TimeContext, false)
 			helps.RecordAPIWebsocketRequest(ctx, e.cfg, helps.UpstreamRequestLog{
 				URL:       wsURL,
 				Method:    "WEBSOCKET",
@@ -2244,6 +2254,7 @@ func (e *CodexWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *
 	sess.authInstanceID = auth.RuntimeInstanceID()
 	sess.proxyBindingID = requestedProxyBindingID
 	sess.proxyIdentity = requestedProxyIdentity
+	sess.timeContextRoute = e.timeContextRoute(auth, wsURL)
 	sess.managedStateModel = requestedStateModel
 	sess.managedStateUse = managedUse
 	sess.responseGuardHandshake = config.CodexResponseEvidence{}
@@ -2819,4 +2830,19 @@ func (e *CodexWebsocketsExecutor) newWebsocketResponseGuard(ctx context.Context,
 		guard.SetStateEvidence(evidence)
 	}
 	return guard
+}
+
+func (e *CodexAutoExecutor) SetIPRegionService(service *proxyregion.Service) {
+	e.httpExec.SetIPRegionService(service)
+	e.wsExec.SetIPRegionService(service)
+}
+func (e *CodexWebsocketsExecutor) websocketTimeRoute(sess *codexWebsocketSession, conn *websocket.Conn, auth *cliproxyauth.Auth, target string) proxyregion.Route {
+	if sess != nil {
+		sess.connMu.Lock()
+		defer sess.connMu.Unlock()
+		if sess.conn == conn {
+			return sess.timeContextRoute
+		}
+	}
+	return e.timeContextRoute(auth, target)
 }

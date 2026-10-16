@@ -313,6 +313,12 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	if !reflect.DeepEqual(oldCfg.XAI, newCfg.XAI) {
 		changes = append(changes, "xai: upstream address, global headers, request defaults or identity policy changed")
 	}
+	if !reflect.DeepEqual(oldCfg.Codex.TimeContext, newCfg.Codex.TimeContext) {
+		changes = append(changes, "codex.time-context changed")
+	}
+	if !reflect.DeepEqual(oldCfg.EffectiveProxyIP(), newCfg.EffectiveProxyIP()) {
+		changes = append(changes, "proxy-ip metadata settings changed")
+	}
 	if oldCfg.Codex.IdentityConfuse != newCfg.Codex.IdentityConfuse {
 		changes = append(changes, fmt.Sprintf("codex.identity-confuse: %t -> %t", oldCfg.Codex.IdentityConfuse, newCfg.Codex.IdentityConfuse))
 	}

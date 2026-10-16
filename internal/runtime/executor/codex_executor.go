@@ -13,10 +13,13 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	codexauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/client/grokbuild"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/proxyregion"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
@@ -28,9 +31,6 @@ import (
 	"github.com/tidwall/sjson"
 	"github.com/tiktoken-go/tokenizer"
 	"golang.org/x/net/http/httpguts"
-
-	"github.com/gin-gonic/gin"
-	"github.com/google/uuid"
 )
 
 const (
@@ -358,6 +358,7 @@ func codexStreamStatusErr(status int, message, code, errType string, param *gjso
 // CodexExecutor is a stateless executor for Codex (OpenAI Responses API entrypoint).
 // If api_key is unavailable on auth, it falls back to legacy via ClientAdapter.
 type CodexExecutor struct {
+	regions                 *proxyregion.Service
 	cfg                     *config.Config
 	agentIdentityBaseURL    string
 	agentIdentityHTTPClient func(context.Context, *cliproxyauth.Auth) *http.Client
@@ -371,6 +372,7 @@ func (e *CodexExecutor) Identifier() string { return "codex" }
 func (*CodexExecutor) DeferAuthRequestCommitUntilUpstream() bool { return true }
 
 type codexPreparedSessionIdentity struct {
+	TimeContext                   helps.CodexTimeContextSnapshot
 	RequestScope                  helps.CodexRequestScope
 	IdentityConfuseEnabled        bool
 	IdentityPolicyFrozen          bool
@@ -443,7 +445,12 @@ func (e *CodexExecutor) PrepareProviderRequest(ctx context.Context, req cliproxy
 	if strings.EqualFold(strings.Trim(strings.TrimSpace(opts.Alt), "/"), "responses/compact") {
 		requestScope.Kind = "compaction"
 	}
+	timePolicy := config.CodexTimeContextConfig{}
+	if e.cfg != nil {
+		timePolicy = e.cfg.Codex.TimeContext
+	}
 	prepared := codexPreparedSessionIdentity{
+		TimeContext:                   helps.CodexTimeContextSnapshot{Policy: timePolicy, At: time.Now()},
 		RequestScope:                  requestScope,
 		IdentityConfuseEnabled:        codexIdentityConfuseEnabled(e.cfg),
 		IdentityPolicyFrozen:          true,
@@ -2100,6 +2107,9 @@ func (e *CodexExecutor) applyCodexHTTPSessionIdentity(
 		invalid.skipAuthResult = true
 		return nil, invalid
 	}
+	if !isCodexOpenAIImageRequest(opts) {
+		projected = helps.ApplyCodexTimeContext(ctx, e.regions, auth, e.timeContextRoute(auth, httpReq.URL.String()), projected, prepared.TimeContext, opts.Alt == "responses/compact")
+	}
 	if state.enabled || !bytes.Equal(projected, rawJSON) {
 		closeCodexRequestBody(httpReq)
 		bodyReader := cliproxyexecutor.NewReleasableReadCloser(projected, nil)
@@ -3307,4 +3317,15 @@ func (e *CodexExecutor) resolveCodexConfig(auth *cliproxyauth.Auth) *config.Code
 		}
 	}
 	return nil
+}
+
+// SetIPRegionService attaches the backend-owned metadata service before use.
+func (e *CodexExecutor) SetIPRegionService(service *proxyregion.Service) { e.regions = service }
+func (e *CodexExecutor) timeContextRoute(auth *cliproxyauth.Auth, target string) proxyregion.Route {
+	binding, owner := "", ""
+	if auth != nil {
+		owner = auth.ID
+		binding = auth.EffectiveProxyBindingID()
+	}
+	return proxyregion.Route{ProxyURL: helps.ResolvedRequestProxy(e.cfg, auth, target), BindingID: binding, OwnerID: owner, Scope: proxyregion.ScopeForTarget(target)}
 }

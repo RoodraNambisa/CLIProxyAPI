@@ -21,6 +21,7 @@ import (
 	chatgptwebauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/chatgptweb"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/proxypool"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/proxyregion"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/sentinelcompat"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
@@ -129,10 +130,14 @@ func NewChatGPTWebExecutorWithLoginCoordinator(cfg *config.Config, manager *clip
 		coordinator = NewChatGPTWebLoginCoordinator()
 	}
 	lifecycleCtx, lifecycleCancel := context.WithCancel(context.Background())
-	browserRegion := chatgptwebauth.NewBrowserRegionResolver(lifecycleCtx)
+	var regions *proxyregion.Service
+	if manager != nil {
+		regions = manager.IPRegions()
+	}
+	browserRegion := chatgptwebauth.NewSharedBrowserRegionResolver(lifecycleCtx, regions)
 	executor := &ChatGPTWebExecutor{
 		manager:            manager,
-		authService:        chatgptwebauth.NewService(chatgptwebauth.Options{ResolveBrowserRegion: browserRegion.Resolve}),
+		authService:        chatgptwebauth.NewService(chatgptwebauth.Options{ResolveBrowserRegion: browserRegion.ResolveContext}),
 		browserRegion:      browserRegion,
 		runtimeBaseURL:     "https://chatgpt.com",
 		runtimeRand:        rand.Reader,
@@ -265,13 +270,18 @@ func (e *ChatGPTWebExecutor) BrowserRegionPreview(auth *cliproxyauth.Auth, refre
 		}
 		routed.ProxyURL = preview.URL
 		routed.RuntimeProxyURL = ""
+		routed.RuntimeProxyBindingID = preview.BindingID
 	}
 	route := e.proxyURLForTarget(routed, e.chatGPTWebBaseURL())
 	code := ""
 	if refresh {
-		code = e.browserRegion.Refresh(route)
+		code = e.browserRegion.Shared().Refresh(proxyregion.Route{ProxyURL: route, BindingID: routed.EffectiveProxyBindingID(), Scope: proxyregion.ScopeForTarget(e.chatGPTWebBaseURL())})
 	}
-	s := e.browserRegion.Preview(route, credential.Persona)
+	policy, errPolicy := e.browserRegionPolicy(auth)
+	if errPolicy != nil {
+		return chatgptwebauth.BrowserRegionSnapshot{}, "credential_invalid"
+	}
+	s := e.browserRegion.Apply(proxyregion.Route{ProxyURL: route, BindingID: routed.EffectiveProxyBindingID(), Scope: proxyregion.ScopeForTarget(e.chatGPTWebBaseURL())}, credential.Persona, &policy, false)
 	return s, code
 }
 
@@ -750,6 +760,9 @@ func (e *ChatGPTWebExecutor) Login(ctx context.Context, input chatgptwebauth.Log
 }
 
 func (e *ChatGPTWebExecutor) loginWithRuntimeSnapshot(ctx context.Context, input chatgptwebauth.LoginInput, cfg *config.Config) (*chatgptwebauth.Credential, error) {
+	if cfg != nil {
+		ctx = chatgptwebauth.WithBrowserRegionPolicy(ctx, cfg.ChatGPTWeb, proxyregion.Route{ProxyURL: input.ProxyURL})
+	}
 	if e.sentinelCompute != nil {
 		ctx = chatgptwebauth.WithSentinelComputePool(ctx, e.sentinelCompute)
 	}
@@ -1691,6 +1704,15 @@ func (e *ChatGPTWebExecutor) reloginCurrent(ctx context.Context, expected *clipr
 	if errCredential != nil {
 		return nil, false, fmt.Errorf("parse chatgpt web credential: %w", errCredential)
 	}
+	if runtimeCfg != nil {
+		copyCfg := *runtimeCfg
+		policy, errPolicy := config.ApplyWebRegionOverride(runtimeCfg.ChatGPTWeb, resolved.Metadata[config.WebRegionMetadataKey])
+		if errPolicy != nil {
+			return nil, false, errPolicy
+		}
+		copyCfg.ChatGPTWeb = policy
+		runtimeCfg = &copyCfg
+	}
 	result, errLogin := e.loginWithRuntimeSnapshot(ctx, chatgptwebauth.LoginInput{
 		Credential:                  credential,
 		ProxyURL:                    chatGPTWebProxyURLForTarget(resolved, chatgptwebauth.AuthBaseURL, runtimeCfg),
@@ -2192,6 +2214,11 @@ type chatGPTWebRefreshResult struct {
 }
 
 func (e *ChatGPTWebExecutor) refreshByStrategy(ctx context.Context, auth *cliproxyauth.Auth, credential *chatgptwebauth.Credential) (*chatgptwebauth.Credential, error, bool) {
+	policy, errPolicy := e.browserRegionPolicy(auth)
+	if errPolicy != nil {
+		return nil, errPolicy, true
+	}
+	ctx = chatgptwebauth.WithBrowserRegionPolicy(ctx, policy, proxyregion.Route{ProxyURL: e.proxyURLForTarget(auth, e.chatGPTWebBaseURL()), BindingID: auth.EffectiveProxyBindingID(), OwnerID: auth.ID})
 	if credential == nil {
 		return nil, newChatGPTWebRefreshModeError("credential_invalid", "chatgpt web credential is invalid"), true
 	}
@@ -2647,3 +2674,15 @@ func (chatGPTWebProtocolUnavailableError) Error() string {
 func (chatGPTWebProtocolUnavailableError) StatusCode() int      { return http.StatusNotImplemented }
 func (chatGPTWebProtocolUnavailableError) SkipAuthResult() bool { return true }
 func (chatGPTWebProtocolUnavailableError) RetryOtherAuth() bool { return true }
+
+func (e *ChatGPTWebExecutor) browserRegionPolicy(auth *cliproxyauth.Auth) (config.ChatGPTWebConfig, error) {
+	base := config.ChatGPTWebConfig{}
+	if cfg := e.configSnapshot(); cfg != nil {
+		base = cfg.ChatGPTWeb
+	}
+	var raw any
+	if auth != nil {
+		raw = auth.Metadata[config.WebRegionMetadataKey]
+	}
+	return config.ApplyWebRegionOverride(base, raw)
+}

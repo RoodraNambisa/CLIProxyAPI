@@ -23,6 +23,7 @@ import (
 	chatgptwebauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/chatgptweb"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/proxyregion"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/sentinelcompat"
@@ -1355,7 +1356,16 @@ func (e *ChatGPTWebExecutor) newRuntimeClientForAcquisition(auth *cliproxyauth.A
 	}
 	timezone := e.chatGPTWebTimezone()
 	if e.browserRegion != nil {
-		err = client.SetBrowserRegion(e.browserRegion.Resolve(client.ProxyURL(), credential.Persona))
+		policy, policyErr := e.browserRegionPolicy(auth)
+		if policyErr != nil {
+			client.CloseIdleConnections()
+			return nil, nil, policyErr
+		}
+		regionCtx := context.Background()
+		if len(requestContexts) > 0 {
+			regionCtx = requestContexts[0]
+		}
+		err = client.SetBrowserRegion(e.browserRegion.ApplyContext(regionCtx, proxyregion.Route{ProxyURL: client.ProxyURL(), BindingID: auth.EffectiveProxyBindingID(), OwnerID: auth.ID, Scope: proxyregion.ScopeForTarget(e.chatGPTWebBaseURL())}, credential.Persona, &policy, true))
 	} else {
 		err = client.SetBrowserTimezone(chatgptwebauth.BrowserTimezone{Name: timezone.Timezone, OffsetMinutes: timezone.OffsetMinutes})
 	}
