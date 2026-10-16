@@ -71,6 +71,9 @@ api-keys:
 # Automatic password re-login only applies to native credentials that retain
 # password/TOTP material and is disabled by default.
 chatgpt-web:
+  # Send the optional trust_anchors TLS extension from the original Chrome 146 template.
+  # Set false to omit only extension 0xca34. Certificate verification is unchanged.
+  tls-trust-anchors-enabled: true
   auto-relogin: false
   # For credentials without complete password/TOTP material, allow a complete
   # ChatGPT session cookie to refresh an expired or rejected access token.

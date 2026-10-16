@@ -12,7 +12,7 @@ func (client *Client) NewBootstrapAttempt(ctx context.Context) (*Client, error) 
 	if client == nil {
 		return nil, fmt.Errorf("browser client is nil")
 	}
-	profile, ok := findTLSProfile(client.persona.Profile)
+	profile, ok := findTLSProfile(client.persona.Profile, client.tlsOptions)
 	if !ok {
 		return nil, fmt.Errorf("unsupported TLS profile %q", client.persona.Profile)
 	}
@@ -23,7 +23,7 @@ func (client *Client) NewBootstrapAttempt(ctx context.Context) (*Client, error) 
 		return nil, err
 	}
 	attempt := &Client{
-		noRedirect: transport, jar: client.jar, persona: client.persona,
+		noRedirect: transport, jar: client.jar, persona: client.persona, tlsOptions: client.tlsOptions,
 		proxyURL: client.proxyURL, sendSessionCookies: client.sendSessionCookies,
 		acquisitionTracker: tracker, beforeRequest: client.runBeforeRequest,
 	}

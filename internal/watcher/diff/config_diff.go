@@ -368,6 +368,9 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 			newCfg.CodexFingerprint.ResolvedSessionIdentityPoolSize(),
 		))
 	}
+	if oldCfg.ChatGPTWeb.TrustAnchorsEnabled() != newCfg.ChatGPTWeb.TrustAnchorsEnabled() {
+		changes = append(changes, fmt.Sprintf("chatgpt-web.tls-trust-anchors-enabled: %t -> %t", oldCfg.ChatGPTWeb.TrustAnchorsEnabled(), newCfg.ChatGPTWeb.TrustAnchorsEnabled()))
+	}
 	if oldCfg.ChatGPTWeb.TokenUsageEstimationEnabled() != newCfg.ChatGPTWeb.TokenUsageEstimationEnabled() {
 		changes = append(changes, fmt.Sprintf("chatgpt-web.estimate-token-usage: %t -> %t", oldCfg.ChatGPTWeb.TokenUsageEstimationEnabled(), newCfg.ChatGPTWeb.TokenUsageEstimationEnabled()))
 	}

@@ -26,15 +26,15 @@ type loginClientRetry struct {
 	delay    time.Duration
 }
 
-func newLoginClient(persona Persona, cookies []Cookie, selector *loginProxySelector, timeout time.Duration) (*Client, error) {
+func newLoginClient(persona Persona, cookies []Cookie, selector *loginProxySelector, timeout time.Duration, options ...TLSOptions) (*Client, error) {
 	if selector == nil {
-		return NewClient(persona, "", cookies)
+		return NewClient(persona, "", cookies, options...)
 	}
 	proxyURL, errProxy := selector.next()
 	if errProxy != nil {
 		return nil, errProxy
 	}
-	client, errClient := newClient(persona, proxyURL, cookies, timeout)
+	client, errClient := newClient(persona, proxyURL, cookies, timeout, options...)
 	if errClient != nil {
 		return nil, errClient
 	}

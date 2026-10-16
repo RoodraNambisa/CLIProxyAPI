@@ -631,6 +631,9 @@ func (c CodexConfig) ResolvedEnforceSoftwareIdentity() bool {
 
 // ChatGPTWebConfig configures ChatGPT Web credential, usage, and Sentinel behavior.
 type ChatGPTWebConfig struct {
+	// TLSTrustAnchorsEnabled controls the optional Chrome 146 trust_anchors extension.
+	// Omitted values select the original dependency template.
+	TLSTrustAnchorsEnabled *bool `yaml:"tls-trust-anchors-enabled,omitempty" json:"tls-trust-anchors-enabled,omitempty"`
 	// AutoRelogin starts a background password login after a terminal refresh failure.
 	AutoRelogin bool `yaml:"auto-relogin" json:"auto-relogin"`
 	// SessionCookieRefreshOnTokenFailure allows incomplete password credentials to refresh access tokens with a complete session cookie.
@@ -740,6 +743,11 @@ func (cfg ChatGPTWebConfig) ResolvedTimezone(at time.Time) ResolvedChatGPTWebTim
 		Timezone:      timezone,
 		OffsetMinutes: offset,
 	}
+}
+
+// TrustAnchorsEnabled reports whether the original Chrome 146 extension is sent.
+func (cfg ChatGPTWebConfig) TrustAnchorsEnabled() bool {
+	return cfg.TLSTrustAnchorsEnabled == nil || *cfg.TLSTrustAnchorsEnabled
 }
 
 // TokenUsageEstimationEnabled returns whether Web response usage is estimated locally.
@@ -4627,6 +4635,7 @@ func preservesExplicitChatGPTWebValue(fullPath string, node *yaml.Node) bool {
 			"timezone",
 			"timezone-offset-minutes",
 			"estimate-token-usage",
+			"tls-trust-anchors-enabled",
 			"usage-cache",
 			"image-usage",
 			"login-proxy",
@@ -4646,7 +4655,7 @@ func preservesExplicitChatGPTWebValue(fullPath string, node *yaml.Node) bool {
 		"chatgpt-web.timezone",
 		"chatgpt-web.timezone-offset-minutes":
 		return true
-	case "chatgpt-web.estimate-token-usage":
+	case "chatgpt-web.estimate-token-usage", "chatgpt-web.tls-trust-anchors-enabled":
 		return node.Kind == yaml.ScalarNode && node.Tag == "!!bool"
 	case "chatgpt-web.import":
 		return node.Kind == yaml.MappingNode && len(node.Content) > 0

@@ -496,7 +496,7 @@ func (sentinel *Sentinel) environment() ConversationTurnstileEnvironment {
 
 func (sentinel *Sentinel) transportKey() string {
 	persona, _ := json.Marshal(sentinel.client.Persona())
-	digest := sha256.Sum256([]byte(sentinel.client.ProxyURL() + "\x00" + string(persona)))
+	digest := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%s\x00%t", sentinel.client.ProxyURL(), persona, sentinel.client.TLSOptions().TrustAnchorsEnabled)))
 	return fmt.Sprintf("%x", digest[:])
 }
 
@@ -506,7 +506,7 @@ func (sentinel *Sentinel) sdkFetcher() SentinelSDKFetcher {
 			return nil, "", "", fmt.Errorf("Sentinel SDK response limit is invalid")
 		}
 		client, errClient := NewAcquisitionClient(
-			sentinel.client.Persona(), sentinel.client.ProxyURL(), nil, sentinel.client.acquisitionTimeout,
+			sentinel.client.Persona(), sentinel.client.ProxyURL(), nil, sentinel.client.acquisitionTimeout, sentinel.client.TLSOptions(),
 		)
 		if errClient != nil {
 			return nil, "", "", fmt.Errorf("create cookie-free Sentinel SDK client: %w", errClient)

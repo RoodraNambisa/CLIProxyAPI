@@ -1308,10 +1308,18 @@ func (e *ChatGPTWebExecutor) newRuntimeClientForRequest(ctx context.Context, aut
 	if cliproxyexecutor.ImageRequestBudgetFromContext(ctx).Limit("chatgpt-web") > 0 {
 		return e.newRuntimeClientForAcquisition(auth, false, ctx)
 	}
-	return e.newRuntimeClient(auth)
+	return e.newRuntimeClientWithTLSOptions(auth, false, e.chatGPTWebTLSOptions(ctx))
 }
 
 func (e *ChatGPTWebExecutor) newRuntimeClientForAcquisition(auth *cliproxyauth.Auth, acquisition bool, requestContexts ...context.Context) (*chatgptwebauth.Client, *chatgptwebauth.Credential, error) {
+	var ctx context.Context
+	if len(requestContexts) > 0 {
+		ctx = requestContexts[0]
+	}
+	return e.newRuntimeClientWithTLSOptions(auth, acquisition, e.chatGPTWebTLSOptions(ctx), requestContexts...)
+}
+
+func (e *ChatGPTWebExecutor) newRuntimeClientWithTLSOptions(auth *cliproxyauth.Auth, acquisition bool, tlsOptions chatgptwebauth.TLSOptions, requestContexts ...context.Context) (*chatgptwebauth.Client, *chatgptwebauth.Credential, error) {
 	if auth == nil {
 		return nil, nil, errors.New("chatgpt web credential is nil")
 	}
@@ -1333,19 +1341,21 @@ func (e *ChatGPTWebExecutor) newRuntimeClientForAcquisition(auth *cliproxyauth.A
 	var client *chatgptwebauth.Client
 	if len(requestContexts) > 0 {
 		client, err = chatgptwebauth.NewRequestClient(requestContexts[0], credential.Persona,
-			e.proxyURLForTarget(auth, e.chatGPTWebBaseURL()), credential.Cookies, false)
+			e.proxyURLForTarget(auth, e.chatGPTWebBaseURL()), credential.Cookies, false, tlsOptions)
 	} else if acquisition {
 		client, err = chatgptwebauth.NewAccessTokenAcquisitionClient(
 			credential.Persona,
 			e.proxyURLForTarget(auth, e.chatGPTWebBaseURL()),
 			credential.Cookies,
 			e.accountInfoTimeout,
+			tlsOptions,
 		)
 	} else {
 		client, err = chatgptwebauth.NewAccessTokenClient(
 			credential.Persona,
 			e.proxyURLForTarget(auth, e.chatGPTWebBaseURL()),
 			credential.Cookies,
+			tlsOptions,
 		)
 	}
 	if err != nil {
@@ -1867,7 +1877,7 @@ func chatGPTWebSentinelTransportKey(client *chatgptwebauth.Client) string {
 		return "default"
 	}
 	persona, _ := json.Marshal(client.Persona())
-	digest := sha256.Sum256([]byte(client.ProxyURL() + "\x00" + string(persona)))
+	digest := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%s\x00%t", client.ProxyURL(), persona, client.TLSOptions().TrustAnchorsEnabled)))
 	return fmt.Sprintf("%x", digest[:])
 }
 
@@ -1881,9 +1891,9 @@ func (e *ChatGPTWebExecutor) chatGPTWebSentinelSDKFetcher(client *chatgptwebauth
 		var sdkClient *chatgptwebauth.Client
 		var errClient error
 		if client.RequestScoped() {
-			sdkClient, errClient = chatgptwebauth.NewRequestClient(ctx, client.Persona(), client.ProxyURL(), nil, true)
+			sdkClient, errClient = chatgptwebauth.NewRequestClient(ctx, client.Persona(), client.ProxyURL(), nil, true, client.TLSOptions())
 		} else {
-			sdkClient, errClient = chatgptwebauth.NewClient(client.Persona(), client.ProxyURL(), nil)
+			sdkClient, errClient = chatgptwebauth.NewClient(client.Persona(), client.ProxyURL(), nil, client.TLSOptions())
 		}
 		if errClient != nil {
 			return nil, "", "", fmt.Errorf("create cookie-free Sentinel SDK client: %w", errClient)

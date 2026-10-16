@@ -14,13 +14,14 @@ import (
 	"testing"
 	"time"
 
+	fhttp "github.com/bogdanfinn/fhttp"
 	"github.com/bogdanfinn/tls-client/profiles"
 	tls "github.com/bogdanfinn/utls"
 )
 
 func TestChatGPTWebTLSProfilePreservesChrome146ExceptTrustAnchors(t *testing.T) {
 	t.Parallel()
-	profile, ok := findTLSProfile(" CHROME_146 ")
+	profile, ok := findTLSProfile(" CHROME_146 ", TLSOptions{TrustAnchorsEnabled: false})
 	if !ok {
 		t.Fatal("Chrome 146 profile unavailable")
 	}
@@ -55,7 +56,7 @@ func TestChatGPTWebTLSProfilePreservesChrome146ExceptTrustAnchors(t *testing.T) 
 }
 
 func TestChatGPTWebTLSProfileSpecsAreIndependent(t *testing.T) {
-	profile, ok := findTLSProfile("chrome_146")
+	profile, ok := findTLSProfile("chrome_146", TLSOptions{TrustAnchorsEnabled: false})
 	if !ok {
 		t.Fatal("Chrome 146 profile unavailable")
 	}
@@ -81,76 +82,104 @@ func TestChatGPTWebTLSProfileSpecsAreIndependent(t *testing.T) {
 }
 
 func TestChatGPTWebTLSProfileOnWireAndCertificateVerification(t *testing.T) {
-	for _, kind := range []string{"session", "runtime", "acquisition"} {
-		for _, path := range []string{"follow", "no_redirect", "poll", "bootstrap"} {
-			t.Run(kind+"/"+path, func(t *testing.T) {
-				t.Parallel()
-				observed := make(chan []uint16, 1)
-				server := httptest.NewUnstartedServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
-					t.Error("untrusted certificate was accepted")
-				}))
-				server.Config.ErrorLog = log.New(io.Discard, "", 0)
-				server.TLS = &stdtls.Config{GetConfigForClient: func(hello *stdtls.ClientHelloInfo) (*stdtls.Config, error) {
+	for _, enabled := range []bool{true, false} {
+		options := TLSOptions{TrustAnchorsEnabled: enabled}
+		for _, kind := range []string{"session", "runtime", "acquisition", "access_token", "login"} {
+			for _, path := range []string{"follow", "no_redirect", "poll", "poll_recreate", "bootstrap", "clone", "sdk"} {
+				t.Run(fmt.Sprintf("%t/%s/%s", enabled, kind, path), func(t *testing.T) {
+					t.Parallel()
+					observed := make(chan []uint16, 1)
+					server := httptest.NewUnstartedServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+						t.Error("untrusted certificate was accepted")
+					}))
+					server.Config.ErrorLog = log.New(io.Discard, "", 0)
+					server.TLS = &stdtls.Config{GetConfigForClient: func(hello *stdtls.ClientHelloInfo) (*stdtls.Config, error) {
+						select {
+						case observed <- slices.Clone(hello.Extensions):
+						default:
+						}
+						if !slices.Contains(hello.SupportedProtos, "h2") || !slices.Contains(hello.SupportedVersions, stdtls.VersionTLS13) {
+							t.Error("HTTP/2 or TLS 1.3 advertisement was lost")
+						}
+						return nil, nil
+					}}
+					server.EnableHTTP2 = true
+					server.StartTLS()
+					defer server.Close()
+					ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+					defer cancel()
+					var client *Client
+					var err error
+					switch kind {
+					case "session":
+						client, err = NewClient(DefaultPersona(), "", nil, options)
+					case "runtime":
+						client, err = NewRequestClient(ctx, DefaultPersona(), "", nil, false, options)
+					case "acquisition":
+						client, err = NewAccessTokenAcquisitionClient(DefaultPersona(), "", nil, 5*time.Second, options)
+					case "access_token":
+						client, err = NewAccessTokenClient(DefaultPersona(), "", nil, options)
+					case "login":
+						client, err = newLoginClient(DefaultPersona(), nil, nil, 5*time.Second, options)
+					}
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer client.CloseIdleConnections()
+					request := client.DoNoRedirectStream
+					switch path {
+					case "follow":
+						request = client.DoFollowStream
+					case "poll", "poll_recreate":
+						if path == "poll_recreate" {
+							poll, errPoll := client.currentPollTransport()
+							if errPoll != nil {
+								t.Fatal(errPoll)
+							}
+							client.retirePollTransport(poll.generation)
+						}
+						request = client.DoPollNoRedirectStream
+					case "clone":
+						clone, errClone := client.CloneWithProxy("")
+						if errClone != nil {
+							t.Fatal(errClone)
+						}
+						defer clone.CloseIdleConnections()
+						request = clone.DoNoRedirectStream
+					case "bootstrap":
+						attempt, errAttempt := client.NewBootstrapAttempt(ctx)
+						if errAttempt != nil {
+							t.Fatal(errAttempt)
+						}
+						defer attempt.CloseIdleConnections()
+						request = attempt.DoNoRedirectStream
+					}
+					if path == "sdk" {
+						request = func(ctx context.Context, _, target string, _ map[string]string, _ io.Reader) (*fhttp.Response, error) {
+							_, _, _, errFetch := (&Sentinel{client: client, baseURL: server.URL}).sdkFetcher()(ctx, target, 1024)
+							return nil, errFetch
+						}
+					}
+					response, err := request(ctx, http.MethodGet, server.URL, nil, nil)
+					if response != nil && response.Body != nil {
+						_ = response.Body.Close()
+					}
+					if err == nil || !strings.Contains(strings.ToLower(err.Error()), "certificate") {
+						t.Fatalf("expected certificate validation failure, got %v", err)
+					}
 					select {
-					case observed <- slices.Clone(hello.Extensions):
-					default:
+					case extensions := <-observed:
+						if slices.Contains(extensions, 0xca34) != enabled {
+							t.Errorf("wire trust_anchors presence differs from %t", enabled)
+						}
+					case <-ctx.Done():
+						t.Fatal("ClientHello was not observed")
 					}
-					if !slices.Contains(hello.SupportedProtos, "h2") || !slices.Contains(hello.SupportedVersions, stdtls.VersionTLS13) {
-						t.Error("HTTP/2 or TLS 1.3 advertisement was lost")
-					}
-					return nil, nil
-				}}
-				server.EnableHTTP2 = true
-				server.StartTLS()
-				defer server.Close()
-				ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
-				defer cancel()
-				var client *Client
-				var err error
-				switch kind {
-				case "session":
-					client, err = NewClient(DefaultPersona(), "", nil)
-				case "runtime":
-					client, err = NewRequestClient(ctx, DefaultPersona(), "", nil, false)
-				case "acquisition":
-					client, err = NewAccessTokenAcquisitionClient(DefaultPersona(), "", nil, 5*time.Second)
-				}
-				if err != nil {
-					t.Fatal(err)
-				}
-				defer client.CloseIdleConnections()
-				request := client.DoNoRedirectStream
-				switch path {
-				case "follow":
-					request = client.DoFollowStream
-				case "poll":
-					request = client.DoPollNoRedirectStream
-				case "bootstrap":
-					attempt, errAttempt := client.NewBootstrapAttempt(ctx)
-					if errAttempt != nil {
-						t.Fatal(errAttempt)
-					}
-					defer attempt.CloseIdleConnections()
-					request = attempt.DoNoRedirectStream
-				}
-				response, err := request(ctx, http.MethodGet, server.URL, nil, nil)
-				if response != nil && response.Body != nil {
-					_ = response.Body.Close()
-				}
-				if err == nil || !strings.Contains(strings.ToLower(err.Error()), "certificate") {
-					t.Fatalf("expected certificate validation failure, got %v", err)
-				}
-				select {
-				case extensions := <-observed:
-					if slices.Contains(extensions, 0xca34) {
-						t.Error("wire ClientHello still advertises trust_anchors")
-					}
-				case <-ctx.Done():
-					t.Fatal("ClientHello was not observed")
-				}
-			})
+				})
+			}
 		}
 	}
+
 }
 
 func assertChatGPTWebTLSProfileSpec(t *testing.T, profile profiles.ClientProfile) {

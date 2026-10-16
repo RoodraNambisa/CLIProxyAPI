@@ -5045,6 +5045,7 @@ func (e *ChatGPTWebExecutor) fetchChatGPTWebAccountInfo(ctx context.Context, aut
 	persona chatgptwebauth.Persona,
 	current *cliproxyauth.Auth,
 ) {
+	ctx = chatgptwebauth.WithTLSOptions(ctx, e.chatGPTWebTLSOptions(ctx))
 	current = auth
 	for refreshAttempt := 0; refreshAttempt < 2; refreshAttempt++ {
 		resolved, errResolve := e.manager.ResolveProxyAuth(ctx, current)
@@ -5053,7 +5054,7 @@ func (e *ChatGPTWebExecutor) fetchChatGPTWebAccountInfo(ctx context.Context, aut
 			quotaErr = errResolve
 			return
 		}
-		client, credential, errClient := e.newRuntimeClientForAcquisition(resolved, true)
+		client, credential, errClient := e.newRuntimeClientWithTLSOptions(resolved, true, e.chatGPTWebTLSOptions(ctx))
 		if errClient != nil {
 			profileErr = errClient
 			quotaErr = errClient
@@ -5065,6 +5066,7 @@ func (e *ChatGPTWebExecutor) fetchChatGPTWebAccountInfo(ctx context.Context, aut
 			client.ProxyURL(),
 			baselineCookies,
 			e.accountInfoTimeout,
+			client.TLSOptions(),
 		)
 		if errQuotaClient != nil {
 			client.CloseIdleConnections()

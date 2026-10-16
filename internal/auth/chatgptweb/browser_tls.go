@@ -7,9 +7,7 @@ import (
 
 // chatGPTWebChrome146Profile preserves the browser identity and HTTP settings,
 // but does not advertise trust-anchor negotiation through a generic extension.
-// The pinned template sends that optional capability unconditionally; this
-// client does not implement it. Matched-exit image controls reproduce a 404
-// with that advertisement and succeed without it. Certificate verification,
+// This is the explicitly selected compatibility variant. Certificate verification,
 // cipher suites, supported versions and all other extensions are unchanged.
 func chatGPTWebChrome146Profile() profiles.ClientProfile {
 	base := profiles.Chrome_146

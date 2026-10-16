@@ -547,6 +547,16 @@ func (e *ChatGPTWebExecutor) UsageCacheSnapshot() helps.ChatGPTWebUsageCacheSnap
 	return e.usageCache.Snapshot()
 }
 
+// chatGPTWebTLSOptions preserves a flow snapshot across configuration updates.
+func (e *ChatGPTWebExecutor) chatGPTWebTLSOptions(ctx context.Context) chatgptwebauth.TLSOptions {
+	cfg := e.configSnapshot()
+	enabled := true
+	if cfg != nil {
+		enabled = cfg.ChatGPTWeb.TrustAnchorsEnabled()
+	}
+	return chatgptwebauth.TLSOptionsFromContext(ctx, chatgptwebauth.TLSOptions{TrustAnchorsEnabled: enabled})
+}
+
 func (e *ChatGPTWebExecutor) configSnapshot() *config.Config {
 	if e == nil {
 		return nil
@@ -589,6 +599,7 @@ func restoreChatGPTWebRawPayloadBytes(snapshot, source []config.PayloadRule) {
 // Execute runs a ChatGPT Web request and translates the result to the inbound
 // protocol.
 func (e *ChatGPTWebExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	ctx = chatgptwebauth.WithTLSOptions(ctx, e.chatGPTWebTLSOptions(ctx))
 	response, err := e.executeRuntime(ctx, auth, req, opts)
 	return response, e.handleChatGPTWebRuntimeLifecycleError(ctx, auth, err)
 }
@@ -618,6 +629,7 @@ func (*ChatGPTWebExecutor) DeferAuthRequestCommitUntilUpstream() bool {
 
 // ExecuteStream runs a streaming ChatGPT Web request.
 func (e *ChatGPTWebExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	ctx = chatgptwebauth.WithTLSOptions(ctx, e.chatGPTWebTLSOptions(ctx))
 	result, err := e.executeRuntimeStream(ctx, auth, req, opts)
 	return result, e.handleChatGPTWebRuntimeLifecycleError(ctx, auth, err)
 }
@@ -721,6 +733,7 @@ func (e *ChatGPTWebExecutor) PrepareRequestAuth(ctx context.Context, auth *clipr
 // installed as lifecycle transitions and therefore return no manager-level
 // refresh error; transient infrastructure errors remain retryable.
 func (e *ChatGPTWebExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*cliproxyauth.Auth, error) {
+	ctx = chatgptwebauth.WithTLSOptions(ctx, e.chatGPTWebTLSOptions(ctx))
 	updated, refreshErr, terminal := e.refreshCredential(ctx, auth, false)
 	if refreshErr == nil {
 		return updated, nil
@@ -734,6 +747,7 @@ func (e *ChatGPTWebExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Aut
 // RefreshToCompletion keeps waiting for a provider-owned token exchange after
 // it starts so rotating refresh tokens cannot be discarded by caller timeout.
 func (e *ChatGPTWebExecutor) RefreshToCompletion(ctx context.Context, auth *cliproxyauth.Auth) (*cliproxyauth.Auth, error) {
+	ctx = chatgptwebauth.WithTLSOptions(ctx, e.chatGPTWebTLSOptions(ctx))
 	updated, refreshErr, terminal := e.refreshCredential(ctx, auth, true)
 	if refreshErr == nil {
 		return updated, nil
@@ -760,6 +774,11 @@ func (e *ChatGPTWebExecutor) Login(ctx context.Context, input chatgptwebauth.Log
 }
 
 func (e *ChatGPTWebExecutor) loginWithRuntimeSnapshot(ctx context.Context, input chatgptwebauth.LoginInput, cfg *config.Config) (*chatgptwebauth.Credential, error) {
+	enabled := true
+	if cfg != nil {
+		enabled = cfg.ChatGPTWeb.TrustAnchorsEnabled()
+	}
+	ctx = chatgptwebauth.WithTLSOptions(ctx, chatgptwebauth.TLSOptions{TrustAnchorsEnabled: enabled})
 	if cfg != nil {
 		ctx = chatgptwebauth.WithBrowserRegionPolicy(ctx, cfg.ChatGPTWeb, proxyregion.Route{ProxyURL: input.ProxyURL})
 	}
@@ -813,6 +832,7 @@ func chatGPTWebLoginProxySnapshot(cfg *config.Config) chatgptwebauth.LoginProxyC
 // NormalizeImportedCredential validates and refreshes one imported credential
 // before management persists it.
 func (e *ChatGPTWebExecutor) NormalizeImportedCredential(ctx context.Context, credential *chatgptwebauth.Credential, proxyURL string) (*chatgptwebauth.Credential, error) {
+	ctx = chatgptwebauth.WithTLSOptions(ctx, e.chatGPTWebTLSOptions(ctx))
 	if e == nil || e.authService == nil || credential == nil {
 		return nil, errors.New("chatgpt web imported credential is unavailable")
 	}
@@ -1278,6 +1298,7 @@ func (e *ChatGPTWebExecutor) joinReloginFlight(ctx context.Context, expected *cl
 			return nil, context.Canceled
 		}
 		flightCtx, cancel := context.WithCancel(e.lifecycleContext())
+		flightCtx = chatgptwebauth.WithTLSOptions(flightCtx, e.chatGPTWebTLSOptions(ctx))
 		flight := &chatGPTWebReloginFlight{
 			key:         key,
 			done:        make(chan struct{}),
@@ -2104,6 +2125,7 @@ func (e *ChatGPTWebExecutor) refreshCredential(ctx context.Context, auth *clipro
 			acquisitionCtx, cancel = e.acquisitionContext()
 		}
 		defer cancel()
+		acquisitionCtx = chatgptwebauth.WithTLSOptions(acquisitionCtx, e.chatGPTWebTLSOptions(ctx))
 		acquisitionCtx, release, active := auth.BeginRuntimeExecution(acquisitionCtx)
 		if !active {
 			return chatGPTWebRefreshResult{err: context.Canceled}, nil
@@ -2214,6 +2236,7 @@ type chatGPTWebRefreshResult struct {
 }
 
 func (e *ChatGPTWebExecutor) refreshByStrategy(ctx context.Context, auth *cliproxyauth.Auth, credential *chatgptwebauth.Credential) (*chatgptwebauth.Credential, error, bool) {
+	ctx = chatgptwebauth.WithTLSOptions(ctx, e.chatGPTWebTLSOptions(ctx))
 	policy, errPolicy := e.browserRegionPolicy(auth)
 	if errPolicy != nil {
 		return nil, errPolicy, true
