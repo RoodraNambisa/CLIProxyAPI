@@ -2099,6 +2099,7 @@ func (e *ChatGPTWebExecutor) refreshCredential(ctx context.Context, auth *clipro
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	ctx = chatgptwebauth.WithTLSOptions(ctx, e.chatGPTWebTLSOptions(ctx))
 	if errContext := ctx.Err(); errContext != nil {
 		return nil, errContext, false
 	}

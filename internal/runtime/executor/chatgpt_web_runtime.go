@@ -1445,12 +1445,13 @@ func chatGPTWebMetadataString(metadata map[string]any, key string) string {
 
 // FetchModels refreshes the authenticated ChatGPT Web model catalog.
 func (e *ChatGPTWebExecutor) FetchModels(ctx context.Context, auth *cliproxyauth.Auth) (models []chatgptwebauth.CatalogModel, errResult error) {
+	ctx = chatgptwebauth.WithTLSOptions(ctx, e.chatGPTWebTLSOptions(ctx))
 	defer func() {
 		if e.manager != nil {
 			errResult = e.manager.RecoverChatGPTWebUnauthorizedInBackground(ctx, auth, errResult)
 		}
 	}()
-	client, credential, err := e.newRuntimeClient(auth)
+	client, credential, err := e.newRuntimeClientWithTLSOptions(auth, false, e.chatGPTWebTLSOptions(ctx))
 	if err != nil {
 		return nil, err
 	}
