@@ -1438,6 +1438,9 @@ func (m *Manager) deleteHealth(bindingID string) {
 	m.mu.Lock()
 	delete(m.health, bindingID)
 	m.mu.Unlock()
+	if m.exits != nil {
+		m.exits.forget(bindingID)
+	}
 	if m.regions != nil {
 		m.regions.ForgetBinding(bindingID)
 	}

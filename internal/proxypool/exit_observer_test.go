@@ -137,3 +137,29 @@ func TestUnifiedExitReusesMatchingPoolHealthWithoutSecondCheck(t *testing.T) {
 		t.Fatalf("duplicate exit check: before%d after%d", before, calls.Load())
 	}
 }
+
+func TestUnifiedExitReplacementRemovesRetiredBinding(t *testing.T) {
+	m := newTestManager(t, filepath.Join(t.TempDir(), "config.yaml"), proxyPoolTestConfig("3334"))
+	t.Cleanup(m.Stop)
+	m.check = successfulTrace
+	a := proxyPoolTestAuth("replace")
+	resolved, err := m.Resolve(t.Context(), a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := proxyregion.Route{ProxyURL: resolved.URL, BindingID: resolved.BindingID, OwnerID: a.ID}
+	m.ensureRegionObservation(t.Context(), r)
+	m.mu.RLock()
+	replacement := m.bindings[a.ID]
+	m.mu.RUnlock()
+	replacement.ID = "new-binding"
+	if err := m.saveBinding(replacement); err != nil {
+		t.Fatal(err)
+	}
+	m.exits.mu.Lock()
+	_, exists := m.exits.bound[resolved.BindingID]
+	m.exits.mu.Unlock()
+	if exists {
+		t.Fatal("retired binding observation retained")
+	}
+}
