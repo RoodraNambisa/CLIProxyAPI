@@ -25,7 +25,7 @@ func (h *Handler) GetProxyIP(c *gin.Context) {
 	health, _ := config.NormalizeProxyHealthCheckConfiguration(cfg.EffectiveProxyHealthCheck())
 	common["temporary-route-check-interval-seconds"] = *health.TemporaryRouteCheckIntervalSeconds
 	common["temporary-route-cache-size"] = *health.TemporaryRouteCacheSize
-	c.JSON(200, gin.H{"config": common, "proxy_region": cfg.ProxyRegion, "legacy": cfg.ProxyIP == nil, "capabilities": gin.H{"proxy_ip": true, "scheduled_refresh": true, "cold_cache_wait": true, "codex_time_context": true, "credential_region": true, "region_lifecycle": true, "proxy_region": true}})
+	c.JSON(200, gin.H{"config": common, "proxy_region": cfg.ProxyRegion, "legacy": cfg.ProxyIP == nil, "capabilities": gin.H{"proxy_ip": true, "scheduled_refresh": true, "cold_cache_wait": true, "codex_time_context": true, "credential_region": true, "region_lifecycle": true, "proxy_region": true, "region_application": true, "region_credentials": true}})
 }
 func (h *Handler) PatchProxyIP(c *gin.Context) {
 	var fields map[string]json.RawMessage
@@ -136,6 +136,11 @@ func (h *Handler) proxyIPLookup(c *gin.Context, refresh bool) {
 	// PreviewProxyAuth never allocates a binding or probes the network.
 	resolved, err := authManager.PreviewProxyAuth(auth)
 	if err != nil || resolved.Pending {
+		if !refresh {
+			c.Header("Cache-Control", "no-store")
+			c.JSON(200, gin.H{"reason": "route_unresolved", "cache_state": "missing", "refresh_state": "idle", "application": h.proxyRegionApplication(c.Request.Context(), auth, "")})
+			return
+		}
 		c.JSON(409, gin.H{"error": "route_unresolved"})
 		return
 	}
@@ -181,7 +186,10 @@ func (h *Handler) proxyIPLookup(c *gin.Context, refresh bool) {
 		}
 	}
 	c.Header("Cache-Control", "no-store")
-	c.JSON(status, snapshot)
+	c.JSON(status, struct {
+		proxyregion.Snapshot
+		Application proxyRegionApplicationView `json:"application"`
+	}{snapshot, h.proxyRegionApplication(c.Request.Context(), auth, "")})
 }
 func (h *Handler) GetCodexTimeContext(c *gin.Context) {
 	cfg := h.currentConfig()

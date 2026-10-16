@@ -229,5 +229,8 @@ func (h *Handler) browserRegionPreview(c *gin.Context, refresh bool) {
 		status = 503
 		snapshot.Reason = "unavailable"
 	}
-	c.JSON(status, snapshot)
+	c.JSON(status, struct {
+		chatgptwebauth.BrowserRegionSnapshot
+		Application proxyRegionApplicationView `json:"application"`
+	}{snapshot, h.proxyRegionApplication(c.Request.Context(), auth, "")})
 }

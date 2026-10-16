@@ -275,13 +275,13 @@ func (e *ChatGPTWebExecutor) BrowserRegionPreview(auth *cliproxyauth.Auth, refre
 	route := e.proxyURLForTarget(routed, e.chatGPTWebBaseURL())
 	code := ""
 	if refresh {
-		code = e.browserRegion.Shared().Refresh(proxyregion.Route{ProxyURL: route, BindingID: routed.EffectiveProxyBindingID(), Scope: proxyregion.ScopeForTarget(e.chatGPTWebBaseURL())})
+		code = e.browserRegion.Shared().Refresh(proxyregion.Route{ProxyURL: route, BindingID: routed.EffectiveProxyBindingID(), OwnerID: auth.ID, Scope: proxyregion.ScopeForTarget(e.chatGPTWebBaseURL())})
 	}
 	policy, errPolicy := e.browserRegionPolicy(auth)
 	if errPolicy != nil {
 		return chatgptwebauth.BrowserRegionSnapshot{}, "credential_invalid"
 	}
-	s := e.browserRegion.Apply(proxyregion.Route{ProxyURL: route, BindingID: routed.EffectiveProxyBindingID(), Scope: proxyregion.ScopeForTarget(e.chatGPTWebBaseURL())}, credential.Persona, &policy, false)
+	s := e.browserRegion.Apply(proxyregion.Route{ProxyURL: route, BindingID: routed.EffectiveProxyBindingID(), OwnerID: auth.ID, Scope: proxyregion.ScopeForTarget(e.chatGPTWebBaseURL())}, credential.Persona, &policy, false)
 	return s, code
 }
 

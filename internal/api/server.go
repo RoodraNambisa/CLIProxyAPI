@@ -827,6 +827,7 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/proxy-ip", s.mgmt.GetProxyIP)
 		mgmt.PATCH("/proxy-ip", s.mgmt.PatchProxyIP)
 		mgmt.GET("/proxy-ip/status", s.mgmt.GetProxyIPStatus)
+		mgmt.GET("/proxy-ip/credentials", s.mgmt.GetProxyRegionCredentials)
 		mgmt.POST("/proxy-ip/preview", s.mgmt.PreviewProxyIP)
 		mgmt.POST("/proxy-ip/refresh", s.mgmt.RefreshProxyIP)
 		mgmt.GET("/codex/time-context", s.mgmt.GetCodexTimeContext)
@@ -1116,6 +1117,7 @@ func startupManagementPathAvailable(path string) bool {
 		"/startup/status",
 		"/proxy-ip",
 		"/proxy-ip/status",
+		"/proxy-ip/credentials",
 		"/codex/time-context",
 		"/chatgpt-web/browser-region",
 		"/chatgpt-web/browser-region/preview",

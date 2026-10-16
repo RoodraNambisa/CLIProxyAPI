@@ -52,3 +52,75 @@ func (m *Manager) PreviewProxyAuth(auth *Auth) (ProxyPreview, error) {
 	}
 	return ProxyPreview{ResolvedProxy: ResolvedProxy{Source: "inherit"}, Pending: resolver != nil, Linked: source != auth}, nil
 }
+
+// ProxyCredentialSummary contains only fields needed to search region consumers.
+// It deliberately excludes proxy URLs, tokens, model maps, and auth metadata.
+type ProxyCredentialSummary struct {
+	ID             string `json:"auth_id"`
+	Index          string `json:"auth_index"`
+	Name           string `json:"name"`
+	Provider       string `json:"provider"`
+	Disabled       bool   `json:"disabled"`
+	HasCustomProxy bool   `json:"-"`
+	BindingOwnerID string `json:"-"`
+}
+
+// ProxyCredentialSummaries limits bound-only searches to the supplied IDs and
+// their linked Web consumers, using the dependency index rather than a full scan.
+// A nil ID list requests all credentials; an empty non-nil list requests none.
+func (m *Manager) ProxyCredentialSummaries(ids []string) []ProxyCredentialSummary {
+	if m == nil {
+		return nil
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if ids == nil {
+		ids = make([]string, 0, len(m.auths))
+		for id := range m.auths {
+			ids = append(ids, id)
+		}
+	} else {
+		selected := make(map[string]struct{}, len(ids))
+		for _, id := range ids {
+			selected[id] = struct{}{}
+			source := m.auths[id]
+			for dependentID := range m.dependencyDependentIDs[ChatGPTWebCredentialUID(source)] {
+				if ChatGPTWebLinkedSourceMatches(m.auths[dependentID], source) {
+					selected[dependentID] = struct{}{}
+				}
+			}
+		}
+		ids = make([]string, 0, len(selected))
+		for id := range selected {
+			ids = append(ids, id)
+		}
+	}
+	result := make([]ProxyCredentialSummary, 0, len(ids))
+	for _, id := range ids {
+		a := m.auths[id]
+		if a == nil {
+			continue
+		}
+		name := a.FileName
+		if name == "" {
+			name = a.Label
+		}
+		if name == "" {
+			name = a.ID
+		}
+		owner := a
+		if sourceID := ChatGPTWebLinkedSourceID(a); sourceID != "" {
+			owner = m.auths[sourceID]
+			if !ChatGPTWebLinkedSourceMatches(a, owner) {
+				owner = nil
+			}
+		}
+		summary := ProxyCredentialSummary{ID: a.ID, Index: a.Index, Name: name, Provider: a.Provider, Disabled: a.Disabled}
+		if owner != nil {
+			summary.BindingOwnerID = owner.ID
+			summary.HasCustomProxy = strings.TrimSpace(owner.ProxyURL) != ""
+		}
+		result = append(result, summary)
+	}
+	return result
+}

@@ -21,10 +21,19 @@ func (m *Manager) manualRegion(r proxyregion.Route) (config.ProxyRegionConfig, s
 			return config.ProxyRegionConfig{}, ""
 		}
 		m.mu.RLock()
-		b := m.bindings[owner]
+		b, exists := m.bindings[owner]
 		m.mu.RUnlock()
-		pool := snapshot.pools[strings.ToLower(b.Pool)]
-		entry := pool.byID[strings.ToLower(b.Entry)]
+		if !exists || b.ID != r.BindingID {
+			return config.ProxyRegionConfig{}, ""
+		}
+		pool, poolExists := snapshot.pools[strings.ToLower(b.Pool)]
+		if !poolExists {
+			return config.ProxyRegionConfig{}, ""
+		}
+		entry, entryExists := pool.byID[strings.ToLower(b.Entry)]
+		if !entryExists {
+			return config.ProxyRegionConfig{}, ""
+		}
 		return pool.config.Region.Overlay(entry.config.Region), "proxy_pool"
 	}
 	m.mu.RLock()
@@ -136,9 +145,19 @@ func (m *Manager) manualRegionSources(r proxyregion.Route) (string, string) {
 		owner, _, valid := m.exits.binding(r, snapshot)
 		if valid {
 			m.mu.RLock()
-			b := m.bindings[owner]
+			b, exists := m.bindings[owner]
 			m.mu.RUnlock()
-			entry := snapshot.pools[strings.ToLower(b.Pool)].byID[strings.ToLower(b.Entry)]
+			if !exists || b.ID != r.BindingID {
+				return "", ""
+			}
+			pool, poolExists := snapshot.pools[strings.ToLower(b.Pool)]
+			if !poolExists {
+				return "", ""
+			}
+			entry, entryExists := pool.byID[strings.ToLower(b.Entry)]
+			if !entryExists {
+				return "", ""
+			}
 			if entry.config.Region.Timezone != "" {
 				tz = "proxy_node"
 			}

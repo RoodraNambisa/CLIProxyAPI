@@ -166,6 +166,10 @@ func (h *Handler) GetProxyBindings(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "proxy pool manager unavailable"})
 		return
 	}
+	if c.Query("paged") == "true" {
+		h.proxyBindingRegions(c, manager)
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"bindings": manager.BindingStatuses()})
 }
 

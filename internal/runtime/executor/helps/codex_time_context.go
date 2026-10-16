@@ -199,21 +199,21 @@ func RewriteCodexTimeContext(body []byte, timezone string, at time.Time, compact
 	return body, changed, nil
 }
 
-func ApplyCodexTimeContext(ctx context.Context, service *proxyregion.Service, auth *coreauth.Auth, route proxyregion.Route, body []byte, snapshot CodexTimeContextSnapshot, compact bool) []byte {
+// SelectCodexTimeContext uses the same policy for execution and read-only previews.
+// A preview never enqueues lookups or records a request as applied.
+func SelectCodexTimeContext(ctx context.Context, service *proxyregion.Service, auth *coreauth.Auth, route proxyregion.Route, base config.CodexTimeContextConfig, lookup bool) CodexTimeContextDiagnostic {
 	var override any
 	if auth != nil {
 		override = auth.Metadata[config.CodexTimeContextMetadataKey]
 	}
-	policy, err := config.EffectiveCodexTimeContext(snapshot.Policy, override)
+	policy, err := config.EffectiveCodexTimeContext(base, override)
 	diagnostic := CodexTimeContextDiagnostic{Mode: policy.Mode, Source: "disabled", Changed: []string{}}
 	if err != nil {
 		diagnostic.Reason = "invalid_policy"
-		RecordTimeContextDiagnostic(ctx, diagnostic)
-		return body
+		return diagnostic
 	}
 	if !policy.Enabled || policy.Mode == "off" {
-		RecordTimeContextDiagnostic(ctx, diagnostic)
-		return body
+		return diagnostic
 	}
 	zone := policy.Timezone
 	diagnostic.Source = "manual"
@@ -227,7 +227,11 @@ func ApplyCodexTimeContext(ctx context.Context, service *proxyregion.Service, au
 			diagnostic.Region.TimezoneSource = source
 			diagnostic.Source = source
 		} else {
-			diagnostic.Region = service.ResolveForRequest(ctx, route)
+			if lookup {
+				diagnostic.Region = service.ResolveForRequest(ctx, route)
+			} else {
+				diagnostic.Region = service.Preview(route)
+			}
 		}
 		zone = diagnostic.Region.Timezone
 		diagnostic.Reason = diagnostic.Region.Reason
@@ -237,13 +241,24 @@ func ApplyCodexTimeContext(ctx context.Context, service *proxyregion.Service, au
 				diagnostic.Source = "fallback"
 			} else {
 				diagnostic.Source = "preserved"
-				RecordTimeContextDiagnostic(ctx, diagnostic)
-				return body
+				return diagnostic
 			}
 		}
 	}
+	diagnostic.Timezone = zone
+	return diagnostic
+}
+
+func ApplyCodexTimeContext(ctx context.Context, service *proxyregion.Service, auth *coreauth.Auth, route proxyregion.Route, body []byte, snapshot CodexTimeContextSnapshot, compact bool) []byte {
+	diagnostic := SelectCodexTimeContext(ctx, service, auth, route, snapshot.Policy, true)
+	zone := diagnostic.Timezone
+	if zone == "" {
+		RecordTimeContextDiagnostic(ctx, diagnostic)
+		return body
+	}
 	result, changed, err := RewriteCodexTimeContext(body, zone, snapshot.At, compact)
 	if err != nil {
+		diagnostic.Timezone = ""
 		diagnostic.Reason = "context_rewrite_failed"
 		RecordTimeContextDiagnostic(ctx, diagnostic)
 		return body
