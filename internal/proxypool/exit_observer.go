@@ -19,6 +19,9 @@ type exitRecord struct {
 	attempted  time.Time
 	generation uint64
 	reason     string
+	failures   int
+	retryAt    time.Time
+	failedAt   time.Time
 }
 type exitTask struct {
 	key      string
@@ -28,6 +31,7 @@ type exitTask struct {
 	ctx      context.Context
 	cancel   context.CancelFunc
 	done     chan struct{}
+	queued   bool
 }
 
 // exitObserver extends proxy management to destination-scoped observations.
@@ -44,6 +48,7 @@ type exitObserver struct {
 	ctx             context.Context
 	cancel          context.CancelFunc
 	started, closed bool
+	workers         int
 	wg              sync.WaitGroup
 }
 
@@ -155,10 +160,10 @@ func (o *exitObserver) snapshot(r proxyregion.Route) proxyregion.Observation {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	v := o.getLocked(r)
-	if v == nil || v.generation != snapshot.generation || !v.value.OK {
+	if v == nil || v.generation != snapshot.generation {
 		return proxyregion.Observation{}
 	}
-	return proxyregion.Observation{IP: v.value.IP, At: v.value.CheckedAt, Source: r.Scope, Reason: v.reason}
+	return proxyregion.Observation{IP: v.value.IP, At: v.value.CheckedAt, Source: r.Scope, Reason: v.reason, RetryAt: v.retryAt, FailedAt: v.failedAt}
 }
 func (o *exitObserver) request(r proxyregion.Route) *exitTask {
 	r = normalizeExitRoute(r)
@@ -177,27 +182,38 @@ func (o *exitObserver) request(r proxyregion.Route) *exitTask {
 	if pending := o.pending[key]; pending != nil {
 		return pending
 	}
-	if v := o.getLocked(r); v != nil && v.generation == snapshot.generation && o.manager.now().Sub(v.attempted) < interval {
+	if v := o.getLocked(r); v != nil && v.generation == snapshot.generation && v.fresh(o.manager.now(), interval) {
 		return nil
 	}
 	if !o.started {
 		o.started = true
-		for range 2 {
-			o.wg.Add(1)
-			go o.worker()
-		}
+		o.startWorkersLocked(snapshot.health.Concurrency)
 	}
 	ctx, cancel := context.WithCancel(o.ctx)
 	task := &exitTask{key: key, route: r, owner: owner, snapshot: snapshot, ctx: ctx, cancel: cancel, done: make(chan struct{})}
-	select {
-	case o.queue <- task:
-		o.pending[key] = task
-		return task
-	default:
-		cancel()
-		return nil
+	o.pending[key] = task
+	o.dispatchLocked()
+	return task
+}
+func (o *exitObserver) dispatchLocked() {
+	for _, task := range o.pending {
+		if !task.queued {
+			select {
+			case o.queue <- task:
+				task.queued = true
+			default:
+				return
+			}
+		}
 	}
 }
+func (v *exitRecord) fresh(now time.Time, interval time.Duration) bool {
+	if v.reason != "" {
+		return now.Before(v.retryAt)
+	}
+	return v.value.OK && v.value.IP != "" && now.Sub(v.value.CheckedAt) < interval
+}
+
 func (o *exitObserver) ensure(ctx context.Context, r proxyregion.Route) proxyregion.Observation {
 	task := o.request(r)
 	if task != nil {
@@ -209,9 +225,17 @@ func (o *exitObserver) ensure(ctx context.Context, r proxyregion.Route) proxyreg
 	}
 	return o.snapshot(r)
 }
-func (o *exitObserver) worker() {
+func (o *exitObserver) worker(index int) {
 	defer o.wg.Done()
 	for {
+		if index >= o.manager.snapshot().health.Concurrency {
+			select {
+			case <-o.ctx.Done():
+				return
+			case <-time.After(100 * time.Millisecond):
+				continue
+			}
+		}
 		select {
 		case <-o.ctx.Done():
 			return
@@ -221,7 +245,7 @@ func (o *exitObserver) worker() {
 				_, interval, valid := o.binding(task.route, task.snapshot)
 				o.mu.Lock()
 				record := o.getLocked(task.route)
-				fresh := record != nil && record.generation == task.snapshot.generation && o.manager.now().Sub(record.attempted) < interval
+				fresh := record != nil && record.generation == task.snapshot.generation && record.fresh(o.manager.now(), interval)
 				o.mu.Unlock()
 				if valid && !fresh {
 					result := o.manager.checkProxyTarget(task.ctx, task.route.ProxyURL, config.ProxyHealthCheckEndpointConfig{Name: task.route.Scope, URL: task.route.Scope, Mode: config.ProxyHealthCheckModeCloudflareTrace}, task.snapshot)
@@ -233,6 +257,7 @@ func (o *exitObserver) worker() {
 			if o.pending[task.key] == task {
 				delete(o.pending, task.key)
 			}
+			o.dispatchLocked()
 			o.mu.Unlock()
 			close(task.done)
 			task.cancel()
@@ -253,17 +278,27 @@ func (o *exitObserver) publish(task *exitTask, result TraceResult) {
 		return
 	}
 	old := o.getLocked(task.route)
+	if old != nil && old.generation == task.snapshot.generation && old.reason == "" && result.OK && old.value.IP == result.IP && old.attempted.Equal(result.CheckedAt) {
+		return
+	}
 	if old != nil && old.attempted.After(result.CheckedAt) {
 		return
 	}
 	v := &exitRecord{route: task.route, owner: task.owner, value: result, attempted: result.CheckedAt, generation: task.snapshot.generation}
-	if !result.OK {
+	if !result.OK || result.IP == "" {
+		v.failures = 1
+		if old != nil {
+			v.failures = old.failures + 1
+		}
+		v.failedAt = result.CheckedAt
+		v.retryAt = result.CheckedAt.Add(proxyregion.RetryDelay(v.failures))
 		v.reason = "exit_refresh_failed"
 		if old != nil {
 			v.value = old.value
 		}
 	}
 	o.putLocked(v, task.snapshot)
+	o.manager.regions.Observed(task.route, v.value.IP)
 }
 func (o *exitObserver) importHealth(snapshot *configSnapshot, binding Binding, proxy string, result TraceResult) {
 	if !result.OK || result.IP == "" {
@@ -285,7 +320,7 @@ func (o *exitObserver) refreshBound(ctx context.Context, snapshot *configSnapsho
 	o.mu.Lock()
 	routes := []proxyregion.Route{}
 	for _, v := range o.bound[binding.ID] {
-		if o.manager.now().Sub(v.attempted) >= time.Duration(snapshot.pools[strings.ToLower(binding.Pool)].config.CheckIntervalSeconds)*time.Second {
+		if !v.fresh(o.manager.now(), time.Duration(snapshot.pools[strings.ToLower(binding.Pool)].config.CheckIntervalSeconds)*time.Second) {
 			routes = append(routes, v.route)
 		}
 	}
@@ -301,7 +336,7 @@ func (o *exitObserver) refreshBound(ctx context.Context, snapshot *configSnapsho
 		}
 		o.mu.Lock()
 		current := o.getLocked(r)
-		fresh := current != nil && current.generation == snapshot.generation && o.manager.now().Sub(current.attempted) < time.Duration(snapshot.pools[strings.ToLower(binding.Pool)].config.CheckIntervalSeconds)*time.Second
+		fresh := current != nil && current.generation == snapshot.generation && current.fresh(o.manager.now(), time.Duration(snapshot.pools[strings.ToLower(binding.Pool)].config.CheckIntervalSeconds)*time.Second)
 		o.mu.Unlock()
 		if fresh {
 			continue
@@ -313,6 +348,9 @@ func (o *exitObserver) refreshBound(ctx context.Context, snapshot *configSnapsho
 func (o *exitObserver) configure(snapshot *configSnapshot) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
+	if o.started && !o.closed {
+		o.startWorkersLocked(snapshot.health.Concurrency)
+	}
 	for _, task := range o.pending {
 		if task.snapshot.generation != snapshot.generation {
 			task.cancel()
@@ -355,6 +393,16 @@ func (o *exitObserver) resume(parent context.Context) {
 	o.ctx, o.cancel = context.WithCancel(parent)
 	o.closed = false
 	o.started = false
+	o.workers = 0
 	clear(o.pending)
 	o.queue = make(chan *exitTask, 256)
+}
+
+func (o *exitObserver) startWorkersLocked(n int) {
+	for o.workers < n {
+		index := o.workers
+		o.workers++
+		o.wg.Add(1)
+		go o.worker(index)
+	}
 }

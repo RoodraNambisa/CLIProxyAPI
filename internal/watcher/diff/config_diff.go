@@ -316,6 +316,9 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	if !reflect.DeepEqual(oldCfg.Codex.TimeContext, newCfg.Codex.TimeContext) {
 		changes = append(changes, "codex.time-context changed")
 	}
+	if !reflect.DeepEqual(oldCfg.ProxyRegion, newCfg.ProxyRegion) {
+		changes = append(changes, "global proxy region changed")
+	}
 	if !reflect.DeepEqual(oldCfg.EffectiveProxyIP(), newCfg.EffectiveProxyIP()) {
 		changes = append(changes, "proxy-ip metadata settings changed")
 	}

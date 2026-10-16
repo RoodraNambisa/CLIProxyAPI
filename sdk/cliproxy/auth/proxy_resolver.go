@@ -282,3 +282,16 @@ func (m *Manager) IPRegions() *proxyregion.Service {
 	}
 	return nil
 }
+
+// NotifyRegionConsumer updates shared references after credential mutations.
+func (m *Manager) NotifyRegionConsumer(id string) {
+	if m == nil {
+		return
+	}
+	m.mu.RLock()
+	r := m.proxyResolver
+	m.mu.RUnlock()
+	if notify, ok := r.(interface{ NotifyRegionConsumer(string) }); ok {
+		notify.NotifyRegionConsumer(id)
+	}
+}

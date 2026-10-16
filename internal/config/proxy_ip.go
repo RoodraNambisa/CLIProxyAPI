@@ -7,6 +7,7 @@ import (
 
 // ProxyIPConfig owns only IP metadata settings. Proxy health owns exit observations.
 type ProxyIPConfig struct {
+	LookupConcurrency      *int   `yaml:"lookup-concurrency,omitempty" json:"lookup-concurrency,omitempty"`
 	LookupURL              string `yaml:"lookup-url,omitempty" json:"lookup-url"`
 	LookupTimeoutSeconds   *int   `yaml:"lookup-timeout-seconds,omitempty" json:"lookup-timeout-seconds,omitempty"`
 	IPCacheTTLSeconds      *int   `yaml:"ip-cache-ttl-seconds,omitempty" json:"ip-cache-ttl-seconds,omitempty"`
@@ -17,6 +18,7 @@ type ProxyIPConfig struct {
 	RefreshIntervalSeconds *int   `yaml:"refresh-interval-seconds,omitempty" json:"refresh-interval-seconds,omitempty"`
 }
 type ResolvedProxyIP struct {
+	LookupConcurrency      int    `json:"lookup-concurrency"`
 	LookupURL              string `json:"lookup-url"`
 	LookupTimeoutSeconds   int    `json:"lookup-timeout-seconds"`
 	IPCacheTTLSeconds      int    `json:"ip-cache-ttl-seconds"`
@@ -28,7 +30,7 @@ type ResolvedProxyIP struct {
 }
 
 func (c ProxyIPConfig) Resolved() ResolvedProxyIP {
-	r := ResolvedProxyIP{LookupURL: strings.TrimSpace(c.LookupURL), LookupTimeoutSeconds: 8, IPCacheTTLSeconds: 86400, IPCacheSize: 100000, RefreshMode: c.RefreshMode, ColdCacheMode: c.ColdCacheMode, RefreshBatchSize: 64, RefreshIntervalSeconds: 5}
+	r := ResolvedProxyIP{LookupURL: strings.TrimSpace(c.LookupURL), LookupTimeoutSeconds: 8, LookupConcurrency: 8, IPCacheTTLSeconds: 86400, IPCacheSize: 100000, RefreshMode: c.RefreshMode, ColdCacheMode: c.ColdCacheMode, RefreshBatchSize: 64, RefreshIntervalSeconds: 5}
 	if r.LookupURL == "" {
 		r.LookupURL = "https://ipwho.is/{ip}"
 	}
@@ -37,6 +39,9 @@ func (c ProxyIPConfig) Resolved() ResolvedProxyIP {
 	}
 	if r.ColdCacheMode == "" {
 		r.ColdCacheMode = "fallback"
+	}
+	if c.LookupConcurrency != nil {
+		r.LookupConcurrency = *c.LookupConcurrency
 	}
 	if c.LookupTimeoutSeconds != nil {
 		r.LookupTimeoutSeconds = *c.LookupTimeoutSeconds
@@ -57,6 +62,9 @@ func (c ProxyIPConfig) Resolved() ResolvedProxyIP {
 }
 func (c ProxyIPConfig) Validate() error {
 	r := c.Resolved()
+	if r.LookupConcurrency < 1 || r.LookupConcurrency > 256 {
+		return fmt.Errorf("proxy-ip.lookup-concurrency must be between 1 and 256")
+	}
 	if r.RefreshMode != "lazy" && r.RefreshMode != "scheduled" {
 		return fmt.Errorf("proxy-ip.refresh-mode must be lazy or scheduled")
 	}
@@ -84,4 +92,16 @@ func (c *Config) EffectiveProxyIP() ProxyIPConfig {
 	v := c.ChatGPTWeb.BrowserRegion
 	return ProxyIPConfig{LookupURL: v.LookupURL, LookupTimeoutSeconds: v.LookupTimeoutSeconds, IPCacheSize: v.IPCacheSize}
 }
-func (c *Config) ValidateProxyIP() error { return c.EffectiveProxyIP().Validate() }
+func (c *Config) ValidateProxyIP() error {
+	if c != nil {
+		if err := c.ProxyRegion.Validate(); err != nil {
+			return err
+		}
+		for _, k := range c.CodexKey {
+			if err := k.ProxyRegion.Validate(); err != nil {
+				return err
+			}
+		}
+	}
+	return c.EffectiveProxyIP().Validate()
+}

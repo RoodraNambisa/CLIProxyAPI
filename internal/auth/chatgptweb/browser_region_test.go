@@ -23,3 +23,24 @@ func TestBrowserRegionPolicyDoesNotResetSharedService(t *testing.T) {
 		t.Fatal("provider closed shared service")
 	}
 }
+
+func TestManualProxyRegionNeedsNoLookupAndRespectsConsumerFlags(t *testing.T) {
+	shared := proxyregion.New(t.Context(), config.ProxyIPConfig{})
+	defer shared.Close()
+	shared.SetManualSource(func(proxyregion.Route) (config.ProxyRegionConfig, string) {
+		return config.ProxyRegionConfig{Timezone: "Asia/Tokyo", Language: "ja-JP"}, "global_proxy"
+	})
+	r := NewSharedBrowserRegionResolver(t.Context(), shared)
+	r.UpdateConfig(config.ChatGPTWebConfig{BrowserRegion: config.ChatGPTWebBrowserRegionConfig{AutoTimezone: true, AutoLanguage: true}})
+	v := r.Resolve("http://fixture:80", DefaultPersona())
+	if v.Timezone != "Asia/Tokyo" || v.Language != "ja-JP" || v.TimezoneSource != "global_proxy" {
+		t.Fatal(v)
+	}
+	if shared.Counts()["pending"] != 0 {
+		t.Fatal("manual region started lookup")
+	}
+	r.UpdateConfig(config.ChatGPTWebConfig{Timezone: "UTC"})
+	if v = r.Resolve("http://fixture:80", DefaultPersona()); v.Timezone != "UTC" || v.TimezoneSource == "global_proxy" {
+		t.Fatal("manual proxy data enabled disabled consumer")
+	}
+}

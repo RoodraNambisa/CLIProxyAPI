@@ -2022,6 +2022,7 @@ func (m ClaudeModel) GetThinking() *registry.ThinkingSupport { return m.Thinking
 // CodexKey represents the configuration for a Codex API key,
 // including the API key itself and an optional base URL for the API endpoint.
 type CodexKey struct {
+	ProxyRegion         ProxyRegionConfig        `yaml:"proxy-region,omitempty" json:"proxy-region,omitempty"`
 	TimeContext         *CodexTimeContextConfig  `yaml:"time-context,omitempty" json:"time-context,omitempty"`
 	RequestScopedErrors []RequestScopedErrorRule `yaml:"request-scoped-errors,omitempty" json:"request-scoped-errors,omitempty"`
 	// RequestRetry overrides additional credential retry rounds. Nil inherits;

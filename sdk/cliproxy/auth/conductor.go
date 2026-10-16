@@ -3193,6 +3193,9 @@ var ErrAuthMutationIdentityChanged = errors.New("auth mutation identity changed 
 
 // Register inserts or replaces an auth entry in the manager.
 func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
+	if auth != nil {
+		defer m.NotifyRegionConsumer(auth.ID)
+	}
 	return m.register(ctx, auth, false)
 }
 
@@ -3463,6 +3466,9 @@ func (m *Manager) chatGPTWebStoredCredentialConflict(ctx context.Context, authID
 
 // Update replaces an existing auth entry and notifies hooks.
 func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
+	if auth != nil {
+		defer m.NotifyRegionConsumer(auth.ID)
+	}
 	if auth == nil || strings.TrimSpace(auth.ID) == "" {
 		return nil, nil
 	}
@@ -4082,6 +4088,7 @@ func persistedAuthIndexConflict(err error) bool {
 
 // Delete removes an auth entry from runtime state and optionally from the backing store.
 func (m *Manager) Delete(ctx context.Context, id string) error {
+	defer m.NotifyRegionConsumer(id)
 	_, err := m.deleteIf(ctx, id, nil)
 	return err
 }
@@ -4089,6 +4096,7 @@ func (m *Manager) Delete(ctx context.Context, id string) error {
 // DeleteIf removes an auth only when predicate still matches the current
 // runtime entry while the per-auth persistence lock is held.
 func (m *Manager) DeleteIf(ctx context.Context, id string, predicate func(*Auth) bool) (bool, error) {
+	defer m.NotifyRegionConsumer(id)
 	return m.deleteIf(ctx, id, predicate)
 }
 
@@ -4210,6 +4218,7 @@ func (m *Manager) deleteIf(ctx context.Context, id string, predicate func(*Auth)
 // DeleteWithOperation retires an auth, runs a backing-store deletion while the
 // auth persistence key is locked, and removes the runtime entry only on success.
 func (m *Manager) DeleteWithOperation(ctx context.Context, id string, operation func(context.Context) error) error {
+	defer m.NotifyRegionConsumer(id)
 	return m.deleteWithOperation(ctx, id, operation, true)
 }
 
@@ -4217,6 +4226,7 @@ func (m *Manager) DeleteWithOperation(ctx context.Context, id string, operation 
 // deletion is rolled back. It is intended for credentials that must not become
 // executable again even when their historical backing file remains.
 func (m *Manager) DeleteWithOperationFailClosed(ctx context.Context, id string, operation func(context.Context) error) error {
+	defer m.NotifyRegionConsumer(id)
 	return m.deleteWithOperation(ctx, id, operation, false)
 }
 
@@ -5237,6 +5247,9 @@ func (m *Manager) installPreparedRequestAuthWithRuntimeMetadata(
 // asynchronous provider work that must not overwrite a concurrent file reload
 // or management edit.
 func (m *Manager) UpdateIfCurrent(ctx context.Context, expected, updated *Auth) (*Auth, bool, error) {
+	if expected != nil {
+		defer m.NotifyRegionConsumer(expected.ID)
+	}
 	installed, err := m.installPreparedRequestAuth(ctx, expected, updated, false)
 	if isRuntimeAuthInstanceRetiredError(err) {
 		return nil, false, nil
@@ -5252,6 +5265,9 @@ func (m *Manager) UpdateIfCurrent(ctx context.Context, expected, updated *Auth) 
 // image quota, to advance on the same installed credential. Management edits
 // and credential replacements still supersede the re-login.
 func (m *Manager) UpdateChatGPTWebReloginIfCurrent(ctx context.Context, expected, updated *Auth) (*Auth, bool, error) {
+	if expected != nil {
+		defer m.NotifyRegionConsumer(expected.ID)
+	}
 	installed, err := m.installPreparedRequestAuthWithRuntimeMetadata(
 		WithForceRuntimeReplacement(ctx),
 		expected,
@@ -5272,6 +5288,9 @@ func (m *Manager) UpdateChatGPTWebReloginIfCurrent(ctx context.Context, expected
 // UpdateRefreshedIfCurrent installs a controlled refresh result while treating
 // opaque token rotation as the same credential when account evidence agrees.
 func (m *Manager) UpdateRefreshedIfCurrent(ctx context.Context, expected, updated *Auth) (*Auth, bool, error) {
+	if expected != nil {
+		defer m.NotifyRegionConsumer(expected.ID)
+	}
 	installed, err := m.installPreparedRequestAuthDurably(ctx, expected, updated, true)
 	if isRuntimeAuthInstanceRetiredError(err) {
 		return nil, false, nil
@@ -5292,6 +5311,9 @@ func preparePreparedRequestCredentialReplacement(existing, next *Auth, now time.
 // UpdateRuntimeMetadataIfCurrent persists selected runtime metadata without
 // replacing the current auth installation or notifying model-sync hooks.
 func (m *Manager) UpdateRuntimeMetadataIfCurrent(ctx context.Context, expected *Auth, updates map[string]any) (*Auth, bool, error) {
+	if expected != nil {
+		defer m.NotifyRegionConsumer(expected.ID)
+	}
 	if len(updates) == 0 {
 		return m.MutateRuntimeMetadataIfCurrent(ctx, expected, nil)
 	}

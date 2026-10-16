@@ -63,10 +63,12 @@ func (r Route) valid() bool {
 }
 
 type Observation struct {
-	Reason string
-	IP     string
-	Source string
-	At     time.Time
+	Reason   string
+	RetryAt  time.Time
+	FailedAt time.Time
+	IP       string
+	Source   string
+	At       time.Time
 }
 type Geo struct {
 	IP       string    `json:"ip"`
@@ -78,6 +80,8 @@ type Geo struct {
 }
 type Snapshot struct {
 	Geo
+	RefreshMode       string    `json:"refresh_mode,omitempty"`
+	ColdCacheMode     string    `json:"cold_cache_mode,omitempty"`
 	RouteID           string    `json:"route_id"`
 	SuggestedLanguage string    `json:"suggested_language,omitempty"`
 	CacheState        string    `json:"cache_state"`
@@ -86,6 +90,10 @@ type Snapshot struct {
 	Reason            string    `json:"reason,omitempty"`
 	RetryAfterSeconds int64     `json:"retry_after_seconds,omitempty"`
 	ObservedAt        time.Time `json:"observed_at,omitempty"`
+	LastFailure       time.Time `json:"last_failure,omitempty"`
+	NextRetry         time.Time `json:"next_retry,omitempty"`
+	TimezoneSource    string    `json:"timezone_source,omitempty"`
+	LanguageSource    string    `json:"language_source,omitempty"`
 }
 
 // subscription retains consumers and cooldowns, not exit data. Exit observations
@@ -100,6 +108,8 @@ type subscription struct {
 	RetryAt  time.Time
 	Reason   string
 	Failures int
+	IPRef    string
+	FailedAt time.Time
 }
 type job struct {
 	done       chan struct{}
@@ -110,23 +120,33 @@ type job struct {
 	cancel     context.CancelFunc
 	settings   config.ResolvedProxyIP
 	running    bool
+	queued     bool
+	urgent     bool
+	element    *list.Element
+	finish     sync.Once
 }
 type regionLRUItem[V any] struct {
 	key   string
 	value V
 }
 type regionLRU[V any] struct {
-	items map[string]*list.Element
-	order *list.List
+	items     map[string]*list.Element
+	order     *list.List
+	pins      map[string]int
+	idle      *list.List
+	idleNodes map[string]*list.Element
 }
 
 func newRegionLRU[V any]() *regionLRU[V] {
-	return &regionLRU[V]{items: make(map[string]*list.Element), order: list.New()}
+	return &regionLRU[V]{items: make(map[string]*list.Element), order: list.New(), pins: map[string]int{}, idle: list.New(), idleNodes: map[string]*list.Element{}}
 }
 func (l *regionLRU[V]) get(key string, touch bool) (V, bool) {
 	if e := l.items[key]; e != nil {
 		if touch {
 			l.order.MoveToFront(e)
+			if idle := l.idleNodes[key]; idle != nil {
+				l.idle.MoveToFront(idle)
+			}
 		}
 		return e.Value.(regionLRUItem[V]).value, true
 	}
@@ -140,13 +160,43 @@ func (l *regionLRU[V]) put(key string, value V, capacity int) {
 	} else {
 		l.items[key] = l.order.PushFront(regionLRUItem[V]{key, value})
 	}
+	if l.pins[key] == 0 {
+		if e := l.idleNodes[key]; e != nil {
+			l.idle.MoveToFront(e)
+		} else {
+			l.idleNodes[key] = l.idle.PushFront(key)
+		}
+	}
 	l.resize(capacity)
 }
+func (l *regionLRU[V]) pin(key string) {
+	l.pins[key]++
+	if e := l.idleNodes[key]; e != nil {
+		l.idle.Remove(e)
+		delete(l.idleNodes, key)
+	}
+}
+func (l *regionLRU[V]) unpin(key string) {
+	if key == "" {
+		return
+	}
+	if l.pins[key] > 1 {
+		l.pins[key]--
+		return
+	}
+	delete(l.pins, key)
+	if _, ok := l.items[key]; ok && l.idleNodes[key] == nil {
+		l.idleNodes[key] = l.idle.PushFront(key)
+	}
+}
 func (l *regionLRU[V]) resize(capacity int) {
-	for len(l.items) > capacity {
-		e := l.order.Back()
-		delete(l.items, e.Value.(regionLRUItem[V]).key)
-		l.order.Remove(e)
+	for l.idle.Len() > capacity {
+		e := l.idle.Back()
+		key := e.Value.(string)
+		l.idle.Remove(e)
+		delete(l.idleNodes, key)
+		l.order.Remove(l.items[key])
+		delete(l.items, key)
 	}
 }
 
@@ -161,6 +211,12 @@ type Service struct {
 	owners                            map[string]string
 	pending                           map[string]*job
 	queue                             chan *job
+	jobs                              *list.List
+	wake                              chan struct{}
+	consumerWake                      chan struct{}
+	workers                           int
+	reconcile                         func()
+	manual                            func(Route) (config.ProxyRegionConfig, string)
 	ctx                               context.Context
 	cancel                            context.CancelFunc
 	generation                        uint64
@@ -181,7 +237,7 @@ func New(parent context.Context, cfg config.ProxyIPConfig) *Service {
 		parent = context.Background()
 	}
 	ctx, cancel := context.WithCancel(parent)
-	return &Service{settings: cfg.Resolved(), ips: newRegionLRU[Geo](), cooldowns: newRegionLRU[cooldown](), subscriptions: map[string]*list.Element{}, order: list.New(), owners: map[string]string{}, pending: map[string]*job{}, queue: make(chan *job, 256), ctx: ctx, cancel: cancel, now: time.Now, probe: probeRegion}
+	return &Service{settings: cfg.Resolved(), ips: newRegionLRU[Geo](), cooldowns: newRegionLRU[cooldown](), subscriptions: map[string]*list.Element{}, order: list.New(), owners: map[string]string{}, pending: map[string]*job{}, queue: make(chan *job, 256), jobs: list.New(), wake: make(chan struct{}, 1), consumerWake: make(chan struct{}, 1), ctx: ctx, cancel: cancel, now: time.Now, probe: probeRegion}
 }
 func (s *Service) SetObservationSource(read func(Route) Observation, ensure func(context.Context, Route) Observation) {
 	s.mu.Lock()
@@ -212,11 +268,15 @@ func (s *Service) UpdateConfig(cfg config.ProxyIPConfig) error {
 	if next.LookupURL != s.settings.LookupURL || next.LookupTimeoutSeconds != s.settings.LookupTimeoutSeconds {
 		s.generation++
 		for _, j := range s.pending {
-			j.cancel()
+			j.complete()
 		}
 		clear(s.pending)
+		s.jobs.Init()
 		if next.LookupURL != s.settings.LookupURL {
 			s.ips = newRegionLRU[Geo]()
+			for e := s.order.Front(); e != nil; e = e.Next() {
+				e.Value.(*subscription).IPRef = ""
+			}
 			s.cooldowns = newRegionLRU[cooldown]()
 			for e := s.order.Front(); e != nil; e = e.Next() {
 				v := e.Value.(*subscription)
@@ -227,9 +287,13 @@ func (s *Service) UpdateConfig(cfg config.ProxyIPConfig) error {
 		}
 	}
 	s.settings = next
+	if s.started {
+		s.startWorkersLocked()
+	}
 	s.ips.resize(next.IPCacheSize)
 	s.cooldowns.resize(next.IPCacheSize)
 	s.startSchedulerLocked()
+	s.NotifyConsumers()
 	return nil
 }
 func (s *Service) Close() {
@@ -251,6 +315,7 @@ func (s *Service) Close() {
 	s.order.Init()
 	s.ips = newRegionLRU[Geo]()
 	s.cooldowns = newRegionLRU[cooldown]()
+	s.jobs.Init()
 	s.mu.Unlock()
 }
 func (s *Service) readObservation(route Route) Observation {
@@ -295,6 +360,10 @@ func (s *Service) snapshot(route Route, enqueue bool) Snapshot {
 		return result
 	}
 	now := s.now()
+	result.RefreshMode = s.settings.RefreshMode
+	result.ColdCacheMode = s.settings.ColdCacheMode
+	result.LastFailure = observation.FailedAt
+	result.NextRetry = observation.RetryAt
 	result.ObservedAt = observation.At
 	result.Source = observation.Source
 	result.Reason = observation.Reason
@@ -303,6 +372,8 @@ func (s *Service) snapshot(route Route, enqueue bool) Snapshot {
 		result.Geo = geo
 		result.Source = observation.Source
 		result.SuggestedLanguage = SuggestedLanguage(geo.Country)
+		result.TimezoneSource = "ip_cache"
+		result.LanguageSource = "country_mapping"
 		result.CacheState = "fresh"
 		result.CacheAgeSeconds = max(0, int64(now.Sub(geo.At).Seconds()))
 		if now.Sub(geo.At) >= time.Duration(s.settings.IPCacheTTLSeconds)*time.Second {
@@ -311,6 +382,12 @@ func (s *Service) snapshot(route Route, enqueue bool) Snapshot {
 	}
 	if el := s.subscriptions[route.Key()]; el != nil {
 		v := el.Value.(*subscription)
+		if !v.FailedAt.IsZero() {
+			result.LastFailure = v.FailedAt
+		}
+		if !v.RetryAt.IsZero() {
+			result.NextRetry = v.RetryAt
+		}
 		if v.Reason != "" {
 			result.Reason = v.Reason
 		}
@@ -321,7 +398,7 @@ func (s *Service) snapshot(route Route, enqueue bool) Snapshot {
 			result.CacheState = "stale"
 		}
 	}
-	if pause, ok := s.cooldowns.get(route.Key(), false); ok && now.Before(pause.until) {
+	if pause, ok := s.cooldowns.get(quotaKey(route), false); ok && now.Before(pause.until) {
 		result.Reason = pause.reason
 		result.RetryAfterSeconds = max(1, int64(pause.until.Sub(now).Seconds()))
 		if result.CacheState == "fresh" {
@@ -330,6 +407,7 @@ func (s *Service) snapshot(route Route, enqueue bool) Snapshot {
 	}
 	if enqueue {
 		s.subscribeLocked(route)
+		s.pinLocked(route, observation.IP)
 		if result.CacheState != "fresh" {
 			if reason := s.enqueueLocked(route, now); reason != "" {
 				result.Reason = reason
@@ -340,6 +418,8 @@ func (s *Service) snapshot(route Route, enqueue bool) Snapshot {
 		result.RefreshState = "queued"
 		if j.running {
 			result.RefreshState = "running"
+		} else if !j.queued {
+			result.RefreshState = "pending"
 		}
 	}
 	if result.CacheState == "missing" && result.Reason == "" {
@@ -373,11 +453,19 @@ func (s *Service) subscribeLocked(route Route) {
 }
 func (s *Service) removeSubscriptionLocked(key string) {
 	if el := s.subscriptions[key]; el != nil {
+		v := el.Value.(*subscription)
+		if v.IPRef != "" {
+			s.ips.unpin(v.IPRef)
+		}
 		s.order.Remove(el)
 		delete(s.subscriptions, key)
 	}
 	if j := s.pending[key]; j != nil {
-		j.cancel()
+		j.complete()
+		if j.element != nil {
+			s.jobs.Remove(j.element)
+			j.element = nil
+		}
 		delete(s.pending, key)
 	}
 }
@@ -385,6 +473,7 @@ func (s *Service) Refresh(route Route) string {
 	if s == nil {
 		return "unavailable"
 	}
+	s.requestObservation(route)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !route.valid() {
@@ -404,27 +493,23 @@ func (s *Service) enqueueLocked(route Route, now time.Time) string {
 	if el := s.subscriptions[key]; el != nil && now.Before(el.Value.(*subscription).RetryAt) {
 		return "refresh_cooldown"
 	}
-	if pause, ok := s.cooldowns.get(key, false); ok && now.Before(pause.until) {
+	if pause, ok := s.cooldowns.get(quotaKey(route), false); ok && now.Before(pause.until) {
 		return "refresh_cooldown"
 	}
 	if !s.started {
 		s.started = true
-		for range 2 {
-			s.wg.Add(1)
-			go s.worker()
-		}
+		s.startWorkersLocked()
+		s.wg.Add(1)
+		go s.dispatchLoop()
 	}
 	ctx, cancel := context.WithCancel(s.ctx)
 	j := &job{done: make(chan struct{}), route: route, key: key, generation: s.generation, ctx: ctx, cancel: cancel, settings: s.settings}
-	select {
-	case s.queue <- j:
-		s.pending[key] = j
-		return ""
-	default:
-		cancel()
-		return "queue_full"
-	}
+	s.pending[key] = j
+	j.element = s.jobs.PushBack(j)
+	s.signal()
+	return ""
 }
+
 func (s *Service) ForgetBinding(binding string) {
 	if s == nil || binding == "" {
 		return
@@ -484,57 +569,74 @@ func (s *Service) active(route Route) bool {
 	s.mu.Unlock()
 	return false
 }
-func (s *Service) worker() {
+func (s *Service) worker(index int) {
 	defer s.wg.Done()
 	for {
+		s.mu.Lock()
+		enabled := index < s.settings.LookupConcurrency
+		s.mu.Unlock()
+		if !enabled {
+			select {
+			case <-s.ctx.Done():
+				return
+			case <-time.After(100 * time.Millisecond):
+				continue
+			}
+		}
 		select {
 		case <-s.ctx.Done():
 			return
 		case j := <-s.queue:
 			s.mu.Lock()
-			valid := !s.closed && j.generation == s.generation && s.pending[j.key] == j
+			valid := !s.closed && j.generation == s.generation && s.pending[j.key] == j && j.ctx.Err() == nil
 			if valid {
 				j.running = true
 			}
 			s.mu.Unlock()
 			if !valid || !s.active(j.route) {
-				j.cancel()
-				close(j.done)
+				s.finishJob(j, lookupResult{Reason: "lookup_cancelled"})
 				continue
 			}
 			ctx, cancel := context.WithTimeout(j.ctx, time.Duration(j.settings.LookupTimeoutSeconds)*time.Second)
 			result := s.lookup(ctx, j)
 			cancel()
-			s.mu.Lock()
-			if !s.closed && j.generation == s.generation && s.pending[j.key] == j {
-				if el := s.subscriptions[j.key]; el != nil {
-					v := el.Value.(*subscription)
-					v.Reason = result.Reason
-					if result.Reason == "" {
-						v.Failures = 0
-						v.RetryAt = time.Time{}
-					} else {
-						v.Failures++
-						v.RetryAt = s.now().Add(max(result.Retry, regionRetryDelay(v.Failures)))
-						s.cooldowns.put(j.key, cooldown{until: v.RetryAt, reason: v.Reason}, s.settings.IPCacheSize)
-					}
-				}
-				delete(s.pending, j.key)
-				if el := s.subscriptions[j.key]; el != nil {
-					owners := el.Value.(*subscription).Owners
-					if len(owners) == 1 {
-						if _, anonymous := owners[""]; anonymous {
-							s.order.Remove(el)
-							delete(s.subscriptions, j.key)
-						}
-					}
-				}
-			}
-			s.mu.Unlock()
-			close(j.done)
-			j.cancel()
+			s.finishJob(j, result)
 		}
 	}
+}
+func (s *Service) finishJob(j *job, result lookupResult) {
+	s.mu.Lock()
+	if !s.closed && j.generation == s.generation && s.pending[j.key] == j {
+		if el := s.subscriptions[j.key]; el != nil {
+			v := el.Value.(*subscription)
+			v.Reason = result.Reason
+			if result.Reason == "" {
+				v.Failures = 0
+				v.RetryAt = time.Time{}
+			} else if j.ctx.Err() == nil {
+				v.Failures++
+				v.FailedAt = s.now()
+				v.RetryAt = s.now().Add(max(result.Retry, RetryDelay(v.Failures)))
+				s.cooldowns.put(quotaKey(j.route), cooldown{until: v.RetryAt, reason: v.Reason}, s.settings.IPCacheSize)
+			}
+		}
+		delete(s.pending, j.key)
+		if j.element != nil {
+			s.jobs.Remove(j.element)
+			j.element = nil
+		}
+		if el := s.subscriptions[j.key]; el != nil {
+			v := el.Value.(*subscription)
+			if len(v.Owners) == 1 {
+				if _, ok := v.Owners[""]; ok {
+					s.removeSubscriptionLocked(j.key)
+				}
+			}
+		}
+	}
+	s.mu.Unlock()
+	j.complete()
+	s.signal()
 }
 
 type lookupResult struct {
@@ -545,13 +647,6 @@ type lookupResult struct {
 
 func (s *Service) lookup(ctx context.Context, j *job) lookupResult {
 	observation := s.readObservation(j.route)
-	s.mu.Lock()
-	ensure := s.ensureObservation
-	s.mu.Unlock()
-	if ensure != nil {
-		observation = ensure(ctx, j.route)
-		observation.IP = regionPublicIP(observation.IP)
-	}
 	if observation.IP == "" {
 		return lookupResult{Reason: "exit_unobserved"}
 	}
@@ -580,8 +675,10 @@ func (s *Service) lookup(ctx context.Context, j *job) lookupResult {
 			result.Geo, result.Reason = regionResponse(body, observation.IP, observation.Source, s.now())
 		}
 		if result.Geo.IP != "" {
+			latest := s.readObservation(j.route)
 			s.mu.Lock()
 			if !s.closed && j.generation == s.generation && j.ctx.Err() == nil {
+				s.pinLocked(j.route, latest.IP)
 				s.ips.put(result.Geo.IP, result.Geo, s.settings.IPCacheSize)
 			}
 			s.mu.Unlock()
@@ -601,7 +698,7 @@ func (s *Service) lookup(ctx context.Context, j *job) lookupResult {
 		return result
 	}
 }
-func regionRetryDelay(n int) time.Duration {
+func RetryDelay(n int) time.Duration {
 	return time.Duration(float64(min(30*time.Minute, 30*time.Second*time.Duration(1<<min(max(n-1, 0), 6)))) * (0.8 + rand.Float64()*0.4))
 }
 func (s *Service) ResolveForRequest(ctx context.Context, route Route) Snapshot {
@@ -612,8 +709,15 @@ func (s *Service) ResolveForRequest(ctx context.Context, route Route) Snapshot {
 	s.mu.Lock()
 	settings := s.settings
 	j := s.pending[route.Key()]
+	if j != nil {
+		j.urgent = true
+		s.signal()
+	}
 	s.mu.Unlock()
 	if settings.ColdCacheMode != "wait" || j == nil {
+		if j == nil && settings.ColdCacheMode == "wait" {
+			return s.Preview(route)
+		}
 		return result
 	}
 	wait, cancel := context.WithTimeout(ctx, time.Duration(settings.LookupTimeoutSeconds)*time.Second)
@@ -624,7 +728,10 @@ func (s *Service) ResolveForRequest(ctx context.Context, route Route) Snapshot {
 	case <-s.ctx.Done():
 		result.Reason = "closed"
 	case <-j.ctx.Done():
-		result.Reason = "lookup_cancelled"
+		result = s.Preview(route)
+		if result.Timezone == "" && result.Reason == "" {
+			result.Reason = "lookup_cancelled"
+		}
 	case <-wait.Done():
 		result = s.Preview(route)
 		result.Reason = "lookup_wait_timeout"
@@ -644,17 +751,33 @@ func (s *Service) startSchedulerLocked() {
 }
 func (s *Service) schedule() {
 	defer s.wg.Done()
+	s.mu.Lock()
+	delay := time.Duration(s.settings.RefreshIntervalSeconds) * time.Second
+	s.mu.Unlock()
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
 	for {
-		s.mu.Lock()
-		delay := time.Duration(s.settings.RefreshIntervalSeconds) * time.Second
-		s.mu.Unlock()
-		timer := time.NewTimer(delay)
 		select {
 		case <-s.ctx.Done():
-			timer.Stop()
 			return
+		case <-s.consumerWake:
+			s.mu.Lock()
+			reconcile := s.reconcile
+			nextDelay := time.Duration(s.settings.RefreshIntervalSeconds) * time.Second
+			s.mu.Unlock()
+			if nextDelay != delay {
+				delay = nextDelay
+				timer.Reset(delay)
+			}
+			if reconcile != nil {
+				reconcile()
+			}
 		case <-timer.C:
 			s.RefreshBatch()
+			s.mu.Lock()
+			delay = time.Duration(s.settings.RefreshIntervalSeconds) * time.Second
+			s.mu.Unlock()
+			timer.Reset(delay)
 		}
 	}
 }
@@ -667,6 +790,7 @@ func (s *Service) RefreshBatch() int {
 		return 0
 	}
 	scheduled := s.settings.RefreshMode == "scheduled"
+	prepare := s.settings.ColdCacheMode == "wait"
 	batch := s.settings.RefreshBatchSize
 	routes := []Route{}
 	current := s.subscriptions[s.cursor]
@@ -687,10 +811,13 @@ func (s *Service) RefreshBatch() int {
 		if !s.active(route) {
 			continue
 		}
-		if !scheduled {
+		snapshot := s.Preview(route)
+		s.mu.Lock()
+		s.pinLocked(route, snapshot.IP)
+		s.mu.Unlock()
+		if !scheduled && !(prepare && snapshot.CacheState == "missing") {
 			continue
 		}
-		snapshot := s.Preview(route)
 		if snapshot.CacheState != "fresh" && snapshot.RefreshState == "idle" && snapshot.RetryAfterSeconds == 0 {
 			if s.Refresh(route) == "" {
 				count++
@@ -710,6 +837,7 @@ func (s *Service) Resume(parent context.Context) {
 	s.ctx, s.cancel = context.WithCancel(parent)
 	s.closed = false
 	s.started = false
+	s.workers = 0
 	s.schedulerStarted = false
 	s.queue = make(chan *job, 256)
 	s.startSchedulerLocked()

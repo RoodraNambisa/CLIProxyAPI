@@ -204,3 +204,6 @@ func NormalizeCommentIndentation(data []byte) []byte {
 func NormalizeRequestBodyRelease(in RequestBodyReleaseConfig) RequestBodyReleaseConfig {
 	return internalconfig.NormalizeRequestBodyRelease(in)
 }
+
+// ProxyRegionConfig holds manual timezone and language for a proxy route.
+type ProxyRegionConfig = internalconfig.ProxyRegionConfig

@@ -86,3 +86,17 @@ func TestCodexTimeContextOffInheritAndFallback(t *testing.T) {
 		t.Fatal("fallback not applied")
 	}
 }
+
+func TestCodexManualProxyRegionPreservesLanguageAndSkipsLookup(t *testing.T) {
+	s := proxyregion.New(t.Context(), config.ProxyIPConfig{})
+	defer s.Close()
+	s.SetManualSource(func(proxyregion.Route) (config.ProxyRegionConfig, string) {
+		return config.ProxyRegionConfig{Timezone: "Asia/Tokyo", Language: "ja-JP"}, "global_proxy"
+	})
+	cfg := config.CodexTimeContextConfig{Enabled: true, Mode: "proxy"}
+	body := timeBody(timeMessage("user", cliTime), timeMessage("developer", desktopTime))
+	got := ApplyCodexTimeContext(t.Context(), s, nil, proxyregion.Route{ProxyURL: "http://fixture:80"}, body, CodexTimeContextSnapshot{Policy: cfg, At: time.Now()}, false)
+	if !strings.Contains(string(got), "Asia/Tokyo") || strings.Contains(string(got), "ja-JP") || s.Counts()["pending"] != 0 {
+		t.Fatalf("manual region not applied correctly %s", got)
+	}
+}

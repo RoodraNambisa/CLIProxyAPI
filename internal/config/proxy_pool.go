@@ -31,6 +31,9 @@ func NormalizeProxyConfiguration(pools []ProxyPoolConfig, rules []ProxyRuleConfi
 	poolNames := make(map[string]string, len(pools))
 	for index, rawPool := range pools {
 		pool := rawPool
+		if err := pool.Region.Validate(); err != nil {
+			return nil, nil, fmt.Errorf("proxy pool region: %w", err)
+		}
 		pool.Name = strings.TrimSpace(pool.Name)
 		if pool.Name == "" {
 			return nil, nil, fmt.Errorf("proxy-pools[%d].name is required", index)
@@ -74,6 +77,9 @@ func NormalizeProxyConfiguration(pools []ProxyPoolConfig, rules []ProxyRuleConfi
 		entryIDs := make(map[string]struct{}, len(pool.Entries))
 		for entryIndex, rawEntry := range pool.Entries {
 			entry := rawEntry
+			if err := entry.Region.Validate(); err != nil {
+				return nil, nil, fmt.Errorf("proxy entry region: %w", err)
+			}
 			entry.ID = strings.TrimSpace(entry.ID)
 			if entry.ID == "" {
 				return nil, nil, fmt.Errorf("proxy-pools[%d].entries[%d].id is required", index, entryIndex)

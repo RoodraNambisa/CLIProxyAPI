@@ -78,13 +78,15 @@ type poolRoundState struct {
 // Manager owns immutable proxy configuration snapshots, stable credential
 // bindings, and runtime-only node health.
 type Manager struct {
-	checkFlights singleflight.Group
-	exits        *exitObserver
-	regions      *proxyregion.Service
-	regionConfig atomic.Pointer[internalconfig.Config]
-	config       atomic.Pointer[configSnapshot]
-	configMu     sync.RWMutex
-	probeSeq     atomic.Uint64
+	checkFlights  singleflight.Group
+	exits         *exitObserver
+	regions       *proxyregion.Service
+	regionConfig  atomic.Pointer[internalconfig.Config]
+	regionChanges sync.Map
+	regionAll     atomic.Bool
+	config        atomic.Pointer[configSnapshot]
+	configMu      sync.RWMutex
+	probeSeq      atomic.Uint64
 
 	mu             sync.RWMutex
 	bindings       map[string]Binding
@@ -143,6 +145,8 @@ func NewManager(configPath string, cfg *internalconfig.Config) (*Manager, error)
 	m.regions.SetOwnerValidator(m.regionOwnerActive)
 	m.regions.SetObservationSource(m.regionObservation, m.ensureRegionObservation)
 	m.regions.SetObservationDemand(m.demandRegionObservation)
+	m.regions.SetManualSource(m.manualRegion)
+	m.regions.SetReconciler(m.reconcileRegionChanges)
 	if errLoad := m.loadBindings(); errLoad != nil {
 		m.regions.Close()
 		return nil, errLoad
@@ -214,6 +218,7 @@ func (m *Manager) SetAuthSource(source AuthSource) {
 	m.mu.Lock()
 	m.auths = source
 	m.mu.Unlock()
+	m.notifyAllRegions()
 }
 
 // UpdateConfig atomically replaces the normalized routing snapshot.
@@ -228,6 +233,11 @@ func (m *Manager) UpdateConfigWithPoolRename(cfg *internalconfig.Config, oldName
 }
 
 func (m *Manager) updateConfig(cfg *internalconfig.Config, oldPoolName, newPoolName string) error {
+	defer func() {
+		if m != nil {
+			m.notifyAllRegions()
+		}
+	}()
 	if m == nil {
 		return nil
 	}
@@ -1013,15 +1023,12 @@ func (m *Manager) allocateBinding(ctx context.Context, snapshot *configSnapshot,
 		if ctx != nil && ctx.Err() != nil {
 			return Binding{}, "", time.Time{}, ctx.Err()
 		}
-		health := m.storeHealth(snapshot, binding, resolvedURL, result, probeEpoch)
+		m.storeHealth(snapshot, binding, resolvedURL, result, probeEpoch)
 		if result.OK {
 			return binding, resolvedURL, time.Time{}, nil
 		}
 		m.deleteHealth(binding.ID)
 		lastErr = errors.New("proxy health check failed")
-		if earliestRetry.IsZero() || health.RetryAfter.Before(earliestRetry) {
-			earliestRetry = health.RetryAfter
-		}
 	}
 	if lastErr == nil {
 		lastErr = errors.New("proxy pool has no distinct candidate")
@@ -1057,16 +1064,13 @@ func (m *Manager) allocateSpreadBinding(ctx context.Context, snapshot *configSna
 			m.releaseSpreadReservation(binding.ID)
 			return Binding{}, "", time.Time{}, ctx.Err()
 		}
-		health := m.storeHealth(snapshot, binding, resolvedURL, result, probeEpoch)
+		m.storeHealth(snapshot, binding, resolvedURL, result, probeEpoch)
 		if result.OK {
 			return binding, resolvedURL, time.Time{}, nil
 		}
 		m.deleteHealth(binding.ID)
 		m.releaseSpreadReservation(binding.ID)
 		lastErr = errors.New("proxy health check failed")
-		if earliestRetry.IsZero() || health.RetryAfter.Before(earliestRetry) {
-			earliestRetry = health.RetryAfter
-		}
 	}
 	if lastErr == nil {
 		lastErr = errors.New("proxy pool has no distinct candidate")
@@ -1578,6 +1582,7 @@ func (m *Manager) bindingURL(snapshot *configSnapshot, binding Binding) (string,
 }
 
 func (m *Manager) saveBinding(binding Binding) error {
+	defer m.NotifyRegionConsumer(binding.AuthID)
 	if strings.TrimSpace(binding.AuthID) == "" || strings.TrimSpace(binding.ID) == "" {
 		return errors.New("proxy binding is incomplete")
 	}

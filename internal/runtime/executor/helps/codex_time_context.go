@@ -219,7 +219,15 @@ func ApplyCodexTimeContext(ctx context.Context, service *proxyregion.Service, au
 	diagnostic.Source = "manual"
 	if policy.Mode == "proxy" {
 		diagnostic.Source = "proxy"
-		diagnostic.Region = service.ResolveForRequest(ctx, route)
+		manual, source := service.Manual(route)
+		if manual.Timezone != "" {
+			diagnostic.Region = service.Preview(route)
+			diagnostic.Region.Timezone = manual.Timezone
+			diagnostic.Region.TimezoneSource = source
+			diagnostic.Source = source
+		} else {
+			diagnostic.Region = service.ResolveForRequest(ctx, route)
+		}
 		zone = diagnostic.Region.Timezone
 		diagnostic.Reason = diagnostic.Region.Reason
 		if zone == "" {

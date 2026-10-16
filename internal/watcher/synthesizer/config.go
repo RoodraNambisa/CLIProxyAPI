@@ -221,6 +221,12 @@ func (s *ConfigSynthesizer) synthesizeCodexKeys(ctx *SynthesisContext) []*coreau
 		if ck.TimeContext != nil {
 			a.Metadata = map[string]any{config.CodexTimeContextMetadataKey: *ck.TimeContext}
 		}
+		if ck.ProxyRegion.Timezone != "" || ck.ProxyRegion.Language != "" {
+			if a.Metadata == nil {
+				a.Metadata = map[string]any{}
+			}
+			a.Metadata[config.ProxyRegionMetadataKey] = ck.ProxyRegion
+		}
 		ApplyAuthExcludedModelsMeta(a, cfg, ck.ExcludedModels, "apikey")
 		applyConfigCredentialRequestRetry(a, ck.RequestRetry)
 		applyConfigRequestScopedErrors(a, ck.RequestScopedErrors)
