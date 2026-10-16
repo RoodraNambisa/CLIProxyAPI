@@ -43,6 +43,7 @@ type patchAuthFileFieldsRequest struct {
 }
 
 type authFileFieldValues struct {
+	regionPolicies       map[string]any
 	prefix               *string
 	routingAlias         *string
 	proxyURL             *string
@@ -381,6 +382,26 @@ func decodeAuthFileFieldValues(raw json.RawMessage) (authFileFieldValues, error)
 				return authFileFieldValues{}, fmt.Errorf("invalid api798_url")
 			}
 			values.api798URL = &decoded
+		case config.CodexTimeContextMetadataKey, config.WebRegionMetadataKey:
+			var policy any
+			if err := json.Unmarshal(value, &policy); err != nil {
+				return values, err
+			}
+			if policy != nil {
+				if name == config.CodexTimeContextMetadataKey {
+					if _, err := config.EffectiveCodexTimeContext(config.CodexTimeContextConfig{}, policy); err != nil {
+						return values, err
+					}
+				} else {
+					if _, err := config.ApplyWebRegionOverride(config.ChatGPTWebConfig{}, policy); err != nil {
+						return values, err
+					}
+				}
+			}
+			if values.regionPolicies == nil {
+				values.regionPolicies = map[string]any{}
+			}
+			values.regionPolicies[name] = policy
 		case codexauth.FingerprintModeMetadataKey:
 			var decoded string
 			if err := decodeNonNullAuthField(value, &decoded); err != nil {
@@ -409,13 +430,13 @@ func decodeNonNullAuthField(raw json.RawMessage, target any) error {
 }
 
 func (v authFileFieldValues) hasFields() bool {
-	return v.proxyBindingSet || v.routingAlias != nil || v.prefix != nil || v.proxyURL != nil || v.baseURL != nil || v.xaiCatalogSources != nil || v.xaiModelRoutes != nil || v.headersSet || v.prioritySet || v.weightSet || v.note != nil ||
+	return len(v.regionPolicies) > 0 || v.proxyBindingSet || v.routingAlias != nil || v.prefix != nil || v.proxyURL != nil || v.baseURL != nil || v.xaiCatalogSources != nil || v.xaiModelRoutes != nil || v.headersSet || v.prioritySet || v.weightSet || v.note != nil ||
 		v.usingAPI != nil || v.websockets != nil || v.excludedSet || v.disableCooling != nil ||
 		v.loginMethod != nil || v.api798URL != nil || v.codexFingerprintMode != nil || v.errorRules.set
 }
 
 func (v authFileFieldValues) hasNonHeaderFields() bool {
-	return v.proxyBindingSet || v.routingAlias != nil || v.prefix != nil || v.proxyURL != nil || v.baseURL != nil || v.xaiCatalogSources != nil || v.xaiModelRoutes != nil || v.prioritySet || v.weightSet || v.note != nil || v.usingAPI != nil ||
+	return len(v.regionPolicies) > 0 || v.proxyBindingSet || v.routingAlias != nil || v.prefix != nil || v.proxyURL != nil || v.baseURL != nil || v.xaiCatalogSources != nil || v.xaiModelRoutes != nil || v.prioritySet || v.weightSet || v.note != nil || v.usingAPI != nil ||
 		v.websockets != nil || v.excludedSet || v.disableCooling != nil || v.loginMethod != nil ||
 		v.api798URL != nil || v.codexFingerprintMode != nil || v.errorRules.set
 }
@@ -455,6 +476,11 @@ func validateBatchAuthFileFields(auth *coreauth.Auth, values authFileFieldValues
 		}
 		if codexAuthUsesAPIKeyCredential(auth) {
 			return errors.New("codex_fingerprint_mode is not supported for codex api-key auth files")
+		}
+	}
+	for key := range values.regionPolicies {
+		if key == config.CodexTimeContextMetadataKey && provider != "codex" || key == config.WebRegionMetadataKey && provider != "chatgpt-web" {
+			return errors.New("region policy does not match credential provider")
 		}
 	}
 	if values.loginMethod == nil && values.api798URL == nil {
@@ -671,6 +697,13 @@ func (h *Handler) applyAuthFileFieldValues(auth *coreauth.Auth, values authFileF
 		mode := string(*values.codexFingerprintMode)
 		auth.Metadata[codexauth.FingerprintModeMetadataKey] = mode
 		auth.Attributes[codexauth.FingerprintModeMetadataKey] = mode
+	}
+	for key, value := range values.regionPolicies {
+		if value == nil {
+			delete(auth.Metadata, key)
+		} else {
+			auth.Metadata[key] = value
+		}
 	}
 	if values.excludedSet {
 		models := config.NormalizeExcludedModels(values.excludedModels)

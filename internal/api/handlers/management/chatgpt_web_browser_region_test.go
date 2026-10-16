@@ -33,7 +33,7 @@ func TestBrowserRegionManagementPersistenceAndValidation(t *testing.T) {
 	e := &browserRegionTestExecutor{}
 	manager.RegisterExecutor(e)
 	h.authManager = manager
-	ctx, w := newChatGPTWebLoginProxyRequest(http.MethodPatch, `{"auto-timezone":true,"language":"ja-JP","timezone":"Asia/Tokyo","timezone-offset-minutes":null,"cache-ttl-seconds":36000,"route-cache-size":100000}`)
+	ctx, w := newChatGPTWebLoginProxyRequest(http.MethodPatch, `{"auto-timezone":true,"language":"ja-JP","timezone":"Asia/Tokyo","timezone-offset-minutes":null}`)
 	h.PatchChatGPTWebBrowserRegion(ctx)
 	if w.Code != 200 || e.updates != 1 {
 		t.Fatalf("PATCH failed: %d %s", w.Code, w.Body.String())
@@ -45,11 +45,18 @@ func TestBrowserRegionManagementPersistenceAndValidation(t *testing.T) {
 	if !loaded.ChatGPTWeb.BrowserRegion.AutoTimezone || loaded.ChatGPTWeb.Timezone != "Asia/Tokyo" || loaded.ChatGPTWeb.BrowserRegion.Resolved().RouteCacheSize != 100000 {
 		t.Fatal("configuration did not roundtrip")
 	}
-	for _, body := range []string{`null`, `[]`, `{"unknown":1}`, `{"auto-timezone":null}`, `{"language":null}`, `{"lookup-url":"http://example.test"}`, `{"ip-cache-size":0}`, `{"timezone":"Invalid/Zone"}`, `{} {}`} {
+	for _, body := range []string{`null`, `[]`, `{"unknown":1}`, `{"auto-timezone":null}`, `{"language":null}`, `{"timezone":"Invalid/Zone"}`, `{} {}`} {
 		ctx, w = newChatGPTWebLoginProxyRequest(http.MethodPatch, body)
 		h.PatchChatGPTWebBrowserRegion(ctx)
 		if w.Code != 400 {
 			t.Fatalf("invalid body accepted: %s %d", body, w.Code)
+		}
+	}
+	for _, body := range []string{`{"lookup-url":"https://example.test"}`, `{"cache-ttl-seconds":42}`, `{"route-cache-size":1}`} {
+		ctx, w = newChatGPTWebLoginProxyRequest(http.MethodPatch, body)
+		h.PatchChatGPTWebBrowserRegion(ctx)
+		if w.Code != 409 {
+			t.Fatalf("legacy common settings were writable: %d", w.Code)
 		}
 	}
 	ctx, w = newChatGPTWebLoginProxyRequest(http.MethodGet, "")

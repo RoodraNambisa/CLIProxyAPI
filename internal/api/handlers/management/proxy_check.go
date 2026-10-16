@@ -4,8 +4,10 @@ import (
 	"context"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/proxypool"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/proxyutil"
 )
 
@@ -53,6 +55,12 @@ func (h *Handler) PostProxyURLCheck(c *gin.Context) {
 
 func (h *Handler) writeProxyURLCheck(c *gin.Context, proxyURL string) {
 	result := checkProxyURL(c.Request.Context(), proxyURL)
+	h.mu.Lock()
+	manager := h.proxyPoolManager
+	h.mu.Unlock()
+	if manager != nil {
+		manager.RecordUnboundObservation(proxyURL, proxypool.TraceResult{OK: result.OK, IP: result.IP, Endpoint: proxyTraceURL, CheckedAt: time.Now()})
+	}
 	c.JSON(http.StatusOK, result)
 }
 

@@ -824,6 +824,13 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/proxy-health-check", s.mgmt.GetProxyHealthCheck)
 		mgmt.PATCH("/proxy-health-check", s.mgmt.PatchProxyHealthCheck)
 		mgmt.POST("/proxy-health-check/test", s.mgmt.PostProxyHealthCheckTest)
+		mgmt.GET("/proxy-ip", s.mgmt.GetProxyIP)
+		mgmt.PATCH("/proxy-ip", s.mgmt.PatchProxyIP)
+		mgmt.GET("/proxy-ip/status", s.mgmt.GetProxyIPStatus)
+		mgmt.POST("/proxy-ip/preview", s.mgmt.PreviewProxyIP)
+		mgmt.POST("/proxy-ip/refresh", s.mgmt.RefreshProxyIP)
+		mgmt.GET("/codex/time-context", s.mgmt.GetCodexTimeContext)
+		mgmt.PATCH("/codex/time-context", s.mgmt.PatchCodexTimeContext)
 		mgmt.GET("/proxy-pools", s.mgmt.GetProxyPools)
 		mgmt.POST("/proxy-pools", s.mgmt.PostProxyPool)
 		mgmt.PATCH("/proxy-pools/:name", s.mgmt.PatchProxyPool)
@@ -1107,6 +1114,9 @@ func startupManagementPathAvailable(path string) bool {
 	}
 	for _, suffix := range []string{
 		"/startup/status",
+		"/proxy-ip",
+		"/proxy-ip/status",
+		"/codex/time-context",
 		"/chatgpt-web/browser-region",
 		"/chatgpt-web/browser-region/preview",
 		"/config",

@@ -38,31 +38,32 @@ type modelProbeRequest struct {
 }
 
 type modelProbeResult struct {
-	XAIDiagnostics      []helps.XAITransmission   `json:"xai_diagnostics,omitempty"`
-	CodexResponseGuard  *core.ResponseGuardRecord `json:"codex_response_guard,omitempty"`
-	CodexCookie         *modelProbeCookieResult   `json:"codex_cookie,omitempty"`
-	Success             bool                      `json:"success"`
-	Name                string                    `json:"name"`
-	Provider            string                    `json:"provider,omitempty"`
-	Model               string                    `json:"model"`
-	UpstreamModel       string                    `json:"upstream_model,omitempty"`
-	ReturnedModel       string                    `json:"returned_model,omitempty"`
-	RequestPath         string                    `json:"request_path"`
-	UpstreamURL         string                    `json:"upstream_url,omitempty"`
-	Stream              bool                      `json:"stream"`
-	LatencyMS           int64                     `json:"latency_ms"`
-	StatusCode          int                       `json:"status_code,omitempty"`
-	RequestID           string                    `json:"request_id,omitempty"`
-	ResponseID          string                    `json:"response_id,omitempty"`
-	FinishReason        string                    `json:"finish_reason,omitempty"`
-	Response            string                    `json:"response,omitempty"`
-	Error               string                    `json:"error,omitempty"`
-	Usage               *modelProbeUsage          `json:"usage,omitempty"`
-	RequestBody         string                    `json:"request_body,omitempty"`
-	UpstreamRequestBody string                    `json:"upstream_request_body,omitempty"`
-	ResponseBody        string                    `json:"response_body,omitempty"`
-	DetailsTruncated    bool                      `json:"details_truncated,omitempty"`
-	CodexState          *modelProbeStateResult    `json:"codex_state,omitempty"`
+	CodexTimeContext    []helps.CodexTimeContextDiagnostic `json:"codex_time_context,omitempty"`
+	XAIDiagnostics      []helps.XAITransmission            `json:"xai_diagnostics,omitempty"`
+	CodexResponseGuard  *core.ResponseGuardRecord          `json:"codex_response_guard,omitempty"`
+	CodexCookie         *modelProbeCookieResult            `json:"codex_cookie,omitempty"`
+	Success             bool                               `json:"success"`
+	Name                string                             `json:"name"`
+	Provider            string                             `json:"provider,omitempty"`
+	Model               string                             `json:"model"`
+	UpstreamModel       string                             `json:"upstream_model,omitempty"`
+	ReturnedModel       string                             `json:"returned_model,omitempty"`
+	RequestPath         string                             `json:"request_path"`
+	UpstreamURL         string                             `json:"upstream_url,omitempty"`
+	Stream              bool                               `json:"stream"`
+	LatencyMS           int64                              `json:"latency_ms"`
+	StatusCode          int                                `json:"status_code,omitempty"`
+	RequestID           string                             `json:"request_id,omitempty"`
+	ResponseID          string                             `json:"response_id,omitempty"`
+	FinishReason        string                             `json:"finish_reason,omitempty"`
+	Response            string                             `json:"response,omitempty"`
+	Error               string                             `json:"error,omitempty"`
+	Usage               *modelProbeUsage                   `json:"usage,omitempty"`
+	RequestBody         string                             `json:"request_body,omitempty"`
+	UpstreamRequestBody string                             `json:"upstream_request_body,omitempty"`
+	ResponseBody        string                             `json:"response_body,omitempty"`
+	DetailsTruncated    bool                               `json:"details_truncated,omitempty"`
+	CodexState          *modelProbeStateResult             `json:"codex_state,omitempty"`
 }
 
 // ProbeAuthFileModel uses the credential's provider implementation with temporary
@@ -220,6 +221,9 @@ func (h *Handler) ProbeAuthFileModel(c *gin.Context) {
 			execCtx = helps.WithXAIDiagnostics(execCtx, false, trace.xaiTransmission)
 		}
 		if provider == "codex" {
+			var diagnostics *helps.TimeContextDiagnostics
+			execCtx, diagnostics = helps.WithTimeContextDiagnostics(execCtx)
+			defer func() { result.CodexTimeContext = diagnostics.Items() }()
 			execCtx = helps.WithCodexStateDiagnostic(execCtx, stateMode, stateValue, trace.stateApplied)
 			execCtx = helps.WithCodexCookieDiagnostic(execCtx, cookieMode, trace.cookieApplied)
 		}

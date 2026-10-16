@@ -17,6 +17,7 @@ import (
 
 type chatGPTWebBrowserRegionResponse struct {
 	config.ResolvedChatGPTWebBrowserRegion
+	SharedProxyIP         bool   `json:"shared_proxy_ip"`
 	Timezone              string `json:"timezone"`
 	TimezoneOffsetMinutes *int   `json:"timezone-offset-minutes"`
 }
@@ -35,7 +36,14 @@ func (h *Handler) GetChatGPTWebBrowserRegion(c *gin.Context) {
 	if zone == "" {
 		zone = config.DefaultChatGPTWebTimezone
 	}
-	c.JSON(200, chatGPTWebBrowserRegionResponse{cfg.BrowserRegion.Resolved(), zone, cfg.TimezoneOffsetMinutes})
+	common := h.currentConfig().EffectiveProxyIP().Resolved()
+	view := cfg.BrowserRegion.Resolved()
+	view.LookupURL = common.LookupURL
+	view.LookupTimeoutSeconds = common.LookupTimeoutSeconds
+	// Legacy route settings are compatibility-only; proxy health owns observations.
+
+	view.IPCacheSize = common.IPCacheSize
+	c.JSON(200, chatGPTWebBrowserRegionResponse{view, true, zone, cfg.TimezoneOffsetMinutes})
 }
 func (h *Handler) PatchChatGPTWebBrowserRegion(c *gin.Context) {
 	var fields map[string]json.RawMessage
@@ -52,6 +60,13 @@ func (h *Handler) PatchChatGPTWebBrowserRegion(c *gin.Context) {
 		h.mu.Unlock()
 		c.JSON(503, gin.H{"error": "configuration unavailable"})
 		return
+	}
+	for _, key := range []string{"lookup-url", "lookup-timeout-seconds", "cache-ttl-seconds", "route-cache-size", "ip-cache-size", "ip-cache-ttl-seconds"} {
+		if _, ok := fields[key]; ok {
+			h.mu.Unlock()
+			c.JSON(409, gin.H{"error": "shared_proxy_ip_settings", "message": "Edit common settings in proxy/IP management."})
+			return
+		}
 	}
 	previous := h.cfg.ChatGPTWeb
 	candidate := previous
