@@ -1,6 +1,7 @@
 package proxyregion
 
 import (
+	"strings"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
@@ -89,6 +90,13 @@ func (s *Service) dispatch() {
 		}
 		observation := s.readObservation(j.route)
 		if observation.IP == "" {
+			s.mu.Lock()
+			hasDetector := s.demandObservation != nil
+			s.mu.Unlock()
+			if !hasDetector {
+				s.finishJob(j, lookupResult{Reason: "exit_unobserved"})
+				continue
+			}
 			s.requestObservation(j.route)
 			if observation.Reason != "" && s.now().Before(observation.RetryAt) {
 				s.finishJob(j, lookupResult{Reason: observation.Reason, Retry: max(0, observation.RetryAt.Sub(s.now()))})
@@ -108,6 +116,10 @@ func (s *Service) dispatch() {
 	}
 }
 func (s *Service) pinLocked(r Route, ip string) {
+	// A missing temporary observation does not prove the active exit changed.
+	if ip == "" {
+		return
+	}
 	el := s.subscriptions[r.Key()]
 	if el == nil {
 		return
@@ -153,7 +165,11 @@ func (s *Service) ForgetOwner(id string) {
 			s.removeSubscriptionLocked(key)
 		}
 	}
-	delete(s.owners, id)
+	for key := range s.owners {
+		if strings.HasPrefix(key, id+"\x00") {
+			delete(s.owners, key)
+		}
+	}
 	s.ips.resize(s.settings.IPCacheSize)
 }
 func (s *Service) SetReconciler(f func()) { s.mu.Lock(); s.reconcile = f; s.mu.Unlock() }
@@ -195,12 +211,16 @@ func (s *Service) Counts() map[string]int {
 
 func (s *Service) PruneOwners(active func(string) bool) {
 	s.mu.Lock()
-	ids := make([]string, 0, len(s.owners))
-	for id := range s.owners {
-		ids = append(ids, id)
+	ids := map[string]bool{}
+	for _, el := range s.subscriptions {
+		for id := range el.Value.(*subscription).Owners {
+			if id != "" {
+				ids[id] = true
+			}
+		}
 	}
 	s.mu.Unlock()
-	for _, id := range ids {
+	for id := range ids {
 		if !active(id) {
 			s.ForgetOwner(id)
 		}
@@ -227,4 +247,30 @@ func (s *Service) Observed(r Route, ip string) {
 		s.pinLocked(r, ip)
 		s.signal()
 	}
+}
+
+func (s *Service) SetManualSources(f func(Route) (string, string)) {
+	s.mu.Lock()
+	s.manualSources = f
+	s.mu.Unlock()
+}
+func (s *Service) ManualSources(r Route) (string, string) {
+	if s == nil {
+		return "", ""
+	}
+	s.mu.Lock()
+	f := s.manualSources
+	s.mu.Unlock()
+	if f != nil {
+		return f(r)
+	}
+	_, source := s.Manual(r)
+	return source, source
+}
+
+func ownerScopeKey(id, scope string) string {
+	if scope == "" {
+		scope = ChatGPTScope
+	}
+	return id + "\x00" + scope
 }

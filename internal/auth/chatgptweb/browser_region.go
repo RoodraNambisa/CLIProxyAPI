@@ -102,7 +102,8 @@ func (r *BrowserRegionResolver) ApplyContext(ctx context.Context, route proxyreg
 		result.OverrideLanguage = true
 	}
 	value := r.shared.Preview(route)
-	manual, manualSource := r.shared.Manual(route)
+	manual, _ := r.shared.Manual(route)
+	manualTimezoneSource, manualLanguageSource := r.shared.ManualSources(route)
 	if enqueue && ((settings.AutoTimezone && manual.Timezone == "") || (settings.AutoLanguage && manual.Language == "")) {
 		value = r.shared.ResolveForRequest(ctx, route)
 	}
@@ -129,12 +130,12 @@ func (r *BrowserRegionResolver) ApplyContext(ctx context.Context, route proxyreg
 	if settings.AutoTimezone && manual.Timezone != "" {
 		result.Timezone = manual.Timezone
 		result.OffsetMinutes = (config.ChatGPTWebConfig{Timezone: manual.Timezone}).ResolvedTimezone(time.Now()).OffsetMinutes
-		result.TimezoneSource = manualSource
+		result.TimezoneSource = manualTimezoneSource
 	}
 	if settings.AutoLanguage && manual.Language != "" {
 		result.Language = manual.Language
 		result.OverrideLanguage = true
-		result.LanguageSource = manualSource
+		result.LanguageSource = manualLanguageSource
 	}
 	return result
 }

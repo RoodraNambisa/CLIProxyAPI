@@ -153,14 +153,15 @@ func (h *Handler) proxyIPLookup(c *gin.Context, refresh bool) {
 		reason = service.Refresh(route)
 	}
 	snapshot := service.Preview(route)
-	manual, source := service.Manual(route)
+	manual, _ := service.Manual(route)
+	timezoneSource, languageSource := service.ManualSources(route)
 	if manual.Timezone != "" {
 		snapshot.Timezone = manual.Timezone
-		snapshot.TimezoneSource = source
+		snapshot.TimezoneSource = timezoneSource
 	}
 	if manual.Language != "" {
 		snapshot.SuggestedLanguage = manual.Language
-		snapshot.LanguageSource = source
+		snapshot.LanguageSource = languageSource
 	}
 
 	if manual.Timezone != "" && (auth.Provider == "codex" || manual.Language != "") {

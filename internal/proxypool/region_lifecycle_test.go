@@ -92,6 +92,10 @@ func TestManualRegionSourceIsolation(t *testing.T) {
 		t.Fatal(e)
 	}
 	p, _ := m.manualRegion(proxyregion.Route{ProxyURL: v.URL, BindingID: v.BindingID, OwnerID: a.ID})
+	tzSource, langSource := m.manualRegionSources(proxyregion.Route{ProxyURL: v.URL, BindingID: v.BindingID, OwnerID: a.ID})
+	if tzSource != "proxy_node" || langSource != "proxy_pool" {
+		t.Fatal(tzSource, langSource)
+	}
 	if p.Timezone != "Europe/Paris" || p.Language != "en-US" {
 		t.Fatal(p)
 	}

@@ -127,3 +127,25 @@ func (m *Manager) reconcileRegionChanges() {
 		return true
 	})
 }
+
+func (m *Manager) manualRegionSources(r proxyregion.Route) (string, string) {
+	_, source := m.manualRegion(r)
+	tz, lang := source, source
+	if source == "proxy_pool" {
+		snapshot := m.snapshot()
+		owner, _, valid := m.exits.binding(r, snapshot)
+		if valid {
+			m.mu.RLock()
+			b := m.bindings[owner]
+			m.mu.RUnlock()
+			entry := snapshot.pools[strings.ToLower(b.Pool)].byID[strings.ToLower(b.Entry)]
+			if entry.config.Region.Timezone != "" {
+				tz = "proxy_node"
+			}
+			if entry.config.Region.Language != "" {
+				lang = "proxy_node"
+			}
+		}
+	}
+	return tz, lang
+}

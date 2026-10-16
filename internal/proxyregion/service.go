@@ -110,6 +110,7 @@ type subscription struct {
 	Failures int
 	IPRef    string
 	FailedAt time.Time
+	revision uint64
 }
 type job struct {
 	done       chan struct{}
@@ -217,6 +218,7 @@ type Service struct {
 	workers                           int
 	reconcile                         func()
 	manual                            func(Route) (config.ProxyRegionConfig, string)
+	manualSources                     func(Route) (string, string)
 	ctx                               context.Context
 	cancel                            context.CancelFunc
 	generation                        uint64
@@ -437,7 +439,7 @@ func (s *Service) subscribeLocked(route Route) {
 		el = s.order.PushBack(&subscription{Route: route, Owners: map[string]struct{}{}})
 		s.subscriptions[key] = el
 	}
-	if previous := s.owners[route.OwnerID]; route.OwnerID != "" && previous != "" && previous != key {
+	if previous := s.owners[ownerScopeKey(route.OwnerID, route.Scope)]; route.OwnerID != "" && previous != "" && previous != key {
 		if old := s.subscriptions[previous]; old != nil {
 			delete(old.Value.(*subscription).Owners, route.OwnerID)
 			if len(old.Value.(*subscription).Owners) == 0 {
@@ -446,8 +448,9 @@ func (s *Service) subscribeLocked(route Route) {
 		}
 	}
 	el.Value.(*subscription).Owners[route.OwnerID] = struct{}{}
+	el.Value.(*subscription).revision++
 	if route.OwnerID != "" {
-		s.owners[route.OwnerID] = key
+		s.owners[ownerScopeKey(route.OwnerID, route.Scope)] = key
 	}
 	s.startSchedulerLocked()
 }
@@ -519,7 +522,7 @@ func (s *Service) ForgetBinding(binding string) {
 	for key, el := range s.subscriptions {
 		if el.Value.(*subscription).Route.BindingID == binding {
 			for owner := range el.Value.(*subscription).Owners {
-				delete(s.owners, owner)
+				delete(s.owners, ownerScopeKey(owner, el.Value.(*subscription).Route.Scope))
 			}
 			s.removeSubscriptionLocked(key)
 		}
@@ -547,7 +550,10 @@ func (s *Service) active(route Route) bool {
 	s.mu.Lock()
 	check := s.ownerActive
 	owners := []string{}
+	var revision uint64
+	original := s.subscriptions[route.Key()]
 	if el := s.subscriptions[route.Key()]; el != nil {
+		revision = el.Value.(*subscription).revision
 		for owner := range el.Value.(*subscription).Owners {
 			owners = append(owners, owner)
 		}
@@ -562,9 +568,16 @@ func (s *Service) active(route Route) bool {
 		}
 	}
 	s.mu.Lock()
+	current := s.subscriptions[route.Key()]
+	if current != original || current != nil && current.Value.(*subscription).revision != revision {
+		s.mu.Unlock()
+		return true
+	}
 	s.removeSubscriptionLocked(route.Key())
 	for _, owner := range owners {
-		delete(s.owners, owner)
+		if s.owners[ownerScopeKey(owner, route.Scope)] == route.Key() {
+			delete(s.owners, ownerScopeKey(owner, route.Scope))
+		}
 	}
 	s.mu.Unlock()
 	return false

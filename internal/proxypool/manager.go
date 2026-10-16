@@ -146,6 +146,7 @@ func NewManager(configPath string, cfg *internalconfig.Config) (*Manager, error)
 	m.regions.SetObservationSource(m.regionObservation, m.ensureRegionObservation)
 	m.regions.SetObservationDemand(m.demandRegionObservation)
 	m.regions.SetManualSource(m.manualRegion)
+	m.regions.SetManualSources(m.manualRegionSources)
 	m.regions.SetReconciler(m.reconcileRegionChanges)
 	if errLoad := m.loadBindings(); errLoad != nil {
 		m.regions.Close()

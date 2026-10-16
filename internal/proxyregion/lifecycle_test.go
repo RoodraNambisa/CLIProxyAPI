@@ -175,3 +175,46 @@ func TestLateMetadataCannotRepinPreviousExit(t *testing.T) {
 		t.Fatal("late result restored old IP reference")
 	}
 }
+
+func TestMissingObservationDoesNotEvictActiveMetadata(t *testing.T) {
+	s, _ := testService(t)
+	one := 1
+	s.UpdateConfig(config.ProxyIPConfig{IPCacheSize: &one})
+	r := Route{ProxyURL: "http://fixture:80", OwnerID: "active"}
+	s.Register(r)
+	s.mu.Lock()
+	s.ips.put("8.8.8.8", Geo{IP: "8.8.8.8", Timezone: "UTC"}, 1)
+	s.mu.Unlock()
+	s.SetObservationSource(func(Route) Observation { return Observation{} }, nil)
+	s.Register(r)
+	s.mu.Lock()
+	s.ips.put("1.1.1.1", Geo{IP: "1.1.1.1"}, 1)
+	s.ips.put("9.9.9.9", Geo{IP: "9.9.9.9"}, 1)
+	_, retained := s.ips.get("8.8.8.8", false)
+	s.mu.Unlock()
+	if !retained {
+		t.Fatal("missing observation released an active reference")
+	}
+	s.ForgetOwner("active")
+	if s.Counts()["active_ips"] != 0 {
+		t.Fatal("removed owner retained reference")
+	}
+}
+
+func TestOneConsumerKeepsIndependentTargetScopes(t *testing.T) {
+	s, _ := testService(t)
+	a := Route{ProxyURL: "http://fixture:80", OwnerID: "same", Scope: "https://a.test/cdn-cgi/trace"}
+	b := a
+	b.Scope = "https://b.test/cdn-cgi/trace"
+	s.Register(a)
+	s.Register(b)
+	_, n, _ := s.Status(0, 10)
+	if n != 2 {
+		t.Fatalf("one target replaced another: %d", n)
+	}
+	s.ForgetOwner("same")
+	_, n, _ = s.Status(0, 10)
+	if n != 0 {
+		t.Fatal("owner removal left references")
+	}
+}
