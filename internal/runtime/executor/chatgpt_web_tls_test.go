@@ -3,6 +3,7 @@ package executor
 import (
 	"context"
 	stdtls "crypto/tls"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -116,5 +117,53 @@ func TestChatGPTWebTLSLoginAndImportSnapshot(t *testing.T) {
 	}
 	if calls != 3 {
 		t.Fatalf("calls=%d", calls)
+	}
+}
+
+func TestChatGPTWebTLSFollowupQueriesRetainSnapshot(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		for _, flow := range []string{"refresh_probe", "models"} {
+			t.Run(fmt.Sprintf("%t/%s", enabled, flow), func(t *testing.T) {
+				t.Parallel()
+				observed := make(chan []uint16, 1)
+				server := httptest.NewUnstartedServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+					t.Error("untrusted certificate accepted")
+				}))
+				server.Config.ErrorLog = log.New(io.Discard, "", 0)
+				server.TLS = &stdtls.Config{GetConfigForClient: func(h *stdtls.ClientHelloInfo) (*stdtls.Config, error) {
+					select {
+					case observed <- slices.Clone(h.Extensions):
+					default:
+					}
+					return nil, nil
+				}}
+				server.StartTLS()
+				defer server.Close()
+				e := NewChatGPTWebExecutor(&config.Config{ChatGPTWeb: config.ChatGPTWebConfig{TLSTrustAnchorsEnabled: &enabled}}, nil)
+				defer func() { _ = e.Close() }()
+				e.runtimeBaseURL = server.URL
+				ctx := chatgptwebauth.WithTLSOptions(t.Context(), e.chatGPTWebTLSOptions(t.Context()))
+				next := !enabled
+				e.UpdateConfig(&config.Config{ChatGPTWeb: config.ChatGPTWebConfig{TLSTrustAnchorsEnabled: &next}})
+				auth := chatGPTWebRuntimeAuth()
+				var err error
+				if flow == "refresh_probe" {
+					_, err = e.probeChatGPTWebUnauthorizedRefresh(ctx, auth, auth)
+				} else {
+					_, err = e.FetchModels(ctx, auth)
+				}
+				if err == nil {
+					t.Fatal("untrusted certificate accepted")
+				}
+				select {
+				case extensions := <-observed:
+					if slices.Contains(extensions, 0xca34) != enabled {
+						t.Fatal("follow-up query lost frozen TLS policy")
+					}
+				default:
+					t.Fatal("follow-up ClientHello not observed")
+				}
+			})
+		}
 	}
 }

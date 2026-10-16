@@ -5197,6 +5197,7 @@ func (e *ChatGPTWebExecutor) probeChatGPTWebUnauthorizedRefresh(
 	previous *cliproxyauth.Auth,
 	refreshed *cliproxyauth.Auth,
 ) (*cliproxyauth.Auth, error) {
+	ctx = chatgptwebauth.WithTLSOptions(ctx, e.chatGPTWebTLSOptions(ctx))
 	resolved := refreshed
 	if e.manager != nil {
 		var errResolve error
@@ -5205,7 +5206,7 @@ func (e *ChatGPTWebExecutor) probeChatGPTWebUnauthorizedRefresh(
 			return nil, errResolve
 		}
 	}
-	client, credential, errClient := e.newRuntimeClientForAcquisition(resolved, true)
+	client, credential, errClient := e.newRuntimeClientWithTLSOptions(resolved, true, e.chatGPTWebTLSOptions(ctx))
 	if errClient != nil {
 		return nil, errClient
 	}
