@@ -15,13 +15,8 @@ type CodexUpstream struct {
 // ResolveCodexUpstream keeps explicit credential/API-key addresses authoritative.
 // The provider default applies only to OAuth credentials, including agent identities.
 func ResolveCodexUpstream(auth *coreauth.Auth, cfg *config.Config) CodexUpstream {
-	apiKey := false
+	apiKey := codexUsesAPIKeyAuth(auth)
 	if auth != nil {
-		apiKey = strings.TrimSpace(auth.Attributes["api_key"]) != ""
-		for _, kind := range []string{auth.Attributes["auth_kind"], codexMetadataString(auth, "auth_kind")} {
-			kind = strings.ToLower(strings.TrimSpace(kind))
-			apiKey = apiKey || kind == "apikey" || kind == "api_key"
-		}
 		for _, value := range []string{auth.Attributes["base_url"], codexMetadataString(auth, "base_url")} {
 			if value = strings.TrimSpace(value); value != "" {
 				// API-key Alpha Search URLs may contain a query ending in '/'.
@@ -38,6 +33,22 @@ func ResolveCodexUpstream(auth *coreauth.Auth, cfg *config.Config) CodexUpstream
 		}
 	}
 	return CodexUpstream{BaseURL: config.DefaultCodexBaseURL, Source: "official"}
+}
+
+func codexUsesAPIKeyAuth(auth *coreauth.Auth) bool {
+	if auth == nil {
+		return false
+	}
+	if strings.TrimSpace(auth.Attributes["api_key"]) != "" {
+		return true
+	}
+	for _, kind := range []string{auth.Attributes["auth_kind"], codexMetadataString(auth, "auth_kind")} {
+		switch strings.ToLower(strings.TrimSpace(kind)) {
+		case "apikey", "api_key":
+			return true
+		}
+	}
+	return false
 }
 
 func codexMetadataString(auth *coreauth.Auth, key string) string {

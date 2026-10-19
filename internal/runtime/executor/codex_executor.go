@@ -952,6 +952,10 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	}
 	body = helps.SanitizeCodexInputItemIDs(body)
 	body = helps.SanitizeCodexReasoningEncryptedContent(ctx, "codex executor", body, helps.APIKeyModelIsCompat(req))
+	body, err = helps.EnsureCodexWebSearchHistoryTool(body, auth, e.codexPreparedSessionIdentity(ctx, req, opts).ResponsesLite.Enabled)
+	if err != nil {
+		return resp, err
+	}
 	body = helps.NormalizeCodexToolSelection(body)
 	body = e.codexPreparedSessionIdentity(ctx, req, opts).ResponsesLite.ApplyBody(body, false)
 	body, multiAgentResponse := helps.OptimizeCodexMultiAgentV2Request(body, e.codexPreparedSessionIdentity(ctx, req, opts).MultiAgentV2, helps.APIKeyModelIsCompat(req))
@@ -1348,6 +1352,10 @@ func (e *CodexExecutor) executeStream(ctx context.Context, auth *cliproxyauth.Au
 	}
 	body = helps.SanitizeCodexInputItemIDs(body)
 	body = helps.SanitizeCodexReasoningEncryptedContent(ctx, "codex executor", body, helps.APIKeyModelIsCompat(req))
+	body, err = helps.EnsureCodexWebSearchHistoryTool(body, auth, e.codexPreparedSessionIdentity(ctx, req, opts).ResponsesLite.Enabled)
+	if err != nil {
+		return nil, err
+	}
 	body = helps.NormalizeCodexToolSelection(body)
 	body = e.codexPreparedSessionIdentity(ctx, req, opts).ResponsesLite.ApplyBody(body, false)
 	body, multiAgentResponse := helps.OptimizeCodexMultiAgentV2Request(body, e.codexPreparedSessionIdentity(ctx, req, opts).MultiAgentV2, helps.APIKeyModelIsCompat(req))
