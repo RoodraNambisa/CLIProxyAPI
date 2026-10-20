@@ -26,7 +26,7 @@ func TestDecodedRequestBodyIsAuditedAndBounded(t *testing.T) {
 	}{
 		{"allowed", "zstd", encoder.EncodeAll([]byte(`{"input":"hello"}`), nil), 200},
 		{"audited", "zstd", encoder.EncodeAll([]byte(`{"input":"blocked"}`), nil), 403},
-		{"already-decoded", "zstd", []byte(`{"input":"hello"}`), 200},
+		{"json-marked-zstd", "zstd", []byte(`{"input":"hello"}`), 400},
 		{"plain-audited", "", []byte(`{"input":"blocked"}`), 403},
 		{"oversized", "zstd", encoder.EncodeAll(bytes.Repeat([]byte("x"), 4096), nil), 413},
 		{"corrupt", "zstd", []byte("invalid compressed body"), 400},

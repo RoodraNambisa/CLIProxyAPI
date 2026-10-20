@@ -2,7 +2,6 @@ package util
 
 import (
 	"bytes"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -43,10 +42,6 @@ func ReadDecodedRequestBody(req *http.Request, limit int64) ([]byte, error) {
 		case "", "identity":
 			continue
 		case "zstd":
-			// An intermediary may already have decoded JSON but retained its header.
-			if json.Valid(body) {
-				continue
-			}
 			if len(body) == 0 {
 				return nil, errors.New("empty zstd request body")
 			}

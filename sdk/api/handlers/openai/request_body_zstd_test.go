@@ -52,6 +52,7 @@ func TestOpenAIRequestBodyZstdLimitsAndCorruption(t *testing.T) {
 		{"encoded-overflow", wire, 4, true},
 		{"truncated", wire[:len(wire)-1], 8192, false},
 		{"invalid", []byte("not zstd"), 8192, false},
+		{"json-marked-zstd", []byte(`{"model":"fixture","input":[]}`), 8192, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c, _ := gin.CreateTestContext(httptest.NewRecorder())
