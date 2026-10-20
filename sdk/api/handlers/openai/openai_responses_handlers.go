@@ -596,7 +596,7 @@ func (h *OpenAIResponsesAPIHandler) Responses(c *gin.Context) {
 		writeResponsesRequestReadError(c, err)
 		return
 	}
-	h.BeginChatGPTWebImageErrorSanitization(c, cliproxyauth.PayloadHasImageGenerationTool(rawJSON))
+	h.BeginChatGPTWebImageErrorSanitization(c, !coreexecutor.IsResponsesCompaction(rawJSON, "") && cliproxyauth.PayloadHasImageGenerationTool(rawJSON))
 	rawJSON = h.prepareOrphanDelegation(c, rawJSON)
 	rawJSON = h.prepareCodexMultiAgentV2(c, rawJSON)
 
@@ -617,7 +617,7 @@ func (h *OpenAIResponsesAPIHandler) Compact(c *gin.Context) {
 		writeResponsesRequestReadError(c, err)
 		return
 	}
-	h.BeginChatGPTWebImageErrorSanitization(c, cliproxyauth.PayloadHasImageGenerationTool(rawJSON))
+	h.BeginChatGPTWebImageErrorSanitization(c, false)
 	rawJSON = h.prepareOrphanDelegation(c, rawJSON)
 	rawJSON = h.prepareCodexMultiAgentV2(c, rawJSON)
 
@@ -715,7 +715,7 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 	// New core execution path
 	modelName := gjson.GetBytes(rawJSON, "model").String()
 	cliCtx, cliCancel := h.GetImageContextWithCancel(h, c, context.Background(), rawJSON)
-	requestedImageStreamPassthrough := cliproxyauth.PayloadHasImageGenerationTool(rawJSON)
+	requestedImageStreamPassthrough := !coreexecutor.IsResponsesCompaction(rawJSON, "") && cliproxyauth.PayloadHasImageGenerationTool(rawJSON)
 	var imageStreamPassthroughState *coreexecutor.ImageGenerationStreamPassthroughState
 	if requestedImageStreamPassthrough {
 		imageStreamPassthroughState = &coreexecutor.ImageGenerationStreamPassthroughState{}

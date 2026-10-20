@@ -90,22 +90,25 @@ func TestCodexManagerLocalRejectionDoesNotConsumeRequestLimit(t *testing.T) {
 				return err
 			}
 			request := core.Request{Model: "gpt-5.4", Payload: []byte(`{"input":[],"tools":[{"type":"image_generation"}]}`)}
-			for range 3 {
-				diagnostics := &core.RequestExecutionDiagnostics{}
-				if err := invoke(request, diagnostics); logging.LocalPolicyReason(err) != "disabled_image_generation_tool" {
-					t.Fatalf("local rejection exhausted request capacity: %v", err)
+			// Compaction is an upstream operation after image declarations are removed.
+			if transport != "compact" {
+				for range 3 {
+					diagnostics := &core.RequestExecutionDiagnostics{}
+					if err := invoke(request, diagnostics); logging.LocalPolicyReason(err) != "disabled_image_generation_tool" {
+						t.Fatalf("local rejection exhausted request capacity: %v", err)
+					}
+					if snapshot := diagnostics.Snapshot(); snapshot.UpstreamCommitted || snapshot.AuthRequestSlotConsumed {
+						t.Fatal("local rejection consumed capacity")
+					}
+					if _, err := manager.ExecuteCount(t.Context(), []string{"codex"}, request, core.Options{SourceFormat: translator.FormatCodex}); err != nil {
+						t.Fatalf("local token count exhausted request capacity: %v", err)
+					}
 				}
-				if snapshot := diagnostics.Snapshot(); snapshot.UpstreamCommitted || snapshot.AuthRequestSlotConsumed {
-					t.Fatal("local rejection consumed capacity")
+				if calls.Load() != 0 {
+					t.Fatal("local operations sent upstream traffic")
 				}
-				if _, err := manager.ExecuteCount(t.Context(), []string{"codex"}, request, core.Options{SourceFormat: translator.FormatCodex}); err != nil {
-					t.Fatalf("local token count exhausted request capacity: %v", err)
-				}
+				request.Payload = []byte(`{"input":[]}`)
 			}
-			if calls.Load() != 0 {
-				t.Fatal("local operations sent upstream traffic")
-			}
-			request.Payload = []byte(`{"input":[]}`)
 			diagnostics := &core.RequestExecutionDiagnostics{}
 			if err := invoke(request, diagnostics); err == nil || !strings.Contains(err.Error(), "fixture upstream validation") || calls.Load() != 1 || !diagnostics.Snapshot().AuthRequestSlotConsumed {
 				t.Fatalf("allowed upstream request lost accounting: %v; calls=%d", err, calls.Load())

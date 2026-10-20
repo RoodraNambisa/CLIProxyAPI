@@ -283,7 +283,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		toolCacheTurn := newResponsesWebsocketToolCacheTurn(conversation.tools)
 		requestJSON = toolCacheTurn.repairRequest(requestJSON)
 		requestJSON = dedupeResponsesWebsocketInputItemsByID(requestJSON)
-		h.PinChatGPTWebImageErrorSanitization(c, coreauth.PayloadHasImageGenerationTool(requestJSON))
+		h.PinChatGPTWebImageErrorSanitization(c, !cliproxyexecutor.IsResponsesCompaction(requestJSON, "") && coreauth.PayloadHasImageGenerationTool(requestJSON))
 		updatedLastRequest = bytes.Clone(requestJSON)
 
 		modelName := gjson.GetBytes(requestJSON, "model").String()

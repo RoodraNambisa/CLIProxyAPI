@@ -556,6 +556,8 @@ type CodexHeaderDefaults struct {
 // CodexConfig configures provider-wide Codex request behavior.
 type CodexConfig struct {
 	TimeContext CodexTimeContextConfig `yaml:"time-context,omitempty" json:"time-context"`
+	// UpstreamRequestCompression opts official Codex HTTP requests into zstd.
+	UpstreamRequestCompression string `yaml:"upstream-request-compression,omitempty" json:"upstream-request-compression"`
 	// BaseURL overrides the default Codex OAuth model endpoint, not OAuth or quota endpoints.
 	BaseURL string `yaml:"base-url" json:"base-url"`
 	// AutoCookie passively stores allowlisted upstream cookies per credential.
@@ -2452,6 +2454,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	}
 	cfg.RemoteManagement.AccessPath = accessPath
 	if cfg.Codex.TurnStatePolicy, err = NormalizeCodexTurnStatePolicy(cfg.Codex.TurnStatePolicy); err != nil {
+		return nil, err
+	}
+	if cfg.Codex.UpstreamRequestCompression, err = NormalizeCodexRequestCompression(cfg.Codex.UpstreamRequestCompression); err != nil {
 		return nil, err
 	}
 	if cfg.CodexFingerprint.DefaultMode, err = NormalizeCodexFingerprintMode(cfg.CodexFingerprint.DefaultMode); err != nil {

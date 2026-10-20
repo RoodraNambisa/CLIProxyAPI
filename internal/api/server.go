@@ -29,6 +29,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/managementasset"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/proxypool"
+	executorhelps "github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/sentinelservice"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
@@ -516,6 +517,7 @@ func (s *Server) setupRoutes() {
 	// OpenAI compatible API routes
 	v1 := s.engine.Group("/v1")
 	v1.Use(AuthMiddleware(s.accessManager, s.handlers.AuthManager))
+	v1.Use(middleware.RequestBodyDecodingMiddleware(executorhelps.ChatGPTWebMaxRequestBytes))
 	v1.Use(s.proxyReadinessMiddleware())
 	v1.Use(s.requestBodyAuditMiddleware())
 	{
@@ -551,7 +553,7 @@ func (s *Server) setupRoutes() {
 	}
 
 	// Local temporary credentials are accepted only by native connection routes.
-	liveV1 := s.engine.Group("/v1", s.codexLiveAuthMiddleware(), s.proxyReadinessMiddleware(), s.requestBodyAuditMiddleware())
+	liveV1 := s.engine.Group("/v1", s.codexLiveAuthMiddleware(), middleware.RequestBodyDecodingMiddleware(executorhelps.ChatGPTWebMaxRequestBytes), s.proxyReadinessMiddleware(), s.requestBodyAuditMiddleware())
 	liveV1.GET("/realtime", s.codexLive.HandleRealtimeWebsocket)
 	liveV1.GET("/live/:call_id", s.codexLive.HandleSideband)
 	liveV1.GET("/realtime/calls/:call_id", s.codexLive.HandleSideband)
@@ -560,11 +562,12 @@ func (s *Server) setupRoutes() {
 	liveV1.POST("/realtime/calls", s.codexLive.HandleCall)
 
 	// Codex CLI search alias uses the same authentication and request policies.
-	s.engine.POST("/backend-api/codex/alpha/search", AuthMiddleware(s.accessManager, s.handlers.AuthManager), s.proxyReadinessMiddleware(), s.requestBodyAuditMiddleware(), codexSearchHandlers.Search)
+	s.engine.POST("/backend-api/codex/alpha/search", AuthMiddleware(s.accessManager, s.handlers.AuthManager), middleware.RequestBodyDecodingMiddleware(executorhelps.ChatGPTWebMaxRequestBytes), s.proxyReadinessMiddleware(), s.requestBodyAuditMiddleware(), codexSearchHandlers.Search)
 
 	// Gemini compatible API routes
 	v1beta := s.engine.Group("/v1beta")
 	v1beta.Use(AuthMiddleware(s.accessManager, s.handlers.AuthManager))
+	v1beta.Use(middleware.RequestBodyDecodingMiddleware(executorhelps.ChatGPTWebMaxRequestBytes))
 	v1beta.Use(s.proxyReadinessMiddleware())
 	v1beta.Use(s.requestBodyAuditMiddleware())
 	{

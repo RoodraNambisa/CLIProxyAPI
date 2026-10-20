@@ -974,6 +974,7 @@ xai:
 # `same-account-only` keeps only states known to belong to the selected account, and `strip` removes all.
 # Upstream response states are always recorded and returned to the client. The default is `guard-cross-account`.
 # codex:
+#   upstream-request-compression: "off" # off or zstd; official ChatGPT Codex HTTP endpoints only.
 #   time-context:
 #     enabled: false
 #     mode: "proxy" # proxy or manual. Credential overrides also allow inherit/off.

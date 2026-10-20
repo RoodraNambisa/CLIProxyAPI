@@ -946,7 +946,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	if err != nil {
 		return resp, err
 	}
-	body, err = e.applyDisabledImageGenerationToolPolicy(auth, body)
+	body, err = e.applyDisabledImageGenerationToolPolicy(auth, body, opts.Alt)
 	if err != nil {
 		return resp, err
 	}
@@ -1011,8 +1011,9 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	if guardModel == "" {
 		guardModel = baseModel
 	}
+	compressed := helps.PrepareCodexRequestCompression(httpReq, upstreamBody, auth, e.cfg)
 	upstreamBody = nil
-	httpClient := reporter.TrackHTTPClient(e.newCodexHTTPClient(ctx, auth, imageRequest))
+	httpClient := helps.CodexCompressedHTTPClient(reporter.TrackHTTPClient(e.newCodexHTTPClient(ctx, auth, imageRequest)), compressed)
 	httpResp, err := helps.DoUpstreamHTTPRequest(httpClient, httpReq)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
@@ -1188,7 +1189,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	body, _ = helps.SetStringIfDifferent(body, "model", baseModel)
 	body, _ = sjson.DeleteBytes(body, "stream")
 	body = normalizeCodexInstructions(body)
-	body, err = e.applyDisabledImageGenerationToolPolicy(auth, body)
+	body, err = e.applyDisabledImageGenerationToolPolicy(auth, body, opts.Alt)
 	if err != nil {
 		return resp, err
 	}
@@ -1239,8 +1240,9 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 		AuthType:  authType,
 		AuthValue: authValue,
 	})
+	compressed := helps.PrepareCodexRequestCompression(httpReq, upstreamBody, auth, e.cfg)
 	upstreamBody = nil
-	httpClient := reporter.TrackHTTPClient(e.newCodexHTTPClient(ctx, auth, imageRequest))
+	httpClient := helps.CodexCompressedHTTPClient(reporter.TrackHTTPClient(e.newCodexHTTPClient(ctx, auth, imageRequest)), compressed)
 	httpResp, err := helps.DoUpstreamHTTPRequest(httpClient, httpReq)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
@@ -1346,7 +1348,7 @@ func (e *CodexExecutor) executeStream(ctx context.Context, auth *cliproxyauth.Au
 	if err != nil {
 		return nil, err
 	}
-	body, err = e.applyDisabledImageGenerationToolPolicy(auth, body)
+	body, err = e.applyDisabledImageGenerationToolPolicy(auth, body, opts.Alt)
 	if err != nil {
 		return nil, err
 	}
@@ -1415,9 +1417,10 @@ func (e *CodexExecutor) executeStream(ctx context.Context, auth *cliproxyauth.Au
 	if guardModel == "" {
 		guardModel = baseModel
 	}
+	compressed := helps.PrepareCodexRequestCompression(httpReq, upstreamBody, auth, e.cfg)
 	upstreamBody = nil
 
-	httpClient := reporter.TrackHTTPClient(e.newCodexHTTPClient(ctx, auth, imageRequest))
+	httpClient := helps.CodexCompressedHTTPClient(reporter.TrackHTTPClient(e.newCodexHTTPClient(ctx, auth, imageRequest)), compressed)
 	httpResp, err := helps.DoUpstreamHTTPRequest(httpClient, httpReq)
 	if err != nil {
 		cleanupBodies()
@@ -3090,9 +3093,13 @@ func metadataBool(meta map[string]any, key string) bool {
 	}
 }
 
-func (e *CodexExecutor) applyDisabledImageGenerationToolPolicy(auth *cliproxyauth.Auth, body []byte) ([]byte, error) {
+func (e *CodexExecutor) applyDisabledImageGenerationToolPolicy(auth *cliproxyauth.Auth, body []byte, alt string) ([]byte, error) {
 	if !cliproxyauth.AuthDisablesImageGeneration(e.cfg, auth, e.Identifier()) || !cliproxyauth.PayloadHasImageGenerationTool(body) {
 		return body, nil
+	}
+	// Compaction replays declarations; disabling generation must not block it.
+	if cliproxyexecutor.IsResponsesCompaction(body, alt) {
+		return removeCodexImageGenerationTool(body), nil
 	}
 	action, ok := config.NormalizeDisabledImageGenerationToolAction(disabledImageGenerationToolAction(e.cfg))
 	if !ok || action == config.DisabledImageGenerationToolActionRemove {

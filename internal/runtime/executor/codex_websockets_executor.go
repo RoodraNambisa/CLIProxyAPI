@@ -318,7 +318,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	if !gjson.GetBytes(body, "instructions").Exists() {
 		body, _ = sjson.SetBytes(body, "instructions", "")
 	}
-	body, err = e.applyDisabledImageGenerationToolPolicy(auth, body)
+	body, err = e.applyDisabledImageGenerationToolPolicy(auth, body, opts.Alt)
 	if err != nil {
 		return resp, err
 	}
@@ -711,7 +711,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	if err != nil {
 		return nil, fmt.Errorf("codex websockets executor: set base model in request body: %w", err)
 	}
-	body, err = e.applyDisabledImageGenerationToolPolicy(auth, body)
+	body, err = e.applyDisabledImageGenerationToolPolicy(auth, body, opts.Alt)
 	if err != nil {
 		return nil, err
 	}

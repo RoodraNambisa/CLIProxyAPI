@@ -328,6 +328,9 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	if oldCfg.Codex.BaseURL != newCfg.Codex.BaseURL {
 		changes = append(changes, "codex.base-url: updated")
 	}
+	if oldCfg.Codex.UpstreamRequestCompression != newCfg.Codex.UpstreamRequestCompression {
+		changes = append(changes, fmt.Sprintf("codex.upstream-request-compression: %s -> %s", oldCfg.Codex.UpstreamRequestCompression, newCfg.Codex.UpstreamRequestCompression))
+	}
 	if oldCfg.Codex.LiveEnabled != newCfg.Codex.LiveEnabled {
 		changes = append(changes, fmt.Sprintf("codex.live-enabled: %t -> %t", oldCfg.Codex.LiveEnabled, newCfg.Codex.LiveEnabled))
 	}

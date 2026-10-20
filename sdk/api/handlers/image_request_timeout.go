@@ -64,7 +64,7 @@ func (h *BaseAPIHandler) GetImageContextWithCancel(handler interfaces.APIHandler
 	if _, pinned := coreexecutor.ImageBootstrapPolicyFromContext(ctx); !pinned {
 		ctx = coreexecutor.WithImageBootstrapPolicy(ctx, h.imageBootstrapPolicy())
 	}
-	if !coreauth.PayloadMaySelectImageGenerationTool(payload) {
+	if coreexecutor.IsResponsesCompaction(payload, "") || !coreauth.PayloadMaySelectImageGenerationTool(payload) {
 		return ctx, cancel
 	}
 	if coreexecutor.ImageRequestBudgetFromContext(ctx) != nil {

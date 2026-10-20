@@ -53,7 +53,7 @@ func TestCodexResponsesLitePreservesImageToolPolicy(t *testing.T) {
 		if !cliproxyauth.PayloadHasImageGenerationTool(body) {
 			t.Fatal("image declarations escaped scheduling checks")
 		}
-		got, err := executor.applyDisabledImageGenerationToolPolicy(auth, body)
+		got, err := executor.applyDisabledImageGenerationToolPolicy(auth, body, "")
 		if action == "error" {
 			if err == nil {
 				t.Fatal("Lite image tool bypassed rejection")

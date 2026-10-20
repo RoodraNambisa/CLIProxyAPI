@@ -10548,6 +10548,9 @@ func requestHasImageGenerationToolForFallback(req cliproxyexecutor.Request, opts
 	if len(payload) == 0 {
 		payload = opts.OriginalRequest
 	}
+	if cliproxyexecutor.IsResponsesCompaction(payload, opts.Alt) {
+		return false
+	}
 	return PayloadMaySelectImageGenerationTool(payload)
 }
 

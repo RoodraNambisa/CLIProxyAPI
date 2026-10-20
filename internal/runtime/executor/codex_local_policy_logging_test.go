@@ -20,7 +20,7 @@ import (
 func TestCodexLocalPolicyLoggingAcrossTransports(t *testing.T) {
 	const message = "Rate limit exceeded for image_generation. Please try again later."
 	const body = `{"error":{"message":"` + message + `","type":"rate_limit_exceeded","code":"rate_limit_exceeded"}}`
-	for _, transport := range []string{"http", "http-stream", "compact", "websocket", "websocket-stream"} {
+	for _, transport := range []string{"http", "http-stream", "websocket", "websocket-stream"} {
 		t.Run(transport, func(t *testing.T) {
 			hook := logtest.NewGlobal()
 			defer hook.Reset()
@@ -49,10 +49,7 @@ func TestCodexLocalPolicyLoggingAcrossTransports(t *testing.T) {
 			options := core.Options{SourceFormat: translator.FromString("codex")}
 			var err error
 			switch transport {
-			case "http", "compact":
-				if transport == "compact" {
-					options.Alt = "responses/compact"
-				}
+			case "http":
 				_, err = NewCodexExecutor(cfg).Execute(ctx, credential, request, options)
 			case "http-stream":
 				_, err = NewCodexExecutor(cfg).ExecuteStream(ctx, credential, request, options)

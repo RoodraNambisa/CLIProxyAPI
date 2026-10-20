@@ -24,7 +24,7 @@ func TestCodexExecutorDisabledImageGenerationToolRemove(t *testing.T) {
 	}
 	body := []byte(`{"tools":[{"type":"image_generation","model":"gpt-image-2"},{"type":"function","name":"lookup"}],"tool_choice":{"type":"image_generation"},"input":"draw"}`)
 
-	got, err := executor.applyDisabledImageGenerationToolPolicy(auth, body)
+	got, err := executor.applyDisabledImageGenerationToolPolicy(auth, body, "")
 	if err != nil {
 		t.Fatalf("applyDisabledImageGenerationToolPolicy() error = %v", err)
 	}
@@ -53,7 +53,7 @@ func TestCodexExecutorDisabledImageGenerationToolRemoveDeletesStringToolChoiceWh
 	}
 	body := []byte(`{"tools":[{"type":"image_generation","model":"gpt-image-2"}],"tool_choice":"required","parallel_tool_calls":true,"input":"draw"}`)
 
-	got, err := executor.applyDisabledImageGenerationToolPolicy(auth, body)
+	got, err := executor.applyDisabledImageGenerationToolPolicy(auth, body, "")
 	if err != nil {
 		t.Fatalf("applyDisabledImageGenerationToolPolicy() error = %v", err)
 	}
@@ -73,7 +73,7 @@ func TestCodexExecutorDisabledImageGenerationToolRemoveFunctionForm(t *testing.T
 	auth := &cliproxyauth.Auth{Provider: "codex", Attributes: map[string]string{"priority": "-1"}}
 	body := []byte(`{"tools":[{"type":"function","name":"image_gen.imagegen"},{"type":"function","name":"lookup"}],"tool_choice":{"type":"function","name":"image_gen.imagegen"}}`)
 
-	got, err := executor.applyDisabledImageGenerationToolPolicy(auth, body)
+	got, err := executor.applyDisabledImageGenerationToolPolicy(auth, body, "")
 	if err != nil {
 		t.Fatalf("applyDisabledImageGenerationToolPolicy() error = %v", err)
 	}
@@ -93,7 +93,7 @@ func TestCodexExecutorDisabledImageGenerationToolRemoveNamespaceMember(t *testin
 	auth := &cliproxyauth.Auth{Provider: "codex", Attributes: map[string]string{"priority": "-1"}}
 	body := []byte(`{"tools":[{"type":"namespace","name":"image_gen","tools":[{"type":"function","name":"imagegen"},{"type":"function","name":"inspect"}]},{"type":"function","name":"lookup"}],"tool_choice":{"type":"namespace","name":"image_gen"}}`)
 
-	got, err := executor.applyDisabledImageGenerationToolPolicy(auth, body)
+	got, err := executor.applyDisabledImageGenerationToolPolicy(auth, body, "")
 	if err != nil {
 		t.Fatalf("applyDisabledImageGenerationToolPolicy() error = %v", err)
 	}
@@ -116,7 +116,7 @@ func TestCodexExecutorDisabledImageGenerationToolRemoveNamespaceFunctionObject(t
 	auth := &cliproxyauth.Auth{Provider: "codex", Attributes: map[string]string{"priority": "-1"}}
 	body := []byte(`{"tools":[{"type":"namespace","name":"image_gen","tools":[{"type":"function","function":{"name":"imagegen"}},{"type":"function","name":"inspect"}]}]}`)
 
-	got, err := executor.applyDisabledImageGenerationToolPolicy(auth, body)
+	got, err := executor.applyDisabledImageGenerationToolPolicy(auth, body, "")
 	if err != nil {
 		t.Fatalf("applyDisabledImageGenerationToolPolicy() error = %v", err)
 	}
@@ -147,7 +147,7 @@ func TestCodexExecutorDisabledImageGenerationToolError(t *testing.T) {
 	}
 	body := []byte(`{"tools":[{"type":"image_generation","model":"gpt-image-2"}],"tool_choice":{"type":"image_generation"},"input":"draw"}`)
 
-	_, err := executor.applyDisabledImageGenerationToolPolicy(auth, body)
+	_, err := executor.applyDisabledImageGenerationToolPolicy(auth, body, "")
 	if err == nil {
 		t.Fatal("applyDisabledImageGenerationToolPolicy() error = nil, want configured error")
 	}

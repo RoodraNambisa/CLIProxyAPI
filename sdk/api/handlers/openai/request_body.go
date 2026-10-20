@@ -31,7 +31,7 @@ func readOpenAIJSONRequestBodyWithLimit(c *gin.Context, limit int64) ([]byte, er
 		return nil, &http.MaxBytesError{Limit: limit}
 	}
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, limit)
-	body, err := c.GetRawData()
+	body, err := util.ReadDecodedRequestBody(c.Request, limit)
 	util.RegisterPromptCacheLogPolicy(c, body)
 	releaseOpenAIRequestBody(c)
 	return body, err
