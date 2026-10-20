@@ -86,6 +86,24 @@ func TestCodexNativeParallelToolCallsConfiguredDefault(t *testing.T) {
 
 func testCodexParallelToolCallsWire(t *testing.T, source translator.Format, transport, value string, lite bool, cfg *config.Config, want string) {
 	t.Helper()
+	payload := []byte(`{"model":"gpt-6-astra","input":[{"role":"user","content":"hello"}],"tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}]}`)
+	if source == translator.FormatOpenAI {
+		payload = []byte(`{"model":"gpt-6-astra","messages":[{"role":"user","content":"hello"}],"tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}]}`)
+	}
+	if value != "" {
+		payload, _ = sjson.SetRawBytes(payload, "parallel_tool_calls", []byte(value))
+	}
+	body := testCodexRequestControlsWire(t, source, transport, payload, lite, cfg)
+	if got := gjson.GetBytes(body, "parallel_tool_calls").Raw; got != want {
+		t.Fatalf("wire parallel_tool_calls=%q, want %q", got, want)
+	}
+	if len(gjson.GetBytes(body, "tools").Array()) != 1 || !gjson.GetBytes(body, "input").IsArray() {
+		t.Fatal("tool declarations or input history were lost")
+	}
+}
+
+func testCodexRequestControlsWire(t *testing.T, source translator.Format, transport string, payload []byte, lite bool, cfg *config.Config) []byte {
+	t.Helper()
 	if cfg == nil {
 		cfg = &config.Config{}
 	}
@@ -130,13 +148,6 @@ func testCodexParallelToolCallsWire(t *testing.T, source translator.Format, tran
 		}
 	}))
 	defer server.Close()
-	payload := []byte(`{"model":"gpt-6-astra","input":[{"role":"user","content":"hello"}],"tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}]}`)
-	if source == translator.FormatOpenAI {
-		payload = []byte(`{"model":"gpt-6-astra","messages":[{"role":"user","content":"hello"}],"tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}]}`)
-	}
-	if value != "" {
-		payload, _ = sjson.SetRawBytes(payload, "parallel_tool_calls", []byte(value))
-	}
 	opts := core.Options{SourceFormat: source, Headers: make(http.Header)}
 	ctx := t.Context()
 	if lite {
@@ -160,7 +171,7 @@ func testCodexParallelToolCallsWire(t *testing.T, source translator.Format, tran
 	}
 	if transport == "stream" || transport == "websocket-stream" {
 		opts.Stream = true
-		if transport == "websocket-stream" && source == translator.FormatOpenAI {
+		if transport == "websocket-stream" && source != translator.FormatCodex && source != translator.FormatOpenAIResponse {
 			// The WebSocket stream entry consumes an already translated Responses frame.
 			request.Payload = translator.TranslateRequest(source, translator.FormatCodex, request.Model, payload, true)
 		}
@@ -178,13 +189,9 @@ func testCodexParallelToolCallsWire(t *testing.T, source translator.Format, tran
 	}
 	select {
 	case body := <-payloads:
-		if got := gjson.GetBytes(body, "parallel_tool_calls").Raw; got != want {
-			t.Fatalf("wire parallel_tool_calls=%q, want %q", got, want)
-		}
-		if len(gjson.GetBytes(body, "tools").Array()) != 1 || !gjson.GetBytes(body, "input").IsArray() {
-			t.Fatal("tool declarations or input history were lost")
-		}
+		return body
 	default:
 		t.Fatal("request did not reach the test upstream")
 	}
+	return nil
 }

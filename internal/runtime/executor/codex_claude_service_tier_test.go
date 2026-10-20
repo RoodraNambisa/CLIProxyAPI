@@ -62,9 +62,10 @@ func TestCodexExplicitFastTierAtActualTransport(t *testing.T) {
 						}
 					}))
 					defer upstream.Close()
-					var executor coreauth.ProviderExecutor = NewCodexExecutor(&config.Config{})
+					cfg := &config.Config{Codex: config.CodexConfig{AllowClientServiceTier: true}}
+					var executor coreauth.ProviderExecutor = NewCodexExecutor(cfg)
 					if transport == "websocket" {
-						executor = NewCodexWebsocketsExecutor(&config.Config{})
+						executor = NewCodexWebsocketsExecutor(cfg)
 					}
 					credential := &coreauth.Auth{ID: t.Name(), Provider: "codex", ProxyURL: "direct", Attributes: map[string]string{"api_key": "fixture", "base_url": upstream.URL}}
 					payload := []byte(`{"messages":[{"role":"user","content":"fixture"}],"speed":"standard"}`)

@@ -8,6 +8,16 @@ import (
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
 )
 
+func TestCodexServiceTierConfigChangeDetails(t *testing.T) {
+	oldCfg, newCfg := &config.Config{}, &config.Config{Codex: config.CodexConfig{AllowClientServiceTier: true}}
+	if changes := BuildConfigChangeDetails(oldCfg, newCfg); len(changes) != 1 || changes[0] != "codex.allow-client-service-tier: false -> true" {
+		t.Fatalf("service tier update was not reported: %v", changes)
+	}
+	if changes := BuildConfigChangeDetails(newCfg, newCfg); len(changes) != 0 {
+		t.Fatal("unchanged service tier setting produced a change")
+	}
+}
+
 func TestCodexAlphaSearchConfigChangeDetails(t *testing.T) {
 	for _, enabled := range []bool{true, false} {
 		oldCfg := &config.Config{CodexKey: []config.CodexKey{{APIKey: "private-fixture", BaseURL: "https://example.invalid", AlphaSearch: !enabled}}}

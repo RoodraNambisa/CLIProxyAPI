@@ -10,7 +10,7 @@ import (
 
 func TestRequestPolicyBooleansRejectInvalidOptionalConfig(t *testing.T) {
 	fields := map[string][]string{
-		"codex":   {"passthrough-prompt-cache-key", "stream-bootstrap-buffering", "optimize-multi-agent-v2", "orphan-delegation-compatibility", "estimate-claude-input-tokens", "observe-quota"},
+		"codex":   {"allow-client-service-tier", "passthrough-prompt-cache-key", "stream-bootstrap-buffering", "optimize-multi-agent-v2", "orphan-delegation-compatibility", "estimate-claude-input-tokens", "observe-quota"},
 		"routing": {"session-affinity-lcp", "session-affinity-subagents", "session-affinity-across-priorities", "session-affinity-use-history"},
 	}
 	for section, keys := range fields {

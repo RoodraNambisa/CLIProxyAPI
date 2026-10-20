@@ -307,7 +307,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	}
 
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
-	body = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel)
+	body = helps.ApplyCodexPayloadConfig(e.cfg, e.codexPreparedSessionIdentity(ctx, req, opts).AllowClientServiceTier, baseModel, to.String(), body, originalTranslated, requestedModel)
 	body, err = helps.SetStringIfDifferent(body, "model", baseModel)
 	if err != nil {
 		return resp, fmt.Errorf("codex websockets executor: set base model in request body: %w", err)
@@ -708,7 +708,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	payloadConfigSource := body
 	body = helps.DefaultCodexParallelToolCalls(body)
-	body = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, payloadConfigSource, requestedModel)
+	body = helps.ApplyCodexPayloadConfig(e.cfg, e.codexPreparedSessionIdentity(ctx, req, opts).AllowClientServiceTier, baseModel, to.String(), body, payloadConfigSource, requestedModel)
 	payloadConfigSource = nil
 	body, err = helps.SetStringIfDifferent(body, "model", baseModel)
 	if err != nil {

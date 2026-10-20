@@ -378,6 +378,7 @@ type codexPreparedSessionIdentity struct {
 	IdentityPolicyFrozen          bool
 	MultiAgentV2                  helps.CodexMultiAgentPolicy
 	StreamBootstrapBuffering      bool
+	AllowClientServiceTier        bool
 	ClaudeInputTokensEstimate     int64
 	PromptCacheLog                *util.PromptCacheLogRedactor
 	PromptCacheKey                helps.CodexPromptCacheKeySnapshot
@@ -456,6 +457,7 @@ func (e *CodexExecutor) PrepareProviderRequest(ctx context.Context, req cliproxy
 		IdentityPolicyFrozen:          true,
 		MultiAgentV2:                  helps.SnapshotCodexMultiAgentPolicy(ctx, opts.Headers, e.cfg != nil && e.cfg.Codex.OptimizeMultiAgentV2),
 		StreamBootstrapBuffering:      e.cfg != nil && e.cfg.Codex.StreamBootstrapBuffering,
+		AllowClientServiceTier:        e.cfg != nil && e.cfg.Codex.AllowClientServiceTier,
 		PromptCacheLog:                helps.SnapshotCodexPromptCacheLog(ctx, payload),
 		PromptCacheKey:                helps.SnapshotCodexPromptCacheKey(payload, e.cfg != nil && e.cfg.Codex.PassthroughPromptCacheKey, opts.Headers, incomingHeaders),
 		ResponsesLite:                 helps.SnapshotCodexResponsesLite(payload, liteHeaders, cliproxyexecutor.DownstreamWebsocket(ctx)),
@@ -936,7 +938,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	}
 
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
-	body = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel)
+	body = helps.ApplyCodexPayloadConfig(e.cfg, e.codexPreparedSessionIdentity(ctx, req, opts).AllowClientServiceTier, baseModel, to.String(), body, originalTranslated, requestedModel)
 	originalTranslated = nil
 	body, err = helps.RewriteCodexRequestEnvelope(body, helps.CodexRequestRewriteOptions{
 		Model:              baseModel,
@@ -1185,7 +1187,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	}
 
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
-	body = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel)
+	body = helps.ApplyCodexPayloadConfig(e.cfg, e.codexPreparedSessionIdentity(ctx, req, opts).AllowClientServiceTier, baseModel, to.String(), body, originalTranslated, requestedModel)
 	originalTranslated = nil
 	body, _ = helps.SetStringIfDifferent(body, "model", baseModel)
 	body, _ = sjson.DeleteBytes(body, "stream")
@@ -1338,7 +1340,7 @@ func (e *CodexExecutor) executeStream(ctx context.Context, auth *cliproxyauth.Au
 	}
 
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
-	body = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel)
+	body = helps.ApplyCodexPayloadConfig(e.cfg, e.codexPreparedSessionIdentity(ctx, req, opts).AllowClientServiceTier, baseModel, to.String(), body, originalTranslated, requestedModel)
 	originalTranslated = nil
 	body, err = helps.RewriteCodexRequestEnvelope(body, helps.CodexRequestRewriteOptions{
 		Model:              baseModel,

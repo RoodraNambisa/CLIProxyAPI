@@ -83,7 +83,7 @@ func convertOpenAIResponsesRequestToCodexFastPath(inputRawJSON []byte) ([]byte, 
 		case "include":
 			hasInclude = true
 			output = appendJSONObjectFieldName(output, field, &wroteField)
-			output = append(output, codexResponsesIncludeRaw...)
+			output = appendCodexResponsesInclude(output, value)
 			return true
 		case "tools":
 			output = appendJSONObjectFieldName(output, field, &wroteField)
@@ -92,12 +92,6 @@ func convertOpenAIResponsesRequestToCodexFastPath(inputRawJSON []byte) ([]byte, 
 		case "tool_choice":
 			output = appendJSONObjectFieldName(output, field, &wroteField)
 			output = appendNormalizedCodexFastPathToolChoice(output, value.Raw)
-			return true
-		case "service_tier":
-			if value.Type == gjson.String && value.String() == "priority" {
-				output = appendJSONObjectFieldName(output, field, &wroteField)
-				output = append(output, value.Raw...)
-			}
 			return true
 		default:
 			output = appendJSONObjectFieldName(output, field, &wroteField)
@@ -139,6 +133,31 @@ func convertOpenAIResponsesRequestToCodexFastPath(inputRawJSON []byte) ([]byte, 
 
 	output = append(output, '}')
 	return output, true
+}
+
+func appendCodexResponsesInclude(dst []byte, include gjson.Result) []byte {
+	if !include.Exists() {
+		return append(dst, codexResponsesIncludeRaw...)
+	}
+	if !include.IsArray() {
+		// Leave invalid types visible to upstream validation.
+		return append(dst, include.Raw...)
+	}
+	hasReasoning, hasItems := false, false
+	include.ForEach(func(_, value gjson.Result) bool {
+		hasItems = true
+		hasReasoning = value.Type == gjson.String && value.String() == "reasoning.encrypted_content"
+		return !hasReasoning
+	})
+	if hasReasoning {
+		return append(dst, include.Raw...)
+	}
+	// Retain all client include items, including output replay and future fields.
+	dst = append(dst, include.Raw[:len(include.Raw)-1]...)
+	if hasItems {
+		dst = append(dst, ',')
+	}
+	return append(dst, `"reasoning.encrypted_content"]`...)
 }
 
 func appendJSONObjectFieldName(dst []byte, field string, wroteField *bool) []byte {
@@ -402,7 +421,8 @@ func convertOpenAIResponsesRequestToCodexFallback(inputRawJSON []byte) []byte {
 			return inputRawJSON
 		}
 	}
-	if output, err = sjson.SetRawBytes(output, "include", []byte(codexResponsesIncludeRaw)); err != nil {
+	include := appendCodexResponsesInclude(nil, gjson.GetBytes(output, "include"))
+	if output, err = sjson.SetRawBytes(output, "include", include); err != nil {
 		return inputRawJSON
 	}
 
@@ -418,12 +438,6 @@ func convertOpenAIResponsesRequestToCodexFallback(inputRawJSON []byte) []byte {
 		"user",
 	} {
 		if output, err = sjson.DeleteBytes(output, path); err != nil {
-			return inputRawJSON
-		}
-	}
-
-	if tier := gjson.GetBytes(output, "service_tier"); tier.Exists() && (tier.Type != gjson.String || tier.String() != "priority") {
-		if output, err = sjson.DeleteBytes(output, "service_tier"); err != nil {
 			return inputRawJSON
 		}
 	}

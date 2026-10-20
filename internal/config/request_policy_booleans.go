@@ -17,7 +17,7 @@ func validateRequestPolicyBooleansYAML(data []byte) error {
 		name string
 		keys []string
 	}{
-		{"codex", []string{"passthrough-prompt-cache-key", "stream-bootstrap-buffering", "optimize-multi-agent-v2", "orphan-delegation-compatibility", "estimate-claude-input-tokens", "observe-quota"}},
+		{"codex", []string{"allow-client-service-tier", "passthrough-prompt-cache-key", "stream-bootstrap-buffering", "optimize-multi-agent-v2", "orphan-delegation-compatibility", "estimate-claude-input-tokens", "observe-quota"}},
 		{"routing", []string{"session-affinity-lcp", "session-affinity-subagents", "session-affinity-across-priorities", "session-affinity-use-history"}},
 	} {
 		node, err := credentialYAMLField(document.Content[0], section.name, make(map[*yaml.Node]bool))

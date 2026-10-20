@@ -556,6 +556,8 @@ type CodexHeaderDefaults struct {
 // CodexConfig configures provider-wide Codex request behavior.
 type CodexConfig struct {
 	TimeContext CodexTimeContextConfig `yaml:"time-context,omitempty" json:"time-context"`
+	// AllowClientServiceTier permits client tier selection before administrator payload rules.
+	AllowClientServiceTier bool `yaml:"allow-client-service-tier" json:"allow-client-service-tier"`
 	// UpstreamRequestCompression opts official Codex HTTP requests into zstd.
 	UpstreamRequestCompression string `yaml:"upstream-request-compression,omitempty" json:"upstream-request-compression"`
 	// BaseURL overrides the default Codex OAuth model endpoint, not OAuth or quota endpoints.

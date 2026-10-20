@@ -975,6 +975,11 @@ xai:
 # Upstream response states are always recorded and returned to the client. The default is `guard-cross-account`.
 # codex:
 #   upstream-request-compression: "off" # off or zstd; official ChatGPT Codex HTTP endpoints only.
+#   # Allow client service_tier (and translated fast mode) on Codex HTTP, WebSocket and compact requests.
+#   # Default false: ignore the client's tier, including priority. True preserves the supplied value;
+#   # upstream validates model/account support. Administrator payload default/override/filter rules still apply.
+#   # Hot updates affect new requests/WS turns; retries retain their original policy.
+#   allow-client-service-tier: false
 #   time-context:
 #     enabled: false
 #     mode: "proxy" # proxy or manual. Credential overrides also allow inherit/off.

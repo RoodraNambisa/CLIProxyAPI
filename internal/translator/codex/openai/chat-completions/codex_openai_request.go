@@ -72,6 +72,10 @@ func ConvertOpenAIRequestToCodex(modelName string, inputRawJSON []byte, stream b
 
 	// Model
 	out, _ = sjson.SetBytes(out, "model", modelName)
+	// Client tier selection is governed by the Codex executor's request policy.
+	if tier := gjson.Get(rawView, "service_tier"); tier.Exists() {
+		out, _ = sjson.SetRawBytes(out, "service_tier", []byte(tier.Raw))
+	}
 
 	originalToolNameMap, customToolNames := codexOpenAIToolNames(rawJSON)
 	var toolBatch codexOpenAIToolBatch
@@ -171,6 +175,9 @@ func ConvertOpenAIRequestToCodex(modelName string, inputRawJSON []byte, stream b
 								part, _ = sjson.SetBytes(part, "type", "input_image")
 								if u := it.Get("image_url.url"); u.Exists() {
 									part, _ = sjson.SetBytes(part, "image_url", u.String())
+								}
+								if detail := it.Get("image_url.detail"); detail.Exists() {
+									part, _ = sjson.SetRawBytes(part, "detail", []byte(detail.Raw))
 								}
 								msg, _ = sjson.SetRawBytes(msg, "content.-1", part)
 							}
@@ -280,20 +287,14 @@ func ConvertOpenAIRequestToCodex(modelName string, inputRawJSON []byte, stream b
 			}
 		}
 
-		// Map verbosity if provided
-		if text.Exists() {
-			if v := text.Get("verbosity"); v.Exists() {
-				out, _ = sjson.SetBytes(out, "text.verbosity", v.Value())
-			}
-		}
-	} else if text.Exists() {
-		// If only text.verbosity present (no response_format), map verbosity
-		if v := text.Get("verbosity"); v.Exists() {
-			if !gjson.GetBytes(out, "text").Exists() {
-				out, _ = sjson.SetRawBytes(out, "text", []byte(`{}`))
-			}
-			out, _ = sjson.SetBytes(out, "text.verbosity", v.Value())
-		}
+	}
+	// Chat's top-level verbosity takes precedence over the legacy nested form.
+	verbosity := gjson.Get(rawView, "verbosity")
+	if !verbosity.Exists() {
+		verbosity = text.Get("verbosity")
+	}
+	if verbosity.Exists() {
+		out, _ = sjson.SetRawBytes(out, "text.verbosity", []byte(verbosity.Raw))
 	}
 
 	// Map tools (flatten function fields)
