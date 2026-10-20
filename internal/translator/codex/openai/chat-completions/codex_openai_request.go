@@ -62,7 +62,11 @@ func ConvertOpenAIRequestToCodex(modelName string, inputRawJSON []byte, stream b
 	} else {
 		out, _ = sjson.SetBytes(out, "reasoning.effort", "medium")
 	}
-	out, _ = sjson.SetBytes(out, "parallel_tool_calls", true)
+	if parallelToolCalls := gjson.Get(rawView, "parallel_tool_calls"); parallelToolCalls.Exists() {
+		out, _ = sjson.SetRawBytes(out, "parallel_tool_calls", []byte(parallelToolCalls.Raw))
+	} else {
+		out, _ = sjson.SetBytes(out, "parallel_tool_calls", true)
+	}
 	// Summary visibility is applied from the source protocol by the registry.
 	out, _ = sjson.SetBytes(out, "include", []string{"reasoning.encrypted_content"})
 

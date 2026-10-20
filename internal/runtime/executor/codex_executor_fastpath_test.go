@@ -6,6 +6,7 @@ import (
 
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
+	"github.com/tidwall/sjson"
 )
 
 func TestTranslateCodexRequestBodies_ReusesTranslationWhenOriginalMatchesPayload(t *testing.T) {
@@ -69,12 +70,17 @@ func TestTranslateCodexFallbackRetainsConvertedBodyAndOriginalDeclaration(t *tes
 			if from == sdktranslator.FormatOpenAIResponse || from == sdktranslator.FormatCodex {
 				wantBody = sdktranslator.TranslateRequest(from, sdktranslator.FormatCodex, "gpt-5.4", working, true)
 			}
+			wantNext := wantOriginal
+			if from == sdktranslator.FormatCodex {
+				wantBody, _ = sjson.SetBytes(wantBody, "parallel_tool_calls", true)
+				wantNext, _ = sjson.SetBytes(wantNext, "parallel_tool_calls", true)
+			}
 			gotOriginal, originalTranslated, body := translateCodexRequestBodies(from, sdktranslator.FormatCodex, "gpt-5.4", cliproxyexecutor.Request{Payload: working}, cliproxyexecutor.Options{OriginalRequest: original}, true, true)
 			if !bytes.Equal(gotOriginal, original) || !bytes.Equal(originalTranslated, wantOriginal) || !bytes.Equal(body, wantBody) || bytes.Equal(body, originalTranslated) {
 				t.Fatal("fallback mixed original declarations and converted working history")
 			}
 			_, _, next := translateCodexRequestBodies(from, sdktranslator.FormatCodex, "gpt-5.4", cliproxyexecutor.Request{Payload: original}, cliproxyexecutor.Options{}, true)
-			if !bytes.Equal(next, wantOriginal) {
+			if !bytes.Equal(next, wantNext) {
 				t.Fatal("ordinary HTTP request inherited fallback translation state")
 			}
 		})

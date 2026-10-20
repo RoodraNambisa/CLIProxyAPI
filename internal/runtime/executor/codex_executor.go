@@ -689,6 +689,7 @@ func translateCodexRequestBodies(from, to sdktranslator.Format, baseModel string
 		body = helps.TranslateRequestWithAPIKeyModelCompatibility(from, to, baseModel, req.Payload, stream, isCompat)
 	}
 	originalTranslated := body
+	body = helps.DefaultCodexParallelToolCalls(body)
 	if len(originalPayload) > 0 && !bytes.Equal(originalPayload, req.Payload) {
 		originalTranslated = helps.TranslateRequestWithAPIKeyModelCompatibility(from, to, baseModel, originalPayload, stream, isCompat)
 	}

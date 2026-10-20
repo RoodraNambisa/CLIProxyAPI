@@ -78,7 +78,7 @@ func convertOpenAIResponsesRequestToCodexFastPath(inputRawJSON []byte) ([]byte, 
 		case "parallel_tool_calls":
 			hasParallelToolCalls = true
 			output = appendJSONObjectFieldName(output, field, &wroteField)
-			output = append(output, "true"...)
+			output = append(output, value.Raw...)
 			return true
 		case "include":
 			hasInclude = true
@@ -397,8 +397,10 @@ func convertOpenAIResponsesRequestToCodexFallback(inputRawJSON []byte) []byte {
 	if output, err = sjson.SetBytes(output, "store", false); err != nil {
 		return inputRawJSON
 	}
-	if output, err = sjson.SetBytes(output, "parallel_tool_calls", true); err != nil {
-		return inputRawJSON
+	if !gjson.GetBytes(output, "parallel_tool_calls").Exists() {
+		if output, err = sjson.SetBytes(output, "parallel_tool_calls", true); err != nil {
+			return inputRawJSON
+		}
 	}
 	if output, err = sjson.SetRawBytes(output, "include", []byte(codexResponsesIncludeRaw)); err != nil {
 		return inputRawJSON

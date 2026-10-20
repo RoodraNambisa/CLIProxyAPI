@@ -6,6 +6,16 @@ import (
 	"github.com/tidwall/sjson"
 )
 
+// DefaultCodexParallelToolCalls fills the native request default before payload
+// policy is applied. Explicit values are preserved for upstream validation.
+func DefaultCodexParallelToolCalls(body []byte) []byte {
+	if gjson.GetBytes(body, "parallel_tool_calls").Exists() || !HasCodexToolDeclarations(body) {
+		return body
+	}
+	body, _ = sjson.SetBytes(body, "parallel_tool_calls", true)
+	return body
+}
+
 // NormalizeCodexToolSelection removes tool-only controls when no tools remain.
 func NormalizeCodexToolSelection(body []byte) []byte {
 	if HasCodexToolDeclarations(body) {

@@ -9,6 +9,28 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+func TestCodexParallelToolCallsDefaultPreservesExplicitValueAndHistory(t *testing.T) {
+	for _, tc := range []struct{ input, want string }{
+		{`{}`, ""},
+		{`{"tools":[]}`, ""},
+		{`{"tools":[{"type":"function","name":"lookup"}]}`, "true"},
+		{`{"input":[{"type":"additional_tools","tools":[{"type":"custom","name":"exec"}]}]}`, "true"},
+		{`{"tools":[{"type":"function","name":"lookup"}],"parallel_tool_calls":false}`, "false"},
+		{`{"tools":[{"type":"function","name":"lookup"}],"parallel_tool_calls":true}`, "true"},
+		{`{"tools":[{"type":"function","name":"lookup"}],"parallel_tool_calls":null}`, "null"},
+	} {
+		body := []byte(tc.input)
+		original := bytes.Clone(body)
+		out := DefaultCodexParallelToolCalls(body)
+		if got := gjson.GetBytes(out, "parallel_tool_calls").Raw; got != tc.want {
+			t.Fatalf("parallel_tool_calls=%s, want %s", got, tc.want)
+		}
+		if !bytes.Equal(body, original) || gjson.GetBytes(out, "input").Raw != gjson.GetBytes(original, "input").Raw {
+			t.Fatal("default changed its input buffer or tool history")
+		}
+	}
+}
+
 func TestCodexToolSelectionKeepsDeclarationsAndRequestOwnership(t *testing.T) {
 	for _, tc := range []struct {
 		body  string
