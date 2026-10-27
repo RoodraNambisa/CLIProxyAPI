@@ -81,7 +81,7 @@ func (h *OpenAIAPIHandler) OpenAIModels(c *gin.Context) {
 	cfg := h.ConfigSnapshot()
 	optimizeMultiAgentV2 := cfg != nil && cfg.CodexOptimizeMultiAgentV2
 	if _, ok := c.Request.URL.Query()["client_version"]; ok {
-		c.JSON(http.StatusOK, codexClientModelsForRequest(c, h.BaseAPIHandler, c.Query("client_version"), optimizeMultiAgentV2))
+		c.JSON(http.StatusOK, codexClientModelsForRequest(c, h.BaseAPIHandler, c.Query("client_version"), optimizeMultiAgentV2, cfg))
 		return
 	}
 	allModels := h.ModelsForProviderAccess(c, "openai")

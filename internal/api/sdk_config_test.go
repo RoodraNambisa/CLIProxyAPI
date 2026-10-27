@@ -49,3 +49,31 @@ func TestServerMultiAgentPolicyReloadKeepsOldSnapshot(t *testing.T) {
 		t.Fatal("derived field contaminated saved config")
 	}
 }
+
+func TestServerServiceTierPolicyReloadKeepsOldSnapshot(t *testing.T) {
+	server := newTestServerWithConfig(t, func(cfg *config.Config) {
+		cfg.Codex.AllowClientServiceTier = true
+		cfg.Codex.ServiceTierRules = []config.CodexServiceTierRule{{Models: []string{"m"}, Tiers: []string{"priority"}}}
+	})
+	old := server.handlers.ConfigSnapshot()
+	next, err := config.Clone(server.currentConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	next.Codex.AllowClientServiceTier = false
+	next.Codex.ServiceTierRules[0].Tiers[0] = "ultrafast"
+	if err := server.UpdateClients(next); err != nil {
+		t.Fatal(err)
+	}
+	current := server.handlers.ConfigSnapshot()
+	if !old.CodexAllowClientServiceTier || old.CodexServiceTierRules[0].Tiers[0] != "priority" || current.CodexAllowClientServiceTier || current.CodexServiceTierRules[0].Tiers[0] != "ultrafast" {
+		t.Fatal("handler tier policy did not isolate reload")
+	}
+	next.Codex.ServiceTierRules[0].Default = "flex"
+	if err := server.UpdateClients(next); err == nil {
+		t.Fatal("invalid tier reload accepted")
+	}
+	if server.handlers.ConfigSnapshot() != current {
+		t.Fatal("invalid reload changed handler policy")
+	}
+}

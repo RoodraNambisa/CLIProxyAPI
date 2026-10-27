@@ -57,3 +57,21 @@ func TestCodexServiceTierPolicyRemovesDuplicateAndEscapedKeys(t *testing.T) {
 		}
 	}
 }
+
+func TestCodexServiceTierRuleFilteringBeforeAdministratorPolicy(t *testing.T) {
+	rule := &config.CodexServiceTierRule{Tiers: []string{"priority"}}
+	cfg := &config.Config{Payload: config.PayloadConfig{Default: []config.PayloadRule{{Models: []config.PayloadModelRule{{Name: "*", Protocol: "codex"}}, Params: map[string]any{"service_tier": "ultrafast"}}}}}
+	for _, raw := range []string{`"flex"`, `null`, `17`} {
+		body := []byte(`{"service_tier":` + raw + `,"input":[]}`)
+		out := ApplyCodexPayloadConfig(cfg, true, "m", "codex", body, body, "m", rule)
+		if gjson.GetBytes(out, "service_tier").String() != "ultrafast" {
+			t.Fatal("rejected client choice suppressed administrator default")
+		}
+	}
+	for _, body := range []string{`{"service_tier":"priority","service_tier":"ultrafast"}`, `{"service\u005ftier":"ultrafast"}`} {
+		out := ApplyCodexPayloadConfig(nil, true, "m", "codex", []byte(body), nil, "m", rule)
+		if gjson.GetBytes(out, "service_tier").Exists() {
+			t.Fatal("duplicate or escaped tier bypassed model rule")
+		}
+	}
+}

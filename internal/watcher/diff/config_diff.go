@@ -331,6 +331,9 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	if oldCfg.Codex.UpstreamRequestCompression != newCfg.Codex.UpstreamRequestCompression {
 		changes = append(changes, fmt.Sprintf("codex.upstream-request-compression: %s -> %s", oldCfg.Codex.UpstreamRequestCompression, newCfg.Codex.UpstreamRequestCompression))
 	}
+	if !reflect.DeepEqual(oldCfg.Codex.ServiceTierRules, newCfg.Codex.ServiceTierRules) {
+		changes = append(changes, "codex.service-tier-rules: updated")
+	}
 	if oldCfg.Codex.AllowClientServiceTier != newCfg.Codex.AllowClientServiceTier {
 		changes = append(changes, fmt.Sprintf("codex.allow-client-service-tier: %t -> %t", oldCfg.Codex.AllowClientServiceTier, newCfg.Codex.AllowClientServiceTier))
 	}

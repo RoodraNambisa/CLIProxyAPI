@@ -336,7 +336,7 @@ func applyCodexClientModelMetadata(entry map[string]any, id string, model map[st
 	entry["display_name"] = displayName
 	entry["description"] = description
 	entry["prefer_websockets"] = false
-	entry["service_tiers"] = []any{}
+	clearCodexClientServiceTiers(entry)
 	delete(entry, "apply_patch_tool_type")
 	delete(entry, "upgrade")
 	delete(entry, "availability_nux")

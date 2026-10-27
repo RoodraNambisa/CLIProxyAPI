@@ -140,3 +140,44 @@ func TestCodexServiceTierSnapshotSurvivesConfigUpdate(t *testing.T) {
 		}
 	}
 }
+
+func TestCodexServiceTierRulesAtActualTransport(t *testing.T) {
+	for _, transport := range []string{"http", "stream", "websocket", "websocket-stream", "websocket-http-fallback", "compact"} {
+		for _, value := range []string{"priority", "fast", "ultrafast", "flex", "default", "auto", ""} {
+			t.Run(transport+"/"+value, func(t *testing.T) {
+				cfg := &config.Config{Codex: config.CodexConfig{AllowClientServiceTier: true, ServiceTierRules: []config.CodexServiceTierRule{{Models: []string{"gpt-6-astra"}, Tiers: []string{"priority"}, Default: "priority"}}}}
+				payload := []byte(`{"input":[]}`)
+				if value != "" {
+					payload, _ = sjson.SetBytes(payload, "service_tier", value)
+				}
+				out := testCodexRequestControlsWire(t, translator.FormatOpenAIResponse, transport, payload, false, cfg)
+				want := ""
+				if value == "priority" || value == "fast" {
+					want = "priority"
+				}
+				if value == "default" {
+					want = "default"
+				}
+				if got := gjson.GetBytes(out, "service_tier").String(); got != want {
+					t.Fatalf("service_tier=%q, want %q", got, want)
+				}
+			})
+		}
+	}
+}
+
+func TestCodexServiceTierRuleSnapshotUsesClientAlias(t *testing.T) {
+	cfg := &config.Config{Codex: config.CodexConfig{AllowClientServiceTier: true, ServiceTierRules: []config.CodexServiceTierRule{{Models: []string{"public-alias"}, Tiers: []string{"priority"}}}}}
+	e := NewCodexExecutor(cfg)
+	request := core.Request{Model: "upstream-model", Payload: []byte(`{"input":[]}`)}
+	opts := core.Options{SourceFormat: translator.FormatOpenAIResponse, Metadata: map[string]any{core.RequestedModelMetadataKey: "public-alias(high)"}}
+	prepared, err := e.PrepareProviderRequest(t.Context(), request, opts, core.RequestOperationExecute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Codex.ServiceTierRules[0].Tiers[0] = "ultrafast"
+	snapshot := prepared.(codexPreparedSessionIdentity)
+	if snapshot.ServiceTierRule == nil || snapshot.ServiceTierRule.Tiers[0] != "priority" {
+		t.Fatal("request did not retain its client-alias policy snapshot")
+	}
+}

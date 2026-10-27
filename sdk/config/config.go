@@ -42,6 +42,7 @@ type Config = internalconfig.Config
 type RuntimeApplyResult = internalconfig.RuntimeApplyResult
 
 type StreamingConfig = internalconfig.StreamingConfig
+type CodexServiceTierRule = internalconfig.CodexServiceTierRule
 type CodexFingerprintConfig = internalconfig.CodexFingerprintConfig
 type CodexStateOverrideConfig = internalconfig.CodexStateOverrideConfig
 type CodexResponseGuardConfig = internalconfig.CodexResponseGuardConfig

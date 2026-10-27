@@ -558,6 +558,8 @@ type CodexConfig struct {
 	TimeContext CodexTimeContextConfig `yaml:"time-context,omitempty" json:"time-context"`
 	// AllowClientServiceTier permits client tier selection before administrator payload rules.
 	AllowClientServiceTier bool `yaml:"allow-client-service-tier" json:"allow-client-service-tier"`
+	// ServiceTierRules declares available client tiers and defaults by model.
+	ServiceTierRules []CodexServiceTierRule `yaml:"service-tier-rules" json:"service-tier-rules"`
 	// UpstreamRequestCompression opts official Codex HTTP requests into zstd.
 	UpstreamRequestCompression string `yaml:"upstream-request-compression,omitempty" json:"upstream-request-compression"`
 	// BaseURL overrides the default Codex OAuth model endpoint, not OAuth or quota endpoints.
@@ -2331,6 +2333,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	if lifecycleErr := validateChatGPTWebLifecycleOptionsYAML(data); lifecycleErr != nil {
 		return nil, fmt.Errorf("failed to parse config file: %w", lifecycleErr)
 	}
+	if errTiers := validateCodexServiceTiersYAML(data); errTiers != nil {
+		return nil, errTiers
+	}
 	if errWeight := validateCredentialWeightYAML(data); errWeight != nil {
 		return nil, errWeight
 	}
@@ -2401,6 +2406,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	}
 	if errRules := cfg.ValidateRequestScopedErrorRules(); errRules != nil {
 		return nil, errRules
+	}
+	if errTiers := cfg.ValidateCodexServiceTiers(); errTiers != nil {
+		return nil, errTiers
 	}
 	if errQuota := cfg.ValidateCodexQuotaAutoDisable(); errQuota != nil {
 		return nil, errQuota
@@ -4120,6 +4128,9 @@ func SaveConfigPreserveComments(configFile string, cfg *Config) error {
 	if cfg == nil {
 		return fmt.Errorf("config is nil")
 	}
+	if errTiers := cfg.ValidateCodexServiceTiers(); errTiers != nil {
+		return errTiers
+	}
 	if errQuota := cfg.ValidateCodexQuotaAutoDisable(); errQuota != nil {
 		return errQuota
 	}
@@ -4867,6 +4878,9 @@ func reorderSequenceForMerge(dst, src *yaml.Node, paths ...[]string) {
 func matchSequenceElement(original []*yaml.Node, used []bool, target *yaml.Node, paths ...[]string) int {
 	if target == nil {
 		return -1
+	}
+	if len(paths) > 0 && strings.Join(paths[0], ".") == "codex.service-tier-rules" {
+		return matchCodexServiceTierYAMLRule(original, used, target)
 	}
 	if len(paths) > 0 {
 		if index, handled := matchCredentialYAMLSequenceElement(original, used, target, paths[0]); handled {

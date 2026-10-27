@@ -980,6 +980,17 @@ xai:
 #   # upstream validates model/account support. Administrator payload default/override/filter rules still apply.
 #   # Hot updates affect new requests/WS turns; retries retain their original policy.
 #   allow-client-service-tier: false
+#   # Optional client model catalog overrides. Exact client-visible model IDs win over *.
+#   # Unmatched models inherit catalog tiers. Standard is always available; [] means Standard only.
+#   # The default is a client picker default, not a forced upgrade of requests omitting service_tier.
+#   # With client selection disabled, extra tiers/defaults are hidden. Administrator payload rules still win.
+#   # Configured rules discard disallowed client tiers, including auto; Fast uses priority on the wire.
+#   # Declaring a tier does not grant upstream model/account access. Flex requires explicit support.
+#   service-tier-rules: []
+#   # - models: ["gpt-6-astra"]
+#   #   tiers: ["priority", "ultrafast"]
+#   #   default: "default" # default, priority (fast alias), ultrafast or flex; must be in tiers.
+
 #   time-context:
 #     enabled: false
 #     mode: "proxy" # proxy or manual. Credential overrides also allow inherit/off.

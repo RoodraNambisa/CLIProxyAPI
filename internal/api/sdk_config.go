@@ -9,6 +9,8 @@ func sdkHandlerConfig(cfg *config.Config) *config.SDKConfig {
 		return nil
 	}
 	snapshot := cfg.SDKConfig
+	snapshot.CodexAllowClientServiceTier = cfg.Codex.AllowClientServiceTier
+	snapshot.CodexServiceTierRules = config.CloneCodexServiceTierRules(cfg.Codex.ServiceTierRules)
 	snapshot.CodexOptimizeMultiAgentV2 = cfg.Codex.OptimizeMultiAgentV2
 	snapshot.CodexOrphanDelegationCompatibility = cfg.Codex.OrphanDelegationCompatibility
 	return &snapshot

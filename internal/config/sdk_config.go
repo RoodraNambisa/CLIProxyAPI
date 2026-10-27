@@ -13,6 +13,9 @@ import (
 
 // SDKConfig represents the application's configuration, loaded from a YAML file.
 type SDKConfig struct {
+	// Codex tier controls are derived handler policies, never saved SDK fields.
+	CodexAllowClientServiceTier bool                   `yaml:"-" json:"-"`
+	CodexServiceTierRules       []CodexServiceTierRule `yaml:"-" json:"-"`
 	// CodexOptimizeMultiAgentV2 is a derived request policy, never a saved SDK field.
 	CodexOptimizeMultiAgentV2 bool `yaml:"-" json:"-"`
 	// CodexOrphanDelegationCompatibility is a derived Responses handler policy.

@@ -379,6 +379,7 @@ type codexPreparedSessionIdentity struct {
 	MultiAgentV2                  helps.CodexMultiAgentPolicy
 	StreamBootstrapBuffering      bool
 	AllowClientServiceTier        bool
+	ServiceTierRule               *config.CodexServiceTierRule
 	ClaudeInputTokensEstimate     int64
 	PromptCacheLog                *util.PromptCacheLogRedactor
 	PromptCacheKey                helps.CodexPromptCacheKeySnapshot
@@ -469,6 +470,10 @@ func (e *CodexExecutor) PrepareProviderRequest(ctx context.Context, req cliproxy
 		AffinityDigest:                affinityDigest,
 		TenantDigest:                  tenantDigest,
 		ClientThreadID:                clientThreadID,
+	}
+	if e.cfg != nil {
+		clientModel := thinking.ParseSuffix(helps.PayloadRequestedModel(opts, req.Model)).ModelName
+		prepared.ServiceTierRule = config.CodexServiceTierRuleForModel(e.cfg.Codex.ServiceTierRules, clientModel)
 	}
 	if errValidate := prepared.PromptCacheKey.Validate(); errValidate != nil {
 		invalid := codexStreamStatusErr(http.StatusInternalServerError, errValidate.Error(), "invalid_prompt_cache_key", "invalid_request_error", nil)
@@ -938,7 +943,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	}
 
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
-	body = helps.ApplyCodexPayloadConfig(e.cfg, e.codexPreparedSessionIdentity(ctx, req, opts).AllowClientServiceTier, baseModel, to.String(), body, originalTranslated, requestedModel)
+	body = helps.ApplyCodexPayloadConfig(e.cfg, e.codexPreparedSessionIdentity(ctx, req, opts).AllowClientServiceTier, baseModel, to.String(), body, originalTranslated, requestedModel, e.codexPreparedSessionIdentity(ctx, req, opts).ServiceTierRule)
 	originalTranslated = nil
 	body, err = helps.RewriteCodexRequestEnvelope(body, helps.CodexRequestRewriteOptions{
 		Model:              baseModel,
@@ -1187,7 +1192,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	}
 
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
-	body = helps.ApplyCodexPayloadConfig(e.cfg, e.codexPreparedSessionIdentity(ctx, req, opts).AllowClientServiceTier, baseModel, to.String(), body, originalTranslated, requestedModel)
+	body = helps.ApplyCodexPayloadConfig(e.cfg, e.codexPreparedSessionIdentity(ctx, req, opts).AllowClientServiceTier, baseModel, to.String(), body, originalTranslated, requestedModel, e.codexPreparedSessionIdentity(ctx, req, opts).ServiceTierRule)
 	originalTranslated = nil
 	body, _ = helps.SetStringIfDifferent(body, "model", baseModel)
 	body, _ = sjson.DeleteBytes(body, "stream")
@@ -1340,7 +1345,7 @@ func (e *CodexExecutor) executeStream(ctx context.Context, auth *cliproxyauth.Au
 	}
 
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
-	body = helps.ApplyCodexPayloadConfig(e.cfg, e.codexPreparedSessionIdentity(ctx, req, opts).AllowClientServiceTier, baseModel, to.String(), body, originalTranslated, requestedModel)
+	body = helps.ApplyCodexPayloadConfig(e.cfg, e.codexPreparedSessionIdentity(ctx, req, opts).AllowClientServiceTier, baseModel, to.String(), body, originalTranslated, requestedModel, e.codexPreparedSessionIdentity(ctx, req, opts).ServiceTierRule)
 	originalTranslated = nil
 	body, err = helps.RewriteCodexRequestEnvelope(body, helps.CodexRequestRewriteOptions{
 		Model:              baseModel,
