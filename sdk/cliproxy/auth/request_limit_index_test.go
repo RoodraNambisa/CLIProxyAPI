@@ -90,7 +90,7 @@ func TestRequestLimitIndexMixedSchedulerAndHotUpdate(t *testing.T) {
 	}
 	routing.PerAuthRequestLimit = 2
 	scheduler.setRoutingConfig(routing)
-	for range 4 {
+	for range 2 {
 		if _, _, err := scheduler.pickMixed(t.Context(), []string{"alpha", "beta"}, "", core.Options{}, nil); err != nil {
 			t.Fatalf("new generation stayed excluded: %v", err)
 		}
@@ -164,6 +164,7 @@ func TestRequestLimitIndexDoesNotPublishStaleBlockAfterReleaseNotification(t *te
 				reservation.Release()
 			case "reset":
 				limiter.reset(1)
+				reservation.Release()
 			case "remove":
 				limiter.remove("chosen")
 			}
@@ -199,6 +200,10 @@ func TestRequestLimitIndexExpiryResetAndMissedChanges(t *testing.T) {
 				now = now.Add(time.Minute)
 			case "reset":
 				limiter.reset(2)
+				if picked, _ := view.pickWithRequestLimit(schedulerStrategyRandom, nil, policy, limiter); picked != nil {
+					t.Fatal("reset erased active window")
+				}
+				now = now.Add(time.Minute)
 			case "remove":
 				limiter.remove("chosen")
 			case "journal_overflow":
@@ -265,5 +270,72 @@ func TestRequestLimitIndexUpdatesChangedCredentialPolicy(t *testing.T) {
 	unlimited := func(*Auth) authRequestLimitPolicy { return authRequestLimitPolicy{windowMinutes: 1} }
 	if picked, _ := view.pickWithRequestLimit(schedulerStrategyRandom, nil, unlimited, limiter); picked == nil {
 		t.Fatal("changed plan kept old limit exclusion")
+	}
+}
+
+func TestOrderedRequestLimitIndexPreservesSuccessorAndSkipsSaturation(t *testing.T) {
+	for _, strategy := range []schedulerStrategy{schedulerStrategyRoundRobin, schedulerStrategyFillFirst, schedulerStrategyWeightedRoundRobin} {
+		t.Run(fmt.Sprint(strategy), func(t *testing.T) {
+			view, limiter, policy := benchmarkLimitedReadyView(10000, 0)
+			for _, entry := range view.flat {
+				if ok, block := limiter.tryAcquireAt(entry.auth.ID, policy(entry.auth), limiter.nowTime()); !ok {
+					view.requestLimitIndex(limiter, limiter.nowTime()).exclude(entry, block, limiter.nowTime())
+				}
+			}
+			before := SelectionMetricsSnapshot().CandidateChecks
+			for range 10 {
+				if picked, block := view.pickWithRequestLimit(strategy, nil, policy, limiter); picked != nil || !block.limited() {
+					t.Fatal("saturated selection did not preserve error")
+				}
+			}
+			if SelectionMetricsSnapshot().CandidateChecks != before {
+				t.Fatal("saturated ordered view rescanned credentials")
+			}
+			limiter.remove("candidate-42")
+			picked, _ := view.pickWithRequestLimit(strategy, nil, policy, limiter)
+			if picked == nil || picked.auth.ID != "candidate-42" {
+				t.Fatal("release did not restore indexed position")
+			}
+		})
+	}
+}
+
+func TestOrderedAvailabilityRanksMatchStableCredentialOrder(t *testing.T) {
+	for _, size := range []int{1, 63, 64, 65, 1024} {
+		view, limiter, policy := benchmarkLimitedReadyView(size, 0)
+		index := view.requestLimitIndex(limiter, limiter.nowTime())
+		for i, entry := range view.flat {
+			if i%2 == 0 {
+				_, block := limiter.tryAcquireAt(entry.auth.ID, policy(entry.auth), limiter.nowTime())
+				index.exclude(entry, block, limiter.nowTime())
+			}
+		}
+		for phase := 0; phase < 2; phase++ {
+			for position := 0; position <= size; position++ {
+				for _, wrap := range []bool{false, true} {
+					want := -1
+					for i := position; i < size; i++ {
+						if index.excluded[view.flat[i].auth.ID] == nil {
+							want = i
+							break
+						}
+					}
+					if want < 0 && wrap {
+						for i := 0; i < position && i < size; i++ {
+							if index.excluded[view.flat[i].auth.ID] == nil {
+								want = i
+								break
+							}
+						}
+					}
+					if got := index.nextOrdered(position, wrap); got != want {
+						t.Fatalf("size=%d position=%d wrap=%v: %d want %d", size, position, wrap, got, want)
+					}
+				}
+			}
+			for i := 0; i < size; i += 4 {
+				index.restore(view.flat[i].auth.ID)
+			}
+		}
 	}
 }

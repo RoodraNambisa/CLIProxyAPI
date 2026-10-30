@@ -33,7 +33,9 @@ type safeRemoteManagementConfig struct {
 }
 
 type configResponse struct {
-	RuntimeRole string `json:"runtime-role"`
+	AdmissionSupported bool   `json:"admission-supported"`
+	TrafficSupported   bool   `json:"traffic-supported"`
+	RuntimeRole        string `json:"runtime-role"`
 	*config.Config
 	RemoteManagement safeRemoteManagementConfig `json:"remote-management"`
 }
@@ -58,8 +60,8 @@ func (h *Handler) GetConfig(c *gin.Context) {
 		role = "sentinel-solver"
 	}
 	c.JSON(200, &configResponse{
-		RuntimeRole: role,
-		Config:      &snapshot,
+		RuntimeRole: role, AdmissionSupported: true, TrafficSupported: true,
+		Config: &snapshot,
 		RemoteManagement: safeRemoteManagementConfig{
 			LiveLogs: cfg.RemoteManagement.LiveLogs,
 			Diagnostics: config.ManagementDiagnosticsConfig{

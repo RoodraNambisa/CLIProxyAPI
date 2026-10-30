@@ -133,7 +133,6 @@ func TestAuthRequestWindowLimiterOldReservationCannotDecrementReplacement(t *tes
 	}{
 		{name: "window rollover", now: fixed.Add(30 * time.Second), policy: policy},
 		{name: "remove and readd", replace: func(limiter *authRequestWindowLimiter) { limiter.remove("auth") }, now: fixed, policy: policy},
-		{name: "generation reset", replace: func(limiter *authRequestWindowLimiter) { limiter.reset(2) }, now: fixed, policy: authRequestLimitPolicy{limit: 1, windowMinutes: 5, generation: 2}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -981,17 +980,21 @@ func TestManagerLegacyStaleGenerationClearsDynamicExclusions(t *testing.T) {
 				t.Fatal("failed to consume auth a quota")
 			}
 			newGeneration := oldPolicy.generation + 1
+			var concurrentReservation *authRequestReservation
 			selector.onPick = func(call int, selected *Auth) {
 				switch call {
 				case 1:
 					if selected.ID != "b" {
 						t.Fatalf("first selector auth = %s, want b", selected.ID)
 					}
-					if acquired, _ := manager.authRequestLimiter().tryAcquireAt("b", oldPolicy, fixed); !acquired {
+					var acquired bool
+					concurrentReservation, acquired, _ = manager.authRequestLimiter().reserveAt("b", oldPolicy, fixed)
+					if !acquired {
 						t.Fatal("failed to create concurrent auth b limit")
 					}
 				case 2:
 					manager.authRequestLimiter().reset(newGeneration)
+					concurrentReservation.Release()
 				case 3:
 					manager.scheduler.mu.Lock()
 					manager.scheduler.requestLimitGeneration = newGeneration

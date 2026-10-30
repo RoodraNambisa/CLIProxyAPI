@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/admission"
 	"io"
 	"net/http"
 	"path/filepath"
@@ -409,6 +410,7 @@ type hookState struct {
 
 // Manager orchestrates auth lifecycle, selection, execution, and persistence.
 type Manager struct {
+	admission          *admission.Controller
 	responseModelStats responseModelStats
 	errorHistory       map[string]*authErrorHistory
 	store              Store
@@ -795,6 +797,8 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 	manager.routingPolicy.Store(newRoutingRequestPolicy(manager, selector, internalconfig.RoutingConfig{FillFirstRange: fillFirstRangeFromSelector(selector)}))
 	manager.apiKeyModelRouting.Store(&apiKeyModelRoutingSnapshot{config: manager.currentConfig()})
 	manager.scheduler = newAuthScheduler(selector)
+	manager.admission = admission.NewController()
+	manager.scheduler.requestLimiter.traffic = manager.admission
 	manager.executionMetrics = &cliproxyexecutor.RequestExecutionMetrics{}
 	manager.responseModelStats.since = time.Now().UTC()
 	manager.refreshPersistence.Store(newRefreshPersistenceCoordinator(store))
@@ -1304,6 +1308,10 @@ func (m *Manager) SetConfig(cfg *internalconfig.Config) {
 	if m == nil {
 		return
 	}
+	if err := cfg.ValidateAdmission(); err != nil {
+		log.WithError(err).Warn("ignoring invalid admission configuration")
+		return
+	}
 	if err := cfg.ValidateCodexQuotaAutoDisable(); err != nil {
 		log.WithError(err).Warn("ignoring invalid Codex quota auto-disable configuration")
 		return
@@ -1341,6 +1349,10 @@ func (m *Manager) SetConfig(cfg *internalconfig.Config) {
 // Existing request snapshots keep their selector and priority rules together.
 func (m *Manager) SetConfigAndSelector(cfg *internalconfig.Config, selector Selector) {
 	if m == nil {
+		return
+	}
+	if err := cfg.ValidateAdmission(); err != nil {
+		log.WithError(err).Warn("ignoring invalid admission configuration")
 		return
 	}
 	if err := cfg.ValidateCodexQuotaAutoDisable(); err != nil {
@@ -1394,6 +1406,9 @@ func (m *Manager) SetConfigAndSelector(cfg *internalconfig.Config, selector Sele
 func (m *Manager) setConfigLocked(cfg *internalconfig.Config) {
 	if cfg == nil {
 		cfg = &internalconfig.Config{}
+	}
+	if m.admission != nil {
+		m.admission.Configure(cfg)
 	}
 	// Both public configuration setters validate before publishing any state.
 	oauthErrorRules, _ := cfg.CompileOAuthRequestScopedErrors()
@@ -1765,7 +1780,7 @@ func (m *Manager) pickBoundAcrossPriorities(ctx context.Context, auths []*Auth, 
 		rpm := m.routingFillFirstPerAuthRPMForPriority(priority, ctx)
 		if rpm > 0 && !m.fillFirstLimiter().tryAcquireAt(bound.ID, rpm, now) {
 			if !selector.failover && selector.cachedStrictAuthID(ctx, provider, model, opts) == bound.ID {
-				return nil, true, newAuthRPMLimitedError(fillFirstRPMRetryAfterAt(m.fillFirstLimiter(), now))
+				return nil, true, newAuthRPMLimitedError(fillFirstRPMRetryAfterAt(m.fillFirstLimiter(), now), authPriority(bound))
 			}
 			return nil, false, nil
 		}
@@ -2436,9 +2451,14 @@ func streamBootstrapPayloadHasSemanticPayload(payload []byte) bool {
 }
 
 func (m *Manager) wrapStreamResult(ctx, resultCtx context.Context, auth *Auth, affinityProviders []string, provider, routeModel, resultModel string, opts cliproxyexecutor.Options, headers http.Header, buffered []cliproxyexecutor.StreamChunk, remaining <-chan cliproxyexecutor.StreamChunk, aliasResult OAuthModelAliasResult, onDone func() bool) *cliproxyexecutor.StreamResult {
+	finishAdmission := opts.AuthRequestSlot.TransferReservation()
+	releaseLogicalStream := retainLogicalStream(resultCtx)
 	out := make(chan cliproxyexecutor.StreamChunk, cliproxyexecutor.StreamBufferSize)
 	releaseProducer := claimResultPersistenceProducer(resultCtx)
 	go func() {
+		defer releaseLogicalStream()
+		defer finishManagedLogical(resultCtx)
+		defer finishAdmission()
 		defer releaseProducer()
 		if resultCtx == nil {
 			resultCtx = context.Background()
@@ -4627,6 +4647,13 @@ func authFilePathQuarantined(auth *Auth, authDir string) bool {
 // Execute performs a non-streaming execution using the configured selector and executor.
 // It supports multiple providers for the same model and round-robins the starting provider per model.
 func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (response cliproxyexecutor.Response, err error) {
+	var releaseAdmission func()
+	var errAdmission error
+	ctx, releaseAdmission, errAdmission = m.beginClientRequest(ctx, req.Payload, true)
+	if errAdmission != nil {
+		return cliproxyexecutor.Response{}, errAdmission
+	}
+	defer releaseAdmission()
 	ctx = cliproxyexecutor.WithCodexStateSnapshot(coreusage.WithStreamDefault(ctx, false))
 	ctx = contextWithGenerateMetadata(ctx, opts)
 	ctx = cliproxyexecutor.WithResponseGuardRequest(m.WithRoutingPolicySnapshot(ctx))
@@ -4727,6 +4754,13 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 // ExecuteCount performs a non-streaming execution using the configured selector and executor.
 // It supports multiple providers for the same model and round-robins the starting provider per model.
 func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (response cliproxyexecutor.Response, err error) {
+	var releaseAdmission func()
+	var errAdmission error
+	ctx, releaseAdmission, errAdmission = m.beginClientRequest(ctx, req.Payload, true)
+	if errAdmission != nil {
+		return cliproxyexecutor.Response{}, errAdmission
+	}
+	defer releaseAdmission()
 	ctx = cliproxyexecutor.WithCodexStateSnapshot(coreusage.WithStreamDefault(ctx, false))
 	ctx = contextWithGenerateMetadata(ctx, opts)
 	ctx = cliproxyexecutor.WithResponseGuardRequest(m.WithRoutingPolicySnapshot(ctx))
@@ -4817,6 +4851,17 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 // ExecuteStream performs a streaming execution using the configured selector and executor.
 // It supports multiple providers for the same model and round-robins the starting provider per model.
 func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (result *cliproxyexecutor.StreamResult, err error) {
+	var releaseAdmission func()
+	var errAdmission error
+	ctx, releaseAdmission, errAdmission = m.beginClientRequest(ctx, req.Payload, true)
+	if errAdmission != nil {
+		return nil, errAdmission
+	}
+	defer func() {
+		if err != nil || result == nil {
+			releaseAdmission()
+		}
+	}()
 	ctx = cliproxyexecutor.WithCodexStateSnapshot(coreusage.WithStreamDefault(ctx, true))
 	ctx = contextWithGenerateMetadata(ctx, opts)
 	ctx = cliproxyexecutor.WithResponseGuardRequest(m.WithRoutingPolicySnapshot(ctx))
@@ -5817,7 +5862,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 	opts = setSelectionAttemptMetadata(opts, requestAttempt)
 	opts = withImageGenerationResultState(req, opts)
 	opts.AuthRequestSlot = newAuthRequestSlot(opts.ExecutionDiagnostics, opts.ExecutionMetrics)
-	defer opts.AuthRequestSlot.Release()
+	defer opts.AuthRequestSlot.AbandonReservation()
 	strictSessionAffinity := m.strictSessionAffinityForRequest(ctx, req, opts)
 	pickAllowed := m.requestRoundPickAllowed(ctx, roundState, maxRetryCredentials, requestAttempt, defaultRequestRetry)
 	unregisterRelease := registerRequestBodyReleaseCallback(ctx, opts, func([]byte) {
@@ -6117,7 +6162,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 	opts = ensureRequestedModelMetadata(opts, routeModel)
 	opts = setSelectionAttemptMetadata(opts, requestAttempt)
 	opts.AuthRequestSlot = newAuthRequestSlot(opts.ExecutionDiagnostics, opts.ExecutionMetrics)
-	defer opts.AuthRequestSlot.Release()
+	defer opts.AuthRequestSlot.AbandonReservation()
 	strictSessionAffinity := m.strictSessionAffinityForRequest(ctx, req, opts)
 	pickAllowed := m.requestRoundPickAllowed(ctx, roundState, maxRetryCredentials, requestAttempt, defaultRequestRetry)
 	unregisterRelease := registerRequestBodyReleaseCallback(ctx, opts, func([]byte) {
@@ -6256,6 +6301,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			roundState.markAttempted(auth)
 			runtimeCtx = cliproxyexecutor.WithUpstreamAttemptSlot(runtimeCtx, opts.AuthRequestSlot)
 			resp, errExec := executor.CountTokens(runtimeCtx, auth, execReq, opts)
+			opts.AuthRequestSlot.FinishReservation()()
 			retiredDuringExecution := releaseExecution()
 			if !retiredDuringExecution {
 				errExec = recordExecutionAttemptError(runtimeCtx, auth, provider, errExec)
@@ -6316,6 +6362,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 					}
 					retryCtx = cliproxyexecutor.WithUpstreamAttemptSlot(retryCtx, opts.AuthRequestSlot)
 					resp, errExec = executor.CountTokens(retryCtx, auth, execReq, opts)
+					opts.AuthRequestSlot.FinishReservation()()
 					retiredDuringRetry := releaseRetry()
 					if !retiredDuringRetry {
 						errExec = recordExecutionAttemptError(retryCtx, auth, provider, errExec)
@@ -6399,7 +6446,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 	opts = setSelectionAttemptMetadata(opts, requestAttempt)
 	opts = withImageGenerationResultState(req, opts)
 	opts.AuthRequestSlot = newAuthRequestSlot(opts.ExecutionDiagnostics, opts.ExecutionMetrics)
-	defer opts.AuthRequestSlot.Release()
+	defer opts.AuthRequestSlot.AbandonReservation()
 	strictSessionAffinity := m.strictSessionAffinityForRequest(ctx, req, opts)
 	pickAllowed := m.requestRoundPickAllowed(ctx, roundState, maxRetryCredentials, requestAttempt, defaultRequestRetry)
 	unregisterRelease := registerRequestBodyReleaseCallback(ctx, opts, func([]byte) {
@@ -7078,7 +7125,7 @@ func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxy
 		return cliproxyexecutor.Response{}, false, nil
 	}
 	opts.AuthRequestSlot = newAuthRequestSlot(opts.ExecutionDiagnostics, opts.ExecutionMetrics)
-	defer opts.AuthRequestSlot.Release()
+	defer opts.AuthRequestSlot.AbandonReservation()
 	routeModel := req.Model
 	_, maxRetryCredentials, _ := m.retrySettings(ctx)
 	roundState := newRequestRoundState()
@@ -7192,7 +7239,7 @@ func (m *Manager) tryAntigravityCreditsExecuteStream(ctx context.Context, req cl
 		return nil, false, nil
 	}
 	opts.AuthRequestSlot = newAuthRequestSlot(opts.ExecutionDiagnostics, opts.ExecutionMetrics)
-	defer opts.AuthRequestSlot.Release()
+	defer opts.AuthRequestSlot.AbandonReservation()
 	routeModel := req.Model
 	_, maxRetryCredentials, _ := m.retrySettings(ctx)
 	roundState := newRequestRoundState()
@@ -8091,6 +8138,10 @@ func shouldRetryRequestRound(err error, rules []internalconfig.NonRetryableError
 		return false
 	}
 	if isAuthRequestLimitedError(err) {
+		return false
+	}
+	var busy *admission.Busy
+	if errors.As(err, &busy) {
 		return false
 	}
 	status := statusCodeFromError(err)
@@ -10035,9 +10086,8 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		if err != nil {
 			return nil, nil, err
 		}
-		// Preserve transport diagnostics without reserving ordinary request capacity.
-		if opts.AuthRequestSlot != nil {
-			opts.AuthRequestSlot.Bind(&authRequestReservation{noOp: true})
+		if err := m.reserveTargetConcurrency(available[0], opts); err != nil {
+			return nil, nil, err
 		}
 		return cloneSelectedAuth(available[0]), executor, nil
 	}
@@ -10153,7 +10203,7 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 	}
 }
 
-func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, error) {
+func (m *Manager) pickNextImmediate(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, error) {
 	ctx = cliproxyexecutor.WithResponseGuardRequest(m.WithRoutingPolicySnapshot(ctx))
 	if ctx != nil && ctx.Err() != nil {
 		return nil, nil, ctx.Err()
@@ -10283,8 +10333,8 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 			return nil, nil, "", err
 		}
 		selected := cloneSelectedAuth(available[0])
-		if opts.AuthRequestSlot != nil {
-			opts.AuthRequestSlot.Bind(&authRequestReservation{noOp: true})
+		if err := m.reserveTargetConcurrency(selected, opts); err != nil {
+			return nil, nil, "", err
 		}
 		return selected, executors[selected.ExecutionProvider()], selected.ExecutionProvider(), nil
 	}
@@ -10408,7 +10458,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 	}
 }
 
-func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}, pickAllowed ...func(*Auth) bool) (*Auth, ProviderExecutor, string, error) {
+func (m *Manager) pickNextMixedImmediate(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}, pickAllowed ...func(*Auth) bool) (*Auth, ProviderExecutor, string, error) {
 	ctx = cliproxyexecutor.WithResponseGuardRequest(m.WithRoutingPolicySnapshot(ctx))
 	if ctx != nil && ctx.Err() != nil {
 		return nil, nil, "", ctx.Err()
@@ -11206,6 +11256,9 @@ func (m *Manager) BeginCloseExecutors() {
 func (m *Manager) beginCloseExecutors() <-chan struct{} {
 	m.executorLifecycleMu.Lock()
 	if !m.executorsClosed {
+		if m.admission != nil {
+			m.admission.Close()
+		}
 		m.executorsClosed = true
 		m.stopAcceptingResultPersistenceProducers()
 		m.executorsCloseDone = make(chan struct{})

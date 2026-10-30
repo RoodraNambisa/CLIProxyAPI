@@ -7,6 +7,7 @@ import (
 )
 
 func executeProviderRequest(ctx context.Context, provider ProviderExecutor, auth *Auth, req executor.Request, opts executor.Options) (executor.Response, error) {
+	defer opts.AuthRequestSlot.FinishReservation()()
 	req, opts = executor.PrepareImageRequestForProvider(auth.Provider, req, opts)
 	executor.ObserveImageResponseProvider(auth.Provider, opts)
 	if err := executor.ImageRequestBudgetFromOptions(opts).Select(auth.Provider); err != nil {

@@ -2,6 +2,7 @@ package auth
 
 import (
 	"container/heap"
+	"math/bits"
 	"math/rand/v2"
 	"time"
 )
@@ -74,6 +75,9 @@ func (h *requestLimitExpiryHeap) Pop() any {
 // A view excludes only authoritative request-limit failures. Request-local
 // predicates never remove a credential from this shared candidate index.
 type requestLimitReadyIndex struct {
+	original  []*scheduledAuth
+	order     map[string]int
+	tree      []int
 	limiter   *authRequestWindowLimiter
 	sequence  uint64
 	available []*scheduledAuth
@@ -106,6 +110,15 @@ func (v *readyView) requestLimitIndex(limiter *authRequestWindowLimiter, now tim
 
 func (index *requestLimitReadyIndex) reset(entries []*scheduledAuth) {
 	selectionRuntime.indexRebuilds.Add(1)
+	index.original = entries
+	index.order = make(map[string]int, len(entries))
+	index.tree = make([]int, len(entries)+1)
+	for i, entry := range entries {
+		if entry != nil && entry.auth != nil {
+			index.order[entry.auth.ID] = i
+		}
+		index.tree[i+1] = (i + 1) & -(i + 1)
+	}
 	index.available = append(index.available[:0], entries...)
 	if index.positions == nil {
 		index.positions = make(map[string]int, len(entries))
@@ -144,6 +157,9 @@ func (index *requestLimitReadyIndex) exclude(entry *scheduledAuth, block authReq
 	index.limiter.mu.Lock()
 	current, present := index.limiter.counts[entry.auth.ID]
 	stillLimited := present && current.window == window && current.windowMinutes == block.windowMinutes && current.limit == block.limit && current.count >= current.limit
+	if block.concurrency > 0 && index.limiter.traffic != nil {
+		stillLimited = index.limiter.traffic.Traffic.Lookup("credential", entry.auth.ID).Busy(block.concurrency)
+	}
 	index.limiter.mu.Unlock()
 	if !stillLimited {
 		return
@@ -158,6 +174,7 @@ func (index *requestLimitReadyIndex) exclude(entry *scheduledAuth, block authReq
 	delete(index.positions, entry.auth.ID)
 	exclusion := &requestLimitExclusion{entry: entry, block: block, until: now.Add(block.resetIn)}
 	index.excluded[entry.auth.ID] = exclusion
+	index.updateOrder(index.order[entry.auth.ID], -1)
 	heap.Push(&index.expiry, exclusion)
 	selectionRuntime.exclusions.Add(1)
 }
@@ -172,6 +189,7 @@ func (index *requestLimitReadyIndex) restore(authID string) {
 	}
 	heap.Remove(&index.expiry, exclusion.heapIndex)
 	delete(index.excluded, authID)
+	index.updateOrder(index.order[authID], 1)
 	index.positions[authID] = len(index.available)
 	index.available = append(index.available, exclusion.entry)
 }
@@ -293,4 +311,37 @@ func pickMixedRandomWithRequestLimits(views []mixedRandomReadyView, predicate fu
 		blocked = earlierAuthRequestLimitBlock(blocked, v.view.limited.earliestBlock(predicate, now))
 	}
 	return nil, "", blocked
+}
+
+// A Fenwick availability index preserves credential ID ordering for round-robin
+// and fill-first selection, including after a released credential is restored.
+func (index *requestLimitReadyIndex) updateOrder(position, delta int) {
+	for i := position + 1; i < len(index.tree); i += i & -i {
+		index.tree[i] += delta
+	}
+}
+func (index *requestLimitReadyIndex) nextOrdered(position int, wrap bool) int {
+	if len(index.available) == 0 {
+		return -1
+	}
+	before := 0
+	for i := min(position, len(index.original)); i > 0; i -= i & -i {
+		before += index.tree[i]
+	}
+	if before >= len(index.available) {
+		if !wrap {
+			return -1
+		}
+		before = 0
+	}
+	rank := before + 1
+	pos := 0
+	for step := 1 << (bits.Len(uint(len(index.original))) - 1); step > 0; step >>= 1 {
+		next := pos + step
+		if next < len(index.tree) && index.tree[next] < rank {
+			pos = next
+			rank -= index.tree[next]
+		}
+	}
+	return pos
 }

@@ -951,6 +951,7 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
 			parentCtx = logging.WithRequestID(parentCtx, requestID)
 		}
 	}
+	parentCtx = coreauth.InheritClientRequest(parentCtx, requestCtx)
 	parentCtx = logging.WithRequestCredentialFrom(parentCtx, requestCtx)
 	newCtx, cancel := context.WithCancel(parentCtx)
 	cancelCtx := newCtx
@@ -1378,10 +1379,20 @@ func (h *BaseAPIHandler) executeStreamWithResolvedProviders(ctx context.Context,
 		SourceFormat:    sdktranslator.FromString(handlerType),
 	}
 	opts.Metadata = reqMeta
+	var releaseAdmission func()
+	var admissionErr error
+	ctx, releaseAdmission, admissionErr = h.AuthManager.BeginClientRequest(ctx, rawJSON)
+	if admissionErr != nil {
+		errChan := make(chan *interfaces.ErrorMessage, 1)
+		errChan <- executionErrorMessage(admissionErr, providers, normalizedRouteModel)
+		close(errChan)
+		return nil, nil, errChan
+	}
 	allowRequestErrorRetry := h.AuthManager.SnapshotRequestErrorRetryPolicy(ctx)
 	streamResult, err := h.AuthManager.ExecuteStream(ctx, providers, req, opts)
 	err = coreexecutor.ImageRequestContextError(ctx, err)
 	if err != nil {
+		releaseAdmission()
 		errChan := make(chan *interfaces.ErrorMessage, 1)
 		if strictErr := chatGPTWebStrictImageSizeUnavailableError(ctx, err); strictErr != nil {
 			errChan <- strictErr
@@ -1403,6 +1414,7 @@ func (h *BaseAPIHandler) executeStreamWithResolvedProviders(ctx context.Context,
 	errChan := make(chan *interfaces.ErrorMessage, 1)
 	headersReady := make(chan struct{})
 	go func() {
+		defer releaseAdmission()
 		defer close(dataChan)
 		defer close(errChan)
 		headersPublished := false

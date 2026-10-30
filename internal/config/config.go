@@ -1762,6 +1762,7 @@ type RequestBodyAuditErrorConfig struct {
 // RoutingSubscriptionOverride overrides request limits by provider, plan or credential
 // within one credential priority. Credential rules override provider/plan rules.
 type RoutingSubscriptionOverride struct {
+	PerAuthConcurrency *int `yaml:"per-auth-concurrency,omitempty" json:"per-auth-concurrency,omitempty"`
 	// Providers optionally limits this rule to exact runtime provider IDs.
 	// An empty list matches every provider.
 	Providers []string `yaml:"providers,omitempty" json:"providers,omitempty"`
@@ -1779,6 +1780,8 @@ type RoutingSubscriptionOverride struct {
 
 // RoutingPriorityOverride overrides routing behavior for one credential priority.
 type RoutingPriorityOverride struct {
+	PerAuthConcurrency *int            `yaml:"per-auth-concurrency,omitempty" json:"per-auth-concurrency,omitempty"`
+	Queue              *AdmissionQueue `yaml:"queue,omitempty" json:"queue,omitempty"`
 	// Priority is the credential priority this rule applies to.
 	Priority int `yaml:"priority" json:"priority"`
 	// Strategy optionally overrides the global credential selection strategy.
@@ -1802,6 +1805,8 @@ type RoutingPriorityOverride struct {
 
 // RoutingConfig configures how credentials are selected for requests.
 type RoutingConfig struct {
+	PerAuthConcurrency int            `yaml:"per-auth-concurrency" json:"per-auth-concurrency"`
+	Queue              AdmissionQueue `yaml:"queue" json:"queue"`
 	// Strategy selects the credential selection strategy.
 	// Supported values: "round-robin" (default), "fill-first", "random".
 	Strategy string `yaml:"strategy,omitempty" json:"strategy,omitempty"`
@@ -2406,6 +2411,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	}
 	if errRules := cfg.ValidateRequestScopedErrorRules(); errRules != nil {
 		return nil, errRules
+	}
+	if errAdmission := cfg.ValidateAdmission(); errAdmission != nil {
+		return nil, errAdmission
 	}
 	if errTiers := cfg.ValidateCodexServiceTiers(); errTiers != nil {
 		return nil, errTiers
@@ -3654,7 +3662,7 @@ func normalizeRoutingSubscriptionOverrides(priorityIndex, priority int, override
 		if len(planTypes) == 0 && len(providers) == 0 && len(credentials) == 0 {
 			return nil, fmt.Errorf("routing.priority-overrides[%d] (priority %d).subscription-overrides[%d].plan-types: at least one provider, plan type or credential is required", priorityIndex, priority, index)
 		}
-		if override.PerAuthRequestLimit == nil && override.PerAuthRequestWindowMinutes == nil {
+		if override.PerAuthRequestLimit == nil && override.PerAuthRequestWindowMinutes == nil && override.PerAuthConcurrency == nil {
 			return nil, fmt.Errorf("routing.priority-overrides[%d] (priority %d).subscription-overrides[%d]: at least one request limit field is required", priorityIndex, priority, index)
 		}
 
@@ -3692,6 +3700,7 @@ func normalizeRoutingSubscriptionOverrides(priorityIndex, priority int, override
 		}
 
 		out = append(out, RoutingSubscriptionOverride{
+			PerAuthConcurrency:          override.PerAuthConcurrency,
 			Providers:                   providers,
 			PlanTypes:                   planTypes,
 			Credentials:                 credentials,
@@ -3758,6 +3767,7 @@ func NormalizeRoutingPriorityOverrides(overrides []RoutingPriorityOverride) ([]R
 		}
 
 		out = append(out, RoutingPriorityOverride{
+			PerAuthConcurrency: override.PerAuthConcurrency, Queue: override.Queue,
 			Priority:                    override.Priority,
 			Strategy:                    strategy,
 			MaxRetryCredentials:         maxRetryCredentials,
@@ -4041,6 +4051,9 @@ func normalizeAPIKeyGroups(groups []APIKeyGroup, apiKeys []string, pruneUnknown 
 			return nil, fmt.Errorf("api-key-groups contains duplicate api-key %q", key)
 		}
 		seenKeys[key] = struct{}{}
+		if errAdmission := (&Config{SDKConfig: SDKConfig{APIKeyGroups: []APIKeyGroup{group}}}).ValidateAdmission(); errAdmission != nil {
+			return nil, errAdmission
+		}
 
 		name, errName := NormalizeAPIKeyName(group.Name)
 		if errName != nil {
@@ -4075,7 +4088,7 @@ func normalizeAPIKeyGroups(groups []APIKeyGroup, apiKeys []string, pruneUnknown 
 		if errExcluded != nil {
 			return nil, errExcluded
 		}
-		if name == "" && len(providers) == 0 && len(allowed) == 0 && len(excluded) == 0 && !group.AllowCredentialTargeting && !group.CredentialTargetRespectStatePolicy && !group.CredentialTargetRespectRequestLimit && !group.CredentialTargetResponseModelRewrite && !group.CredentialTargetResponseGuard {
+		if group.ConcurrencyLimit == 0 && group.RPMLimit == 0 && group.Queue == (AdmissionQueue{}) && name == "" && len(providers) == 0 && len(allowed) == 0 && len(excluded) == 0 && !group.AllowCredentialTargeting && !group.CredentialTargetRespectStatePolicy && !group.CredentialTargetRespectRequestLimit && !group.CredentialTargetResponseModelRewrite && !group.CredentialTargetResponseGuard {
 			continue
 		}
 		group.APIKey, group.Name, group.Providers = key, name, providers
@@ -4127,6 +4140,9 @@ func hashSecret(secret string) (string, error) {
 func SaveConfigPreserveComments(configFile string, cfg *Config) error {
 	if cfg == nil {
 		return fmt.Errorf("config is nil")
+	}
+	if errAdmission := cfg.ValidateAdmission(); errAdmission != nil {
+		return errAdmission
 	}
 	if errTiers := cfg.ValidateCodexServiceTiers(); errTiers != nil {
 		return errTiers

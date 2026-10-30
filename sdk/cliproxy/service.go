@@ -5483,6 +5483,9 @@ func (s *Service) runShutdown() {
 	if s.watcherCancel != nil {
 		s.watcherCancel()
 	}
+	if s.coreManager != nil {
+		s.coreManager.TrafficController().Close()
+	}
 	if s.server != nil {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		errStop := s.server.Stop(shutdownCtx)

@@ -48,8 +48,14 @@ func TestCodexLiveLeaseReservesUntilUpstreamAndClosesIdempotently(t *testing.T) 
 					t.Fatal("repeated commit was not idempotent")
 				}
 			}
+			if snapshot := m.admission.Overview(time.Now(), 60, false, false); snapshot.Active != 1 || snapshot.Requests != 1 {
+				t.Fatalf("live lease not counted: %+v", snapshot)
+			}
 			lease.Close()
 			lease.Close()
+			if snapshot := m.admission.Overview(time.Now(), 60, false, false); snapshot.Active != 0 {
+				t.Fatal("live lease leaked")
+			}
 			if !errors.Is(lease.CommitUpstream(), context.Canceled) || lease.Context().Err() == nil {
 				t.Fatal("closed lease remains usable")
 			}

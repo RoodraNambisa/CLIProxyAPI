@@ -1346,6 +1346,12 @@ func TestOpenAIImagesGenerationsAggregatesMultipleNonStreamingImages(t *testing.
 	if executor.calls != 2 {
 		t.Fatalf("executor calls = %d, want 2", executor.calls)
 	}
+	if snapshot := h.AuthManager.TrafficController().Overview(time.Now(), 60, false, false); snapshot.Requests != 1 || snapshot.Active != 0 {
+		t.Fatalf("image aggregation counted twice or leaked: %+v", snapshot)
+	}
+	if snapshot := h.AuthManager.TrafficController().Traffic.Lookup("credential", "codex-auth").Snapshot(time.Now()); snapshot.RPM60 != 2 || snapshot.Active != 0 {
+		t.Fatalf("image attempt counts: %+v", snapshot)
+	}
 	assertImageToolNAbsent(t, executor.payload)
 	if count := len(gjson.Get(resp.Body.String(), "data").Array()); count != 2 {
 		t.Fatalf("data count = %d, want 2: %s", count, resp.Body.String())

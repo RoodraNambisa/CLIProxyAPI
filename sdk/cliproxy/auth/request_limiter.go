@@ -2,6 +2,7 @@ package auth
 
 import (
 	"encoding/json"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/admission"
 	"math"
 	"net/http"
 	"slices"
@@ -16,6 +17,8 @@ import (
 )
 
 type authRequestLimitPolicy struct {
+	concurrency   int
+	priority      int
 	limit         int
 	windowMinutes int
 	generation    uint64
@@ -30,12 +33,16 @@ func normalizeAuthRequestLimitPolicy(policy authRequestLimitPolicy) authRequestL
 
 func authRequestLimitPolicyForRouting(routing internalconfig.RoutingConfig, priority int) authRequestLimitPolicy {
 	policy := authRequestLimitPolicy{
+		concurrency: routing.PerAuthConcurrency, priority: priority,
 		limit:         internalconfig.NormalizePerAuthRequestLimit(routing.PerAuthRequestLimit),
 		windowMinutes: internalconfig.NormalizePerAuthRequestWindowMinutes(routing.PerAuthRequestWindowMinutes),
 	}
 	for _, override := range routing.PriorityOverrides {
 		if override.Priority != priority {
 			continue
+		}
+		if override.PerAuthConcurrency != nil {
+			policy.concurrency = *override.PerAuthConcurrency
 		}
 		if override.PerAuthRequestLimit != nil {
 			policy.limit = internalconfig.NormalizePerAuthRequestLimit(*override.PerAuthRequestLimit)
@@ -128,6 +135,9 @@ func applyRoutingSubscriptionRequestLimitPolicy(policy authRequestLimitPolicy, a
 			continue
 		}
 		override := overrides[index]
+		if override.PerAuthConcurrency != nil {
+			policy.concurrency = *override.PerAuthConcurrency
+		}
 		if override.PerAuthRequestLimit != nil {
 			policy.limit = internalconfig.NormalizePerAuthRequestLimit(*override.PerAuthRequestLimit)
 		}
@@ -158,13 +168,15 @@ type authRequestWindowCount struct {
 }
 
 type authRequestWindowLimiter struct {
-	mu             sync.Mutex
-	now            func() time.Time
-	generation     uint64
-	nextVersion    uint64
-	counts         map[string]authRequestWindowCount
-	changeSequence uint64
-	changes        [requestLimitChangeHistory]requestLimitChange
+	traffic          *admission.Controller
+	mu               sync.Mutex
+	now              func() time.Time
+	generation       uint64
+	generationAtomic atomic.Uint64
+	nextVersion      uint64
+	counts           map[string]authRequestWindowCount
+	changeSequence   uint64
+	changes          [requestLimitChangeHistory]requestLimitChange
 }
 
 type authRequestLimitUsage struct {
@@ -182,6 +194,10 @@ const (
 )
 
 type authRequestReservation struct {
+	streamOwned    atomic.Bool
+	entity         *admission.Entity
+	priority       int
+	finish         sync.Once
 	limiter        *authRequestWindowLimiter
 	authID         string
 	generation     uint64
@@ -195,23 +211,28 @@ type authRequestReservation struct {
 }
 
 func (r *authRequestReservation) Commit() bool {
-	return r != nil && r.state.CompareAndSwap(authRequestReservationReserved, authRequestReservationCommitted)
+	if r == nil || !r.state.CompareAndSwap(authRequestReservationReserved, authRequestReservationCommitted) {
+		return false
+	}
+	if r.entity != nil {
+		r.entity.Start(time.Now())
+	}
+	return true
 }
 
 func (r *authRequestReservation) Release() bool {
 	if r == nil || !r.state.CompareAndSwap(authRequestReservationReserved, authRequestReservationReleased) {
 		return false
 	}
+	defer r.Finish()
 	if r.noOp || r.limiter == nil || r.authID == "" {
 		return true
 	}
 	r.limiter.mu.Lock()
 	defer r.limiter.mu.Unlock()
-	if r.limiter.generation != r.generation {
-		return true
-	}
+
 	entry, ok := r.limiter.counts[r.authID]
-	if !ok || entry.window != r.window || entry.windowMinutes != r.windowMinutes || entry.limit != r.limit || entry.version != r.entryVersion {
+	if !ok || entry.window != r.window || entry.windowMinutes != r.windowMinutes || entry.version != r.entryVersion {
 		return true
 	}
 	if entry.count >= entry.limit {
@@ -239,7 +260,9 @@ func (r *authRequestReservation) Consumed() bool {
 }
 
 func newAuthRequestWindowLimiter() *authRequestWindowLimiter {
-	return &authRequestWindowLimiter{generation: 1, counts: make(map[string]authRequestWindowCount)}
+	l := &authRequestWindowLimiter{generation: 1, counts: make(map[string]authRequestWindowCount)}
+	l.generationAtomic.Store(1)
+	return l
 }
 
 func (l *authRequestWindowLimiter) nowTime() time.Time {
@@ -276,7 +299,7 @@ func (l *authRequestWindowLimiter) reset(generation uint64) {
 	}
 	l.mu.Lock()
 	l.generation = generation
-	clear(l.counts)
+	l.generationAtomic.Store(generation)
 	l.changedLocked("")
 	l.mu.Unlock()
 }
@@ -287,6 +310,9 @@ func (l *authRequestWindowLimiter) remove(authID string) {
 	}
 	l.mu.Lock()
 	delete(l.counts, authID)
+	if l.traffic != nil {
+		l.traffic.Traffic.Retire("credential", authID)
+	}
 	l.changedLocked(authID)
 	l.mu.Unlock()
 }
@@ -295,6 +321,9 @@ func (l *authRequestWindowLimiter) availableAt(authID string, policy authRequest
 	policy = normalizeAuthRequestLimitPolicy(policy)
 	if l == nil || authID == "" {
 		return true, authRequestLimitBlock{}
+	}
+	if l.traffic != nil && l.traffic.Traffic.Lookup("credential", authID).Busy(policy.concurrency) {
+		return false, authRequestLimitBlock{concurrency: policy.concurrency, priority: policy.priority, resetIn: 24 * time.Hour}
 	}
 	var window int64
 	var resetAt time.Time
@@ -310,7 +339,7 @@ func (l *authRequestWindowLimiter) availableAt(authID string, policy authRequest
 		return true, authRequestLimitBlock{}
 	}
 	entry := l.counts[authID]
-	if entry.window != window || entry.windowMinutes != policy.windowMinutes || entry.limit != policy.limit || entry.count < policy.limit {
+	if entry.window != window || entry.windowMinutes != policy.windowMinutes || entry.count < policy.limit {
 		return true, authRequestLimitBlock{}
 	}
 	return false, newAuthRequestLimitBlock(policy, resetAt.Sub(now))
@@ -339,7 +368,7 @@ func (l *authRequestWindowLimiter) usageAt(authID string, policy authRequestLimi
 	}
 	window, _ := authRequestWindowAt(now, policy.windowMinutes)
 	entry := l.counts[authID]
-	if entry.window != window || entry.windowMinutes != policy.windowMinutes || entry.limit != policy.limit {
+	if entry.window != window || entry.windowMinutes != policy.windowMinutes {
 		return usage
 	}
 	consumed := entry.count
@@ -382,6 +411,21 @@ func (l *authRequestWindowLimiter) reserveAt(authID string, policy authRequestLi
 	if l == nil || authID == "" {
 		return &authRequestReservation{authID: authID, noOp: true}, true, authRequestLimitBlock{}
 	}
+	if policy.limit == 0 {
+		generation := l.generationAtomic.Load()
+		if policy.generation != 0 && policy.generation != generation {
+			return nil, false, authRequestLimitBlock{stalePolicy: true}
+		}
+		var entity *admission.Entity
+		if l.traffic != nil && policy.requestSlot != nil {
+			var ok bool
+			entity, ok = l.traffic.Traffic.Acquire("credential", authID, policy.concurrency)
+			if !ok {
+				return nil, false, authRequestLimitBlock{concurrency: policy.concurrency, priority: policy.priority, resetIn: 24 * time.Hour}
+			}
+		}
+		return &authRequestReservation{entity: entity, priority: policy.priority, limiter: l, authID: authID, generation: generation, noOp: true}, true, authRequestLimitBlock{}
+	}
 	var window int64
 	var resetAt time.Time
 	if policy.limit > 0 {
@@ -392,19 +436,25 @@ func (l *authRequestWindowLimiter) reserveAt(authID string, policy authRequestLi
 	if policy.generation != 0 && policy.generation != l.generation {
 		return nil, false, authRequestLimitBlock{stalePolicy: true}
 	}
-	if policy.limit == 0 {
-		return &authRequestReservation{limiter: l, authID: authID, generation: l.generation, windowMinutes: policy.windowMinutes, noOp: true}, true, authRequestLimitBlock{}
-	}
 	if l.counts == nil {
 		l.counts = make(map[string]authRequestWindowCount)
 	}
 	entry := l.counts[authID]
-	if entry.window != window || entry.windowMinutes != policy.windowMinutes || entry.limit != policy.limit {
+	if entry.window != window || entry.windowMinutes != policy.windowMinutes {
 		l.nextVersion++
 		entry = authRequestWindowCount{window: window, windowMinutes: policy.windowMinutes, limit: policy.limit, version: l.nextVersion}
 	}
+	entry.limit = policy.limit
 	if entry.count >= policy.limit {
 		return nil, false, newAuthRequestLimitBlock(policy, resetAt.Sub(now))
+	}
+	var entity *admission.Entity
+	if l.traffic != nil && policy.requestSlot != nil {
+		var ok bool
+		entity, ok = l.traffic.Traffic.Acquire("credential", authID, policy.concurrency)
+		if !ok {
+			return nil, false, authRequestLimitBlock{concurrency: policy.concurrency, priority: policy.priority, resetIn: 24 * time.Hour}
+		}
 	}
 	entry.count++
 	l.counts[authID] = entry
@@ -412,7 +462,7 @@ func (l *authRequestWindowLimiter) reserveAt(authID string, policy authRequestLi
 	if entry.count >= policy.limit {
 		exhaustedUntil = resetAt
 	}
-	return &authRequestReservation{
+	return &authRequestReservation{entity: entity, priority: policy.priority,
 		limiter:        l,
 		authID:         authID,
 		generation:     l.generation,
@@ -429,7 +479,7 @@ func (m *Manager) acquireAdditionalAuthRequest(auth *Auth, executor ProviderExec
 		return nil
 	}
 	if requestSlot != nil {
-		requestSlot.Release()
+		requestSlot.FinishReservation()()
 	}
 	limiter := m.authRequestLimiter()
 	if limiter == nil {
@@ -461,6 +511,8 @@ func commitImmediateAuthRequestReservation(executor ProviderExecutor, requestSlo
 }
 
 type authRequestLimitBlock struct {
+	concurrency   int
+	priority      int
 	limit         int
 	windowMinutes int
 	resetIn       time.Duration
@@ -472,11 +524,11 @@ func newAuthRequestLimitBlock(policy authRequestLimitPolicy, resetIn time.Durati
 		resetIn = 0
 	}
 	policy = normalizeAuthRequestLimitPolicy(policy)
-	return authRequestLimitBlock{limit: policy.limit, windowMinutes: policy.windowMinutes, resetIn: resetIn}
+	return authRequestLimitBlock{priority: policy.priority, limit: policy.limit, windowMinutes: policy.windowMinutes, resetIn: resetIn}
 }
 
 func (b authRequestLimitBlock) limited() bool {
-	return b.limit > 0
+	return b.limit > 0 || b.concurrency > 0
 }
 
 func earlierAuthRequestLimitBlock(current, candidate authRequestLimitBlock) authRequestLimitBlock {
@@ -498,6 +550,9 @@ func newAuthRequestLimitedError(block authRequestLimitBlock) *authRequestLimited
 }
 
 func (e *authRequestLimitedError) Error() string {
+	if e.concurrency > 0 {
+		return `{"error":{"type":"rate_limit_error","code":"rate_limit_exceeded","message":"All available credentials reached their concurrent request limit"}}`
+	}
 	resetSeconds := int64(math.Ceil(e.resetIn.Seconds()))
 	if resetSeconds < 0 {
 		resetSeconds = 0
@@ -518,6 +573,8 @@ func (e *authRequestLimitedError) Error() string {
 	return string(data)
 }
 
+func (*authRequestLimitedError) SkipAuthResult() bool { return true }
+
 func (e *authRequestLimitedError) StatusCode() int {
 	return http.StatusTooManyRequests
 }
@@ -525,6 +582,9 @@ func (e *authRequestLimitedError) StatusCode() int {
 func (e *authRequestLimitedError) Headers() http.Header {
 	headers := make(http.Header)
 	headers.Set("Content-Type", "application/json")
+	if e.concurrency > 0 {
+		return headers
+	}
 	resetSeconds := int64(math.Ceil(e.resetIn.Seconds()))
 	if resetSeconds < 0 {
 		resetSeconds = 0
@@ -532,3 +592,29 @@ func (e *authRequestLimitedError) Headers() http.Header {
 	headers.Set("Retry-After", strconv.FormatInt(resetSeconds, 10))
 	return headers
 }
+
+func (r *authRequestReservation) Finish() {
+	if r == nil {
+		return
+	}
+	r.finish.Do(func() {
+		if r.entity == nil {
+			return
+		}
+		freed := r.entity.Release()
+		if r.Committed() {
+			r.entity.Complete(time.Now())
+		}
+		if r.limiter != nil && (freed || !r.Committed()) {
+			r.limiter.mu.Lock()
+			r.limiter.changedLocked(r.authID)
+			r.limiter.mu.Unlock()
+			if r.limiter.traffic != nil {
+				r.limiter.traffic.Queue.NotifyRoutes()
+			}
+		}
+	})
+}
+
+func (r *authRequestReservation) Transfer()        { r.streamOwned.Store(true) }
+func (r *authRequestReservation) CanAbandon() bool { return !r.streamOwned.Load() }

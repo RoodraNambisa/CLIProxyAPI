@@ -18,6 +18,8 @@ type XAIConfig = internalconfig.XAIConfig
 type XAIModelRoute = internalconfig.XAIModelRoute
 type XAIHeaderDefaults = internalconfig.XAIHeaderDefaults
 type APIKeyGroup = internalconfig.APIKeyGroup
+type AdmissionQueue = internalconfig.AdmissionQueue
+type AdmissionConfig = internalconfig.AdmissionConfig
 type APIKeyPriorityList = internalconfig.APIKeyPriorityList
 
 const APIKeyPriorityLimit = internalconfig.APIKeyPriorityLimit

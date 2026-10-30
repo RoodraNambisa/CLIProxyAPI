@@ -760,6 +760,10 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/usage/series", s.mgmt.GetUsageSeries)
 		mgmt.GET("/usage/health", s.mgmt.GetUsageHealth)
 		mgmt.GET("/usage/rates", s.mgmt.GetUsageRates)
+		mgmt.GET("/admission/options", s.mgmt.GetAdmissionOptions)
+		mgmt.GET("/usage/traffic", s.mgmt.GetTraffic)
+		mgmt.POST("/auth-files/traffic", s.mgmt.GetCredentialTraffic)
+		mgmt.POST("/api-keys/traffic", s.mgmt.GetKeyTraffic)
 		mgmt.GET("/usage/tokens", s.mgmt.GetUsageTokens)
 		mgmt.GET("/usage/costs", s.mgmt.GetUsageCosts)
 		mgmt.GET("/usage/prices", s.mgmt.GetUsagePrices)
@@ -1484,6 +1488,9 @@ func (s *Server) updateClients(cfg *config.Config, rollbackOnError bool) error {
 	}
 	if errRules := runtimeCfg.ValidateRequestScopedErrorRules(); errRules != nil {
 		return errRules
+	}
+	if errAdmission := runtimeCfg.ValidateAdmission(); errAdmission != nil {
+		return errAdmission
 	}
 	if errTiers := runtimeCfg.ValidateCodexServiceTiers(); errTiers != nil {
 		return errTiers

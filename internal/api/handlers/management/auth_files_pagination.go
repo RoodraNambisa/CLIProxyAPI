@@ -232,7 +232,7 @@ func authFilesPagedRequested(c *gin.Context) bool {
 }
 
 func writeLegacyAuthFilesResponse(c *gin.Context, files []gin.H, paged bool) {
-	response := gin.H{"files": files}
+	response := gin.H{"files": files, "traffic-supported": true}
 	if paged {
 		response["total"] = len(files)
 		response["pagination"] = authFilesPaginationResponse{Enabled: false}
@@ -465,8 +465,9 @@ func (h *Handler) listAuthFilesPaged(c *gin.Context, manager *coreauth.Manager) 
 		files = append(files, entry)
 	}
 	c.JSON(http.StatusOK, gin.H{
-		"files": files,
-		"total": total,
+		"files":             files,
+		"traffic-supported": true,
+		"total":             total,
 		"pagination": authFilesPaginationResponse{
 			Enabled:    true,
 			Page:       query.page,

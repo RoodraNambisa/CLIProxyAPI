@@ -3,6 +3,7 @@ package management
 import (
 	"encoding/json"
 	"errors"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/admission"
 	"net/http"
 	"slices"
 	"strconv"
@@ -19,7 +20,11 @@ func (h *Handler) GetAPIKeys(c *gin.Context) {
 	if cfg := h.currentConfig(); cfg != nil {
 		keys = append([]string(nil), cfg.APIKeys...)
 	}
-	c.JSON(http.StatusOK, gin.H{"api-keys": keys, "last-used": configaccess.APIKeyLastUsed(keys)})
+	ids := make(map[string]string, len(keys))
+	for _, key := range keys {
+		ids[key] = admission.KeyID(key)
+	}
+	c.JSON(http.StatusOK, gin.H{"traffic-supported": true, "admission-supported": true, "key-ids": ids, "api-keys": keys, "last-used": configaccess.APIKeyLastUsed(keys)})
 }
 
 // PutAPIKeys replaces client API keys and removes group mappings for deleted keys.
@@ -186,7 +191,7 @@ func (h *Handler) GetAPIKeyGroups(c *gin.Context) {
 		priorities = append(priorities, group.ExcludedPriorities...)
 	}
 	slices.Sort(priorities)
-	c.JSON(http.StatusOK, gin.H{"api-key-groups": groups, "available-priorities": slices.Compact(priorities), "names-supported": true, "credential-targeting-supported": true, "credential-target-options-supported": true, "credential-response-guard-supported": true})
+	c.JSON(http.StatusOK, gin.H{"admission-supported": true, "api-key-groups": groups, "available-priorities": slices.Compact(priorities), "names-supported": true, "credential-targeting-supported": true, "credential-target-options-supported": true, "credential-response-guard-supported": true})
 }
 
 // PutAPIKeyGroups replaces all client API key access restrictions.
@@ -209,6 +214,9 @@ func (h *Handler) PutAPIKeyGroups(c *gin.Context) {
 // PatchAPIKeyGroups updates only the supplied access restriction fields.
 func (h *Handler) PatchAPIKeyGroups(c *gin.Context) {
 	var patch struct {
+		Concurrency   json.RawMessage `json:"concurrency-limit"`
+		RPM           json.RawMessage `json:"rpm-limit"`
+		Queue         json.RawMessage `json:"queue"`
 		APIKey        string          `json:"api-key"`
 		Name          json.RawMessage `json:"name"`
 		Providers     json.RawMessage `json:"providers"`
@@ -239,6 +247,15 @@ func (h *Handler) PatchAPIKeyGroups(c *gin.Context) {
 			break
 		}
 	}
+	if string(patch.Concurrency) == "null" {
+		group.ConcurrencyLimit = 0
+	}
+	if string(patch.RPM) == "null" {
+		group.RPMLimit = 0
+	}
+	if string(patch.Queue) == "null" {
+		group.Queue = config.AdmissionQueue{}
+	}
 	if patch.Name != nil {
 		group.Name = ""
 		if err := json.Unmarshal(patch.Name, &group.Name); err != nil {
@@ -265,6 +282,7 @@ func (h *Handler) PatchAPIKeyGroups(c *gin.Context) {
 		raw    json.RawMessage
 		target any
 	}{
+		{patch.Concurrency, &group.ConcurrencyLimit}, {patch.RPM, &group.RPMLimit}, {patch.Queue, &group.Queue},
 		{patch.Providers, &group.Providers}, {patch.Allowed, &group.AllowedPriorities}, {patch.Excluded, &group.ExcludedPriorities},
 		{patch.Targeting, &group.AllowCredentialTargeting},
 		{patch.RespectState, &group.CredentialTargetRespectStatePolicy},

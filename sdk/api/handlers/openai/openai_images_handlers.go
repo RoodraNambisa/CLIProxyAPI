@@ -28,6 +28,7 @@ import (
 	executorhelps "github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v6/sdk/access"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
 	"github.com/tidwall/gjson"
@@ -706,6 +707,18 @@ func (h *OpenAIImagesAPIHandler) handleImagesRequest(c *gin.Context, req openAII
 	responseFormat := strings.ToLower(strings.TrimSpace(req.ResponseFormat))
 	providers := h.configuredImageProviders(req, op, ignoreUnsupportedImageParams, imageConfig)
 	h.PinChatGPTWebImageErrorSanitization(c, imageProvidersContain(providers, ChatGPTWeb))
+
+	if h.AuthManager != nil {
+		admissionCtx, admissionCancel := h.GetContextWithCancel(h, c, c.Request.Context())
+		defer admissionCancel(nil)
+		admissionCtx, releaseAdmission, errAdmission := h.AuthManager.BeginClientRequest(admissionCtx, rawJSON)
+		if errAdmission != nil {
+			h.WriteErrorResponse(c, handlers.ExecutionErrorMessage(errAdmission))
+			return
+		}
+		defer releaseAdmission()
+		c.Request = c.Request.WithContext(coreauth.InheritClientRequest(c.Request.Context(), admissionCtx))
+	}
 	if req.Stream {
 		h.handleStreamingImagesResponse(c, rawJSON, imageModel, codexModel, op, count, responseFormat, providers, ignoreUnsupportedImageParams, imageConfig)
 		return

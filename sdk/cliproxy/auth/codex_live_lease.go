@@ -56,6 +56,18 @@ func (m *Manager) acquireCodexLive(ctx, lifetime context.Context, model string, 
 	if model == "" {
 		return nil, &Error{Code: "invalid_request", Message: "realtime model is required", HTTPStatus: http.StatusBadRequest}
 	}
+	var releaseAdmission func()
+	var admissionErr error
+	ctx, releaseAdmission, admissionErr = m.beginClientRequest(ctx, opts.OriginalRequest, true)
+	if admissionErr != nil {
+		return nil, admissionErr
+	}
+	admissionTransferred := false
+	defer func() {
+		if !admissionTransferred {
+			releaseAdmission()
+		}
+	}()
 	ctx = m.WithRoutingPolicySnapshot(ctx)
 	producerBase := ctx
 	if lifetime != nil {
@@ -84,7 +96,7 @@ func (m *Manager) acquireCodexLive(ctx, lifetime context.Context, model string, 
 	transferred := false
 	defer func() {
 		if !transferred {
-			opts.AuthRequestSlot.Release()
+			opts.AuthRequestSlot.AbandonReservation()
 			releaseProducer()
 		}
 	}()
@@ -127,6 +139,8 @@ func (m *Manager) acquireCodexLive(ctx, lifetime context.Context, model string, 
 	}
 	lease := &CodexLiveLease{ctx: runtimeCtx, auth: prepared, executor: executor, model: models[0], persistent: persistent, slot: opts.AuthRequestSlot, release: release, cancel: cancel}
 	lease.release = func() bool {
+		opts.AuthRequestSlot.FinishReservation()()
+		releaseAdmission()
 		retired := release()
 		releaseProducer()
 		return retired
@@ -135,6 +149,7 @@ func (m *Manager) acquireCodexLive(ctx, lifetime context.Context, model string, 
 	lease.stop = context.AfterFunc(runtimeCtx, lease.Close)
 	lease.mu.Unlock()
 	transferred = true
+	admissionTransferred = true
 	if errCtx := context.Cause(ctx); errCtx != nil {
 		lease.Close()
 		return nil, errCtx
@@ -192,6 +207,6 @@ func (l *CodexLiveLease) Close() {
 		stop()
 	}
 	l.cancel()
-	l.slot.Release()
+	l.slot.FinishReservation()()
 	release()
 }

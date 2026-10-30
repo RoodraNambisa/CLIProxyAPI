@@ -258,8 +258,14 @@ sentinel-solver:
 # Provider IDs are matched exactly after trimming and lowercasing; use "xai" for Grok credentials.
 # api-key-groups:
 #   - api-key: "your-api-key-1"
+#     concurrency-limit: 0 # 0: unlimited. Held across credential waiting, retries and streaming.
+#     rpm-limit: 0 # 0: unlimited. One charge per admitted logical request; calendar-minute reset.
+#     queue:
+#       enabled: false
+#       max-waiting: 0 # 0: use the process-wide queue budget.
+#       wait-timeout-seconds: 0 # 0: no extra wait timeout; client cancellation still applies.
 #     name: "Work" # Optional display name; empty means unnamed, up to 100 Unicode characters, no control characters.
-#     allow-credential-targeting: false # Opt in to <api-key>-auth-<auth_index or routing_alias> single-attempt tests (bypass local per-credential request limits by default).
+#     allow-credential-targeting: false # Opt in to <api-key>-auth-<auth_index or routing_alias> single-attempt tests (bypass local per-credential RPM by default; concurrency still applies).
 #     credential-target-respect-state-policy: false # Fixed tests obey matching missing-State policy: hide returns 503, error returns 429. Otherwise test without State when missing.
 #     credential-target-respect-request-limit: false # Apply per-credential request limits and share ordinary counters during fixed tests.
 #     credential-target-response-model-rewrite: false # Apply existing response-model-rewrite rules and count actual rewrites during fixed tests.
@@ -564,7 +570,19 @@ auth-maintenance:
   disable-quota-strike-threshold: 6
 
 # Routing strategy for selecting credentials when multiple match.
+# Process-local admission state is reset on restart; historical usage is unchanged.
+admission:
+  max-queued-requests: 1024
+  max-queued-bytes: 268435456 # 256 MiB of retained request bodies, shared by Key and routing queues.
+
 routing:
+  per-auth-concurrency: 0 # Independent of per-auth-request-limit. 0: unlimited.
+  queue:
+    enabled: false
+    max-waiting: 0
+    wait-timeout-seconds: 0 # Cumulative waiting across retries, excludes upstream execution time.
+  # Priority overrides may set per-auth-concurrency and queue; subscription overrides
+  # may set per-auth-concurrency (including explicit zero to remove the inherited cap).
   strategy: "round-robin" # round-robin (default), fill-first, random, weighted-round-robin
   # Weighted routing reads each credential's optional weight: absent = 1,
   # integer range 0..1000000; legacy negative integers act as 0. Zero excludes

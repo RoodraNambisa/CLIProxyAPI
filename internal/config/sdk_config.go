@@ -13,6 +13,7 @@ import (
 
 // SDKConfig represents the application's configuration, loaded from a YAML file.
 type SDKConfig struct {
+	Admission AdmissionConfig `yaml:"admission" json:"admission"`
 	// Codex tier controls are derived handler policies, never saved SDK fields.
 	CodexAllowClientServiceTier bool                   `yaml:"-" json:"-"`
 	CodexServiceTierRules       []CodexServiceTierRule `yaml:"-" json:"-"`
@@ -129,7 +130,10 @@ type ProxyRuleConfig struct {
 
 // APIKeyGroup restricts one configured client key to providers and credential priorities.
 type APIKeyGroup struct {
-	APIKey string `yaml:"api-key" json:"api-key"`
+	ConcurrencyLimit int            `yaml:"concurrency-limit" json:"concurrency-limit"`
+	RPMLimit         int            `yaml:"rpm-limit" json:"rpm-limit"`
+	Queue            AdmissionQueue `yaml:"queue" json:"queue"`
+	APIKey           string         `yaml:"api-key" json:"api-key"`
 	// Name is an optional display label and never participates in authorization.
 	Name      string   `yaml:"name,omitempty" json:"name,omitempty"`
 	Providers []string `yaml:"providers" json:"providers"`

@@ -145,14 +145,19 @@ func (e *modelCooldownError) Headers() http.Header {
 }
 
 type authRPMLimitedError struct {
-	resetIn time.Duration
+	priority int
+	resetIn  time.Duration
 }
 
-func newAuthRPMLimitedError(resetIn time.Duration) *authRPMLimitedError {
+func newAuthRPMLimitedError(resetIn time.Duration, priorities ...int) *authRPMLimitedError {
+	priority := 0
+	if len(priorities) > 0 {
+		priority = priorities[0]
+	}
 	if resetIn < 0 {
 		resetIn = 0
 	}
-	return &authRPMLimitedError{resetIn: resetIn}
+	return &authRPMLimitedError{resetIn: resetIn, priority: priority}
 }
 
 func fillFirstRPMRetryAfterAt(rpmLimiter *fillFirstMinuteLimiter, now time.Time) time.Duration {
@@ -880,7 +885,7 @@ func selectFillFirstAuthsForAttemptWithPolicy(auths []*Auth, provider, model str
 		if cooldownBeforeRPMReset(earliest, rpmRetryAfter, now) {
 			return nil, WithStoredAuthFailure(newModelCooldownErrorUntil(model, provider, earliest, now), failures.latest())
 		}
-		return nil, newAuthRPMLimitedError(rpmRetryAfter)
+		return nil, newAuthRPMLimitedError(rpmRetryAfter, priorities...)
 	}
 	if !earliest.IsZero() {
 		return nil, WithStoredAuthFailure(newModelCooldownErrorUntil(model, provider, earliest, now), failures.latest())

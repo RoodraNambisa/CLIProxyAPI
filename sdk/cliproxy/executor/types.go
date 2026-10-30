@@ -520,8 +520,13 @@ func (s *AuthRequestSlot) Bind(reservation AuthRequestReservation) {
 	if metrics != nil && reservation.Consumed() {
 		metrics.authSlotReserved.Add(1)
 	}
-	if previous != nil && previous.Reserved() {
-		settleReleasedReservation(previous, metrics)
+	if previous != nil {
+		if previous.Reserved() {
+			settleReleasedReservation(previous, metrics)
+		}
+		if finished, ok := previous.(interface{ Finish() }); ok {
+			finished.Finish()
+		}
 	}
 }
 
@@ -907,4 +912,39 @@ type StreamResult struct {
 type StatusError interface {
 	error
 	StatusCode() int
+}
+
+// FinishReservation captures one attempt's concurrency lease, not a later retry.
+func (s *AuthRequestSlot) FinishReservation() func() {
+	if s == nil {
+		return func() {}
+	}
+	s.mu.RLock()
+	reservation, metrics := s.reservation, s.metrics
+	s.mu.RUnlock()
+	return func() {
+		if reservation == nil {
+			return
+		}
+		settleReleasedReservation(reservation, metrics)
+		if finished, ok := reservation.(interface{ Finish() }); ok {
+			finished.Finish()
+		}
+	}
+}
+
+// TransferReservation hands a selected lease to the accepted stream owner.
+func (s *AuthRequestSlot) TransferReservation() func() {
+	r := s.current()
+	if transfer, ok := r.(interface{ Transfer() }); ok {
+		transfer.Transfer()
+	}
+	return s.FinishReservation()
+}
+func (s *AuthRequestSlot) AbandonReservation() {
+	r := s.current()
+	if owned, ok := r.(interface{ CanAbandon() bool }); ok && !owned.CanAbandon() {
+		return
+	}
+	s.FinishReservation()()
 }
