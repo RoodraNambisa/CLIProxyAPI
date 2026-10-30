@@ -58,3 +58,20 @@ func TestRequestLimitSummaryMatchesProviderOnlySchedulerPolicy(t *testing.T) {
 		t.Fatalf("inactive fill-first limit shown: %+v", got)
 	}
 }
+
+func TestConcurrencyOnlyOverridePreservesRPMSource(t *testing.T) {
+	concurrency := 2
+	cfg := &config.Config{Routing: config.RoutingConfig{PerAuthRequestLimit: 50, PriorityOverrides: []config.RoutingPriorityOverride{{Priority: 5, SubscriptionOverrides: []config.RoutingSubscriptionOverride{{Credentials: []string{"selected"}, PerAuthConcurrency: &concurrency}}}}}}
+	manager := NewManager(nil, nil, nil)
+	manager.SetConfig(cfg)
+	a := &Auth{ID: "selected", Provider: "codex", Attributes: map[string]string{"priority": "5"}}
+	if summary := manager.AuthRequestLimitSummary(a); summary.Limit != 50 || summary.Source != "global" {
+		t.Fatalf("concurrency override changed RPM source: %+v", summary)
+	}
+	limit := 3
+	cfg.Routing.PriorityOverrides[0].SubscriptionOverrides[0].PerAuthRequestLimit = &limit
+	manager.SetConfig(cfg)
+	if summary := manager.AuthRequestLimitSummary(a); summary.Limit != 3 || summary.Source != "credential" {
+		t.Fatalf("explicit RPM override lost source: %+v", summary)
+	}
+}

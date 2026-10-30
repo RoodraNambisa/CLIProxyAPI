@@ -27,6 +27,10 @@ func (m *Manager) AuthRequestLimitSummary(auth *Auth) RequestLimitSummary {
 	}
 	for layer, index := range routingSubscriptionMatchIndexes(s.prioritySubscriptionRules[result.Priority], auth) {
 		if index >= 0 {
+			rule := s.prioritySubscriptionRules[result.Priority][index]
+			if rule.PerAuthRequestLimit == nil && rule.PerAuthRequestWindowMinutes == nil {
+				continue
+			}
 			result.Source, result.Rule = "subscription", index+1
 			if layer == 1 {
 				result.Source = "credential"
