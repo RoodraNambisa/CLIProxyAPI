@@ -1680,7 +1680,7 @@ func prepareCodexWebsocketHeadersForURL(ctx context.Context, headers http.Header
 	}
 	deleteHeaderCaseInsensitive(headers, "Authorization")
 	util.ApplyCustomHeadersFromAttrs(&http.Request{Header: headers}, attrs)
-	if len(policies) > 0 && !isAPIKey {
+	if len(policies) > 0 {
 		helps.ApplyCodexSoftwarePolicy(headers, policies[0], "")
 	} else {
 		applyCodexSoftwareIdentity(headers, auth, cfg)
@@ -2174,7 +2174,12 @@ func (e *CodexWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *
 	}
 	stateModelChanged := conn != nil && (currentManagedStateModel != requestedStateModel || stateRejected || currentManagedStateUse.CookieNeedsReconnect())
 
-	softwareChanged := conn != nil && len(models) > 0 && codexEnforceSoftwareIdentity(e.cfg) && !codexAuthUsesAPIKey(auth) &&
+	policies := cliproxyauth.CodexIdentityPoliciesFromContext(ctx)
+	if policies == nil {
+		policies = e.compiledIdentityPolicies()
+	}
+	identityPolicy := helps.ResolveCodexIdentityPolicy(policies, auth)
+	softwareChanged := conn != nil && len(models) > 0 && identityPolicy.EnforceSoftwareIdentity && !codexAuthUsesAPIKey(auth) &&
 		!codexauth.SoftwareIdentitySupportsModel(currentSoftwareIdentity, thinking.ParseSuffix(models[0]).ModelName)
 	if cliproxyexecutor.RequiredUpstreamWebsocket(ctx) && (conn == nil || currentAuthID != requestedAuthID || currentAuthInstanceID != requestedAuthInstanceID || currentProxyBindingID != requestedProxyBindingID || currentProxyIdentity != requestedProxyIdentity || currentWSURL != requestedWSURL || softwareChanged || cacheSessionChanged || stateModelChanged || requestScopeChanged) {
 		return nil, nil, cliproxyexecutor.NewUpstreamWebsocketReplayRequiredError()

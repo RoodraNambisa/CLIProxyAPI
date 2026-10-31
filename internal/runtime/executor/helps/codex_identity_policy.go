@@ -70,6 +70,9 @@ func ApplyCodexSoftwarePolicy(headers http.Header, policy config.CodexIdentityPo
 type codexIdentityConnectionKey struct{}
 
 func WithCodexIdentityConnection(ctx context.Context, p config.CodexIdentityPolicy, h http.Header) context.Context {
+	if !p.ConfuseEffective && !p.SpoofSessionIdentity && p.FingerprintMode == "off" && !p.EnforceSoftwareIdentity && p.UserAgent == "" && p.TurnStatePolicy == config.CodexTurnStatePolicyGuardCrossAccount {
+		return ctx
+	}
 	raw, _ := json.Marshal(p)
 	sum := sha256.New()
 	_, _ = sum.Write(raw)

@@ -2822,7 +2822,7 @@ func applyCodexHeadersFromSources(r *http.Request, auth *cliproxyauth.Auth, toke
 	deleteHeaderCaseInsensitive(r.Header, "Authorization")
 	util.ApplyCustomHeadersFromAttrs(r, attrs)
 	normalizeCodexHTTPSessionHeader(r.Header, codexCustomHTTPSessionHeader(attrs))
-	if len(policies) > 0 && !isAPIKey {
+	if len(policies) > 0 {
 		helps.ApplyCodexSoftwarePolicy(r.Header, policies[0], "")
 	} else {
 		applyCodexSoftwareIdentity(r.Header, auth, cfg)

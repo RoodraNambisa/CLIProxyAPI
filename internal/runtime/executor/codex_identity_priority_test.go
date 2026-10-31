@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -206,5 +207,43 @@ func TestCodexIndependentConfusionPoolExcludesClientKeysAndModels(t *testing.T) 
 		} else if first != fingerprint.sessionID {
 			t.Fatal("client key/model/connection changed the same original identity")
 		}
+	}
+}
+
+func TestCodexPriorityDisablesSoftwareReconnectCheck(t *testing.T) {
+	var connections atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		connections.Add(1)
+		conn, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+			if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed","response":{"id":"resp_disabled_software","status":"completed","output":[]}}`)); err != nil {
+				return
+			}
+		}
+	}))
+	defer server.Close()
+	disabled := false
+	mode := "off"
+	cfg := &config.Config{Routing: config.RoutingConfig{PriorityOverrides: []config.RoutingPriorityOverride{{Priority: 5, Codex: &config.CodexIdentityOverride{EnforceSoftwareIdentity: &disabled, FingerprintMode: &mode}}}}}
+	auth := &coreauth.Auth{ID: "inactive-software", Provider: "codex", Attributes: map[string]string{"priority": "5", "base_url": server.URL, "header:User-Agent": "custom-client/1"}, Metadata: map[string]any{"access_token": "fixture"}}
+	exec := NewCodexWebsocketsExecutor(cfg)
+	defer exec.CloseExecutionSession(t.Name())
+	req := core.Request{Model: "gpt-5.4", Payload: []byte(`{"model":"gpt-5.4","input":"hello"}`)}
+	opts := core.Options{SourceFormat: translator.FormatOpenAIResponse, Metadata: map[string]any{core.ExecutionSessionMetadataKey: t.Name()}}
+	for i := 0; i < 2; i++ {
+		if _, err := exec.Execute(t.Context(), auth, req, opts); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if connections.Load() != 1 {
+		t.Fatalf("priority disabled normalization but reconnected %d times", connections.Load())
 	}
 }
