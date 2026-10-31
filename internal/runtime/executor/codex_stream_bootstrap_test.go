@@ -26,6 +26,7 @@ import (
 )
 
 const codexTestBootstrapCreated = `{"type":"response.created","response":{"id":"first","output":[]}}`
+const codexTestBootstrapMetadata = `{"type":"response.metadata","response_id":"first","metadata":{"prompt_moderation":true}}`
 const codexTestBootstrapFailure = `{"type":"response.failed","response":{"error":{"type":"service_unavailable_error","code":"server_is_overloaded","message":"busy"}}}`
 const codexTestBootstrapCompleted = `{"type":"response.completed","response":{"id":"done","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`
 
@@ -34,16 +35,20 @@ func TestCodexBootstrapWireAttemptsRespectExistingBudget(t *testing.T) {
 		for _, tc := range []struct {
 			name        string
 			enabled     bool
-			prefix      string
+			prefix      []string
 			limit       int
 			wantCalls   int64
 			wantSuccess bool
 		}{
-			{"disabled", false, codexTestBootstrapCreated, 0, 1, false},
-			{"enabled", true, codexTestBootstrapCreated, 0, 2, true},
-			{"existing credential limit", true, codexTestBootstrapCreated, 1, 1, false},
-			{"content committed", true, `{"type":"response.output_text.delta","delta":"visible"}`, 0, 1, false},
-			{"unknown event committed", true, `{"type":"future.event"}`, 0, 1, false},
+			{"disabled", false, []string{codexTestBootstrapCreated}, 0, 1, false},
+			{"enabled", true, []string{codexTestBootstrapCreated}, 0, 2, true},
+			{"existing credential limit", true, []string{codexTestBootstrapCreated}, 1, 1, false},
+			{"content committed", true, []string{`{"type":"response.output_text.delta","delta":"visible"}`}, 0, 1, false},
+			{"unknown event committed", true, []string{`{"type":"future.event"}`}, 0, 1, false},
+			{"metadata enabled", true, []string{codexTestBootstrapCreated, `{"type":"response.in_progress"}`, codexTestBootstrapMetadata}, 0, 2, true},
+			{"metadata disabled", false, []string{codexTestBootstrapCreated, codexTestBootstrapMetadata}, 0, 1, false},
+			{"metadata credential limit", true, []string{codexTestBootstrapCreated, codexTestBootstrapMetadata}, 1, 1, false},
+			{"metadata then content", true, []string{codexTestBootstrapMetadata, `{"type":"response.output_text.delta","delta":"visible"}`}, 0, 1, false},
 		} {
 			t.Run(transport+"/"+tc.name, func(t *testing.T) {
 				var calls atomic.Int64
@@ -51,7 +56,7 @@ func TestCodexBootstrapWireAttemptsRespectExistingBudget(t *testing.T) {
 					attempt := calls.Add(1)
 					events := []string{codexTestBootstrapCompleted}
 					if attempt == 1 {
-						events = []string{tc.prefix, codexTestBootstrapFailure}
+						events = append(append([]string(nil), tc.prefix...), codexTestBootstrapFailure)
 					}
 					if transport == "websocket" {
 						upgrader := websocket.Upgrader{}
@@ -150,7 +155,7 @@ func TestCodexBootstrapWireAttemptsRespectExistingBudget(t *testing.T) {
 					if transport != "images" && (!ctrl.Released() || ctrl.Replayable()) {
 						t.Fatal("successful summary request did not release replay state")
 					}
-					if strings.Contains(output.String(), `"id":"first"`) || strings.Contains(output.String(), "server_is_overloaded") {
+					if strings.Contains(output.String(), `"id":"first"`) || strings.Contains(output.String(), "server_is_overloaded") || strings.Contains(output.String(), `"type":"response.metadata"`) {
 						t.Fatal("rejected attempt leaked into successful stream")
 					}
 					if disconnect != nil {

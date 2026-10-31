@@ -37,6 +37,7 @@ func TestCodexBootstrapOnlyAcceptsKnownCapacityFailures(t *testing.T) {
 
 func TestCodexSSEBootstrapReplayAndBounds(t *testing.T) {
 	metadata := "data: {\"type\":\"response.created\"}\n\n"
+	promptMetadata := "event: response.metadata\r\ndata: {\"type\":\"response.metadata\",\"metadata\":{\"prompt_moderation\":true}}\r\n\r\n"
 	overload := "data: " + bootstrapOverload + "\n\n"
 	for _, tc := range []struct {
 		name, prefix string
@@ -44,13 +45,18 @@ func TestCodexSSEBootstrapReplayAndBounds(t *testing.T) {
 	}{
 		{"empty", "", true},
 		{"metadata", metadata, true},
+		{"prompt metadata", metadata + promptMetadata, true},
 		{"controls", ": ping\r\nevent: pending\r\nid: 4\r\nretry: 100\r\n\r\n" + metadata, true},
 		{"standalone lines", strings.TrimSpace(metadata) + "\n", true},
 		{"multiline", "data: {\"type\":\n" + "data: \"response.created\"}\n\n", true},
 		{"content", "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n", false},
+		{"prompt metadata then content", promptMetadata + "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n", false},
+		{"prompt metadata then policy rejection", promptMetadata + "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"type\":\"invalid_request_error\",\"code\":\"content_policy_violation\"}}}\n\n", false},
 		{"unknown", "data: {\"type\":\"future.metadata\"}\n\n", false},
 		{"malformed", "data: invalid\n\n", false},
 		{"event cap", strings.Repeat(metadata, CodexBootstrapMaxEvents), false},
+		{"prompt metadata event cap", strings.Repeat(promptMetadata, CodexBootstrapMaxEvents), false},
+		{"prompt metadata byte cap", "data: {\"type\":\"response.metadata\",\"metadata\":{\"padding\":\"" + strings.Repeat("x", CodexBootstrapMaxBytes) + "\"}}\n\n", false},
 		{"byte cap", ":" + strings.Repeat("x", CodexBootstrapMaxBytes) + "\n", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

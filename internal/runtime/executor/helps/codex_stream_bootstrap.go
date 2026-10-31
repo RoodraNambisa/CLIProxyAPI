@@ -31,7 +31,8 @@ func (p *CodexBootstrapProbe) Observe(payload []byte) (hold bool, overloadStatus
 		return false, status
 	}
 	switch gjson.GetBytes(payload, "type").String() {
-	case "response.created", "response.in_progress", "codex.rate_limits", "codex.response.metadata":
+	// Prompt-moderation metadata can precede an overload; it is not generated output.
+	case "response.created", "response.in_progress", "codex.rate_limits", "codex.response.metadata", "response.metadata":
 		p.events++
 		return p.events < CodexBootstrapMaxEvents, 0
 	default:
