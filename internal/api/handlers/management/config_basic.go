@@ -33,10 +33,11 @@ type safeRemoteManagementConfig struct {
 }
 
 type configResponse struct {
-	CodexIdentityPolicySupported bool   `json:"codex-identity-policy-supported"`
-	AdmissionSupported           bool   `json:"admission-supported"`
-	TrafficSupported             bool   `json:"traffic-supported"`
-	RuntimeRole                  string `json:"runtime-role"`
+	AuthModelExclusionsImagePrioritySupported bool   `json:"auth-model-exclusions-image-priority-supported"`
+	CodexIdentityPolicySupported              bool   `json:"codex-identity-policy-supported"`
+	AdmissionSupported                        bool   `json:"admission-supported"`
+	TrafficSupported                          bool   `json:"traffic-supported"`
+	RuntimeRole                               string `json:"runtime-role"`
 	*config.Config
 	RemoteManagement safeRemoteManagementConfig `json:"remote-management"`
 }
@@ -61,6 +62,7 @@ func (h *Handler) GetConfig(c *gin.Context) {
 		role = "sentinel-solver"
 	}
 	c.JSON(200, &configResponse{
+		AuthModelExclusionsImagePrioritySupported: true,
 		RuntimeRole: role, AdmissionSupported: true, TrafficSupported: true, CodexIdentityPolicySupported: true,
 		Config: &snapshot,
 		RemoteManagement: safeRemoteManagementConfig{
@@ -521,7 +523,10 @@ func (h *Handler) GetAuthModelExclusions(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"auth-model-exclusions": config.NormalizeAuthModelExclusionRules(cfg.AuthModelExclusions)})
+	c.JSON(http.StatusOK, gin.H{
+		"auth-model-exclusions":                          config.NormalizeAuthModelExclusionRules(cfg.AuthModelExclusions),
+		"auth-model-exclusions-image-priority-supported": true,
+	})
 }
 
 func (h *Handler) PutAuthModelExclusions(c *gin.Context) {

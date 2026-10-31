@@ -11,6 +11,7 @@ import (
 )
 
 var credentialYAMLTypes = map[string]reflect.Type{
+	"auth-model-exclusions":       reflect.TypeFor[AuthModelExclusionRule](),
 	"api-key-groups":              reflect.TypeFor[APIKeyGroup](),
 	"codex":                       reflect.TypeFor[CodexConfig](),
 	"gemini-api-key":              reflect.TypeFor[GeminiKey](),
@@ -79,6 +80,8 @@ func matchCredentialYAMLSequenceElement(original []*yaml.Node, used []bool, targ
 	}
 	var primary, secondary string
 	switch credentialYAMLMappingType(path) {
+	case reflect.TypeFor[AuthModelExclusionRule]():
+		return matchAuthModelExclusionYAMLRule(original, used, target), true
 	case reflect.TypeFor[RoutingPriorityOverride]():
 		primary = "priority"
 	case reflect.TypeFor[APIKeyGroup]():
@@ -140,6 +143,52 @@ func matchRequestScopedErrorYAMLRule(original []*yaml.Node, used []bool, target 
 			return index
 		}
 		candidate, matches = index, matches+1
+	}
+	if matches == 1 {
+		return candidate
+	}
+	return -1
+}
+
+func matchAuthModelExclusionYAMLRule(original []*yaml.Node, used []bool, target *yaml.Node) int {
+	var wanted AuthModelExclusionRule
+	if err := target.Decode(&wanted); err != nil {
+		return -1
+	}
+	normalized := NormalizeAuthModelExclusionRules([]AuthModelExclusionRule{wanted})
+	if len(normalized) != 1 {
+		return -1
+	}
+	wanted = normalized[0]
+	candidate, matches := -1, 0
+	sameModels, modelMatches := -1, 0
+	for index, node := range original {
+		if used[index] || node == nil {
+			continue
+		}
+		var current AuthModelExclusionRule
+		if err := node.Decode(&current); err != nil {
+			continue
+		}
+		normalized = NormalizeAuthModelExclusionRules([]AuthModelExclusionRule{current})
+		if len(normalized) != 1 {
+			continue
+		}
+		current = normalized[0]
+		if reflect.DeepEqual(current, wanted) {
+			return index
+		}
+		if slices.Equal(current.Providers, wanted.Providers) &&
+			slices.Equal(current.Priorities, wanted.Priorities) &&
+			slices.Equal(current.KeywordContains, wanted.KeywordContains) {
+			candidate, matches = index, matches+1
+			if slices.Equal(current.Models, wanted.Models) {
+				sameModels, modelMatches = index, modelMatches+1
+			}
+		}
+	}
+	if modelMatches == 1 {
+		return sameModels
 	}
 	if matches == 1 {
 		return candidate
@@ -272,6 +321,14 @@ func pruneMissingCredentialYAMLKeys(dst, src *yaml.Node, path []string) {
 		}
 	}
 	collect(typ)
+	if typ == reflect.TypeFor[AuthModelExclusionRule]() && findMapKeyIndex(src, "disable-image-generation") < 0 {
+		if i := findMapKeyIndex(dst, "disable-image-generation"); i >= 0 {
+			dst.Content[i+1].Kind = yaml.ScalarNode
+			dst.Content[i+1].Tag = "!!bool"
+			dst.Content[i+1].Value = "false"
+			known["disable-image-generation"] = false
+		}
+	}
 	if typ == reflect.TypeFor[RoutingPriorityOverride]() && findMapKeyIndex(src, "codex") < 0 {
 		if i := findMapKeyIndex(dst, "codex"); i >= 0 {
 			node := dst.Content[i+1]

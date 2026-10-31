@@ -6287,6 +6287,13 @@ func authModelExclusionsSignature(cfg *config.Config) string {
 		if rule.DisableImageGeneration {
 			b.WriteString("disable-image-generation")
 		}
+		b.WriteByte(':')
+		for i, priority := range rule.DisableImageGenerationPriorities {
+			if i > 0 {
+				b.WriteByte(',')
+			}
+			b.WriteString(strconv.Itoa(priority))
+		}
 	}
 	return b.String()
 }

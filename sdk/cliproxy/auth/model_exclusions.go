@@ -28,26 +28,8 @@ func AuthModelExclusionRuleMatches(rule internalconfig.AuthModelExclusionRule, a
 			return false
 		}
 	}
-	if len(rule.Priorities) > 0 {
-		priority, ok := authPriorityForModelExclusion(auth)
-		if !ok {
-			if strings.TrimSpace(auth.Attributes["priority"]) != "" || auth.Metadata["priority"] != nil {
-				return false
-			}
-			// Omitted priorities use the same zero default as account selection
-			// and the management UI. Invalid explicit values remain unmatched.
-			priority = 0
-		}
-		matched := false
-		for _, item := range rule.Priorities {
-			if item == priority {
-				matched = true
-				break
-			}
-		}
-		if !matched {
-			return false
-		}
+	if !authMatchesModelExclusionPriorities(auth, rule.Priorities) {
+		return false
 	}
 	if len(rule.KeywordContains) > 0 {
 		haystack := authModelExclusionKeywordHaystack(auth)
@@ -69,6 +51,31 @@ func AuthModelExclusionRuleMatches(rule internalconfig.AuthModelExclusionRule, a
 	return len(rule.Providers) > 0 || len(rule.Priorities) > 0 || len(rule.KeywordContains) > 0
 }
 
+func authMatchesModelExclusionPriorities(auth *Auth, priorities []int) bool {
+	if len(priorities) > 0 {
+		priority, ok := authPriorityForModelExclusion(auth)
+		if !ok {
+			if strings.TrimSpace(auth.Attributes["priority"]) != "" || auth.Metadata["priority"] != nil {
+				return false
+			}
+			// Omitted priorities use the same zero default as account selection
+			// and the management UI. Invalid explicit values remain unmatched.
+			priority = 0
+		}
+		matched := false
+		for _, item := range priorities {
+			if item == priority {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return false
+		}
+	}
+	return true
+}
+
 // AuthDisablesImageGeneration reports whether image_generation should be disabled for this Codex auth.
 func AuthDisablesImageGeneration(cfg *internalconfig.Config, auth *Auth, provider string) bool {
 	if cfg == nil || auth == nil || len(cfg.AuthModelExclusions) == 0 {
@@ -78,7 +85,9 @@ func AuthDisablesImageGeneration(cfg *internalconfig.Config, auth *Auth, provide
 		return false
 	}
 	for _, rule := range cfg.AuthModelExclusions {
-		if rule.DisableImageGeneration && AuthModelExclusionRuleMatches(rule, auth, provider) {
+		if rule.DisableImageGeneration &&
+			authMatchesModelExclusionPriorities(auth, rule.DisableImageGenerationPriorities) &&
+			AuthModelExclusionRuleMatches(rule, auth, provider) {
 			return true
 		}
 	}

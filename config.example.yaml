@@ -508,6 +508,12 @@ response-model-rewrite:
 #     priorities: [-1]
 #   - disable-image-generation: true
 #     keyword-contains: ["free", "trial"]
+#   - models: ["example-excluded-model"]
+#     providers: [codex]
+#     priorities: [3, 5] # Shared model exclusions apply to both priorities.
+#     disable-image-generation: true
+#     disable-image-generation-priorities: [5] # Only priority 5 loses image generation.
+# An omitted or empty image priority list applies to every match. Other rules still apply.
 
 # How to handle regular Codex text requests when a matched credential has image generation disabled
 # but the request body still carries an image_generation tool. Valid values: remove, error.

@@ -1717,6 +1717,9 @@ type AuthModelExclusionRule struct {
 	KeywordContains []string `yaml:"keyword-contains,omitempty" json:"keyword-contains,omitempty"`
 	// DisableImageGeneration disables Codex image-generation capability for matching credentials.
 	DisableImageGeneration bool `yaml:"disable-image-generation,omitempty" json:"disable-image-generation,omitempty"`
+	// DisableImageGenerationPriorities narrows the image restriction within this rule.
+	// An empty list preserves the restriction for every credential matched by the rule.
+	DisableImageGenerationPriorities []int `yaml:"disable-image-generation-priorities,omitempty" json:"disable-image-generation-priorities,omitempty"`
 }
 
 // DisabledImageGenerationToolErrorConfig defines the response for disabled image_generation tool requests.
@@ -3264,21 +3267,23 @@ func NormalizeAuthModelExclusionRules(rules []AuthModelExclusionRule) []AuthMode
 		}
 		providers := normalizeStringListLower(rule.Providers)
 		priorities := normalizeIntList(rule.Priorities)
+		imagePriorities := normalizeIntList(rule.DisableImageGenerationPriorities)
 		keywords := normalizeStringListLower(rule.KeywordContains)
 		if len(providers) == 0 && len(priorities) == 0 && len(keywords) == 0 {
 			continue
 		}
-		key := strings.Join(models, ",") + "\x00" + strings.Join(providers, ",") + "\x00" + intsSignature(priorities) + "\x00" + strings.Join(keywords, ",") + fmt.Sprintf("\x00%t", rule.DisableImageGeneration)
+		key := strings.Join(models, ",") + "\x00" + strings.Join(providers, ",") + "\x00" + intsSignature(priorities) + "\x00" + strings.Join(keywords, ",") + fmt.Sprintf("\x00%t", rule.DisableImageGeneration) + "\x00" + intsSignature(imagePriorities)
 		if _, exists := seen[key]; exists {
 			continue
 		}
 		seen[key] = struct{}{}
 		out = append(out, AuthModelExclusionRule{
-			Models:                 models,
-			Providers:              providers,
-			Priorities:             priorities,
-			KeywordContains:        keywords,
-			DisableImageGeneration: rule.DisableImageGeneration,
+			Models:                           models,
+			Providers:                        providers,
+			Priorities:                       priorities,
+			KeywordContains:                  keywords,
+			DisableImageGeneration:           rule.DisableImageGeneration,
+			DisableImageGenerationPriorities: imagePriorities,
 		})
 	}
 	if len(out) == 0 {
