@@ -611,6 +611,18 @@ routing:
   #     # fill-first-per-auth-rpm: 60 # alternatively, sequentially move to next auth after 60 selections/minute
   #     per-auth-request-limit: 120
   #     per-auth-request-window-minutes: 5
+  #     # Optional runtime Codex identity overrides; omitted fields inherit.
+  #     codex:
+  #       identity-confuse: true
+  #       identity-confuse-require-session-affinity: true
+  #       identity-confuse-restore-response: false
+  #       spoof-session-identity: true
+  #       fingerprint-mode: device # off/device/session/full, not the upload default
+  #       session-identity-pool-size: 4 # 1-64
+  #       enforce-software-identity: true
+  #       user-agent: "" # Canonical UA also determines Originator/Version when normalization is on.
+  #       turn-state-policy: guard-cross-account
+  #       passthrough-prompt-cache-key: false
   #     # Optional provider/plan/credential refinements. Different selector fields are AND.
   #     # Credential-specific fields override matching provider/plan rules, then this priority and global.
   #     # First match per layer wins; same-layer overlapping scopes are rejected.
@@ -1042,6 +1054,12 @@ xai:
 #     # These secrets are retained in YAML and omitted from config JSON responses.
 #     ice-servers: []
 #   identity-confuse: false
+#   # Obfuscation requires actual session affinity; fill-first alone no longer enables it.
+#   identity-confuse-require-session-affinity: true
+#   # Restore protocol identities in responses. False exposes upstream values; returned aliases
+#   # are remembered only in process memory (100000 entries, 64 MiB, one-hour idle TTL).
+#   # A restart/eviction may require full replay context for incremental requests.
+#   identity-confuse-restore-response: true
 #   # Preserve explicit prompt_cache_key and Session-Id/session_id after all identity projections.
 #   # A missing client Session ID uses the explicit cache key; other identity fields stay independent.
 #   # Defaults to false. Without an explicit key, existing cache generation is unchanged.

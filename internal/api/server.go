@@ -994,6 +994,7 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/auth-files/response-model-rewrite", s.mgmt.GetAuthFileResponseModelRewrite)
 		mgmt.GET("/auth-files/codex/response-guard/options", s.mgmt.GetCodexResponseGuardOptions)
 		mgmt.POST("/auth-files/codex/response-guard/preview", s.mgmt.PreviewCodexResponseGuard)
+		mgmt.POST("/auth-files/codex/identity/preview", s.mgmt.PreviewCodexIdentityPolicy)
 		mgmt.GET("/auth-files/errors", s.mgmt.GetAuthFileErrorHistory)
 		mgmt.GET("/model-definitions/:channel", s.mgmt.GetStaticModelDefinitions)
 		mgmt.GET("/auth-files/download", s.mgmt.DownloadAuthFile)

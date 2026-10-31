@@ -33,9 +33,10 @@ type safeRemoteManagementConfig struct {
 }
 
 type configResponse struct {
-	AdmissionSupported bool   `json:"admission-supported"`
-	TrafficSupported   bool   `json:"traffic-supported"`
-	RuntimeRole        string `json:"runtime-role"`
+	CodexIdentityPolicySupported bool   `json:"codex-identity-policy-supported"`
+	AdmissionSupported           bool   `json:"admission-supported"`
+	TrafficSupported             bool   `json:"traffic-supported"`
+	RuntimeRole                  string `json:"runtime-role"`
 	*config.Config
 	RemoteManagement safeRemoteManagementConfig `json:"remote-management"`
 }
@@ -60,7 +61,7 @@ func (h *Handler) GetConfig(c *gin.Context) {
 		role = "sentinel-solver"
 	}
 	c.JSON(200, &configResponse{
-		RuntimeRole: role, AdmissionSupported: true, TrafficSupported: true,
+		RuntimeRole: role, AdmissionSupported: true, TrafficSupported: true, CodexIdentityPolicySupported: true,
 		Config: &snapshot,
 		RemoteManagement: safeRemoteManagementConfig{
 			LiveLogs: cfg.RemoteManagement.LiveLogs,
@@ -757,7 +758,7 @@ func (h *Handler) GetRoutingPriorityOverrides(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
 		return
 	}
-	c.JSON(200, gin.H{"priority-overrides": cfg.Routing.PriorityOverrides, "features": gin.H{"credential_request_limits": true}})
+	c.JSON(200, gin.H{"priority-overrides": cfg.Routing.PriorityOverrides, "features": gin.H{"credential_request_limits": true, "codex_identity_policy": true}})
 }
 
 func (h *Handler) PutRoutingPriorityOverrides(c *gin.Context) {
