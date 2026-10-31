@@ -584,13 +584,15 @@ type CodexConfig struct {
 	ObserveQuota     bool                        `yaml:"observe-quota" json:"observe-quota"`
 	QuotaAutoDisable CodexQuotaAutoDisableConfig `yaml:"quota-auto-disable" json:"quota-auto-disable"`
 	// PassthroughPromptCacheKey pins client cache keys and session IDs after identity projection.
-	PassthroughPromptCacheKey bool                     `yaml:"passthrough-prompt-cache-key" json:"passthrough-prompt-cache-key"`
-	IdentityConfuse           bool                     `yaml:"identity-confuse" json:"identity-confuse"`
-	SpoofSessionIdentity      bool                     `yaml:"spoof-session-identity" json:"spoof-session-identity"`
-	TurnStatePolicy           CodexTurnStatePolicy     `yaml:"turn-state-policy" json:"turn-state-policy"`
-	StateOverride             CodexStateOverrideConfig `yaml:"state-override" json:"state-override"`
-	ResponseGuard             CodexResponseGuardConfig `yaml:"response-guard,omitempty" json:"response-guard"`
-	EnforceSoftwareIdentity   *bool                    `yaml:"enforce-software-identity,omitempty" json:"enforce-software-identity,omitempty"`
+	PassthroughPromptCacheKey             bool                     `yaml:"passthrough-prompt-cache-key" json:"passthrough-prompt-cache-key"`
+	IdentityConfuseRequireSessionAffinity *bool                    `yaml:"identity-confuse-require-session-affinity,omitempty" json:"identity-confuse-require-session-affinity,omitempty"`
+	IdentityConfuseRestoreResponse        *bool                    `yaml:"identity-confuse-restore-response,omitempty" json:"identity-confuse-restore-response,omitempty"`
+	IdentityConfuse                       bool                     `yaml:"identity-confuse" json:"identity-confuse"`
+	SpoofSessionIdentity                  bool                     `yaml:"spoof-session-identity" json:"spoof-session-identity"`
+	TurnStatePolicy                       CodexTurnStatePolicy     `yaml:"turn-state-policy" json:"turn-state-policy"`
+	StateOverride                         CodexStateOverrideConfig `yaml:"state-override" json:"state-override"`
+	ResponseGuard                         CodexResponseGuardConfig `yaml:"response-guard,omitempty" json:"response-guard"`
+	EnforceSoftwareIdentity               *bool                    `yaml:"enforce-software-identity,omitempty" json:"enforce-software-identity,omitempty"`
 }
 
 // CodexTurnStatePolicy controls how client turn-state headers are forwarded to Codex OAuth upstreams.
@@ -1780,8 +1782,9 @@ type RoutingSubscriptionOverride struct {
 
 // RoutingPriorityOverride overrides routing behavior for one credential priority.
 type RoutingPriorityOverride struct {
-	PerAuthConcurrency *int            `yaml:"per-auth-concurrency,omitempty" json:"per-auth-concurrency,omitempty"`
-	Queue              *AdmissionQueue `yaml:"queue,omitempty" json:"queue,omitempty"`
+	Codex              *CodexIdentityOverride `yaml:"codex,omitempty" json:"codex,omitempty"`
+	PerAuthConcurrency *int                   `yaml:"per-auth-concurrency,omitempty" json:"per-auth-concurrency,omitempty"`
+	Queue              *AdmissionQueue        `yaml:"queue,omitempty" json:"queue,omitempty"`
 	// Priority is the credential priority this rule applies to.
 	Priority int `yaml:"priority" json:"priority"`
 	// Strategy optionally overrides the global credential selection strategy.
@@ -3723,6 +3726,10 @@ func NormalizeRoutingPriorityOverrides(overrides []RoutingPriorityOverride) ([]R
 			return nil, fmt.Errorf("routing.priority-overrides: duplicate priority %d", override.Priority)
 		}
 		seen[override.Priority] = struct{}{}
+		override.Codex = override.Codex.Clone()
+		if err := override.Codex.Validate(); err != nil {
+			return nil, fmt.Errorf("routing.priority-overrides[%d].codex: %w", overrideIndex, err)
+		}
 
 		strategy := strings.TrimSpace(override.Strategy)
 		if strategy != "" {
@@ -3767,6 +3774,7 @@ func NormalizeRoutingPriorityOverrides(overrides []RoutingPriorityOverride) ([]R
 		}
 
 		out = append(out, RoutingPriorityOverride{
+			Codex:              override.Codex,
 			PerAuthConcurrency: override.PerAuthConcurrency, Queue: override.Queue,
 			Priority:                    override.Priority,
 			Strategy:                    strategy,
@@ -4446,7 +4454,9 @@ func mergeMappingPreserve(dst, src *yaml.Node, path ...[]string) {
 			dst.Content = append(dst.Content, deepCopyNode(sk), candidate)
 		}
 	}
-	if isCodexResponseGuardYAMLPath(currentPath) {
+	if strings.Join(currentPath, ".") == "routing.priority-overrides.codex" {
+		pruneMissingCredentialYAMLKeys(dst, src, currentPath)
+	} else if isCodexResponseGuardYAMLPath(currentPath) {
 		pruneMissingResponseGuardKeys(dst, src)
 	} else if isCodexStateRuleYAMLPath(currentPath) {
 		// Clearing an override must restore inheritance while retaining unknown extensions.
@@ -4562,6 +4572,15 @@ func isKnownDefaultValue(path []string, node *yaml.Node) bool {
 		return false
 	}
 	fullPath := strings.Join(path, ".")
+	if fullPath == "routing.priority-overrides.codex" || strings.HasPrefix(fullPath, "routing.priority-overrides.codex.") {
+		return false
+	}
+	if fullPath == "codex.identity-confuse-require-session-affinity" || fullPath == "codex.identity-confuse-restore-response" {
+		return false
+	}
+	if fullPath == "codex" && (findMapKeyIndex(node, "identity-confuse-require-session-affinity") >= 0 || findMapKeyIndex(node, "identity-confuse-restore-response") >= 0) {
+		return false
+	}
 	if fullPath == "usage-statistics-persistence-enabled" && node != nil && node.Kind == yaml.ScalarNode && node.Tag == "!!bool" {
 		return node.Value == "true"
 	}

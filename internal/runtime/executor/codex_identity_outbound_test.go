@@ -69,7 +69,7 @@ func TestCodexIdentityOutboundProjection(t *testing.T) {
 						}
 					}))
 					defer server.Close()
-					cfg := &config.Config{SDKConfig: sdkconfig.SDKConfig{ProxyURL: "direct"}, Routing: config.RoutingConfig{Strategy: "fill-first"}, Codex: config.CodexConfig{IdentityConfuse: confuse}, CodexFingerprint: config.CodexFingerprintConfig{SessionIdentityPoolSize: 4}}
+					cfg := &config.Config{SDKConfig: sdkconfig.SDKConfig{ProxyURL: "direct"}, Routing: config.RoutingConfig{Strategy: "fill-first", SessionAffinity: true}, Codex: config.CodexConfig{IdentityConfuse: confuse}, CodexFingerprint: config.CodexFingerprintConfig{SessionIdentityPoolSize: 4}}
 					exec := NewCodexExecutor(cfg)
 					auth := prepareCodexFingerprintAuthForTest(t, exec, &coreauth.Auth{ID: "identity-test", Provider: "codex", Metadata: map[string]any{"access_token": "test-token", "account_id": "test-account", codexauth.FingerprintModeMetadataKey: mode}, Attributes: map[string]string{"base_url": server.URL}})
 					gc, _ := gin.CreateTestContext(httptest.NewRecorder())
@@ -93,6 +93,9 @@ func TestCodexIdentityOutboundProjection(t *testing.T) {
 					converged := mode == "session" || mode == "full"
 					if converged || confuse {
 						want := helps.MapCodexContextWindow("test-account", window)
+						if confuse {
+							want = helps.StableCodexIdentity(auth.ID, "context", window)
+						}
 						if gjson.Get(metadata, "context_window_id").Str != want || gjson.GetBytes(got.body, "client_metadata.context_window_id").Str != want {
 							t.Fatal("context ID not mapped exactly once")
 						}

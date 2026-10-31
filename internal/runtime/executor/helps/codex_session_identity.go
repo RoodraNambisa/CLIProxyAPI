@@ -34,6 +34,8 @@ type CodexSessionIdentityHeaderSource struct {
 // CodexSessionIdentityProjection controls forced per-credential identity while
 // preserving the existing fill-missing behavior for ordinary session spoofing.
 type CodexSessionIdentityProjection struct {
+	FallbackMetadata          []byte
+	Transform                 *CodexIdentityTransform
 	ProtectedPromptCacheKey   string
 	InstallationID            string
 	ForcedIdentity            CodexSessionIdentity
@@ -96,6 +98,14 @@ func ProjectCodexSessionIdentityWithProjection(
 	if err != nil {
 		return nil, CodexSessionIdentity{}, "", err
 	}
+	if len(projection.FallbackMetadata) > 0 {
+		fallback, _ := decodeCodexJSONObject(projection.FallbackMetadata, "original client_metadata", true)
+		for key, value := range fallback {
+			if _, exists := metadata[key]; !exists {
+				metadata[key] = value
+			}
+		}
+	}
 	bodyTurn, err := decodeCodexTurnMetadata(metadata["x-codex-turn-metadata"], "client_metadata.x-codex-turn-metadata", true)
 	if err != nil {
 		return nil, CodexSessionIdentity{}, "", err
@@ -109,6 +119,19 @@ func ProjectCodexSessionIdentityWithProjection(
 		return nil, CodexSessionIdentity{}, "", err
 	}
 
+	if t := projection.Transform; t != nil {
+		t.object(metadata)
+		t.object(bodyTurn)
+		t.object(adminTurn)
+		t.object(clientTurn)
+		admin = t.source(admin)
+		client = t.source(client)
+		defaults.InstallationID = t.Map("installation_id", defaults.InstallationID)
+		defaults.SessionID = t.Map("session_id", defaults.SessionID)
+		defaults.ThreadID = t.Map("thread_id", defaults.ThreadID)
+		defaults.TurnID = t.Map("turn_id", defaults.TurnID)
+		defaults.WindowID = t.Map("window_id", defaults.WindowID)
+	}
 	installationID := firstCodexIdentityValue(
 		admin.InstallationID, codexTurnString(adminTurn, "installation_id"),
 		projection.InstallationID,
@@ -117,8 +140,13 @@ func ProjectCodexSessionIdentityWithProjection(
 		client.InstallationID, codexTurnString(clientTurn, "installation_id"),
 		defaults.InstallationID,
 	)
+	if projection.Transform != nil {
+		projection.Transform.Converge("installation_id", firstCodexIdentityValue(codexTurnString(bodyTurn, "installation_id"), codexRawJSONString(metadata["x-codex-installation-id"]), client.InstallationID), installationID)
+		projection.Transform.object(metadata)
+		projection.Transform.object(bodyTurn)
+	}
 	if !projection.ProjectSession {
-		if installationID == "" && projection.ContextWindowScope == "" {
+		if installationID == "" && projection.ContextWindowScope == "" && projection.Transform == nil {
 			return nil, CodexSessionIdentity{}, "", fmt.Errorf("Codex installation identity is incomplete")
 		}
 		if installationID != "" {
@@ -144,7 +172,10 @@ func ProjectCodexSessionIdentityWithProjection(
 			return nil, CodexSessionIdentity{}, "", fmt.Errorf("encode Codex client_metadata: %w", err)
 		}
 		out := rebuildCodexSessionIdentityPayload(trimmed, rawFields, metadataJSON, projection)
-		return out, CodexSessionIdentity{InstallationID: installationID, ParentThreadID: parentThreadID}, string(turnMetadataJSON), nil
+		if projection.Transform == nil {
+			return out, CodexSessionIdentity{InstallationID: installationID, ParentThreadID: parentThreadID}, string(turnMetadataJSON), nil
+		}
+		return out, CodexSessionIdentity{InstallationID: installationID, ParentThreadID: parentThreadID, SessionID: firstCodexIdentityValue(codexTurnString(turnMetadata, "session_id"), codexTurnString(metadata, "session_id"), client.SessionID), ThreadID: firstCodexIdentityValue(codexTurnString(turnMetadata, "thread_id"), codexTurnString(metadata, "thread_id"), client.ThreadID), WindowID: firstCodexIdentityValue(codexTurnString(turnMetadata, "window_id"), codexTurnString(metadata, "x-codex-window-id"), client.WindowID)}, string(turnMetadataJSON), nil
 	}
 
 	bodySessionID := codexRawJSONString(metadata["session_id"])
@@ -219,6 +250,14 @@ func ProjectCodexSessionIdentityWithProjection(
 	turnMetadata := cloneCodexRawMap(clientTurn)
 	overlayCodexRawMap(turnMetadata, bodyTurn)
 	overlayCodexRawMap(turnMetadata, adminTurn)
+	if t := projection.Transform; t != nil {
+		t.Converge("session_id", firstCodexIdentityValue(codexTurnString(bodyTurn, "session_id"), bodySessionID, client.SessionID, defaults.SessionID), identity.SessionID)
+		t.Converge("thread_id", firstCodexIdentityValue(codexTurnString(bodyTurn, "thread_id"), bodyThreadID, client.ThreadID, defaults.ThreadID), identity.ThreadID)
+		t.Converge("turn_id", firstCodexIdentityValue(codexTurnString(bodyTurn, "turn_id"), bodyTurnID, codexTurnString(clientTurn, "turn_id"), defaults.TurnID), identity.TurnID)
+		t.Converge("window_id", firstCodexIdentityValue(codexTurnString(bodyTurn, "window_id"), bodyWindowID, client.WindowID, defaults.WindowID), identity.WindowID)
+		t.object(metadata)
+		t.object(turnMetadata)
+	}
 	identity.ParentThreadID = projectCodexRelatedIdentities(metadata, turnMetadata, admin, client, identity, projection)
 	setCodexRawString(turnMetadata, "session_id", identity.SessionID)
 	setCodexRawString(turnMetadata, "thread_id", identity.ThreadID)
@@ -228,7 +267,7 @@ func ProjectCodexSessionIdentityWithProjection(
 	if shouldRewriteCodexPromptCacheAlias(codexTurnString(turnMetadata, "prompt_cache_key"), projection) {
 		setCodexRawString(turnMetadata, "prompt_cache_key", projection.PromptCacheKeyReplacement)
 	}
-	if projection.InstallationID != "" {
+	if projection.InstallationID != "" || (projection.Transform != nil && installationID != "") {
 		identity.InstallationID = installationID
 		setCodexRawString(turnMetadata, "installation_id", installationID)
 	}
@@ -242,7 +281,7 @@ func ProjectCodexSessionIdentityWithProjection(
 	setCodexRawString(metadata, "turn_id", identity.TurnID)
 	setCodexRawString(metadata, "x-codex-window-id", identity.WindowID)
 	setCodexRawString(metadata, "x-codex-turn-metadata", string(turnMetadataJSON))
-	if projection.InstallationID != "" {
+	if projection.InstallationID != "" || (projection.Transform != nil && installationID != "") {
 		setCodexRawString(metadata, "x-codex-installation-id", installationID)
 	}
 	metadataJSON, err := json.Marshal(metadata)
@@ -267,6 +306,18 @@ func rebuildCodexSessionIdentityPayload(
 			continue
 		}
 		value := field.value
+		if projection.Transform != nil {
+			key, _ := strconv.Unquote(string(field.key))
+			if CodexIdentityRole(key) != "" {
+				old := codexRawJSONString(value)
+				if key == "prompt_cache_key" {
+					old = exactCodexIdentityString(value)
+				}
+				if next := projection.Transform.Map(key, old); next != old {
+					value = []byte(strconv.Quote(next))
+				}
+			}
+		}
 		if codexJSONKeyEquals(field.key, "prompt_cache_key") &&
 			shouldRewriteCodexPromptCacheAlias(codexRawJSONString(value), projection) {
 			value = []byte(strconv.Quote(projection.PromptCacheKeyReplacement))

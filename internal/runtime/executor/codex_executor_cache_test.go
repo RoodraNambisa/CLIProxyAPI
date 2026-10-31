@@ -82,89 +82,41 @@ func TestCodexExecutorCacheHelper_OpenAIChatCompletions_StablePromptCacheKeyFrom
 }
 
 func TestCodexExecutorCacheHelper_IdentityConfuseRemapsBodyAndHeaders(t *testing.T) {
-	recorder := httptest.NewRecorder()
-	ginCtx, _ := gin.CreateTestContext(recorder)
-	ginCtx.Request = httptest.NewRequest("POST", "/v1/responses", nil)
-	ginCtx.Request.Header.Set("X-Codex-Turn-Metadata", `{"prompt_cache_key":"cache-1","turn_id":"turn-1","window_id":"cache-1:0"}`)
-	ginCtx.Request.Header.Set("X-Client-Request-Id", "client-request-1")
-
-	ctx := context.WithValue(context.Background(), "gin", ginCtx)
-	executor := &CodexExecutor{cfg: &config.Config{
-		Routing: config.RoutingConfig{Strategy: "fill-first"},
-		Codex:   config.CodexConfig{IdentityConfuse: true},
-	}}
-	auth := &cliproxyauth.Auth{ID: "auth-1", Provider: "codex"}
-	rawJSON := []byte(`{"model":"gpt-5-codex","stream":true,"client_metadata":{"x-codex-turn-metadata":"{\"prompt_cache_key\":\"cache-1\",\"turn_id\":\"turn-1\",\"window_id\":\"cache-1:0\"}","x-codex-window-id":"cache-1:0"}}`)
-	req := cliproxyexecutor.Request{
-		Model:   "gpt-5-codex",
-		Payload: []byte(`{"model":"gpt-5-codex","prompt_cache_key":"cache-1","client_metadata":{"x-codex-installation-id":"install-1"}}`),
-	}
-	url := "https://example.com/responses"
-
-	turnID, errTurn := helps.NewCodexUUIDv7()
-	if errTurn != nil {
-		t.Fatalf("generate turn ID: %v", errTurn)
-	}
-	opts := cliproxyexecutor.WithProviderPreparedRequest(cliproxyexecutor.Options{}, executor.Identifier(), codexPreparedSessionIdentity{TurnID: turnID})
-	httpReq, body, identityState, err := executor.cacheHelper(ctx, sdktranslator.FromString("openai-response"), url, auth, req, opts, req.Payload, rawJSON, true)
+	cfg := &config.Config{Routing: config.RoutingConfig{SessionAffinity: true}, Codex: config.CodexConfig{IdentityConfuse: true}}
+	executor := NewCodexExecutor(cfg)
+	auth := &cliproxyauth.Auth{ID: "auth-1", Provider: "codex", Metadata: map[string]any{"codex_fingerprint_mode": "off"}}
+	body := []byte(`{"prompt_cache_key":"cache-1","client_metadata":{"session_id":"cache-1","thread_id":"cache-1","turn_id":"turn-1","x-codex-installation-id":"install-1"}}`)
+	req := cliproxyexecutor.Request{Model: "gpt-5-codex", Payload: body}
+	opts, err := executor.ensureCodexPreparedSessionIdentity(t.Context(), req, cliproxyexecutor.Options{}, cliproxyexecutor.RequestOperationExecute)
 	if err != nil {
-		t.Fatalf("cacheHelper error: %v", err)
+		t.Fatal(err)
 	}
-	applyCodexHeaders(httpReq, auth, "oauth-token", true, executor.cfg)
-	applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
-
-	expectedPromptCacheKey := codexIdentityConfuseUUID("auth-1", "prompt-cache", "cache-1")
-	expectedTurnID := codexIdentityConfuseTurnUUID("auth-1", "turn-1", turnID)
-	if gotKey := gjson.GetBytes(body, "prompt_cache_key").String(); gotKey != expectedPromptCacheKey {
-		t.Fatalf("prompt_cache_key = %q, want %q", gotKey, expectedPromptCacheKey)
+	httpReq, raw, state, err := executor.cacheHelper(t.Context(), sdktranslator.FromString("openai-response"), "https://example.com/responses", auth, req, opts, body, body, true)
+	if err != nil {
+		t.Fatal(err)
 	}
-	expectedInstallationID := codexIdentityConfuseUUID("auth-1", "installation", "install-1")
-	if gotID := gjson.GetBytes(body, "client_metadata.x-codex-installation-id").String(); gotID != expectedInstallationID {
-		t.Fatalf("installation id = %q, want %q", gotID, expectedInstallationID)
+	if string(raw) != string(body) {
+		t.Fatal("body rewritten before the single projection stage")
 	}
-	gotBodyMetadata := gjson.GetBytes(body, "client_metadata.x-codex-turn-metadata").String()
-	if gotMetadataPromptCacheKey := gjson.Get(gotBodyMetadata, "prompt_cache_key").String(); gotMetadataPromptCacheKey != expectedPromptCacheKey {
-		t.Fatalf("client_metadata.x-codex-turn-metadata.prompt_cache_key = %q, want %q", gotMetadataPromptCacheKey, expectedPromptCacheKey)
+	projected, err := executor.applyCodexHTTPSessionIdentity(t.Context(), auth, req, opts, httpReq, raw, &state)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if gotMetadataTurnID := gjson.Get(gotBodyMetadata, "turn_id").String(); gotMetadataTurnID != expectedTurnID {
-		t.Fatalf("client_metadata.x-codex-turn-metadata.turn_id = %q, want %q", gotMetadataTurnID, expectedTurnID)
+	want := helps.StableCodexIdentity(auth.ID, "conversation", "cache-1")
+	if gjson.GetBytes(projected, "prompt_cache_key").String() != want || httpReq.Header.Get("Session-Id") != want || httpReq.Header.Get("Thread-Id") != want {
+		t.Fatalf("header/body mismatch: %s, %v", projected, httpReq.Header)
 	}
-	if gotMetadataWindowID := gjson.Get(gotBodyMetadata, "window_id").String(); gotMetadataWindowID != "cache-1:0" {
-		t.Fatalf("client_metadata.x-codex-turn-metadata.window_id = %q, want original value", gotMetadataWindowID)
+	if gjson.GetBytes(projected, "client_metadata.x-codex-installation-id").String() == "install-1" {
+		t.Fatal("device identity unchanged")
 	}
-	if gotWindowID := gjson.GetBytes(body, "client_metadata.x-codex-window-id").String(); gotWindowID != "cache-1:0" {
-		t.Fatalf("client_metadata.x-codex-window-id = %q, want original value", gotWindowID)
-	}
-	if gotHeader := httpReq.Header.Get("Session-Id"); gotHeader != "" {
-		t.Fatalf("Session-Id = %q, want empty for an opaque prompt_cache_key", gotHeader)
-	}
-	if gotHeader := httpReq.Header.Get("X-Client-Request-Id"); gotHeader != "client-request-1" {
-		t.Fatalf("X-Client-Request-Id = %q, want original client value", gotHeader)
-	}
-	if gotHeader := httpReq.Header.Get("Thread-Id"); gotHeader != "" {
-		t.Fatalf("Thread-Id = %q, want empty", gotHeader)
-	}
-	if gotSession := headerValueCaseInsensitive(httpReq.Header, "Session_id"); gotSession != "" {
-		t.Fatalf("Session_id = %q, want empty", gotSession)
-	}
-	if gotWindow := httpReq.Header.Get("X-Codex-Window-Id"); gotWindow != "" {
-		t.Fatalf("X-Codex-Window-Id = %q, want empty", gotWindow)
-	}
-	gotHeaderMetadata := httpReq.Header.Get("X-Codex-Turn-Metadata")
-	if gotMetadataPromptCacheKey := gjson.Get(gotHeaderMetadata, "prompt_cache_key").String(); gotMetadataPromptCacheKey != expectedPromptCacheKey {
-		t.Fatalf("X-Codex-Turn-Metadata.prompt_cache_key = %q, want %q", gotMetadataPromptCacheKey, expectedPromptCacheKey)
-	}
-	if gotMetadataTurnID := gjson.Get(gotHeaderMetadata, "turn_id").String(); gotMetadataTurnID != expectedTurnID {
-		t.Fatalf("X-Codex-Turn-Metadata.turn_id = %q, want %q", gotMetadataTurnID, expectedTurnID)
-	}
-	if gotMetadataWindowID := gjson.Get(gotHeaderMetadata, "window_id").String(); gotMetadataWindowID != "cache-1:0" {
-		t.Fatalf("X-Codex-Turn-Metadata.window_id = %q, want original value", gotMetadataWindowID)
+	if gjson.GetBytes(body, "client_metadata.session_id").String() != "cache-1" {
+		t.Fatal("original request mutated")
 	}
 }
 
 func TestCodexIdentityConfuseKeepsClientBodySeparateFromUpstreamBody(t *testing.T) {
 	cfg := &config.Config{
-		Routing: config.RoutingConfig{Strategy: "fill-first"},
+		Routing: config.RoutingConfig{Strategy: "fill-first", SessionAffinity: true},
 		Codex:   config.CodexConfig{IdentityConfuse: true},
 	}
 	auth := &cliproxyauth.Auth{ID: "auth-1", Provider: "codex"}

@@ -12,6 +12,7 @@ import (
 // routingRequestPolicy freezes selection choices, not credential availability or
 // limiter generations. Retired instances and current capacity remain authoritative.
 type routingRequestPolicy struct {
+	codexIdentityPolicies *config.CodexIdentityPolicySet
 	manager               *Manager
 	selector              Selector
 	strategy              schedulerStrategy
@@ -172,4 +173,23 @@ func (p *routingRequestPolicy) rpmForPriority(priority int) int {
 		return value
 	}
 	return p.fillRPM
+}
+
+// CodexIdentityPoliciesFromContext returns the logical request configuration snapshot.
+func CodexIdentityPoliciesFromContext(ctx context.Context) *config.CodexIdentityPolicySet {
+	if p := routingPolicyFromContext(ctx); p != nil {
+		return p.codexIdentityPolicies
+	}
+	return nil
+}
+
+// ActiveCodexIdentityPolicies exposes the immutable compiled policy to read-only management previews.
+func (m *Manager) ActiveCodexIdentityPolicies() *config.CodexIdentityPolicySet {
+	if m == nil {
+		return nil
+	}
+	if p := m.routingPolicy.Load(); p != nil {
+		return p.codexIdentityPolicies
+	}
+	return nil
 }

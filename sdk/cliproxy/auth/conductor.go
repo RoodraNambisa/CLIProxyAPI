@@ -1194,6 +1194,7 @@ func (m *Manager) SetSelector(selector Selector) {
 		policy.oauthErrorRules = previous.oauthErrorRules
 		policy.clientKeyPriorities = previous.clientKeyPriorities
 		policy.responseModelRewrite = previous.responseModelRewrite
+		policy.codexIdentityPolicies = previous.codexIdentityPolicies
 		policy.codexResponseGuard = previous.codexResponseGuard
 		policy.codexQuotaAutoDisable = previous.codexQuotaAutoDisable
 	}
@@ -1424,6 +1425,7 @@ func (m *Manager) setConfigLocked(cfg *internalconfig.Config) {
 	policy.oauthErrorRules = oauthErrorRules
 	policy.clientKeyPriorities = compileClientKeyPriorities(cfg)
 	policy.responseModelRewrite = cloneResponseModelRewrite(cfg.ResponseModelRewrite)
+	policy.codexIdentityPolicies = internalconfig.CompileCodexIdentityPolicies(cfg)
 	policy.codexResponseGuard = cfg.Codex.ResponseGuard.Clone()
 	m.routingPolicy.Store(policy)
 	if m.backingPathAuthDir != strings.TrimSpace(cfg.AuthDir) {
@@ -5011,7 +5013,11 @@ func (m *Manager) prepareRequestAuth(ctx context.Context, executor ProviderExecu
 	if err := ctx.Err(); err != nil {
 		return auth, err
 	}
-	resultChannel := m.requestPrepareFlights.DoChan(requestAuthPrepareFlightKey(auth), func() (any, error) {
+	flightKey := requestAuthPrepareFlightKey(auth)
+	if scoped, ok := preparer.(interface{ RequestAuthPreparationScope() string }); ok {
+		flightKey += "\x00" + scoped.RequestAuthPreparationScope()
+	}
+	resultChannel := m.requestPrepareFlights.DoChan(flightKey, func() (any, error) {
 		workerCtx := context.WithoutCancel(ctx)
 		if provider == "chatgpt-web" {
 			releaseFlight, errFlight := m.beginRequestRefreshFlight()

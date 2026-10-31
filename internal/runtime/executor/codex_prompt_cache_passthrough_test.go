@@ -211,6 +211,7 @@ func TestCodexPromptCachePassthroughSnapshotSurvivesReleaseAndReplacement(t *tes
 			t.Fatal("request release lost log protection independently of the passthrough setting")
 		}
 		upstream, state := applyCodexPreparedIdentityConfuseBody(&replacement, &cliproxyauth.Auth{ID: "retry-auth"}, nil, []byte(`{"prompt_cache_key":"generated"}`), prepared)
+		upstream, _ = prepared.PromptCacheKey.ApplyFinal(upstream, nil)
 		want := "generated"
 		if initiallyEnabled {
 			want = "original"
@@ -218,7 +219,7 @@ func TestCodexPromptCachePassthroughSnapshotSurvivesReleaseAndReplacement(t *tes
 		if gjson.GetBytes(upstream, "prompt_cache_key").Str != want {
 			t.Fatal("request changed policy after release/config replacement")
 		}
-		if initiallyEnabled && state.originalPromptCacheKey != "original" {
+		if initiallyEnabled && state.protectedPromptCacheKey != "original" {
 			t.Fatal("release lost the independent identity mapping source")
 		}
 	}

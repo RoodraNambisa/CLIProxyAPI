@@ -9,6 +9,7 @@ import (
 	"strings"
 	"unicode"
 
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/cache"
 	"github.com/tidwall/gjson"
 )
 
@@ -133,6 +134,10 @@ func extractCodexIdentity(headers http.Header, roots []gjson.Result) (Identity, 
 	if fork == "" {
 		fork = rootID(roots, "forked_from_thread_id", "forked_from_id", "metadata.forked_from_thread_id", "metadata.forked_from_id", "extra_body.forked_from_thread_id", "extra_body.forked_from_id")
 	}
+	sid = cache.CanonicalCodexSessionAlias(sid)
+	tid = cache.CanonicalCodexSessionAlias(tid)
+	parent = cache.CanonicalCodexSessionAlias(parent)
+	fork = cache.CanonicalCodexSessionAlias(fork)
 	child := tid
 	if child == "" {
 		child = sid

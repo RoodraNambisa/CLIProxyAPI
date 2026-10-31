@@ -67,7 +67,7 @@ func TestCodexIdentityPolicyFrozenAcrossConfigReplacement(t *testing.T) {
 		prepared := opaque.(codexPreparedSessionIdentity)
 		cfg.Codex.IdentityConfuse = !enabled
 		got, state := applyCodexPreparedIdentityConfuseBody(cfg, &coreauth.Auth{ID: "test"}, body, body, prepared)
-		if state.enabled != enabled || (gjson.GetBytes(got, "prompt_cache_key").Str != "short") != enabled {
+		if state.enabled != enabled || !bytes.Equal(got, body) || (enabled && state.transform.Map("prompt_cache_key", "short") == "short") {
 			t.Fatal("config replacement changed an in-flight identity policy")
 		}
 	}

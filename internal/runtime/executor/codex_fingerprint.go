@@ -64,6 +64,9 @@ func resolveCodexConvergedFingerprint(auth *cliproxyauth.Auth, prepared codexPre
 		return codexConvergedFingerprint{mode: codexauth.FingerprintModeOff}, nil
 	}
 	mode := codexauth.EffectiveFingerprintMode(auth.Metadata)
+	if prepared.PolicyResolved {
+		mode = codexauth.FingerprintMode(prepared.Policy.FingerprintMode)
+	}
 	if mode == codexauth.FingerprintModeOff {
 		return codexConvergedFingerprint{mode: mode}, nil
 	}
@@ -95,11 +98,29 @@ func resolveCodexConvergedFingerprint(auth *cliproxyauth.Auth, prepared codexPre
 		}
 	}
 
+	if prepared.PolicyResolved && prepared.Policy.SessionIdentityPoolSize > 0 && len(pool) > prepared.Policy.SessionIdentityPoolSize {
+		pool = pool[:prepared.Policy.SessionIdentityPoolSize]
+	}
 	resolved.sessionID = pool[codexSessionIdentityPoolIndex(auth, prepared, turnID, len(pool))]
+	ownedThread := false
+	if alias := prepared.ReturnedIdentityAlias; alias != nil && alias.Scope == auth.ID && alias.Generation == auth.RuntimeInstanceID() && alias.Converged && alias.SessionSlot != "" {
+		for _, slot := range pool {
+			if slot == alias.SessionSlot {
+				resolved.sessionID = slot
+				ownedThread = clientThreadID == alias.Mapped
+				break
+			}
+		}
+	}
+
 	if mode == codexauth.FingerprintModeFull {
 		resolved.threadID = resolved.sessionID
 	} else {
-		resolved.threadID = codexSessionThreadID(auth, clientThreadID, resolved.sessionID)
+		if ownedThread {
+			resolved.threadID = clientThreadID
+		} else {
+			resolved.threadID = codexSessionThreadID(auth, clientThreadID, resolved.sessionID)
+		}
 	}
 	resolved.turnID = turnID
 	resolved.windowID = resolved.threadID + ":0"
@@ -163,17 +184,23 @@ func codexFingerprintDigest(value string) string {
 	return fmt.Sprintf("%x", sum[:])
 }
 
-func codexSessionIdentityPoolNeedsPreparation(auth *cliproxyauth.Auth, cfg *config.Config) bool {
+func codexSessionIdentityPoolNeedsPreparation(auth *cliproxyauth.Auth, cfg *config.Config, policies ...config.CodexIdentityPolicy) bool {
 	if auth == nil || codexAuthUsesAPIKey(auth) || !strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
 		return false
 	}
 	mode := codexauth.EffectiveFingerprintMode(auth.Metadata)
+	if len(policies) > 0 {
+		mode = codexauth.FingerprintMode(policies[0].FingerprintMode)
+	}
 	if mode != codexauth.FingerprintModeSession && mode != codexauth.FingerprintModeFull {
 		return false
 	}
 	desired := config.DefaultCodexSessionIdentityPoolSize
 	if cfg != nil {
 		desired = cfg.CodexFingerprint.ResolvedSessionIdentityPoolSize()
+	}
+	if len(policies) > 0 {
+		desired = policies[0].SessionIdentityPoolSize
 	}
 	pool, ok := codexSessionIdentityPool(auth.Metadata)
 	if !ok || len(pool) != desired {
@@ -187,13 +214,16 @@ func codexSessionIdentityPoolNeedsPreparation(auth *cliproxyauth.Auth, cfg *conf
 	return false
 }
 
-func prepareCodexSessionIdentityPool(auth *cliproxyauth.Auth, cfg *config.Config) (*cliproxyauth.Auth, bool, error) {
-	if !codexSessionIdentityPoolNeedsPreparation(auth, cfg) {
+func prepareCodexSessionIdentityPool(auth *cliproxyauth.Auth, cfg *config.Config, policies ...config.CodexIdentityPolicy) (*cliproxyauth.Auth, bool, error) {
+	if !codexSessionIdentityPoolNeedsPreparation(auth, cfg, policies...) {
 		return auth, false, nil
 	}
 	desired := config.DefaultCodexSessionIdentityPoolSize
 	if cfg != nil {
 		desired = cfg.CodexFingerprint.ResolvedSessionIdentityPoolSize()
+	}
+	if len(policies) > 0 {
+		desired = policies[0].SessionIdentityPoolSize
 	}
 	existing, _ := codexSessionIdentityPool(auth.Metadata)
 	pool := make([]string, desired)
@@ -243,18 +273,25 @@ func codexSessionIdentityPool(metadata map[string]any) ([]string, bool) {
 	}
 }
 
-func codexInstallationIDNeedsPreparation(auth *cliproxyauth.Auth) bool {
+func codexInstallationIDNeedsPreparation(auth *cliproxyauth.Auth, policies ...config.CodexIdentityPolicy) bool {
+	mode := codexauth.EffectiveFingerprintMode(nil)
+	if auth != nil {
+		mode = codexauth.EffectiveFingerprintMode(auth.Metadata)
+	}
+	if len(policies) > 0 {
+		mode = codexauth.FingerprintMode(policies[0].FingerprintMode)
+	}
 	if auth == nil || codexAuthUsesAPIKey(auth) ||
 		!strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") ||
-		codexauth.EffectiveFingerprintMode(auth.Metadata) == codexauth.FingerprintModeOff {
+		mode == codexauth.FingerprintModeOff {
 		return false
 	}
 	installationID := canonicalCodexInstallationID(codexMetadataString(auth.Metadata, "openai_device_id"))
 	return installationID == ""
 }
 
-func prepareCodexInstallationID(auth *cliproxyauth.Auth) (*cliproxyauth.Auth, bool) {
-	if !codexInstallationIDNeedsPreparation(auth) {
+func prepareCodexInstallationID(auth *cliproxyauth.Auth, policies ...config.CodexIdentityPolicy) (*cliproxyauth.Auth, bool) {
+	if !codexInstallationIDNeedsPreparation(auth, policies...) {
 		return auth, false
 	}
 	updated := auth.Clone()

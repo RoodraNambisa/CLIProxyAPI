@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	identitycache "github.com/router-for-me/CLIProxyAPI/v6/internal/cache"
 	"math"
 	"math/rand/v2"
 	"net/http"
@@ -1413,10 +1414,10 @@ func extractSessionIDsWithHistory(headers http.Header, payload []byte, metadata 
 	// 3. Session-Id / Session_id header (Codex)
 	if headers != nil {
 		if sid := headers.Get("Session-Id"); sid != "" {
-			return "codex:" + sid, ""
+			return "codex:" + identitycache.CanonicalCodexSessionAlias(sid), ""
 		}
 		if sid := headers.Get("Session_id"); sid != "" {
-			return "codex:" + sid, ""
+			return "codex:" + identitycache.CanonicalCodexSessionAlias(sid), ""
 		}
 	}
 

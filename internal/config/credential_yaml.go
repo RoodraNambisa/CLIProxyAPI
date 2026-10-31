@@ -31,13 +31,18 @@ func credentialYAMLMappingType(path []string) reflect.Type {
 		return reflect.TypeFor[RequestScopedErrorRule]()
 	}
 	typ := credentialYAMLTypes[path[0]]
+	remaining := path[1:]
+	if len(path) >= 2 && path[0] == "routing" && path[1] == "priority-overrides" {
+		typ = reflect.TypeFor[RoutingPriorityOverride]()
+		remaining = path[2:]
+	}
 	unwrap := func(t reflect.Type) reflect.Type {
 		for t != nil && (t.Kind() == reflect.Pointer || t.Kind() == reflect.Slice) {
 			t = t.Elem()
 		}
 		return t
 	}
-	for _, key := range path[1:] {
+	for _, key := range remaining {
 		typ = unwrap(typ)
 		if typ == nil || typ.Kind() != reflect.Struct {
 			return nil
@@ -74,6 +79,8 @@ func matchCredentialYAMLSequenceElement(original []*yaml.Node, used []bool, targ
 	}
 	var primary, secondary string
 	switch credentialYAMLMappingType(path) {
+	case reflect.TypeFor[RoutingPriorityOverride]():
+		primary = "priority"
 	case reflect.TypeFor[APIKeyGroup]():
 		primary = "api-key"
 	case reflect.TypeFor[RequestScopedErrorRule]():
@@ -265,6 +272,15 @@ func pruneMissingCredentialYAMLKeys(dst, src *yaml.Node, path []string) {
 		}
 	}
 	collect(typ)
+	if typ == reflect.TypeFor[RoutingPriorityOverride]() && findMapKeyIndex(src, "codex") < 0 {
+		if i := findMapKeyIndex(dst, "codex"); i >= 0 {
+			node := dst.Content[i+1]
+			pruneMissingCredentialYAMLKeys(node, &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}, []string{"routing", "priority-overrides", "codex"})
+			if len(node.Content) > 0 {
+				known["codex"] = false
+			}
+		}
+	}
 	retained := *src
 	retained.Content = append([]*yaml.Node(nil), src.Content...)
 	for index := 0; index+1 < len(dst.Content); index += 2 {

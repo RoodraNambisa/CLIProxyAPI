@@ -77,6 +77,7 @@ type codexWebsocketSession struct {
 	proxyBindingID         string
 	proxyIdentity          string
 	softwareIdentity       codexauth.SoftwareIdentity
+	identityPolicyDigest   [32]byte
 	requestScopeDigest     [sha256.Size]byte
 	requestModel           string
 	cacheSessionDigest     [sha256.Size]byte
@@ -354,19 +355,24 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		return resp, err
 	}
 	clientBody := body
-	preparedIdentity := e.codexPreparedSessionIdentity(ctx, req, opts)
+	preparedIdentity := e.codexPreparedSessionIdentity(ctx, req, opts).forAuth(auth)
 	upstreamBody, identityState := applyCodexPreparedIdentityConfuseBody(e.cfg, auth, originalPayloadSource, body, preparedIdentity)
-	wsHeaders, err = prepareCodexWebsocketHeadersForURL(ctx, wsHeaders, auth, apiKey, e.cfg, parsedURLOrNil(wsURL))
+	wsHeaders, err = prepareCodexWebsocketHeadersForURL(ctx, wsHeaders, auth, apiKey, e.cfg, parsedURLOrNil(wsURL), preparedIdentity.Policy)
 	if err != nil {
 		return resp, err
 	}
-	applyCodexSoftwareIdentity(wsHeaders, auth, e.cfg, req.Model)
+	if !codexAuthUsesAPIKey(auth) {
+		helps.ApplyCodexSoftwarePolicy(wsHeaders, preparedIdentity.Policy, thinking.ParseSuffix(req.Model).ModelName)
+	}
 	applyCodexIdentityConfuseHeaders(wsHeaders, &identityState)
 	upstreamBody, sessionIdentity, err := e.projectCodexSessionIdentity(ctx, auth, req, opts, upstreamBody, &identityState)
 	if err != nil {
 		return resp, err
 	}
 	applyCodexSessionIdentityHeaders(wsHeaders, sessionIdentity, true)
+	if identityState.transform != nil {
+		identityState.transform.MapHeaders(wsHeaders)
+	}
 	helps.RestoreCodexParentThreadHeader(wsHeaders, upstreamBody)
 	upstreamBody, err = preparedIdentity.PromptCacheKey.ApplyFinal(upstreamBody, wsHeaders)
 	if err != nil {
@@ -375,10 +381,13 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		return resp, invalid
 	}
 	helps.SyncCodexWebsocketRoutingHeaders(wsHeaders, upstreamBody)
+	if !codexAuthUsesAPIKey(auth) || preparedIdentity.Policy.ConfuseEffective {
+		ctx = helps.WithCodexIdentityConnection(ctx, preparedIdentity.Policy, wsHeaders)
+	}
 	ctx = helps.WithCodexCacheSession(ctx, preparedIdentity.PromptCacheKey)
 	ctx = helps.WithCodexRequestScope(ctx, preparedIdentity.RequestScope, gjson.GetBytes(upstreamBody, "model").String())
 	ensureCodexTurnStateHeader(wsHeaders, opts.Headers)
-	guardCodexTurnStateHeader(e.cfg, auth, wsHeaders)
+	guardCodexTurnStatePolicy(preparedIdentity.Policy.TurnStatePolicy, auth, wsHeaders)
 	releasedOriginalPayload := slimCodexOriginalPayloadForTranslation(from, originalPayload)
 	releasedClientBody := slimCodexBodyForStreamUsage(clientBody)
 	originalRef, clientBodyRef, unregisterClientBodies := codexStreamBodyRefs(ctx, opts, originalPayload, clientBody, releasedOriginalPayload, releasedClientBody)
@@ -658,6 +667,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 				sess.commitMultiAgentResponseForConn(conn, multiAgentResponse)
 				helps.CacheCodexReasoningReplayFromCompleted(replayScope, payload, ctx)
 			}
+			identityState.transform.ObserveReturned(out)
 			resp = cliproxyexecutor.Response{Payload: out, Headers: codexSuccessfulResponseHeaders(auth, upstreamHeaders)}
 			return resp, nil
 		}
@@ -751,19 +761,24 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		return nil, err
 	}
 	clientBody := body
-	preparedIdentity := e.codexPreparedSessionIdentity(ctx, req, opts)
+	preparedIdentity := e.codexPreparedSessionIdentity(ctx, req, opts).forAuth(auth)
 	upstreamBody, identityState := applyCodexPreparedIdentityConfuseBody(e.cfg, auth, userPayload, body, preparedIdentity)
-	wsHeaders, err = prepareCodexWebsocketHeadersForURL(ctx, wsHeaders, auth, apiKey, e.cfg, parsedURLOrNil(wsURL))
+	wsHeaders, err = prepareCodexWebsocketHeadersForURL(ctx, wsHeaders, auth, apiKey, e.cfg, parsedURLOrNil(wsURL), preparedIdentity.Policy)
 	if err != nil {
 		return nil, err
 	}
-	applyCodexSoftwareIdentity(wsHeaders, auth, e.cfg, req.Model)
+	if !codexAuthUsesAPIKey(auth) {
+		helps.ApplyCodexSoftwarePolicy(wsHeaders, preparedIdentity.Policy, thinking.ParseSuffix(req.Model).ModelName)
+	}
 	applyCodexIdentityConfuseHeaders(wsHeaders, &identityState)
 	upstreamBody, sessionIdentity, err := e.projectCodexSessionIdentity(ctx, auth, req, opts, upstreamBody, &identityState)
 	if err != nil {
 		return nil, err
 	}
 	applyCodexSessionIdentityHeaders(wsHeaders, sessionIdentity, true)
+	if identityState.transform != nil {
+		identityState.transform.MapHeaders(wsHeaders)
+	}
 	helps.RestoreCodexParentThreadHeader(wsHeaders, upstreamBody)
 	upstreamBody, err = preparedIdentity.PromptCacheKey.ApplyFinal(upstreamBody, wsHeaders)
 	if err != nil {
@@ -772,10 +787,13 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		return nil, invalid
 	}
 	helps.SyncCodexWebsocketRoutingHeaders(wsHeaders, upstreamBody)
+	if !codexAuthUsesAPIKey(auth) || preparedIdentity.Policy.ConfuseEffective {
+		ctx = helps.WithCodexIdentityConnection(ctx, preparedIdentity.Policy, wsHeaders)
+	}
 	ctx = helps.WithCodexCacheSession(ctx, preparedIdentity.PromptCacheKey)
 	ctx = helps.WithCodexRequestScope(ctx, preparedIdentity.RequestScope, gjson.GetBytes(upstreamBody, "model").String())
 	ensureCodexTurnStateHeader(wsHeaders, opts.Headers)
-	guardCodexTurnStateHeader(e.cfg, auth, wsHeaders)
+	guardCodexTurnStatePolicy(preparedIdentity.Policy.TurnStatePolicy, auth, wsHeaders)
 	releasedOriginalPayload := slimCodexOriginalPayloadForTranslation(from, userPayload)
 	releasedClientBody := slimCodexBodyForStreamUsage(clientBody)
 	originalRef, clientBodyRef, unregisterClientBodies := codexStreamBodyRefs(ctx, opts, userPayload, clientBody, releasedOriginalPayload, releasedClientBody)
@@ -1064,6 +1082,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				out <- chunk
 				if chunk.Err == nil && len(chunk.Payload) > 0 {
 					guard.Commit()
+					identityState.transform.ObserveReturned(chunk.Payload)
 				}
 				return true
 			}
@@ -1071,6 +1090,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			case out <- chunk:
 				if chunk.Err == nil && len(chunk.Payload) > 0 {
 					guard.Commit()
+					identityState.transform.ObserveReturned(chunk.Payload)
 				}
 				return true
 			case <-ctx.Done():
@@ -1590,7 +1610,7 @@ func applyCodexWebsocketHeadersForURL(ctx context.Context, headers http.Header, 
 	return prepared
 }
 
-func prepareCodexWebsocketHeadersForURL(ctx context.Context, headers http.Header, auth *cliproxyauth.Auth, token string, cfg *config.Config, target *url.URL) (http.Header, error) {
+func prepareCodexWebsocketHeadersForURL(ctx context.Context, headers http.Header, auth *cliproxyauth.Auth, token string, cfg *config.Config, target *url.URL, policies ...config.CodexIdentityPolicy) (http.Header, error) {
 	if headers == nil {
 		headers = http.Header{}
 	}
@@ -1660,7 +1680,11 @@ func prepareCodexWebsocketHeadersForURL(ctx context.Context, headers http.Header
 	}
 	deleteHeaderCaseInsensitive(headers, "Authorization")
 	util.ApplyCustomHeadersFromAttrs(&http.Request{Header: headers}, attrs)
-	applyCodexSoftwareIdentity(headers, auth, cfg)
+	if len(policies) > 0 && !isAPIKey {
+		helps.ApplyCodexSoftwarePolicy(headers, policies[0], "")
+	} else {
+		applyCodexSoftwareIdentity(headers, auth, cfg)
+	}
 	applyCodexBetaFeatures(headers, auth, cfg, clientBetaFeatures)
 	authorization, err := codexauth.AuthorizationHeader(authMetadata(auth), token, time.Now())
 	if err != nil {
@@ -2122,6 +2146,7 @@ func (e *CodexWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *
 	currentCacheSessionDigest := sess.cacheSessionDigest
 	currentRequestScopeDigest := sess.requestScopeDigest
 	currentRequestModel := sess.requestModel
+	currentIdentityDigest := sess.identityPolicyDigest
 	sess.connMu.Unlock()
 	requestedAuthID := strings.TrimSpace(authID)
 	requestedAuthInstanceID := auth.RuntimeInstanceID()
@@ -2130,7 +2155,8 @@ func (e *CodexWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *
 	requestedWSURL := strings.TrimSpace(wsURL)
 	requestedCacheSessionDigest := helps.CodexCacheSessionDigest(ctx)
 	requestedRequestScopeDigest := helps.CodexRequestScopeDigest(ctx)
-	requestScopeChanged := conn != nil && currentRequestScopeDigest != requestedRequestScopeDigest
+	requestedIdentityDigest := helps.CodexIdentityConnectionDigest(ctx)
+	requestScopeChanged := conn != nil && (currentRequestScopeDigest != requestedRequestScopeDigest || currentIdentityDigest != requestedIdentityDigest)
 	requestedRequestModel := ""
 	if len(models) > 0 {
 		requestedRequestModel = thinking.ParseSuffix(models[0]).ModelName
@@ -2277,6 +2303,7 @@ func (e *CodexWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *
 	sess.cacheSessionDigest = requestedCacheSessionDigest
 	sess.requestScopeDigest = requestedRequestScopeDigest
 	sess.requestModel = requestedRequestModel
+	sess.identityPolicyDigest = requestedIdentityDigest
 	sess.softwareIdentity = codexauth.SoftwareIdentity{
 		UserAgent:  headers.Get("User-Agent"),
 		Version:    headers.Get("Version"),

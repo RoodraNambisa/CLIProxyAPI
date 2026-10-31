@@ -3,6 +3,7 @@ package session
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/cache"
 
 	"github.com/tidwall/gjson"
 )
@@ -17,6 +18,6 @@ func promptCacheIdentity(value gjson.Result) string {
 	if value.Type != gjson.String || value.Str == "" {
 		return ""
 	}
-	digest := sha256.Sum256([]byte(value.Str))
+	digest := sha256.Sum256([]byte(cache.CanonicalCodexSessionAlias(value.Str)))
 	return "cache:" + hex.EncodeToString(digest[:])
 }

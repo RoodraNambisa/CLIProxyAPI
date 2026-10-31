@@ -420,7 +420,7 @@ func TestCodexProjectSessionIdentityKeepsWhitespaceDistinctPromptCacheKey(t *tes
 
 func TestCodexProjectSessionIdentityKeepsConfusedWhitespaceDistinctPromptCacheKey(t *testing.T) {
 	cfg := &config.Config{
-		Routing: config.RoutingConfig{Strategy: "fill-first"},
+		Routing: config.RoutingConfig{Strategy: "fill-first", SessionAffinity: true},
 		Codex:   config.CodexConfig{IdentityConfuse: true},
 	}
 	executor := NewCodexExecutor(cfg)
@@ -449,7 +449,7 @@ func TestCodexProjectSessionIdentityKeepsConfusedWhitespaceDistinctPromptCacheKe
 
 func TestCodexProjectSessionIdentityUpdatesIdentityConfusePromptMapping(t *testing.T) {
 	cfg := &config.Config{
-		Routing: config.RoutingConfig{Strategy: "fill-first"},
+		Routing: config.RoutingConfig{Strategy: "fill-first", SessionAffinity: true},
 		Codex:   config.CodexConfig{IdentityConfuse: true},
 	}
 	executor := NewCodexExecutor(cfg)
@@ -921,7 +921,7 @@ func TestCodexProjectSessionIdentityRejectsMalformedMetadataWithoutCoolingAuth(t
 
 func TestCodexProjectSessionIdentityKeepsIdentityConfuseApplied(t *testing.T) {
 	cfg := &config.Config{
-		Routing: config.RoutingConfig{Strategy: "fill-first"},
+		Routing: config.RoutingConfig{Strategy: "fill-first", SessionAffinity: true},
 		Codex: config.CodexConfig{
 			IdentityConfuse:      true,
 			SpoofSessionIdentity: true,
@@ -974,7 +974,7 @@ func TestCodexProjectSessionIdentityKeepsIdentityConfuseApplied(t *testing.T) {
 
 func TestCodexProjectSessionIdentityConfusesCredentialHeadersBeforePriorityMerge(t *testing.T) {
 	cfg := &config.Config{
-		Routing: config.RoutingConfig{Strategy: "fill-first"},
+		Routing: config.RoutingConfig{Strategy: "fill-first", SessionAffinity: true},
 		Codex: config.CodexConfig{
 			IdentityConfuse:      true,
 			SpoofSessionIdentity: true,

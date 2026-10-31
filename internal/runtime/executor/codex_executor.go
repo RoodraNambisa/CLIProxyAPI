@@ -11,11 +11,13 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	codexauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
+	identitycache "github.com/router-for-me/CLIProxyAPI/v6/internal/cache"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/client/grokbuild"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
@@ -358,6 +360,8 @@ func codexStreamStatusErr(status int, message, code, errType string, param *gjso
 // CodexExecutor is a stateless executor for Codex (OpenAI Responses API entrypoint).
 // If api_key is unavailable on auth, it falls back to legacy via ClientAdapter.
 type CodexExecutor struct {
+	identityPolicyOnce      sync.Once
+	identityPolicies        *config.CodexIdentityPolicySet
 	regions                 *proxyregion.Service
 	cfg                     *config.Config
 	agentIdentityBaseURL    string
@@ -372,6 +376,14 @@ func (e *CodexExecutor) Identifier() string { return "codex" }
 func (*CodexExecutor) DeferAuthRequestCommitUntilUpstream() bool { return true }
 
 type codexPreparedSessionIdentity struct {
+	Policies                      *config.CodexIdentityPolicySet
+	Policy                        config.CodexIdentityPolicy
+	PolicyResolved                bool
+	OriginalPromptCache           helps.CodexPromptCacheKeySnapshot
+	OriginalChatIdentity          *helps.CodexProtocolIdentity
+	CanonicalIdentityDigest       string
+	ReturnedIdentityAlias         *identitycache.CodexIdentityAlias
+	owner                         *CodexExecutor
 	TimeContext                   helps.CodexTimeContextSnapshot
 	RequestScope                  helps.CodexRequestScope
 	IdentityConfuseEnabled        bool
@@ -427,7 +439,16 @@ func (e *CodexExecutor) PrepareProviderRequest(ctx context.Context, req cliproxy
 	if err != nil {
 		return nil, err
 	}
-	affinityKind, affinityDigest, tenantDigest, clientThreadID, spoofThreadID := codexPreparedRequestAffinity(ctx, opts, payload, turnID)
+	policies := cliproxyauth.CodexIdentityPoliciesFromContext(ctx)
+	if policies == nil {
+		policies = e.compiledIdentityPolicies()
+	}
+	var identityCapture codexIdentityCapture
+	var canonicalTarget *codexIdentityCapture
+	if policies.NeedsIdentitySource() {
+		canonicalTarget = &identityCapture
+	}
+	affinityKind, affinityDigest, tenantDigest, clientThreadID, spoofThreadID := codexPreparedRequestAffinity(ctx, opts, payload, turnID, canonicalTarget)
 	if shared := cliproxyauth.SessionAffinityFingerprint(opts); shared != "" {
 		// Reuse routing's pre-translation identity only for pool selection. Caller
 		// authorization, turn state and client thread projection stay independent.
@@ -452,6 +473,7 @@ func (e *CodexExecutor) PrepareProviderRequest(ctx context.Context, req cliproxy
 		timePolicy = e.cfg.Codex.TimeContext
 	}
 	prepared := codexPreparedSessionIdentity{
+		Policies: policies, owner: e, CanonicalIdentityDigest: identityCapture.digest, ReturnedIdentityAlias: identityCapture.alias, OriginalPromptCache: helps.SnapshotCodexPromptCacheKey(payload, policies.NeedsCacheSource(), opts.Headers, incomingHeaders),
 		TimeContext:                   helps.CodexTimeContextSnapshot{Policy: timePolicy, At: time.Now()},
 		RequestScope:                  requestScope,
 		IdentityConfuseEnabled:        codexIdentityConfuseEnabled(e.cfg),
@@ -471,15 +493,18 @@ func (e *CodexExecutor) PrepareProviderRequest(ctx context.Context, req cliproxy
 		TenantDigest:                  tenantDigest,
 		ClientThreadID:                clientThreadID,
 	}
+	if opts.SourceFormat == sdktranslator.FormatOpenAI && policies.NeedsIdentitySource() {
+		metadata := helps.SnapshotCodexProtocolMetadata(payload)
+		key := strings.Clone(gjson.GetBytes(payload, "prompt_cache_key").String())
+		if len(metadata) > 0 || key != "" {
+			prepared.OriginalChatIdentity = &helps.CodexProtocolIdentity{Metadata: metadata, CacheKey: key}
+		}
+	}
 	if e.cfg != nil {
 		clientModel := thinking.ParseSuffix(helps.PayloadRequestedModel(opts, req.Model)).ModelName
 		prepared.ServiceTierRule = config.CodexServiceTierRuleForModel(e.cfg.Codex.ServiceTierRules, clientModel)
 	}
-	if errValidate := prepared.PromptCacheKey.Validate(); errValidate != nil {
-		invalid := codexStreamStatusErr(http.StatusInternalServerError, errValidate.Error(), "invalid_prompt_cache_key", "invalid_request_error", nil)
-		invalid.skipAuthResult = true
-		return nil, cliproxyexecutor.NewGlobalProviderRequestPreparationError(invalid)
-	}
+
 	if opts.SourceFormat != sdktranslator.FormatCodex && opts.SourceFormat != sdktranslator.FormatOpenAIResponse {
 		prepared.MultiAgentV2 = helps.CodexMultiAgentPolicy{}
 	}
@@ -487,7 +512,7 @@ func (e *CodexExecutor) PrepareProviderRequest(ctx context.Context, req cliproxy
 		cliproxyexecutor.ResponseFormatOrSource(opts) == sdktranslator.FormatClaude && e.cfg != nil && e.cfg.Codex.EstimateClaudeInputTokens {
 		prepared.ClaudeInputTokensEstimate = helps.EstimateClaudeInputTokens(ctx, payload)
 	}
-	if !prepared.Enabled {
+	if !policies.NeedsSpoof() {
 		return prepared, nil
 	}
 	if spoofThreadID == "" {
@@ -502,7 +527,12 @@ func (e *CodexExecutor) PrepareProviderRequest(ctx context.Context, req cliproxy
 	return prepared, nil
 }
 
-func codexPreparedRequestAffinity(ctx context.Context, opts cliproxyexecutor.Options, payload []byte, turnID string) (string, string, string, string, string) {
+type codexIdentityCapture struct {
+	digest string
+	alias  *identitycache.CodexIdentityAlias
+}
+
+func codexPreparedRequestAffinity(ctx context.Context, opts cliproxyexecutor.Options, payload []byte, turnID string, canonical ...*codexIdentityCapture) (string, string, string, string, string) {
 	client := codexClientSessionIdentitySource(ctx, opts)
 	var bodyTurnMetadata, bodyThreadID, bodySessionID string
 	if util.JSONMayContainAnyField(payload, "client_metadata") {
@@ -526,6 +556,23 @@ func codexPreparedRequestAffinity(ctx context.Context, opts cliproxyexecutor.Opt
 	promptCacheKey := ""
 	if util.JSONMayContainAnyField(payload, "prompt_cache_key") {
 		promptCacheKey = strings.TrimSpace(gjson.GetBytes(payload, "prompt_cache_key").String())
+	}
+	if len(canonical) > 0 && canonical[0] != nil {
+		for _, value := range []string{threadID, sessionID, promptCacheKey} {
+			if alias, ok := identitycache.GlobalCodexIdentityAliases().Get("conversation", value); ok && alias.Converged && alias.SessionSlot != "" {
+				copy := alias
+				canonical[0].alias = &copy
+				break
+			}
+		}
+		// Canonicalize only known returned one-to-one aliases. Many-to-one aliases
+		// retain their value; the selected credential resolves their owned pool slot.
+		threadID = identitycache.CanonicalCodexSessionAlias(threadID)
+		sessionID = identitycache.CanonicalCodexSessionAlias(sessionID)
+		promptCacheKey = identitycache.CanonicalCodexSessionAlias(promptCacheKey)
+		if value := firstCodexPreparedIdentityValue(threadID, promptCacheKey, sessionID); value != "" {
+			canonical[0].digest = codexFingerprintDigest(value)
+		}
 	}
 	executionSessionID := executionSessionIDFromOptions(opts)
 
@@ -595,7 +642,8 @@ func codexSpoofSessionIdentityEnabled(cfg *config.Config) bool {
 // ShouldPrepareRequestAuth reports whether persistent Codex identity metadata
 // must be completed before the credential is used.
 func (e *CodexExecutor) ShouldPrepareRequestAuth(auth *cliproxyauth.Auth) bool {
-	return codexInstallationIDNeedsPreparation(auth) || codexSessionIdentityPoolNeedsPreparation(auth, e.cfg) || codexAgentIdentityNeedsTask(auth)
+	policy := helps.ResolveCodexIdentityPolicy(e.compiledIdentityPolicies(), auth)
+	return codexInstallationIDNeedsPreparation(auth, policy) || codexSessionIdentityPoolNeedsPreparation(auth, e.cfg, policy) || codexAgentIdentityNeedsTask(auth)
 }
 
 // PrepareRequestAuth prepares a stable installation ID and registers a missing
@@ -604,9 +652,10 @@ func (e *CodexExecutor) PrepareRequestAuth(ctx context.Context, auth *cliproxyau
 	if auth == nil {
 		return nil, errors.New("codex executor: auth is nil")
 	}
-	updated, _ := prepareCodexInstallationID(auth)
+	policy := helps.ResolveCodexIdentityPolicy(e.compiledIdentityPolicies(), auth)
+	updated, _ := prepareCodexInstallationID(auth, policy)
 	var err error
-	updated, _, err = prepareCodexSessionIdentityPool(updated, e.cfg)
+	updated, _, err = prepareCodexSessionIdentityPool(updated, e.cfg, policy)
 	if err != nil {
 		return nil, err
 	}
@@ -981,7 +1030,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	if err != nil {
 		return resp, err
 	}
-	if err = applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg); err != nil {
+	if err = applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg, e.codexPreparedSessionIdentity(ctx, req, opts).forAuth(auth).Policy); err != nil {
 		return resp, err
 	}
 	applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
@@ -1159,6 +1208,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 			helps.ObserveManagedStateCompletion(ctx, auth, baseModel, httpReq.Header)
 			helps.CacheCodexReasoningReplayFromCompleted(replayScope, completedData, ctx)
 		}
+		identityState.transform.ObserveReturned(out)
 		resp = cliproxyexecutor.Response{Payload: out, Headers: codexSuccessfulResponseHeaders(auth, httpResp.Header)}
 		return resp, nil
 	}
@@ -1214,7 +1264,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	if err != nil {
 		return resp, err
 	}
-	if err = applyCodexHeaders(httpReq, auth, apiKey, false, e.cfg); err != nil {
+	if err = applyCodexHeaders(httpReq, auth, apiKey, false, e.cfg, e.codexPreparedSessionIdentity(ctx, req, opts).forAuth(auth).Policy); err != nil {
 		return resp, err
 	}
 	applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
@@ -1293,6 +1343,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	if from == sdktranslator.FormatOpenAIResponse {
 		out = helps.EnsureResponsesUsageDetails(out)
 	}
+	identityState.transform.ObserveReturned(out)
 	resp = cliproxyexecutor.Response{Payload: out, Headers: codexSuccessfulResponseHeaders(auth, httpResp.Header)}
 	return resp, nil
 }
@@ -1385,7 +1436,7 @@ func (e *CodexExecutor) executeStream(ctx context.Context, auth *cliproxyauth.Au
 	if err != nil {
 		return nil, err
 	}
-	if err = applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg); err != nil {
+	if err = applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg, e.codexPreparedSessionIdentity(ctx, req, opts).forAuth(auth).Policy); err != nil {
 		return nil, err
 	}
 	applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
@@ -1521,6 +1572,7 @@ func (e *CodexExecutor) executeStream(ctx context.Context, auth *cliproxyauth.Au
 				out <- chunk
 				if chunk.Err == nil && len(chunk.Payload) > 0 {
 					guard.Commit()
+					identityState.transform.ObserveReturned(chunk.Payload)
 				}
 				return true
 			}
@@ -1530,6 +1582,7 @@ func (e *CodexExecutor) executeStream(ctx context.Context, auth *cliproxyauth.Au
 			case out <- chunk:
 				if chunk.Err == nil && len(chunk.Payload) > 0 {
 					guard.Commit()
+					identityState.transform.ObserveReturned(chunk.Payload)
 				}
 				return true
 			}
@@ -2075,6 +2128,8 @@ func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*
 }
 
 type codexIdentityConfuseState struct {
+	originalInstallationID  string
+	transform               *helps.CodexIdentityTransform
 	protectedPromptCacheKey string
 	protectedSessionID      string
 	enabled                 bool
@@ -2108,9 +2163,11 @@ func (e *CodexExecutor) applyCodexHTTPSessionIdentity(
 	rawJSON []byte,
 	identityConfuse *codexIdentityConfuseState,
 ) ([]byte, error) {
-	prepared := e.codexPreparedSessionIdentity(ctx, req, opts)
+	prepared := e.codexPreparedSessionIdentity(ctx, req, opts).forAuth(auth)
 	prepared.ResponsesLite.ApplyHeaders(httpReq.Header)
-	applyCodexSoftwareIdentity(httpReq.Header, auth, e.cfg, req.Model)
+	if !codexAuthUsesAPIKey(auth) {
+		helps.ApplyCodexSoftwarePolicy(httpReq.Header, prepared.Policy, thinking.ParseSuffix(req.Model).ModelName)
+	}
 	projected, state, err := e.projectCodexSessionIdentity(ctx, auth, req, opts, rawJSON, identityConfuse)
 	if err != nil {
 		closeCodexRequestBody(httpReq)
@@ -2118,6 +2175,9 @@ func (e *CodexExecutor) applyCodexHTTPSessionIdentity(
 	}
 	ensureCodexTurnStateHeader(httpReq.Header, opts.Headers)
 	applyCodexSessionIdentityHeaders(httpReq.Header, state, false)
+	if identityConfuse != nil && identityConfuse.transform != nil {
+		identityConfuse.transform.MapHeaders(httpReq.Header)
+	}
 	helps.RestoreCodexParentThreadHeader(httpReq.Header, projected)
 	projected, err = prepared.PromptCacheKey.ApplyFinal(projected, httpReq.Header)
 	if err != nil {
@@ -2135,7 +2195,7 @@ func (e *CodexExecutor) applyCodexHTTPSessionIdentity(
 		httpReq.Body = bodyReader
 		httpReq.ContentLength = int64(bodyReader.Len())
 	}
-	guardCodexTurnStateHeader(e.cfg, auth, httpReq.Header)
+	guardCodexTurnStatePolicy(prepared.Policy.TurnStatePolicy, auth, httpReq.Header)
 	if errState := helps.ApplyManagedState(ctx, e.cfg, auth, req.Model, httpReq.Header, httpReq.URL.String()); errState != nil {
 		return nil, errState
 	}
@@ -2153,7 +2213,7 @@ func (e *CodexExecutor) projectCodexSessionIdentity(
 	if auth == nil || codexAuthUsesAPIKey(auth) {
 		return rawJSON, codexSessionIdentityState{}, nil
 	}
-	prepared := e.codexPreparedSessionIdentity(ctx, req, opts)
+	prepared := e.codexPreparedSessionIdentity(ctx, req, opts).forAuth(auth)
 	if identityConfuse != nil && strings.TrimSpace(identityConfuse.turnIDBase) == "" {
 		identityConfuse.turnIDBase = prepared.TurnID
 	}
@@ -2193,8 +2253,11 @@ func (e *CodexExecutor) projectCodexSessionIdentity(
 		SessionID: prepared.SessionID, ThreadID: prepared.ThreadID, TurnID: prepared.TurnID,
 		WindowID: prepared.WindowID, RequestKind: prepared.RequestKind,
 	}
+	if identityConfuse != nil {
+		defaults.InstallationID = identityConfuse.originalInstallationID
+	}
 	admin := codexCredentialSessionIdentitySource(auth)
-	if identityConfuse != nil && identityConfuse.enabled {
+	if identityConfuse != nil && identityConfuse.enabled && identityConfuse.transform == nil {
 		rawJSON = applyCodexIdentityConfuseFlatTurnID(rawJSON, identityConfuse)
 		admin = applyCodexIdentityConfuseSessionSource(admin, identityConfuse)
 		client = applyCodexIdentityConfuseSessionSource(client, identityConfuse)
@@ -2204,7 +2267,13 @@ func (e *CodexExecutor) projectCodexSessionIdentity(
 		InstallationID:          fingerprint.installationID,
 		ProjectSession:          projectSession,
 	}
-	if mapContext {
+	if prepared.OriginalChatIdentity != nil && (prepared.Policy.ConfuseEffective || prepared.Policy.SpoofSessionIdentity) {
+		projection.FallbackMetadata = prepared.OriginalChatIdentity.Metadata
+	}
+	if identityConfuse != nil {
+		projection.Transform = identityConfuse.transform
+	}
+	if mapContext && projection.Transform == nil {
 		projection.ContextWindowScope = codexFingerprintAccountScope(auth)
 	}
 	if identityConfuse != nil {
@@ -2243,6 +2312,9 @@ func (e *CodexExecutor) projectCodexSessionIdentity(
 		status.skipAuthResult = true
 		return nil, codexSessionIdentityState{}, status
 	}
+	if identityConfuse != nil && identityConfuse.transform != nil {
+		identityConfuse.transform.SessionSlot = fingerprint.sessionID
+	}
 	if projection.PromptCacheKeyAlias != "" && identityConfuse != nil && identityConfuse.enabled {
 		identityConfuse.promptCacheKey = identity.SessionID
 	}
@@ -2256,7 +2328,7 @@ func (e *CodexExecutor) projectCodexSessionIdentity(
 		}
 	}
 	return projected, codexSessionIdentityState{
-		enabled: true, projectSession: projectSession, converged: converged,
+		enabled: true, projectSession: projectSession || projection.Transform != nil, converged: converged,
 		identity: identity, turnMetadata: turnMetadata,
 	}, nil
 }
@@ -2387,9 +2459,15 @@ func applyCodexSessionIdentityHeaders(headers http.Header, state codexSessionIde
 	for _, name := range []string{"Session-Id", "Session_id", "Thread-Id", "X-Codex-Window-Id"} {
 		deleteHeaderCaseInsensitive(headers, name)
 	}
-	setHeaderCasePreserved(headers, "Session-Id", state.identity.SessionID)
-	setHeaderCasePreserved(headers, "Thread-Id", state.identity.ThreadID)
-	setHeaderCasePreserved(headers, "X-Codex-Window-Id", state.identity.WindowID)
+	if state.identity.SessionID != "" {
+		setHeaderCasePreserved(headers, "Session-Id", state.identity.SessionID)
+	}
+	if state.identity.ThreadID != "" {
+		setHeaderCasePreserved(headers, "Thread-Id", state.identity.ThreadID)
+	}
+	if state.identity.WindowID != "" {
+		setHeaderCasePreserved(headers, "X-Codex-Window-Id", state.identity.WindowID)
+	}
 	if state.converged {
 		deleteHeaderCaseInsensitive(headers, "X-Client-Request-Id")
 		setHeaderCasePreserved(headers, "X-Client-Request-Id", state.identity.ThreadID)
@@ -2436,6 +2514,10 @@ func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Form
 		}
 	}
 
+	prepared := e.codexPreparedSessionIdentity(ctx, req, opts).forAuth(auth)
+	if prepared.Policy.ConfuseEffective && prepared.OriginalChatIdentity != nil && prepared.OriginalChatIdentity.CacheKey != "" {
+		cache.ID = prepared.OriginalChatIdentity.CacheKey
+	}
 	if cache.ID != "" {
 		rawJSON, _ = helps.SetStringIfDifferent(rawJSON, "prompt_cache_key", cache.ID)
 	}
@@ -2444,7 +2526,6 @@ func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Form
 		sessionHeaderID = cache.ID
 	}
 	var identityState codexIdentityConfuseState
-	prepared := e.codexPreparedSessionIdentity(ctx, req, opts)
 	if allowIdentityConfuse {
 		rawJSON, identityState = applyCodexPreparedIdentityConfuseBody(e.cfg, auth, userPayload, rawJSON, prepared)
 	} else {
@@ -2490,13 +2571,27 @@ func applyCodexIdentityConfuseBody(cfg *config.Config, auth *cliproxyauth.Auth, 
 }
 
 func applyCodexPreparedIdentityConfuseBody(cfg *config.Config, auth *cliproxyauth.Auth, userPayload, rawJSON []byte, prepared codexPreparedSessionIdentity) ([]byte, codexIdentityConfuseState) {
+	prepared = prepared.forAuth(auth)
 	enabled := prepared.IdentityConfuseEnabled
 	if !prepared.IdentityPolicyFrozen {
 		enabled = codexIdentityConfuseEnabled(cfg)
 	}
-	rawJSON, state := applyCodexIdentityConfuseBodyWithPolicy(enabled, auth, userPayload, rawJSON, prepared.PromptCacheKey.Key, prepared.TurnID)
-	state.protectedSessionID = prepared.PromptCacheKey.SessionID
-	return prepared.PromptCacheKey.Apply(rawJSON), state
+	if !enabled || auth == nil || auth.ID == "" {
+		return prepared.PromptCacheKey.Apply(rawJSON), codexIdentityConfuseState{}
+	}
+	restore := prepared.Policy.RestoreResponse
+	if !prepared.PolicyResolved {
+		restore = cfg == nil || cfg.Codex.IdentityConfuseRestoreResponse == nil || *cfg.Codex.IdentityConfuseRestoreResponse
+	}
+	state := codexIdentityConfuseState{enabled: true, authID: auth.ID, protectedPromptCacheKey: prepared.PromptCacheKey.Key, protectedSessionID: prepared.PromptCacheKey.SessionID,
+		transform: &helps.CodexIdentityTransform{Scope: auth.ID, Generation: auth.RuntimeInstanceID(), Restore: restore}}
+	state.originalInstallationID = gjson.GetBytes(userPayload, "client_metadata.x-codex-installation-id").String()
+	state.transform.ProtectedCache = state.protectedPromptCacheKey
+	state.transform.ProtectedSession = state.protectedSessionID
+	if codexAuthUsesAPIKey(auth) {
+		rawJSON = helps.RewriteCodexIdentityEnvelope(rawJSON, state.transform.Map)
+	}
+	return rawJSON, state
 }
 
 func applyCodexIdentityConfuseBodyWithCacheKey(cfg *config.Config, auth *cliproxyauth.Auth, userPayload []byte, rawJSON []byte, protectedKey string, turnIDBase ...string) ([]byte, codexIdentityConfuseState) {
@@ -2541,6 +2636,9 @@ func applyCodexIdentityConfuseHeaders(headers http.Header, state *codexIdentityC
 		return
 	}
 
+	if state.transform != nil {
+		return
+	}
 	if rawTurnMetadata := strings.TrimSpace(headers.Get("X-Codex-Turn-Metadata")); rawTurnMetadata != "" {
 		headers.Set("X-Codex-Turn-Metadata", applyCodexTurnMetadataIdentityConfuse(rawTurnMetadata, state))
 	}
@@ -2570,6 +2668,9 @@ func applyCodexTurnMetadataIdentityConfuse(rawTurnMetadata string, state *codexI
 }
 
 func applyCodexIdentityExposeResponsePayload(payload []byte, state codexIdentityConfuseState) []byte {
+	if state.transform != nil {
+		return state.transform.Response(payload)
+	}
 	// Upstream identities are already mapped. Restore directly from that snapshot;
 	// mapping them forward again can mistake a mapped ID for another original ID.
 	return helps.ReplaceCodexResponseIdentities(payload, state.responseIdentityReplacements(true))
@@ -2621,8 +2722,7 @@ func codexIdentityConfuseEnabled(cfg *config.Config) bool {
 	if cfg == nil || !cfg.Codex.IdentityConfuse {
 		return false
 	}
-	strategy := strings.ToLower(strings.TrimSpace(cfg.Routing.Strategy))
-	return cfg.Routing.SessionAffinity || strategy == "fill-first" || strategy == "fillfirst" || strategy == "ff"
+	return cfg.Routing.SessionAffinity || cfg.Routing.ClaudeCodeSessionAffinity || (cfg.Codex.IdentityConfuseRequireSessionAffinity != nil && !*cfg.Codex.IdentityConfuseRequireSessionAffinity)
 }
 
 func codexIdentityConfuseUUID(authID string, kind string, value string) string {
@@ -2649,24 +2749,24 @@ func codexIdentityConfuseTurnUUID(authID, value, timestampSource string) string 
 	return id.String()
 }
 
-func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, stream bool, cfg *config.Config) error {
+func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, stream bool, cfg *config.Config, policies ...config.CodexIdentityPolicy) error {
 	var ginHeaders http.Header
 	if ginCtx, ok := r.Context().Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
 		ginHeaders = ginCtx.Request.Header
 	}
-	return applyCodexHeadersFromSources(r, auth, token, stream, cfg, ginHeaders)
+	return applyCodexHeadersFromSources(r, auth, token, stream, cfg, ginHeaders, policies...)
 }
 
-func applyCodexDirectImageHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, stream bool, cfg *config.Config) error {
+func applyCodexDirectImageHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, stream bool, cfg *config.Config, policies ...config.CodexIdentityPolicy) error {
 	var ginHeaders http.Header
 	if ginCtx, ok := r.Context().Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
 		ginHeaders = ginCtx.Request.Header.Clone()
 		ginHeaders.Del("User-Agent")
 	}
-	return applyCodexHeadersFromSources(r, auth, token, stream, cfg, ginHeaders)
+	return applyCodexHeadersFromSources(r, auth, token, stream, cfg, ginHeaders, policies...)
 }
 
-func applyCodexHeadersFromSources(r *http.Request, auth *cliproxyauth.Auth, token string, stream bool, cfg *config.Config, ginHeaders http.Header) error {
+func applyCodexHeadersFromSources(r *http.Request, auth *cliproxyauth.Auth, token string, stream bool, cfg *config.Config, ginHeaders http.Header, policies ...config.CodexIdentityPolicy) error {
 	r.Header.Set("Content-Type", "application/json")
 	clientBetaFeatures := firstCodexHeaderValue("X-Codex-Beta-Features", r.Header, ginHeaders)
 
@@ -2722,7 +2822,11 @@ func applyCodexHeadersFromSources(r *http.Request, auth *cliproxyauth.Auth, toke
 	deleteHeaderCaseInsensitive(r.Header, "Authorization")
 	util.ApplyCustomHeadersFromAttrs(r, attrs)
 	normalizeCodexHTTPSessionHeader(r.Header, codexCustomHTTPSessionHeader(attrs))
-	applyCodexSoftwareIdentity(r.Header, auth, cfg)
+	if len(policies) > 0 && !isAPIKey {
+		helps.ApplyCodexSoftwarePolicy(r.Header, policies[0], "")
+	} else {
+		applyCodexSoftwareIdentity(r.Header, auth, cfg)
+	}
 	applyCodexBetaFeatures(r.Header, auth, cfg, clientBetaFeatures)
 	authorization, err := codexauth.AuthorizationHeader(authMetadata(auth), token, time.Now())
 	if err != nil {
@@ -3351,4 +3455,60 @@ func (e *CodexExecutor) timeContextRoute(auth *cliproxyauth.Auth, target string)
 		binding = auth.EffectiveProxyBindingID()
 	}
 	return proxyregion.Route{ProxyURL: helps.ResolvedRequestProxy(e.cfg, auth, target), BindingID: binding, OwnerID: owner, Scope: proxyregion.ScopeForTarget(target)}
+}
+
+func (e *CodexExecutor) compiledIdentityPolicies() *config.CodexIdentityPolicySet {
+	e.identityPolicyOnce.Do(func() { e.identityPolicies = config.CompileCodexIdentityPolicies(e.cfg) })
+	return e.identityPolicies
+}
+
+func (p codexPreparedSessionIdentity) forAuth(auth *cliproxyauth.Auth) codexPreparedSessionIdentity {
+	if p.Policies == nil {
+		return p
+	}
+	p.Policy = helps.ResolveCodexIdentityPolicy(p.Policies, auth)
+	p.PolicyResolved = true
+	p.IdentityConfuseEnabled = p.Policy.ConfuseEffective
+	if p.Policy.ConfuseEffective {
+		p.TenantDigest = "shared"
+		if p.CanonicalIdentityDigest != "" && p.AffinityKind != "session_affinity" {
+			p.AffinityKind = "identity"
+			p.AffinityDigest = p.CanonicalIdentityDigest
+		}
+	}
+
+	p.Enabled = p.Policy.SpoofSessionIdentity
+	p.PromptCacheKey = helps.CodexPromptCacheKeySnapshot{}
+	if p.Policy.PassthroughPromptCacheKey {
+		p.PromptCacheKey = p.OriginalPromptCache
+	}
+	return p
+}
+
+func (p codexPreparedSessionIdentity) ShouldPrepareRequestAuth(auth *cliproxyauth.Auth) bool {
+	p = p.forAuth(auth)
+	return codexInstallationIDNeedsPreparation(auth, p.Policy) || codexSessionIdentityPoolNeedsPreparation(auth, nil, p.Policy) || codexAgentIdentityNeedsTask(auth)
+}
+
+func (p codexPreparedSessionIdentity) PrepareRequestAuth(ctx context.Context, auth *cliproxyauth.Auth) (*cliproxyauth.Auth, error) {
+	p = p.forAuth(auth)
+	updated, _ := prepareCodexInstallationID(auth, p.Policy)
+	updated, _, err := prepareCodexSessionIdentityPool(updated, nil, p.Policy)
+	if err != nil {
+		return nil, err
+	}
+	if codexAgentIdentityNeedsTask(updated) {
+		if p.owner == nil {
+			return nil, fmt.Errorf("Codex identity preparation owner unavailable")
+		}
+		return p.owner.registerAgentIdentityTask(ctx, updated)
+	}
+	return updated, nil
+}
+
+func (p codexPreparedSessionIdentity) RequestAuthPreparationScope() string {
+	if p.Policies == nil {
+		return ""
+	}
+	return p.Policies.Version
 }

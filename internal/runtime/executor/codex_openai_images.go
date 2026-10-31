@@ -114,7 +114,7 @@ func (e *CodexExecutor) executeOpenAIImage(ctx context.Context, auth *cliproxyau
 	if err != nil {
 		return resp, err
 	}
-	if err = applyCodexDirectImageHeaders(httpReq, auth, apiKey, false, e.cfg); err != nil {
+	if err = applyCodexDirectImageHeaders(httpReq, auth, apiKey, false, e.cfg, e.codexPreparedSessionIdentity(ctx, req, opts).forAuth(auth).Policy); err != nil {
 		return resp, err
 	}
 	applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
@@ -163,6 +163,7 @@ func (e *CodexExecutor) executeOpenAIImage(ctx context.Context, auth *cliproxyau
 	reporter.Publish(ctx, helps.ParseOpenAIUsage(upstreamData))
 	reporter.EnsurePublished(ctx)
 	clientData := applyCodexIdentityExposeResponsePayload(upstreamData, identityState)
+	identityState.transform.ObserveReturned(clientData)
 	return cliproxyexecutor.Response{Payload: clientData, Headers: codexSuccessfulResponseHeaders(auth, httpResp.Header)}, nil
 }
 
@@ -192,7 +193,7 @@ func (e *CodexExecutor) executeOpenAIImageStream(ctx context.Context, auth *clip
 	if err != nil {
 		return nil, err
 	}
-	if err = applyCodexDirectImageHeaders(httpReq, auth, apiKey, true, e.cfg); err != nil {
+	if err = applyCodexDirectImageHeaders(httpReq, auth, apiKey, true, e.cfg, e.codexPreparedSessionIdentity(ctx, req, opts).forAuth(auth).Policy); err != nil {
 		return nil, err
 	}
 	applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
@@ -320,6 +321,7 @@ func (e *CodexExecutor) executeOpenAIImageStream(ctx context.Context, auth *clip
 				if !emitCodexOpenAIImageStreamChunk(ctx, out, cliproxyexecutor.StreamChunk{Payload: clientFrame}) {
 					return
 				}
+				identityState.transform.ObserveReturned(clientFrame)
 				if markerRequested && terminal && (readErr == nil || errors.Is(readErr, io.EOF)) {
 					streamUsage.Publish(ctx, reporter)
 					reporter.EnsurePublished(ctx)

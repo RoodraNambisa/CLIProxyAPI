@@ -17,7 +17,7 @@ func validateRequestPolicyBooleansYAML(data []byte) error {
 		name string
 		keys []string
 	}{
-		{"codex", []string{"allow-client-service-tier", "passthrough-prompt-cache-key", "stream-bootstrap-buffering", "optimize-multi-agent-v2", "orphan-delegation-compatibility", "estimate-claude-input-tokens", "observe-quota"}},
+		{"codex", []string{"identity-confuse-require-session-affinity", "identity-confuse-restore-response", "allow-client-service-tier", "passthrough-prompt-cache-key", "stream-bootstrap-buffering", "optimize-multi-agent-v2", "orphan-delegation-compatibility", "estimate-claude-input-tokens", "observe-quota"}},
 		{"routing", []string{"session-affinity-lcp", "session-affinity-subagents", "session-affinity-across-priorities", "session-affinity-use-history"}},
 	} {
 		node, err := credentialYAMLField(document.Content[0], section.name, make(map[*yaml.Node]bool))
@@ -31,6 +31,31 @@ func validateRequestPolicyBooleansYAML(data []byte) error {
 			}
 			if err := validateRequestPolicyBoolean(value, section.name+"."+key); err != nil {
 				return err
+			}
+		}
+	}
+	routing, err := credentialYAMLField(document.Content[0], "routing", make(map[*yaml.Node]bool))
+	if err != nil {
+		return err
+	}
+	overrides, err := credentialYAMLField(routing, "priority-overrides", make(map[*yaml.Node]bool))
+	if err != nil {
+		return err
+	}
+	if overrides != nil && overrides.Kind == yaml.SequenceNode {
+		for i, item := range overrides.Content {
+			codex, err := credentialYAMLField(item, "codex", make(map[*yaml.Node]bool))
+			if err != nil {
+				return err
+			}
+			for _, key := range []string{"identity-confuse", "identity-confuse-require-session-affinity", "identity-confuse-restore-response", "spoof-session-identity", "enforce-software-identity", "passthrough-prompt-cache-key"} {
+				v, err := credentialYAMLField(codex, key, make(map[*yaml.Node]bool))
+				if err != nil {
+					return err
+				}
+				if err = validateRequestPolicyBoolean(v, fmt.Sprintf("routing.priority-overrides[%d].codex.%s", i, key)); err != nil {
+					return err
+				}
 			}
 		}
 	}

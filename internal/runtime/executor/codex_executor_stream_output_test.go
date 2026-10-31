@@ -631,7 +631,7 @@ func TestCodexExecutorExecuteStream_TrustUpstreamSSEBypassesOutputRepair(t *test
 	}
 	select {
 	case payload := <-requestBody:
-		expected := codexIdentityConfuseUUID(auth.ID, "prompt-cache", "cache-1")
+		expected := helps.StableCodexIdentity(auth.ID, "cache", "cache-1")
 		if got := gjson.GetBytes(payload, "prompt_cache_key").String(); got != expected {
 			t.Fatalf("upstream prompt_cache_key = %q, want %q", got, expected)
 		}

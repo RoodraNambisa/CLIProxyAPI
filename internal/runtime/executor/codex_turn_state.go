@@ -56,15 +56,18 @@ func newCodexTurnStateOriginTracker(limit int, ttl time.Duration) *codexTurnStat
 }
 
 func guardCodexTurnStateHeader(cfg *config.Config, auth *cliproxyauth.Auth, headers http.Header) {
-	owner := codexTurnStateOwner(auth)
-	if owner == "" || headers == nil {
-		return
-	}
 	policy := config.CodexTurnStatePolicyGuardCrossAccount
 	if cfg != nil {
 		policy = cfg.Codex.ResolvedTurnStatePolicy()
 	}
-	globalCodexTurnStateOrigins.apply(policy, owner, headers, time.Now())
+	guardCodexTurnStatePolicy(policy, auth, headers)
+}
+
+func guardCodexTurnStatePolicy(policy config.CodexTurnStatePolicy, auth *cliproxyauth.Auth, headers http.Header) {
+	owner := codexTurnStateOwner(auth)
+	if owner != "" && headers != nil {
+		globalCodexTurnStateOrigins.apply(policy, owner, headers, time.Now())
+	}
 }
 
 func ensureCodexTurnStateHeader(target, source http.Header) {
