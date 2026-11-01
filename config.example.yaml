@@ -11,6 +11,12 @@ tls:
   cert: ""
   key: ""
 
+# Shared live-traffic display preferences for every management browser.
+# Both panels are visible by default; hiding them stops the corresponding UI polling.
+management-ui:
+  api-key-traffic: true
+  credential-traffic: true
+
 # Management API settings
 remote-management:
   # Whether to allow remote (non-localhost) management access.

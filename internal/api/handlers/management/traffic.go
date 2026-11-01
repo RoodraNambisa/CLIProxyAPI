@@ -59,5 +59,5 @@ func (h *Handler) batchTraffic(c *gin.Context, keys bool) {
 }
 
 func (h *Handler) GetAdmissionOptions(c *gin.Context) {
-	c.JSON(200, gin.H{"features": gin.H{"admission": true, "traffic": true, "credential_concurrency": true, "key_rpm": true, "queue": true}})
+	c.JSON(200, gin.H{"features": gin.H{"admission": true, "traffic": true, "credential_concurrency": true, "key_rpm": true, "queue": true, "management_ui": true}})
 }

@@ -290,8 +290,10 @@ func mergedConfigContainsDeprecatedAmp(node *yaml.Node, visited map[*yaml.Node]s
 
 // Config represents the application's configuration, loaded from a YAML file.
 type Config struct {
-	ProxyIP   *ProxyIPConfig `yaml:"proxy-ip,omitempty" json:"proxy-ip,omitempty"`
-	SDKConfig `yaml:",inline"`
+	// ManagementUI stores shared control-panel display preferences.
+	ManagementUI ManagementUIConfig `yaml:"management-ui,omitempty" json:"management-ui"`
+	ProxyIP      *ProxyIPConfig     `yaml:"proxy-ip,omitempty" json:"proxy-ip,omitempty"`
+	SDKConfig    `yaml:",inline"`
 	// Host is the network host/interface on which the API server will bind.
 	// Default is empty ("") to bind all interfaces (IPv4 + IPv6). Use "127.0.0.1" or "localhost" for local-only access.
 	Host string `yaml:"host" json:"-"`
@@ -4577,6 +4579,10 @@ func isKnownDefaultValue(path []string, node *yaml.Node) bool {
 		return false
 	}
 	fullPath := strings.Join(path, ".")
+	if fullPath == "management-ui" || strings.HasPrefix(fullPath, "management-ui.") {
+		// Explicit false hides a panel; omission keeps it visible.
+		return false
+	}
 	if fullPath == "routing.priority-overrides.codex" || strings.HasPrefix(fullPath, "routing.priority-overrides.codex.") {
 		return false
 	}

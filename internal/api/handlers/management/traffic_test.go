@@ -36,6 +36,28 @@ func TestTrafficBatchUsesOpaqueIDsAndCapsRequests(t *testing.T) {
 		t.Fatalf("unbounded batch: %d", w.Code)
 	}
 }
+
+func TestAuthFileLimitSummaryIncludesConcurrencyWithoutTraffic(t *testing.T) {
+	rpm, concurrency := 20, 3
+	cfg := &config.Config{Routing: config.RoutingConfig{PriorityOverrides: []config.RoutingPriorityOverride{{
+		Priority: 5, PerAuthRequestLimit: &rpm, PerAuthConcurrency: &concurrency,
+	}}}}
+	m := coreauth.NewManager(nil, nil, nil)
+	defer m.TrafficController().Close()
+	m.SetConfig(cfg)
+	h := NewHandlerWithoutConfigFilePath(cfg, m)
+	a := &coreauth.Auth{ID: "idle", Provider: "codex", Status: coreauth.StatusActive,
+		Attributes: map[string]string{"runtime_only": "true", "priority": "5"}}
+	entry := h.buildAuthFileEntry(a)
+	if entry == nil {
+		t.Fatal("missing idle credential")
+	}
+	summary, ok := entry["request_limit"].(coreauth.RequestLimitSummary)
+	if !ok || summary.Limit != 20 || summary.Source != "priority" ||
+		summary.ConcurrencyLimit != 3 || summary.ConcurrencySource != "priority" {
+		t.Fatalf("incomplete configured limits: %+v", entry["request_limit"])
+	}
+}
 func TestTrafficOverviewBoundsPointsAndValidatesWindow(t *testing.T) {
 	m := coreauth.NewManager(nil, nil, nil)
 	defer m.TrafficController().Close()

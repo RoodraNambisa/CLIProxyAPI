@@ -1,10 +1,69 @@
 package auth
 
 import (
+	"fmt"
 	"testing"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 )
+
+func TestRequestLimitSummaryIncludesIndependentConcurrencyPolicy(t *testing.T) {
+	rpm, priorityConcurrency, planConcurrency, unlimited := 20, 4, 2, 0
+	cfg := &config.Config{Routing: config.RoutingConfig{
+		PerAuthRequestLimit: 100, PerAuthRequestWindowMinutes: 1, PerAuthConcurrency: 8,
+		PriorityOverrides: []config.RoutingPriorityOverride{{
+			Priority: 5, PerAuthRequestLimit: &rpm, PerAuthConcurrency: &priorityConcurrency,
+			SubscriptionOverrides: []config.RoutingSubscriptionOverride{
+				{Providers: []string{"codex"}, PlanTypes: []string{"pro"}, PerAuthConcurrency: &planConcurrency},
+				{Credentials: []string{"selected"}, PerAuthConcurrency: &unlimited},
+			},
+		}},
+	}}
+	m := NewManager(nil, nil, nil)
+	defer m.TrafficController().Close()
+	m.SetConfig(cfg)
+	for i, tc := range []struct {
+		id, priority, provider, plan string
+		concurrency, rpm             int
+		concurrencySource, rpmSource string
+		concurrencyRule              int
+	}{
+		{"global", "3", "codex", "pro", 8, 100, "global", "global", 0},
+		{"priority", "5", "claude", "", 4, 20, "priority", "priority", 0},
+		{"plan", "5", "codex", "pro", 2, 20, "subscription", "priority", 1},
+		{"selected", "5", "codex", "pro", 0, 20, "credential", "priority", 2},
+	} {
+		t.Run(tc.id, func(t *testing.T) {
+			a, err := m.Register(WithSkipPersist(t.Context()), &Auth{
+				ID: tc.id, Index: fmt.Sprint("scope-", i), Provider: tc.provider,
+				Attributes: map[string]string{"priority": tc.priority, "plan_type": tc.plan},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			summary := m.AuthRequestLimitSummary(a)
+			actual := m.routingAuthRequestLimitPolicyForAuth(a)
+			if summary.ConcurrencyLimit != tc.concurrency || summary.ConcurrencySource != tc.concurrencySource ||
+				summary.ConcurrencyRule != tc.concurrencyRule || summary.Limit != tc.rpm ||
+				summary.Source != tc.rpmSource || summary.ConcurrencyLimit != actual.concurrency {
+				t.Fatalf("summary does not match independent scheduler policies: %+v", summary)
+			}
+			snapshots := m.CredentialTraffic([]string{a.Index}, time.Now())
+			if len(snapshots) != 1 || snapshots[0].Limit != tc.concurrency ||
+				snapshots[0].ConcurrencySource != tc.concurrencySource || snapshots[0].Source != tc.rpmSource ||
+				snapshots[0].Active != 0 {
+				t.Fatalf("idle credential snapshot lost its configured limits: %+v", snapshots)
+			}
+		})
+	}
+	cfg.Routing.PriorityOverrides[0].PerAuthConcurrency = new(7)
+	m.SetConfig(cfg)
+	a, _ := m.GetByID("priority")
+	if got := m.AuthRequestLimitSummary(a); got.ConcurrencyLimit != 7 || got.Limit != 20 {
+		t.Fatalf("updated concurrency is stale or changed RPM: %+v", got)
+	}
+}
 
 func TestProviderOnlyRequestLimitsApplyAcrossProviders(t *testing.T) {
 	for _, provider := range []string{"codex", "chatgpt-web", "xai", "claude", "gemini", "gemini-interactions", "antigravity", "vertex", "aistudio", "kimi", "custom-compat"} {

@@ -201,26 +201,7 @@ func (m *Manager) CredentialTraffic(indexes []string, now time.Time) []admission
 				limiter.mu.Unlock()
 			}
 		}
-		v.ConcurrencySource = "global"
-		if cfg := m.currentConfig(); cfg != nil {
-			for _, rule := range cfg.Routing.PriorityOverrides {
-				if rule.Priority != p.priority {
-					continue
-				}
-				if rule.PerAuthConcurrency != nil {
-					v.ConcurrencySource = "priority"
-				}
-				for layer, index := range routingSubscriptionMatchIndexes(rule.SubscriptionOverrides, a) {
-					if index >= 0 && rule.SubscriptionOverrides[index].PerAuthConcurrency != nil {
-						v.ConcurrencySource = "subscription"
-						if layer == 1 {
-							v.ConcurrencySource = "credential"
-						}
-					}
-				}
-				break
-			}
-		}
+		v.ConcurrencySource = summary.ConcurrencySource
 		v.QueueScope = admissionRouteGroup(p.priority)
 		v.Queued, _ = m.admission.Queue.Counts(admissionRouteGroup(p.priority))
 		out = append(out, v)

@@ -18,6 +18,9 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	}
 
 	// Simple scalars
+	if !reflect.DeepEqual(oldCfg.ManagementUI, newCfg.ManagementUI) {
+		changes = append(changes, "management-ui: display preferences updated")
+	}
 	if oldCfg.Port != newCfg.Port {
 		changes = append(changes, fmt.Sprintf("port: %d -> %d", oldCfg.Port, newCfg.Port))
 	}

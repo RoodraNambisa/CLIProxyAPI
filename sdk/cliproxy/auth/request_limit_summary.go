@@ -1,17 +1,20 @@
 package auth
 
-// RequestLimitSummary exposes the policy used by the scheduler, not a
-// simultaneous-request concurrency limit or the provider's own quota.
+// RequestLimitSummary exposes independent request-window and concurrency policies
+// used by the scheduler, rather than the provider's own quota.
 type RequestLimitSummary struct {
-	Limit         int    `json:"limit"`
-	WindowMinutes int    `json:"window_minutes"`
-	Source        string `json:"source"`
-	Priority      int    `json:"priority"`
-	Rule          int    `json:"rule,omitempty"`
+	Limit             int    `json:"limit"`
+	WindowMinutes     int    `json:"window_minutes"`
+	Source            string `json:"source"`
+	Priority          int    `json:"priority"`
+	Rule              int    `json:"rule,omitempty"`
+	ConcurrencyLimit  int    `json:"concurrency_limit"`
+	ConcurrencySource string `json:"concurrency_source"`
+	ConcurrencyRule   int    `json:"concurrency_rule,omitempty"`
 }
 
 func (m *Manager) AuthRequestLimitSummary(auth *Auth) RequestLimitSummary {
-	result := RequestLimitSummary{WindowMinutes: 1, Source: "global", Priority: authPriority(auth)}
+	result := RequestLimitSummary{WindowMinutes: 1, Source: "global", ConcurrencySource: "global", Priority: authPriority(auth)}
 	if m == nil || m.scheduler == nil {
 		return result
 	}
@@ -20,6 +23,10 @@ func (m *Manager) AuthRequestLimitSummary(auth *Auth) RequestLimitSummary {
 	defer s.mu.RUnlock()
 	policy := s.requestLimitPolicyForAuthLocked(auth)
 	result.Limit, result.WindowMinutes = policy.limit, policy.windowMinutes
+	result.ConcurrencyLimit = policy.concurrency
+	if _, concurrencyOverride := s.priorityConcurrency[result.Priority]; concurrencyOverride {
+		result.ConcurrencySource = "priority"
+	}
 	_, limitOverride := s.priorityRequestLimits[result.Priority]
 	_, windowOverride := s.priorityRequestWindows[result.Priority]
 	if limitOverride || windowOverride {
@@ -28,12 +35,15 @@ func (m *Manager) AuthRequestLimitSummary(auth *Auth) RequestLimitSummary {
 	for layer, index := range routingSubscriptionMatchIndexes(s.prioritySubscriptionRules[result.Priority], auth) {
 		if index >= 0 {
 			rule := s.prioritySubscriptionRules[result.Priority][index]
-			if rule.PerAuthRequestLimit == nil && rule.PerAuthRequestWindowMinutes == nil {
-				continue
-			}
-			result.Source, result.Rule = "subscription", index+1
+			source := "subscription"
 			if layer == 1 {
-				result.Source = "credential"
+				source = "credential"
+			}
+			if rule.PerAuthRequestLimit != nil || rule.PerAuthRequestWindowMinutes != nil {
+				result.Source, result.Rule = source, index+1
+			}
+			if rule.PerAuthConcurrency != nil {
+				result.ConcurrencySource, result.ConcurrencyRule = source, index+1
 			}
 		}
 	}
