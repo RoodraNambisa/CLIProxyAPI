@@ -208,3 +208,23 @@ func TestFillOrderEndpointScopeUsesEffectiveOAuthAddress(t *testing.T) {
 		t.Fatal("upstream identity conflated")
 	}
 }
+
+func TestFillOrderRPMIndexFollowsRequestPolicyGeneration(t *testing.T) {
+	scheduler := newSchedulerForTest(&FillFirstSelector{}, &Auth{ID: "a", Provider: "test"}, &Auth{ID: "b", Provider: "test"})
+	scheduler.setRoutingConfig(config.RoutingConfig{Strategy: "fill-first", FillFirstPerAuthRPM: 1})
+	for range 2 {
+		if _, err := scheduler.pickSingle(t.Context(), "test", "", core.Options{}, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := scheduler.pickSingle(t.Context(), "test", "", core.Options{}, nil); err == nil {
+		t.Fatal("expected legacy RPM exhaustion")
+	}
+	scheduler.setRoutingConfig(config.RoutingConfig{Strategy: "fill-first", FillFirstPerAuthRPM: 1, PerAuthRequestLimit: 2, PerAuthRequestWindowMinutes: 1})
+	for range 2 {
+		a, err := scheduler.pickSingle(t.Context(), "test", "", core.Options{}, nil)
+		if err != nil || a == nil || a.ID != "a" {
+			t.Fatal("stale RPM exclusions survived policy update", a, err)
+		}
+	}
+}

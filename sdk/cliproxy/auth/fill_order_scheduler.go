@@ -100,21 +100,22 @@ func (m *Manager) fillRPMAvailable(a *Auth, ctxPolicy *routingRequestPolicy) boo
 // Legacy fill RPM has its own minute window. This ordered exclusion index is
 // rebuilt only at the minute boundary or after a view/configuration change.
 type fillRPMIndex struct {
-	window int64
-	limit  int
-	order  requestLimitReadyIndex
+	generation uint64
+	window     int64
+	limit      int
+	order      requestLimitReadyIndex
 }
 
-func (v *readyView) rpmIndex(l *fillFirstMinuteLimiter, limit int) *fillRPMIndex {
+func (v *readyView) rpmIndex(l *fillFirstMinuteLimiter, limit int, generation uint64) *fillRPMIndex {
 	window := fillFirstMinuteWindow(l.nowTime())
-	if v.fillRPM == nil || v.fillRPM.window != window || v.fillRPM.limit != limit {
-		v.fillRPM = &fillRPMIndex{window: window, limit: limit}
+	if v.fillRPM == nil || v.fillRPM.window != window || v.fillRPM.limit != limit || v.fillRPM.generation != generation {
+		v.fillRPM = &fillRPMIndex{window: window, limit: limit, generation: generation}
 		v.fillRPM.order.reset(v.flat)
 	}
 	return v.fillRPM
 }
-func (v *readyView) excludeFillRPM(entry *scheduledAuth, l *fillFirstMinuteLimiter, limit int) {
-	idx := v.rpmIndex(l, limit)
+func (v *readyView) excludeFillRPM(entry *scheduledAuth, l *fillFirstMinuteLimiter, limit int, generation uint64) {
+	idx := v.rpmIndex(l, limit, generation)
 	if _, exists := idx.order.positions[entry.auth.ID]; !exists {
 		return
 	}
@@ -137,7 +138,7 @@ func (v *readyView) firstFillGroupAvailable(policy func(*Auth) authRequestLimitP
 	}
 	var ri *fillRPMIndex
 	if rpm != nil && rpmLimit > 0 {
-		ri = v.rpmIndex(rpm, rpmLimit)
+		ri = v.rpmIndex(rpm, rpmLimit, l.generationAtomic.Load())
 	}
 	var block authRequestLimitBlock
 	rpmLimited := ri != nil && len(ri.order.positions) < len(v.flat)
@@ -177,7 +178,7 @@ func (v *readyView) firstFillGroupAvailable(policy func(*Auth) authRequestLimitP
 			continue
 		}
 		if p.limit == 0 && rpm != nil && rpmLimit > 0 && !rpm.availableAt(e.auth.ID, rpmLimit, rpm.nowTime()) {
-			v.excludeFillRPM(e, rpm, rpmLimit)
+			v.excludeFillRPM(e, rpm, rpmLimit, l.generationAtomic.Load())
 			rpmLimited = true
 			continue
 		}
@@ -287,7 +288,7 @@ func pickOrderedFillGroup(providers []string, shards []*modelScheduler, priority
 				continue
 			}
 			if p.limit == 0 && rpm != nil && rpmLimit > 0 && !rpm.availableAt(e.auth.ID, rpmLimit, rpm.nowTime()) {
-				views[best].excludeFillRPM(e, rpm, rpmLimit)
+				views[best].excludeFillRPM(e, rpm, rpmLimit, l.generationAtomic.Load())
 				rpmLimited = true
 				continue
 			}
@@ -315,7 +316,7 @@ func pickOrderedFillGroup(providers []string, shards []*modelScheduler, priority
 				if p.requestSlot != nil {
 					p.requestSlot.FinishReservation()()
 				}
-				candidateViews[c.providerKey].excludeFillRPM(c.entry, rpm, rpmLimit)
+				candidateViews[c.providerKey].excludeFillRPM(c.entry, rpm, rpmLimit, l.generationAtomic.Load())
 				rpmLimited = true
 				continue
 			}
