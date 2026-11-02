@@ -333,9 +333,9 @@ func parseAuthFilesListQuery(c *gin.Context, pagination bool) (authFilesListQuer
 	}
 	query.sort = authFilesFilterValue(sortValue, "default")
 	switch query.sort {
-	case "default", "az", "priority":
+	case "default", "az", "priority", "fill-order":
 	default:
-		return query, fmt.Errorf("sort must be default, az, or priority")
+		return query, fmt.Errorf("sort must be default, az, priority, or fill-order")
 	}
 	query.search = strings.TrimSpace(searchValue)
 	for name, value := range map[string]string{
@@ -753,8 +753,20 @@ func authFileRecordMatchesSearch(record *authFileListRecord, query authFilesList
 func sortAuthFileRecords(records []*authFileListRecord, mode string) {
 	sort.SliceStable(records, func(i, j int) bool {
 		a, b := records[i], records[j]
-		if mode == "priority" && a.priority != b.priority {
+		if (mode == "priority" || mode == "fill-order") && a.priority != b.priority {
 			return a.priority > b.priority
+		}
+		if mode == "fill-order" {
+			left, right := a.auth.FillOrderRank(), b.auth.FillOrderRank()
+			if left != right {
+				if left == 0 {
+					return false
+				}
+				if right == 0 {
+					return true
+				}
+				return left < right
+			}
 		}
 		if mode == "default" {
 			providerCompare := strings.Compare(strings.ToLower(a.provider), strings.ToLower(b.provider))

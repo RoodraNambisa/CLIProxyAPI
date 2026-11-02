@@ -200,15 +200,16 @@ func managementAuthCatalogSummary(auth *Auth, planType string) *Auth {
 		return nil
 	}
 	summary := &Auth{
-		ID:            strings.TrimSpace(auth.ID),
-		Index:         strings.TrimSpace(auth.Index),
-		Provider:      strings.TrimSpace(auth.Provider),
-		FileName:      strings.TrimSpace(auth.FileName),
-		Label:         strings.TrimSpace(auth.Label),
-		Status:        auth.Status,
-		StatusMessage: "",
-		Disabled:      auth.Disabled,
-		Unavailable:   auth.Unavailable,
+		fillOrderRecord: auth.fillOrderRecord,
+		ID:              strings.TrimSpace(auth.ID),
+		Index:           strings.TrimSpace(auth.Index),
+		Provider:        strings.TrimSpace(auth.Provider),
+		FileName:        strings.TrimSpace(auth.FileName),
+		Label:           strings.TrimSpace(auth.Label),
+		Status:          auth.Status,
+		StatusMessage:   "",
+		Disabled:        auth.Disabled,
+		Unavailable:     auth.Unavailable,
 	}
 	if strings.TrimSpace(auth.StatusMessage) != "" {
 		summary.StatusMessage = "problem"
@@ -615,6 +616,11 @@ func (m *Manager) installAuthLocked(id string, auth *Auth) {
 	}
 	if id == "" {
 		return
+	}
+	if m.fillOrder != nil && m.fillOrderReady.Load() {
+		if record, ok := m.fillOrder.Lookup(id); ok {
+			auth.fillOrderRecord = &record
+		}
 	}
 	m.removeAuthIndexesLocked(id)
 	// Carry observations only across installations of the same live credential.

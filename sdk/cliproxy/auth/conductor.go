@@ -23,6 +23,7 @@ import (
 	chatgptwebauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/chatgptweb"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/authfileguard"
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/fillorder"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
@@ -410,6 +411,10 @@ type hookState struct {
 
 // Manager orchestrates auth lifecycle, selection, execution, and persistence.
 type Manager struct {
+	fillOrder          *fillorder.Store
+	fillOrderReady     atomic.Bool
+	fillOrderMutation  sync.Mutex
+	fillOrderDeleted   sync.Map
 	admission          *admission.Controller
 	responseModelStats responseModelStats
 	errorHistory       map[string]*authErrorHistory
@@ -4229,6 +4234,7 @@ func (m *Manager) deleteIf(ctx context.Context, id string, predicate func(*Auth)
 		return false, deleteErr
 	}
 
+	deleteErr = errors.Join(deleteErr, m.forgetFillOrderAfterDelete(id))
 	m.cleanupRemovedAuthRuntimeStateAfterQuarantine(id)
 	unlockPersist()
 	unlockDependency()
@@ -4335,6 +4341,11 @@ func (m *Manager) deleteWithOperation(ctx context.Context, id string, operation 
 		}
 		m.mu.Unlock()
 		if removed {
+			orderErr := m.forgetFillOrderAfterDelete(id)
+			if orderErr != nil {
+				errOperation = errors.Join(errOperation, orderErr)
+				outcome = DeleteOutcomeUncertain
+			}
 			m.cleanupRemovedAuthRuntimeStateAfterQuarantine(id)
 		}
 		unlockPersist()
@@ -4365,7 +4376,9 @@ func (m *Manager) deleteWithOperation(ctx context.Context, id string, operation 
 	}
 	m.recordPersistedAuthDeleteLocked(id)
 	m.mu.Unlock()
+	var orderErr error
 	if removed {
+		orderErr = m.forgetFillOrderAfterDelete(id)
 		m.cleanupRemovedAuthRuntimeStateAfterQuarantine(id)
 	}
 	unlockPersist()
@@ -4374,7 +4387,7 @@ func (m *Manager) deleteWithOperation(ctx context.Context, id string, operation 
 	if deleted != nil {
 		m.finishAuthSessionCleanup(id, deleted, "auth_removed", nil)
 	}
-	return nil
+	return orderErr
 }
 
 // Load resets manager state from the backing store.
@@ -4489,6 +4502,20 @@ func (m *Manager) LoadWithReport(ctx context.Context) (StoreLoadReport, error) {
 			loadedAuth.instanceState = &authInstanceState{}
 		}
 		loaded[auth.ID] = loadedAuth
+	}
+	if m.FillOrderSupported() {
+		inputs := make([]fillorder.Input, 0, len(loaded))
+		for _, a := range loaded {
+			inputs = append(inputs, m.fillOrderInput(a))
+		}
+		if errOrder := m.fillOrder.Reconcile(inputs); errOrder != nil {
+			return report, errOrder
+		}
+		for id, a := range loaded {
+			if r, ok := m.fillOrder.Lookup(id); ok {
+				a.fillOrderRecord = &r
+			}
+		}
 	}
 	schedulerAuths := make([]*Auth, 0, len(loaded))
 	for _, auth := range loaded {
@@ -5224,6 +5251,9 @@ func (m *Manager) installPreparedRequestAuthWithRuntimeMetadata(
 	if expectedSourceHash != "" && m.SupportsSourceConditionalSave() {
 		persistCtx = WithSourceHashSavePrecondition(persistCtx, expectedSourceHash)
 	}
+	if refreshAware {
+		persistCtx = context.WithValue(persistCtx, trustedFillRefreshKey{}, true)
+	}
 	if errPersist := m.persistWithoutLock(persistCtx, candidate, false); errPersist != nil {
 		return nil, requestAuthPersistenceError{err: errPersist}
 	}
@@ -5886,7 +5916,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		cliproxyexecutor.AddResponseGuardExclusions(ctx, roundState.tried)
 		selectionStarted := time.Now()
 		requestSlotBefore := opts.AuthRequestSlot.ReservationDurationNanos()
-		opts = m.withSessionAffinityResultSnapshot(ctx, providers, routeModel, opts)
+		opts = m.withSessionAffinityResultSnapshot(ctx, providers, routeModel, opts, req.Payload)
 		auth, executor, provider, errPick := m.pickNextMixedWithImageToolFallback(ctx, providers, routeModel, req, opts, roundState.tried, pickAllowed)
 		observeImageRequestSelectionPhases(opts.Metadata, opts.AuthRequestSlot, selectionStarted, requestSlotBefore)
 		if errPick != nil {
@@ -6183,7 +6213,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			}
 			return cliproxyexecutor.Response{}, &Error{Code: "request_body_released", Message: "request body released; retry disabled"}
 		}
-		opts = m.withSessionAffinityResultSnapshot(ctx, providers, routeModel, opts)
+		opts = m.withSessionAffinityResultSnapshot(ctx, providers, routeModel, opts, req.Payload)
 		auth, executor, provider, errPick := m.pickNextMixed(ctx, providers, routeModel, opts, roundState.tried, pickAllowed)
 		if errPick != nil {
 			if chatGPTWebImageQuotaRefreshPendingError(errPick) {
@@ -6470,7 +6500,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		cliproxyexecutor.AddResponseGuardExclusions(ctx, roundState.tried)
 		selectionStarted := time.Now()
 		requestSlotBefore := opts.AuthRequestSlot.ReservationDurationNanos()
-		opts = m.withSessionAffinityResultSnapshot(ctx, providers, routeModel, opts)
+		opts = m.withSessionAffinityResultSnapshot(ctx, providers, routeModel, opts, req.Payload)
 		auth, executor, provider, errPick := m.pickNextMixedWithImageToolFallback(ctx, providers, routeModel, req, opts, roundState.tried, pickAllowed)
 		observeImageRequestSelectionPhases(opts.Metadata, opts.AuthRequestSlot, selectionStarted, requestSlotBefore)
 		if errPick != nil {
@@ -10664,7 +10694,7 @@ func authIsRuntimeOnly(auth *Auth) bool {
 	return strings.EqualFold(strings.TrimSpace(auth.Attributes["runtime_only"]), "true")
 }
 
-func (m *Manager) persistWithoutLock(ctx context.Context, auth *Auth, syncCurrentHash bool) error {
+func (m *Manager) persistAuthWithoutLock(ctx context.Context, auth *Auth, syncCurrentHash bool) error {
 	if errRules := prepareAuthRequestScopedErrors(auth); errRules != nil {
 		return errRules
 	}
@@ -10693,7 +10723,7 @@ func (m *Manager) persistWithoutLock(ctx context.Context, auth *Auth, syncCurren
 	return nil
 }
 
-func (m *Manager) persistNewWithoutLock(ctx context.Context, auth *Auth) error {
+func (m *Manager) persistNewAuthWithoutLock(ctx context.Context, auth *Auth) error {
 	if errRules := prepareAuthRequestScopedErrors(auth); errRules != nil {
 		return errRules
 	}

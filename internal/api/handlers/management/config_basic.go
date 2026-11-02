@@ -34,6 +34,8 @@ type safeRemoteManagementConfig struct {
 
 type configResponse struct {
 	AuthModelExclusionsImagePrioritySupported bool   `json:"auth-model-exclusions-image-priority-supported"`
+	FillOrderSupported                        bool   `json:"fill-order-supported"`
+	SessionAffinityCapacitySpilloverSupported bool   `json:"session-affinity-capacity-spillover-supported"`
 	CodexIdentityPolicySupported              bool   `json:"codex-identity-policy-supported"`
 	AdmissionSupported                        bool   `json:"admission-supported"`
 	TrafficSupported                          bool   `json:"traffic-supported"`
@@ -63,7 +65,7 @@ func (h *Handler) GetConfig(c *gin.Context) {
 	}
 	c.JSON(200, &configResponse{
 		AuthModelExclusionsImagePrioritySupported: true,
-		RuntimeRole: role, AdmissionSupported: true, TrafficSupported: true, CodexIdentityPolicySupported: true,
+		RuntimeRole: role, FillOrderSupported: h.authManager != nil && h.authManager.FillOrderSupported(), SessionAffinityCapacitySpilloverSupported: true, AdmissionSupported: true, TrafficSupported: true, CodexIdentityPolicySupported: true,
 		Config: &snapshot,
 		RemoteManagement: safeRemoteManagementConfig{
 			LiveLogs: cfg.RemoteManagement.LiveLogs,
@@ -763,7 +765,7 @@ func (h *Handler) GetRoutingPriorityOverrides(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
 		return
 	}
-	c.JSON(200, gin.H{"priority-overrides": cfg.Routing.PriorityOverrides, "features": gin.H{"credential_request_limits": true, "codex_identity_policy": true}})
+	c.JSON(200, gin.H{"priority-overrides": cfg.Routing.PriorityOverrides, "features": gin.H{"credential_request_limits": true, "codex_identity_policy": true, "session_affinity_capacity_spillover": true}})
 }
 
 func (h *Handler) PutRoutingPriorityOverrides(c *gin.Context) {

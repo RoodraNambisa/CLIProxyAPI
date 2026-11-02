@@ -7,32 +7,10 @@ import (
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 )
 
-type CodexUpstream struct {
-	BaseURL string
-	Source  string
-}
+type CodexUpstream = coreauth.CodexUpstream
 
-// ResolveCodexUpstream keeps explicit credential/API-key addresses authoritative.
-// The provider default applies only to OAuth credentials, including agent identities.
 func ResolveCodexUpstream(auth *coreauth.Auth, cfg *config.Config) CodexUpstream {
-	apiKey := codexUsesAPIKeyAuth(auth)
-	if auth != nil {
-		for _, value := range []string{auth.Attributes["base_url"], codexMetadataString(auth, "base_url")} {
-			if value = strings.TrimSpace(value); value != "" {
-				// API-key Alpha Search URLs may contain a query ending in '/'.
-				if !apiKey {
-					value = strings.TrimRight(value, "/")
-				}
-				return CodexUpstream{BaseURL: value, Source: "credential"}
-			}
-		}
-	}
-	if !apiKey && cfg != nil {
-		if baseURL := strings.TrimRight(strings.TrimSpace(cfg.Codex.BaseURL), "/"); baseURL != "" {
-			return CodexUpstream{BaseURL: baseURL, Source: "global"}
-		}
-	}
-	return CodexUpstream{BaseURL: config.DefaultCodexBaseURL, Source: "official"}
+	return coreauth.ResolveCodexUpstream(auth, cfg)
 }
 
 func codexUsesAPIKeyAuth(auth *coreauth.Auth) bool {

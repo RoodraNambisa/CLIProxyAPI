@@ -602,6 +602,8 @@ routing:
   # Configure weight on each API-key entry or in an OAuth credential JSON file.
   # Strategy choices are fixed per logical request; credential edits apply on
   # the next selection attempt. Capacity and credential retirement stay live.
+  # Fill order is persisted under .cli-proxy-api beside this configuration.
+  # New records append; priority changes retain order; management supports atomic moves.
   fill-first-range: 1 # fill-first only; N credentials per fill group, group-internal random
   fill-first-per-auth-rpm: 0 # fill-first only; 0 disables; mutually exclusive with fill-first-range > 1
   per-auth-request-limit: 0 # all strategies; 0 disables the generic per-auth fixed-window limit
@@ -670,6 +672,10 @@ routing:
   # Requires session affinity. Cold selection and failover still follow priority.
   # Boolean only; hot reload applies to new requests, not in-flight routing policy.
   session-affinity-across-priorities: false
+  # On local concurrency saturation, wait for the bound credential first; if the queue
+  # is full or expires, borrow another available credential without rebinding.
+  # Requires session affinity and failover. Priority overrides accept true/false.
+  session-affinity-capacity-spillover: false
   # Prefer an eligible parent's credential for explicit subagents and forks
   # without an existing binding. Requires session-affinity and a trusted caller
   # scope. Boolean only, default false; hot reload affects new requests only.

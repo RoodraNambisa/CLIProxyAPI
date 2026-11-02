@@ -5357,6 +5357,15 @@ func (s *Service) Run(ctx context.Context) error {
 		s.startupState.AddIssue("watcher_initial_sync", "watcher_initial_sync_failed", "error")
 		return s.waitForFailedStartup(ctx, fmt.Errorf("cliproxy: wait for initial auth updates: %w", err))
 	}
+	if s.coreManager != nil {
+		if errOrder := s.coreManager.InitializeFillOrder(); errOrder != nil {
+			finishWatcherSync(authCount, "fill_order_failed")
+			finishRouting(authCount, "fill_order_failed")
+			s.startupState.AddIssue("fill_order", "fill_order_failed", "error")
+			return s.waitForFailedStartup(ctx, fmt.Errorf("initialize fill order: %w", errOrder))
+		}
+	}
+
 	finishWatcherSync(authCount, "")
 	if s.server != nil {
 		if errReconcileOperations := s.server.ReconcileChatGPTWebManualReloginOperations(); errReconcileOperations != nil {
@@ -5550,6 +5559,9 @@ func (s *Service) runShutdown() {
 		shutdownErr = errors.Join(shutdownErr, errShutdownPprof)
 	}
 	if s.coreManager != nil {
+		if errOrder := s.coreManager.CloseFillOrder(); errOrder != nil {
+			shutdownErr = errors.Join(shutdownErr, errOrder)
+		}
 		errClose := s.coreManager.CloseExecutors()
 		if errClose != nil {
 			log.Errorf("failed to close provider executors: %v", errClose)

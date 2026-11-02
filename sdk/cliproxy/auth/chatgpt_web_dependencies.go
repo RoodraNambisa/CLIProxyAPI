@@ -768,6 +768,7 @@ func (m *Manager) DeleteIfCurrentSourceHash(ctx context.Context, expected *Auth)
 	}
 	m.recordPersistedAuthDeleteLocked(expected.ID)
 	m.mu.Unlock()
+	orderErr := m.forgetFillOrderAfterDelete(expected.ID)
 	if removedRuntime {
 		m.cleanupRemovedAuthRuntimeStateAfterQuarantine(expected.ID)
 	}
@@ -776,7 +777,7 @@ func (m *Manager) DeleteIfCurrentSourceHash(ctx context.Context, expected *Auth)
 	if removedRuntime {
 		m.finishAuthSessionCleanup(expected.ID, removed, "auth_removed", nil)
 	}
-	return true, nil
+	return true, orderErr
 }
 
 // ReserveChatGPTWebDependent conditionally records an in-flight linked Web
@@ -1040,6 +1041,7 @@ func (m *Manager) deleteRetainedCodexSourceIfOrphan(ctx context.Context, sourceI
 	}
 	m.recordPersistedAuthDeleteLocked(sourceID)
 	m.mu.Unlock()
+	orderErr := m.forgetFillOrderAfterDelete(sourceID)
 	if removed {
 		m.cleanupRemovedAuthRuntimeStateAfterQuarantine(sourceID)
 	}
@@ -1048,7 +1050,7 @@ func (m *Manager) deleteRetainedCodexSourceIfOrphan(ctx context.Context, sourceI
 	if removed {
 		m.finishAuthSessionCleanup(sourceID, current, "auth_removed", nil)
 	}
-	return removed, nil
+	return removed, orderErr
 }
 
 func markCodexAuthRetainedForDependents(auth *Auth, now time.Time) *Auth {

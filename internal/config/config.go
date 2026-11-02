@@ -1787,9 +1787,10 @@ type RoutingSubscriptionOverride struct {
 
 // RoutingPriorityOverride overrides routing behavior for one credential priority.
 type RoutingPriorityOverride struct {
-	Codex              *CodexIdentityOverride `yaml:"codex,omitempty" json:"codex,omitempty"`
-	PerAuthConcurrency *int                   `yaml:"per-auth-concurrency,omitempty" json:"per-auth-concurrency,omitempty"`
-	Queue              *AdmissionQueue        `yaml:"queue,omitempty" json:"queue,omitempty"`
+	SessionAffinityCapacitySpillover *bool                  `yaml:"session-affinity-capacity-spillover,omitempty" json:"session-affinity-capacity-spillover,omitempty"`
+	Codex                            *CodexIdentityOverride `yaml:"codex,omitempty" json:"codex,omitempty"`
+	PerAuthConcurrency               *int                   `yaml:"per-auth-concurrency,omitempty" json:"per-auth-concurrency,omitempty"`
+	Queue                            *AdmissionQueue        `yaml:"queue,omitempty" json:"queue,omitempty"`
 	// Priority is the credential priority this rule applies to.
 	Priority int `yaml:"priority" json:"priority"`
 	// Strategy optionally overrides the global credential selection strategy.
@@ -1813,8 +1814,9 @@ type RoutingPriorityOverride struct {
 
 // RoutingConfig configures how credentials are selected for requests.
 type RoutingConfig struct {
-	PerAuthConcurrency int            `yaml:"per-auth-concurrency" json:"per-auth-concurrency"`
-	Queue              AdmissionQueue `yaml:"queue" json:"queue"`
+	SessionAffinityCapacitySpillover bool           `yaml:"session-affinity-capacity-spillover,omitempty" json:"session-affinity-capacity-spillover,omitempty"`
+	PerAuthConcurrency               int            `yaml:"per-auth-concurrency" json:"per-auth-concurrency"`
+	Queue                            AdmissionQueue `yaml:"queue" json:"queue"`
 	// Strategy selects the credential selection strategy.
 	// Supported values: "round-robin" (default), "fill-first", "random".
 	Strategy string `yaml:"strategy,omitempty" json:"strategy,omitempty"`
@@ -3781,8 +3783,9 @@ func NormalizeRoutingPriorityOverrides(overrides []RoutingPriorityOverride) ([]R
 		}
 
 		out = append(out, RoutingPriorityOverride{
-			Codex:              override.Codex,
-			PerAuthConcurrency: override.PerAuthConcurrency, Queue: override.Queue,
+			SessionAffinityCapacitySpillover: override.SessionAffinityCapacitySpillover,
+			Codex:                            override.Codex,
+			PerAuthConcurrency:               override.PerAuthConcurrency, Queue: override.Queue,
 			Priority:                    override.Priority,
 			Strategy:                    strategy,
 			MaxRetryCredentials:         maxRetryCredentials,

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	baseauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/fillorder"
 )
 
 // PostAuthHook defines a function that is called after an Auth record is created
@@ -166,6 +167,7 @@ func GetRequestInfo(ctx context.Context) *RequestInfo {
 
 // Auth encapsulates the runtime state and metadata associated with a single credential.
 type Auth struct {
+	fillOrderRecord *fillorder.Record
 	// ID uniquely identifies the auth record across restarts.
 	ID string `json:"id"`
 	// Index is a stable runtime identifier derived from auth metadata (not persisted).

@@ -132,6 +132,8 @@ type scheduledAuthMeta struct {
 
 // modelScheduler tracks ready and blocked auths for one provider/model combination.
 type modelScheduler struct {
+	fillMembers             map[int][]*scheduledAuth
+	fillMembersWS           map[int][]*scheduledAuth
 	modelKey                string
 	requiresUpload          bool
 	uploadBlockedByPriority map[int][]*scheduledAuth
@@ -153,12 +155,15 @@ type scheduledAuth struct {
 
 // readyBucket keeps the ready views for one priority level.
 type readyBucket struct {
-	all readyView
-	ws  readyView
+	fill   readyView
+	fillWS readyView
+	all    readyView
+	ws     readyView
 }
 
 // readyView holds the selection order for selection traversal.
 type readyView struct {
+	fillRPM    *fillRPMIndex
 	flat       []*scheduledAuth
 	lastPicked string
 	weighted   smoothWeightedState
@@ -1221,108 +1226,10 @@ type mixedFillFirstEntry struct {
 }
 
 func pickMixedFillFirstAtPriorityLocked(providers []string, candidateShards []*modelScheduler, priority int, fillFirstRange int, fillFirstPerAuthRPM int, rpmLimiter *fillFirstMinuteLimiter, requestLimitForAuth func(*Auth) authRequestLimitPolicy, requestLimiter *authRequestWindowLimiter, membershipPredicate func(*scheduledAuth) bool, pickPredicate func(*scheduledAuth) bool) (*Auth, string, bool, authRequestLimitBlock) {
-	fillFirstRange = normalizeFillFirstRangeValue(fillFirstRange)
-	fillFirstPerAuthRPM = normalizeFillFirstPerAuthRPMValue(fillFirstPerAuthRPM)
-	indexedAll := true
-	var indexedBlock authRequestLimitBlock
-	views := make(map[string]*readyView, len(providers))
-	for i, shard := range candidateShards {
-		if shard == nil {
-			continue
-		}
-		if bucket := shard.readyByPriority[priority]; bucket != nil && i < len(providers) {
-			view := &bucket.all
-			views[providers[i]] = view
-			if view.limited == nil {
-				indexedAll = false
-			} else {
-				index := view.requestLimitIndex(requestLimiter, requestLimiter.nowTime())
-				indexedAll = indexedAll && len(index.available) == 0
-				indexedBlock = earlierAuthRequestLimitBlock(indexedBlock, index.earliestBlock(pickPredicate, requestLimiter.nowTime()))
-			}
-		}
+	if normalizeFillFirstRangeValue(fillFirstRange) == 1 && normalizeFillFirstPerAuthRPMValue(fillFirstPerAuthRPM) == 0 {
+		return pickMixedOrderedFillHead(providers, candidateShards, priority, requestLimitForAuth, requestLimiter, membershipPredicate, pickPredicate)
 	}
-	if indexedAll && indexedBlock.limited() {
-		return nil, "", false, indexedBlock
-	}
-	members := make([]mixedFillFirstEntry, 0)
-	for providerIndex, providerKey := range providers {
-		if providerIndex >= len(candidateShards) {
-			continue
-		}
-		shard := candidateShards[providerIndex]
-		if shard == nil {
-			continue
-		}
-		for _, entry := range shard.entries {
-			if entry == nil || entry.auth == nil || entry.meta == nil || entry.meta.priority != priority {
-				continue
-			}
-			if !entryCandidateForPriority(entry, membershipPredicate) {
-				continue
-			}
-			members = append(members, mixedFillFirstEntry{entry: entry, providerKey: providerKey})
-		}
-	}
-	if len(members) == 0 {
-		return nil, "", false, authRequestLimitBlock{}
-	}
-	sort.Slice(members, func(i, j int) bool {
-		leftID := members[i].entry.auth.ID
-		rightID := members[j].entry.auth.ID
-		if leftID == rightID {
-			return members[i].providerKey < members[j].providerKey
-		}
-		return leftID < rightID
-	})
-	requestLimited := authRequestLimitBlock{}
-	rpmLimited := false
-	requestNow := requestLimiter.nowTime()
-	rpmNow := time.Now()
-	if rpmLimiter != nil {
-		rpmNow = rpmLimiter.nowTime()
-	}
-	for start := 0; start < len(members); start += fillFirstRange {
-		end := start + fillFirstRange
-		if end > len(members) {
-			end = len(members)
-		}
-		candidates := make([]mixedFillFirstEntry, 0, end-start)
-		for _, member := range members[start:end] {
-			if member.entry.state != scheduledStateReady {
-				continue
-			}
-			if pickPredicate != nil && !pickPredicate(member.entry) {
-				continue
-			}
-			candidates = append(candidates, member)
-		}
-		for len(candidates) > 0 {
-			index := 0
-			if len(candidates) > 1 {
-				index = rand.IntN(len(candidates))
-			}
-			candidate := candidates[index]
-			requestPolicy := requestLimitForAuth(candidate.entry.auth)
-			if acquired, block := requestLimiter.tryAcquireAt(candidate.entry.auth.ID, requestPolicy, requestNow); !acquired {
-				requestLimited = earlierAuthRequestLimitBlock(requestLimited, block)
-				if view := views[candidate.providerKey]; view != nil && block.limited() {
-					view.requestLimitIndex(requestLimiter, requestNow).exclude(candidate.entry, block, requestNow)
-				}
-				candidates[index] = candidates[len(candidates)-1]
-				candidates = candidates[:len(candidates)-1]
-				continue
-			}
-			if requestPolicy.limit == 0 && fillFirstPerAuthRPM > 0 && rpmLimiter != nil && !rpmLimiter.tryAcquireAt(candidate.entry.auth.ID, fillFirstPerAuthRPM, rpmNow) {
-				rpmLimited = true
-				candidates[index] = candidates[len(candidates)-1]
-				candidates = candidates[:len(candidates)-1]
-				continue
-			}
-			return candidate.entry.auth, candidate.providerKey, false, authRequestLimitBlock{}
-		}
-	}
-	return nil, "", rpmLimited, requestLimited
+	return pickOrderedFillGroup(providers, candidateShards, priority, false, fillFirstRange, fillFirstPerAuthRPM, rpmLimiter, requestLimitForAuth, requestLimiter, membershipPredicate, pickPredicate)
 }
 
 func mixedBlockedEarliestAtPrioritiesLocked(candidateShards []*modelScheduler, priorities []int, predicate func(*scheduledAuth) bool) time.Time {
@@ -1731,6 +1638,8 @@ func (m *modelScheduler) upsertEntryLocked(meta *scheduledAuthMeta, now time.Tim
 		if bucket := m.readyByPriority[meta.priority]; bucket != nil {
 			bucket.all.invalidateRequestLimit(meta.auth.ID)
 			bucket.ws.invalidateRequestLimit(meta.auth.ID)
+			bucket.fill.invalidateRequestLimit(meta.auth.ID)
+			bucket.fillWS.invalidateRequestLimit(meta.auth.ID)
 		}
 		if previousHasExpiry != meta.hasAccessTokenExpiry || !previousExpiry.Equal(meta.accessTokenExpiresAt) {
 			m.updateTokenExpiryLocked(entry)
@@ -2067,6 +1976,12 @@ func (m *modelScheduler) pickReadyAtPriorityLocked(preferWebsocket bool, priorit
 	if preferWebsocket {
 		view = &bucket.ws
 	}
+	if strategy == schedulerStrategyFillFirst {
+		view = &bucket.fill
+		if preferWebsocket {
+			view = &bucket.fillWS
+		}
+	}
 	picked, requestBlock := view.pickWithRequestLimit(strategy, pickPredicate, requestLimitForAuth, requestLimiter)
 	if picked == nil || picked.auth == nil {
 		return nil, false, requestBlock
@@ -2080,9 +1995,9 @@ func (m *modelScheduler) pickFillFirstAtPriorityLocked(preferWebsocket bool, pri
 	}
 	var capacityView *readyView
 	if bucket := m.readyByPriority[priority]; bucket != nil {
-		capacityView = &bucket.all
+		capacityView = &bucket.fill
 		if preferWebsocket {
-			capacityView = &bucket.ws
+			capacityView = &bucket.fillWS
 		}
 		if capacityView.limited != nil {
 			index := capacityView.requestLimitIndex(requestLimiter, requestLimiter.nowTime())
@@ -2098,75 +2013,8 @@ func (m *modelScheduler) pickFillFirstAtPriorityLocked(preferWebsocket bool, pri
 		}
 		return nil, false, block
 	}
-	fillFirstRange = normalizeFillFirstRangeValue(fillFirstRange)
-	fillFirstPerAuthRPM = normalizeFillFirstPerAuthRPMValue(fillFirstPerAuthRPM)
-	members := make([]*scheduledAuth, 0)
-	for _, entry := range m.entries {
-		if entry == nil || entry.auth == nil || entry.meta == nil || entry.meta.priority != priority {
-			continue
-		}
-		if preferWebsocket && !entry.meta.websocketEnabled {
-			continue
-		}
-		if !entryCandidateForPriority(entry, membershipPredicate) {
-			continue
-		}
-		members = append(members, entry)
-	}
-	if len(members) == 0 {
-		return nil, false, authRequestLimitBlock{}
-	}
-	sort.Slice(members, func(i, j int) bool {
-		return members[i].auth.ID < members[j].auth.ID
-	})
-	requestLimited := authRequestLimitBlock{}
-	rpmLimited := false
-	requestNow := requestLimiter.nowTime()
-	rpmNow := time.Now()
-	if rpmLimiter != nil {
-		rpmNow = rpmLimiter.nowTime()
-	}
-	for start := 0; start < len(members); start += fillFirstRange {
-		end := start + fillFirstRange
-		if end > len(members) {
-			end = len(members)
-		}
-		candidates := make([]*scheduledAuth, 0, end-start)
-		for _, entry := range members[start:end] {
-			if entry.state != scheduledStateReady {
-				continue
-			}
-			if pickPredicate != nil && !pickPredicate(entry) {
-				continue
-			}
-			candidates = append(candidates, entry)
-		}
-		for len(candidates) > 0 {
-			index := 0
-			if len(candidates) > 1 {
-				index = rand.IntN(len(candidates))
-			}
-			candidate := candidates[index]
-			requestPolicy := requestLimitForAuth(candidate.auth)
-			if acquired, block := requestLimiter.tryAcquireAt(candidate.auth.ID, requestPolicy, requestNow); !acquired {
-				requestLimited = earlierAuthRequestLimitBlock(requestLimited, block)
-				if capacityView != nil && block.limited() {
-					capacityView.requestLimitIndex(requestLimiter, requestNow).exclude(candidate, block, requestNow)
-				}
-				candidates[index] = candidates[len(candidates)-1]
-				candidates = candidates[:len(candidates)-1]
-				continue
-			}
-			if requestPolicy.limit == 0 && fillFirstPerAuthRPM > 0 && rpmLimiter != nil && !rpmLimiter.tryAcquireAt(candidate.auth.ID, fillFirstPerAuthRPM, rpmNow) {
-				rpmLimited = true
-				candidates[index] = candidates[len(candidates)-1]
-				candidates = candidates[:len(candidates)-1]
-				continue
-			}
-			return candidate.auth, false, authRequestLimitBlock{}
-		}
-	}
-	return nil, rpmLimited, requestLimited
+	a, _, rpmLimited, block := pickOrderedFillGroup([]string{""}, []*modelScheduler{m}, priority, preferWebsocket, fillFirstRange, fillFirstPerAuthRPM, rpmLimiter, requestLimitForAuth, requestLimiter, membershipPredicate, pickPredicate)
+	return a, rpmLimited, block
 }
 
 func (m *modelScheduler) readyCountAtPriorityLocked(preferWebsocket bool, priority int, predicate func(*scheduledAuth) bool) int {
@@ -2338,9 +2186,14 @@ func (m *modelScheduler) rebuildIndexesLocked() {
 	clear(m.expiring)
 	m.expiring = m.expiring[:0]
 	priorityBuckets := make(map[int][]*scheduledAuth)
+	m.fillMembers = make(map[int][]*scheduledAuth)
+	m.fillMembersWS = make(map[int][]*scheduledAuth)
 	for _, entry := range m.entries {
 		if entry == nil || entry.auth == nil {
 			continue
+		}
+		if entryCandidateForPriority(entry, nil) {
+			m.fillMembers[entry.meta.priority] = append(m.fillMembers[entry.meta.priority], entry)
 		}
 		entry.expiryIndex = -1
 		switch entry.state {
@@ -2353,6 +2206,14 @@ func (m *modelScheduler) rebuildIndexesLocked() {
 			priorityBuckets[priority] = append(priorityBuckets[priority], entry)
 		case scheduledStateCooldown, scheduledStateBlocked:
 			m.blocked = append(m.blocked, entry)
+		}
+	}
+	for priority, entries := range m.fillMembers {
+		sort.Slice(entries, func(i, j int) bool { return fillOrderLess(entries[i].auth, entries[j].auth) })
+		for _, entry := range entries {
+			if entry.meta.websocketEnabled {
+				m.fillMembersWS[priority] = append(m.fillMembersWS[priority], entry)
+			}
 		}
 	}
 	heap.Init(&m.expiring)
@@ -2411,6 +2272,12 @@ func buildReadyBucket(entries []*scheduledAuth) *readyBucket {
 		}
 	}
 	bucket.ws = buildReadyView(wsEntries)
+	fill := append([]*scheduledAuth(nil), entries...)
+	sort.Slice(fill, func(i, j int) bool { return fillOrderLess(fill[i].auth, fill[j].auth) })
+	bucket.fill = buildReadyView(fill)
+	fillWS := append([]*scheduledAuth(nil), wsEntries...)
+	sort.Slice(fillWS, func(i, j int) bool { return fillOrderLess(fillWS[i].auth, fillWS[j].auth) })
+	bucket.fillWS = buildReadyView(fillWS)
 	return bucket
 }
 

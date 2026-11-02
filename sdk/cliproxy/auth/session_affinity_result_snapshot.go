@@ -6,6 +6,7 @@ import (
 	"sync"
 
 	core "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
+	"github.com/tidwall/gjson"
 )
 
 const sessionAffinityResultSnapshotKey = "__session_affinity_result_snapshot"
@@ -13,6 +14,8 @@ const sessionAffinityResultSnapshotKey = "__session_affinity_result_snapshot"
 // Each attempt observes its binding before selection. Its own selection commit
 // advances the observation; an unrelated rebind makes a later result a no-op.
 type sessionBindingSnapshot struct {
+	allowSpillover       bool
+	preserveBinding      bool
 	mu                   sync.Mutex
 	cache                *SessionCache
 	provider, model, key string
@@ -32,13 +35,25 @@ func (s *SessionAffinitySelector) captureBindingSnapshot(ctx context.Context, pr
 	return &sessionBindingSnapshot{cache: s.cache, provider: provider, model: model, key: key, version: s.cache.bindingVersion(key)}
 }
 
-func (m *Manager) withSessionAffinityResultSnapshot(ctx context.Context, providers []string, model string, opts core.Options) core.Options {
+func (m *Manager) withSessionAffinityResultSnapshot(ctx context.Context, providers []string, model string, opts core.Options, payloads ...[]byte) core.Options {
 	selector := m.selectorForContext(ctx)
 	var snapshot *sessionBindingSnapshot
 	if observer, ok := selector.(interface {
 		captureBindingSnapshot(context.Context, string, string, core.Options) *sessionBindingSnapshot
 	}); ok {
 		snapshot = observer.captureBindingSnapshot(ctx, affinityProviderKey(providers), selectionArgForSelector(selector, model), opts)
+	}
+	if snapshot != nil {
+		policy := m.selectionPolicy(ctx)
+		if policy != nil && policy.spilloverPossible {
+			snapshot.allowSpillover = true
+			for _, body := range append(payloads, opts.OriginalRequest) {
+				if gjson.GetBytes(body, "previous_response_id").String() != "" || gjson.GetBytes(body, "input.#(encrypted_content)").Exists() {
+					snapshot.allowSpillover = false
+					break
+				}
+			}
+		}
 	}
 	if snapshot == nil && opts.Metadata[sessionAffinityResultSnapshotKey] == nil {
 		return opts
@@ -66,6 +81,9 @@ func sessionBindingSnapshotFromOptions(opts core.Options, cache *SessionCache) *
 func (s *sessionBindingSnapshot) bind(authID string) sessionMutation {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.preserveBinding {
+		return sessionMutation{}
+	}
 	mutation := s.cache.setWithRollbackIfVersion(s.key, authID, s.version)
 	if mutation.version != 0 {
 		s.version = mutation.bindingVersion
@@ -76,6 +94,9 @@ func (s *sessionBindingSnapshot) bind(authID string) sessionMutation {
 func (s *sessionBindingSnapshot) release(authID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.preserveBinding {
+		return
+	}
 	if s.cache.invalidateBindingIfVersion(s.key, authID, s.version) {
 		s.version = 0
 	}

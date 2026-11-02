@@ -629,7 +629,13 @@ func (s *FillFirstSelector) Pick(ctx context.Context, provider, model string, op
 	if err != nil {
 		return nil, err
 	}
-	return available[0], nil
+	first := available[0]
+	for _, a := range available[1:] {
+		if fillOrderLess(a, first) {
+			first = a
+		}
+	}
+	return first, nil
 }
 
 func normalizeFillFirstRangeValue(value int) int {
@@ -827,7 +833,7 @@ func selectFillFirstAuthsForAttemptWithPolicy(auths []*Auth, provider, model str
 		if len(members) == 0 {
 			continue
 		}
-		sort.Slice(members, func(i, j int) bool { return members[i].ID < members[j].ID })
+		sort.Slice(members, func(i, j int) bool { return fillOrderLess(members[i], members[j]) })
 		readyByID := readyByPriority[priority]
 		fillFirstRange := 1
 		if fillFirstRangeForPriority != nil {

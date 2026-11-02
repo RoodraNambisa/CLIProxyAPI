@@ -763,6 +763,8 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/admission/options", s.mgmt.GetAdmissionOptions)
 		mgmt.GET("/usage/traffic", s.mgmt.GetTraffic)
 		mgmt.POST("/auth-files/traffic", s.mgmt.GetCredentialTraffic)
+		mgmt.POST("/auth-files/fill-order/preview", s.mgmt.PreviewFillOrder)
+		mgmt.POST("/auth-files/fill-order/move", s.mgmt.MoveFillOrder)
 		mgmt.POST("/api-keys/traffic", s.mgmt.GetKeyTraffic)
 		mgmt.GET("/usage/tokens", s.mgmt.GetUsageTokens)
 		mgmt.GET("/usage/costs", s.mgmt.GetUsageCosts)

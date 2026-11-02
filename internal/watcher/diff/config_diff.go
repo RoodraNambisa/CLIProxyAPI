@@ -151,6 +151,9 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	if routingSessionAffinityFailoverEnabled(oldCfg) != routingSessionAffinityFailoverEnabled(newCfg) {
 		changes = append(changes, fmt.Sprintf("routing.session-affinity-failover: %t -> %t", routingSessionAffinityFailoverEnabled(oldCfg), routingSessionAffinityFailoverEnabled(newCfg)))
 	}
+	if oldCfg.Routing.SessionAffinityCapacitySpillover != newCfg.Routing.SessionAffinityCapacitySpillover {
+		changes = append(changes, fmt.Sprintf("routing.session-affinity-capacity-spillover: %t -> %t", oldCfg.Routing.SessionAffinityCapacitySpillover, newCfg.Routing.SessionAffinityCapacitySpillover))
+	}
 	if oldCfg.Routing.SessionAffinityAcrossPriorities != newCfg.Routing.SessionAffinityAcrossPriorities {
 		changes = append(changes, fmt.Sprintf("routing.session-affinity-across-priorities: %t -> %t", oldCfg.Routing.SessionAffinityAcrossPriorities, newCfg.Routing.SessionAffinityAcrossPriorities))
 	}

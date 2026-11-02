@@ -708,6 +708,10 @@ func (h *Handler) buildAuthFileEntryAtWithRuntime(auth *coreauth.Auth, now time.
 	}
 	if manager := h.coreAuthRuntimeManager(); manager != nil {
 		entry["request_limit"] = manager.AuthRequestLimitSummary(auth)
+		if order := manager.FillOrderSummary(auth); order != nil {
+			entry["fill_order"] = order
+			entry["fill_order_revision"] = manager.FillOrderRevision()
+		}
 		entry["response_model_rewrite"] = manager.AuthResponseModelRewriteSummary(auth, false)
 		entry["error_history"] = manager.AuthErrorHistory(auth.ID, false)
 	}

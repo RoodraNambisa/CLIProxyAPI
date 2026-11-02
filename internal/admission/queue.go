@@ -16,6 +16,7 @@ import (
 
 // Busy is a local admission failure. A zero ReadyAt means event-driven waiting.
 type Busy struct {
+	Kind    string
 	Reason  string
 	ReadyAt time.Time
 }
@@ -146,7 +147,7 @@ func (q *Queue) Do(ctx context.Context, scope, group string, policy config.Admis
 			remaining -= *spent
 		}
 		if remaining <= 0 {
-			return &Busy{Reason: "Admission queue wait timed out"}
+			return &Busy{Kind: "timeout", Reason: "Admission queue wait timed out"}
 		}
 		w.deadline = start.Add(remaining)
 	}
@@ -157,7 +158,7 @@ func (q *Queue) Do(ctx context.Context, scope, group string, policy config.Admis
 	}
 	if q.count >= q.maxCount || w.bytes > q.maxBytes-q.bytes || policy.MaxWaiting > 0 && q.groups[group] >= policy.MaxWaiting {
 		q.mu.Unlock()
-		return &Busy{Reason: "Admission waiting queue is full"}
+		return &Busy{Kind: "full", Reason: "Admission waiting queue is full"}
 	}
 	l := q.waiters[scope]
 	if l == nil {
@@ -244,7 +245,7 @@ func (q *Queue) run() {
 					err := w.ctx.Err()
 					q.removeLocked(w)
 					if err == nil {
-						err = &Busy{Reason: "Admission queue wait timed out"}
+						err = &Busy{Kind: "timeout", Reason: "Admission queue wait timed out"}
 					}
 					w.done <- err
 					continue
@@ -338,4 +339,28 @@ func (q *Queue) NotifyRoutes() {
 			q.signalLocked(group)
 		}
 	}
+}
+
+// HasWaiters includes a claimed slot, so a newcomer cannot race a granted waiter.
+func (q *Queue) HasWaiters(scope string) bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.claims[scope] || q.waiters[scope] != nil && q.waiters[scope].Len() > 0
+}
+
+// TryNow participates in scope fairness without allocating a waiting node.
+func (q *Queue) TryNow(scope, group string, try func() error) error {
+	q.mu.Lock()
+	if q.closed {
+		q.mu.Unlock()
+		return context.Canceled
+	}
+	if q.claims[scope] || q.waiters[scope] != nil && q.waiters[scope].Len() > 0 {
+		q.mu.Unlock()
+		return &Busy{Kind: "waiting", Reason: "Earlier admission requests are waiting"}
+	}
+	q.claims[scope] = true
+	q.mu.Unlock()
+	defer func() { q.mu.Lock(); delete(q.claims, scope); q.signalLocked(group); q.mu.Unlock() }()
+	return try()
 }

@@ -12,6 +12,11 @@ import (
 // routingRequestPolicy freezes selection choices, not credential availability or
 // limiter generations. Retired instances and current capacity remain authoritative.
 type routingRequestPolicy struct {
+	capacitySpillover     bool
+	spilloverPossible     bool
+	prioritySpillover     map[int]bool
+	queue                 config.AdmissionQueue
+	priorityQueues        map[int]config.AdmissionQueue
 	codexIdentityPolicies *config.CodexIdentityPolicySet
 	manager               *Manager
 	selector              Selector
@@ -76,6 +81,7 @@ func stopReplacedSessionCacheMaintenance(previous, next Selector) {
 func newRoutingRequestPolicy(m *Manager, selector Selector, routing config.RoutingConfig) *routingRequestPolicy {
 	p := &routingRequestPolicy{
 		manager: m, selector: selector, strategy: selectorStrategy(selector),
+		spilloverPossible: routing.SessionAffinityCapacitySpillover, capacitySpillover: routing.SessionAffinityCapacitySpillover, prioritySpillover: make(map[int]bool), queue: routing.Queue, priorityQueues: make(map[int]config.AdmissionQueue),
 		strictAffinity: (routing.SessionAffinity || routing.ClaudeCodeSessionAffinity) && routing.SessionAffinityFailover != nil && !*routing.SessionAffinityFailover,
 		strategies:     make(map[int]schedulerStrategy),
 		fillRange:      normalizeFillFirstRangeValue(routing.FillFirstRange),
@@ -84,6 +90,13 @@ func newRoutingRequestPolicy(m *Manager, selector Selector, routing config.Routi
 		priorityMaxRetries: make(map[int]int),
 	}
 	for _, rule := range routing.PriorityOverrides {
+		if rule.SessionAffinityCapacitySpillover != nil {
+			p.prioritySpillover[rule.Priority] = *rule.SessionAffinityCapacitySpillover
+			p.spilloverPossible = p.spilloverPossible || *rule.SessionAffinityCapacitySpillover
+		}
+		if rule.Queue != nil {
+			p.priorityQueues[rule.Priority] = *rule.Queue
+		}
 		if rule.MaxRetryCredentials != nil {
 			if _, exists := p.priorityMaxRetries[rule.Priority]; !exists {
 				p.priorityMaxRetries[rule.Priority] = max(0, *rule.MaxRetryCredentials)

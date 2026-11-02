@@ -18,6 +18,7 @@ import (
 
 type admissionContextKey struct{}
 type logicalAdmission struct {
+	spillover    atomic.Pointer[stickySpilloverPolicy]
 	lease        *admission.Lease
 	wait         time.Duration
 	bytes        int64
@@ -133,10 +134,20 @@ func (m *Manager) queueSelection(ctx context.Context, providers []string, model 
 }
 
 func (m *Manager) pickNext(ctx context.Context, provider, model string, opts core.Options, tried map[string]struct{}) (a *Auth, e ProviderExecutor, err error) {
+	if result, executor, _, handled, spillErr := m.pickStickyCapacitySpillover(ctx, []string{provider}, model, opts, tried, nil); handled {
+		return result, executor, spillErr
+	}
 	err = m.queueSelection(ctx, []string{provider}, model, opts, func() error { var x error; a, e, x = m.pickNextImmediate(ctx, provider, model, opts, tried); return x })
 	return
 }
 func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model string, opts core.Options, tried map[string]struct{}, allowed ...func(*Auth) bool) (a *Auth, e ProviderExecutor, p string, err error) {
+	var predicate func(*Auth) bool
+	if len(allowed) > 0 {
+		predicate = allowed[0]
+	}
+	if result, executor, selectedProvider, handled, spillErr := m.pickStickyCapacitySpillover(ctx, providers, model, opts, tried, predicate); handled {
+		return result, executor, selectedProvider, spillErr
+	}
 	err = m.queueSelection(ctx, providers, model, opts, func() error {
 		var x error
 		a, e, p, x = m.pickNextMixedImmediate(ctx, providers, model, opts, tried, allowed...)

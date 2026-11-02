@@ -217,6 +217,9 @@ func (index *requestLimitReadyIndex) earliestBlock(predicate func(*scheduledAuth
 }
 
 func (v *readyView) invalidateRequestLimit(authID string) {
+	if v != nil {
+		v.fillRPM = nil
+	}
 	if v != nil && v.limited != nil {
 		v.limited.restore(authID)
 	}

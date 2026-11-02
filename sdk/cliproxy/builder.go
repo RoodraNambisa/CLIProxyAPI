@@ -279,8 +279,12 @@ func (b *Builder) Build() (*Service, error) {
 	coreManager.SetRoundTripperProvider(newDefaultRoundTripperProvider())
 	coreManager.SetConfig(b.cfg)
 	coreManager.SetOAuthModelAlias(b.cfg.OAuthModelAlias)
+	if errOrder := coreManager.ConfigureFillOrder(b.configPath); errOrder != nil {
+		return nil, fmt.Errorf("cliproxy: initialize fill order: %w", errOrder)
+	}
 	proxyPoolManager, errProxyPool := proxypool.NewManager(b.configPath, b.cfg)
 	if errProxyPool != nil {
+		_ = coreManager.CloseFillOrder()
 		return nil, fmt.Errorf("cliproxy: initialize proxy pools: %w", errProxyPool)
 	}
 	proxyPoolManager.SetAuthSource(coreManager)
