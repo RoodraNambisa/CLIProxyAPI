@@ -148,6 +148,10 @@ type openAIImageRequest struct {
 	OutputCompression *int             `json:"output_compression"`
 	FrameCount        *int             `json:"frame_count,omitempty"`
 	FrameDurationMS   *int             `json:"frame_duration_ms,omitempty"`
+	Complexity        json.RawMessage  `json:"complexity,omitempty"`
+	PromptRewriter    json.RawMessage  `json:"prompt_rewriter,omitempty"`
+	Markup            json.RawMessage  `json:"markup,omitempty"`
+	SVG               json.RawMessage  `json:"svg,omitempty"`
 	InputFidelity     string           `json:"input_fidelity"`
 	Moderation        string           `json:"moderation"`
 	Stream            bool             `json:"stream"`
@@ -1278,6 +1282,17 @@ func parseMultipartImageEditRequest(c *gin.Context) (openAIImageRequest, error) 
 	req.XAIAspectRatio = multipartValue(form, "aspect_ratio")
 	req.XAIResolution = multipartValue(form, "resolution")
 	req.Stream = parseBoolValue(multipartValue(form, "stream"))
+	for _, field := range []struct {
+		name  string
+		value *json.RawMessage
+	}{{"complexity", &req.Complexity}, {"prompt_rewriter", &req.PromptRewriter}, {"markup", &req.Markup}, {"svg", &req.SVG}} {
+		if value := multipartValue(form, field.name); value != "" {
+			*field.value, _ = json.Marshal(value)
+		} else if len(multipartFiles(form, field.name)) > 0 {
+			// Remember unsupported upload presence without loading its bytes.
+			*field.value = json.RawMessage(`true`)
+		}
+	}
 	if frames, ok, err := parseOptionalInt(multipartValue(form, "frame_count")); err != nil {
 		return req, err
 	} else if ok {
@@ -2427,6 +2442,16 @@ func imageResponseBudgetError(limit int) error {
 }
 
 func chatGPTWebImageRequestCompatibilityError(req openAIImageRequest, ignoreUnsupportedParams bool, imageConfig coreexecutor.ChatGPTWebImageConfigSnapshot) *chatGPTWebImageCompatibilityError {
+	if !ignoreUnsupportedParams {
+		for _, field := range []struct {
+			name  string
+			value json.RawMessage
+		}{{"complexity", req.Complexity}, {"prompt_rewriter", req.PromptRewriter}, {"markup", req.Markup}, {"svg", req.SVG}} {
+			if value := bytes.TrimSpace(field.value); len(value) > 0 && !bytes.Equal(value, []byte("null")) {
+				return &chatGPTWebImageCompatibilityError{parameter: field.name}
+			}
+		}
+	}
 	format := normalizeChatGPTWebRequestedOutputFormat(req.OutputFormat)
 	frames, duration := 0, 0
 	if req.FrameCount != nil {

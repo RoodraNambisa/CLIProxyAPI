@@ -596,6 +596,13 @@ func validateChatGPTWebImageTool(tool map[string]any, ignoreUnsupportedParams bo
 		}
 	}
 	if !ignoreUnsupportedParams {
+		for _, field := range []string{"complexity", "prompt_rewriter", "markup", "svg"} {
+			if value, exists := tool[field]; exists && value != nil {
+				return &ChatGPTWebUnsupportedToolError{
+					Message: fmt.Sprintf("chatgpt web does not support image_generation field %q", field),
+				}
+			}
+		}
 		for _, candidate := range []struct {
 			field        string
 			defaultValue string
