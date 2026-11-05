@@ -296,17 +296,14 @@ func TestPrepareChatGPTWebImageOutputsUsesTransactionalBudgetFallback(t *testing
 	}
 	limit := len(jpegCandidate) + len(original)
 
-	t.Run("non-strict returns the complete original batch", func(t *testing.T) {
+	t.Run("non-strict rejects when native format conversion exceeds budget", func(t *testing.T) {
 		images := [][]byte{append([]byte(nil), original...), append([]byte(nil), original...)}
-		outputs, err := prepareChatGPTWebImageOutputsWithConfigAndCompression(
+		_, err := prepareChatGPTWebImageOutputsWithConfigAndCompression(
 			"jpeg", 90, "gpt-image-2", "medium", images, nil,
 			cliproxyexecutor.ChatGPTWebImageConfigSnapshot{MaxImageResponseBytes: limit},
 		)
-		if err != nil {
+		if err == nil || !strings.Contains(err.Error(), `"code":"image_response_budget_exceeded"`) {
 			t.Fatalf("prepare non-strict batch error = %v", err)
-		}
-		if len(outputs) != 2 || outputs[0].Width != 16 || outputs[1].Height != 16 {
-			t.Fatalf("outputs = %#v", outputs)
 		}
 		for index := range images {
 			if !bytes.Equal(images[index], original) || chatGPTWebImageOutputFormat(images[index]) != "png" {

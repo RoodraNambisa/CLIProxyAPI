@@ -1212,13 +1212,30 @@ func prepareChatGPTWebImageOutputsWithContextAndCompression(
 					return nil, chatGPTWebImageSizeMismatchError()
 				}
 				if requestedFormat != "gif" {
-					return originalOutputs, nil
+					resizeEnabled = false
+					break
 				}
 			}
 		}
 	}
 
 	candidates := make([][]byte, len(images))
+	// Size fallback may retain dimensions, but must preserve the requested format.
+	fallback := func() ([]helps.ChatGPTWebUsageImage, error) {
+		if imageConfig.StrictSize {
+			return nil, chatGPTWebImagePostProcessingBudgetError()
+		}
+		clear(candidates)
+		for _, data := range images {
+			if chatGPTWebImageOutputFormat(data) != requestedFormat {
+				native := imageConfig
+				native.ResizeToRequestedSize = false
+				native.StrictSize = true
+				return prepareChatGPTWebImageOutputsWithContextAndCompression(ctx, requestedFormat, outputCompression, model, quality, images, nil, native, animationControls...)
+			}
+		}
+		return originalOutputs, nil
+	}
 	candidateOutputs := make([]helps.ChatGPTWebUsageImage, 0, len(images))
 	candidateTotalBytes := 0
 	changed := false
@@ -1244,10 +1261,7 @@ func prepareChatGPTWebImageOutputsWithContextAndCompression(
 		needsEncoding := originalFormat != requestedFormat || requestedFormat == "jpeg" || requestedFormat == "webp"
 		if !needsResize && !needsEncoding {
 			if len(imageData) > responseByteLimit-candidateTotalBytes {
-				if imageConfig.StrictSize {
-					return nil, chatGPTWebImagePostProcessingBudgetError()
-				}
-				return originalOutputs, nil
+				return fallback()
 			}
 			candidates[index] = imageData
 			candidateOutputs = append(candidateOutputs, originalOutputs[index])
@@ -1269,19 +1283,14 @@ func prepareChatGPTWebImageOutputsWithContextAndCompression(
 			imageConfig,
 		)
 		if errors.Is(errEncode, errChatGPTWebImageResponseBudgetExceeded) {
-			if imageConfig.StrictSize {
-				return nil, chatGPTWebImagePostProcessingBudgetError()
-			}
-			return originalOutputs, nil
+			return fallback()
 		}
 		if errEncode != nil {
 			return nil, fmt.Errorf("encode chatgpt web image as %s: %w", requestedFormat, errEncode)
 		}
 		if len(encoded) > responseByteLimit-candidateTotalBytes {
-			if imageConfig.StrictSize {
-				return nil, chatGPTWebImagePostProcessingBudgetError()
-			}
-			return originalOutputs, nil
+			encoded = nil
+			return fallback()
 		}
 		candidates[index] = encoded
 		candidateTotalBytes += len(encoded)
@@ -1327,7 +1336,20 @@ func processChatGPTWebOutputImage(
 	}
 	defer releaseMemory()
 
-	decoded, _, errDecode := decodeAndValidateChatGPTWebOutputImage(imageData, "image/"+originalFormat)
+	var decoded image.Image
+	var errDecode error
+	if originalFormat == "gif" {
+		// A GIF's first frame may cover only part of its logical canvas.
+		var first image.Image
+		first, errDecode = gif.Decode(bytes.NewReader(imageData))
+		if errDecode == nil {
+			canvas := image.NewRGBA(image.Rect(0, 0, sourceWidth, sourceHeight))
+			stddraw.Draw(canvas, first.Bounds(), first, first.Bounds().Min, stddraw.Src)
+			decoded = canvas
+		}
+	} else {
+		decoded, _, errDecode = decodeAndValidateChatGPTWebOutputImage(imageData, "image/"+originalFormat)
+	}
 	if errDecode != nil {
 		return nil, 0, 0, fmt.Errorf("decode chatgpt web %s image for post-processing: %w", originalFormat, errDecode)
 	}
@@ -4402,10 +4424,16 @@ func estimateChatGPTWebWholeFinalizationBytes(
 		if image.gifInfo != nil && requestedFormat == "gif" {
 			processingBytes = chatGPTWebGIFWorkingBytes(*image.gifInfo, targetWidth, targetHeight)
 		}
+		if !imageConfig.StrictSize && requestedFormat != "gif" {
+			processingBytes = max(processingBytes, estimateChatGPTWebImagePostProcessingBytes(image.width, image.height, image.width, image.height, false, requestedFormat))
+		}
 		if processingBytes > transientPeak {
 			transientPeak = processingBytes
 		}
 		encodedUpperBound := chatGPTWebImageEncodedOutputUpperBound(targetWidth, targetHeight)
+		if !imageConfig.StrictSize && requestedFormat != "gif" {
+			encodedUpperBound = max(encodedUpperBound, chatGPTWebImageEncodedOutputUpperBound(image.width, image.height))
+		}
 		if image.gifInfo != nil && requestedFormat == "gif" {
 			encodedUpperBound = saturatingChatGPTWebImageMultiply(encodedUpperBound, image.gifInfo.Frames)
 		}
