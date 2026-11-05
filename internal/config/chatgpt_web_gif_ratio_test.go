@@ -136,3 +136,28 @@ func TestChatGPTWebGIFAspectRatioToleranceConfig(t *testing.T) {
 		t.Fatal("explicit zero or comment lost")
 	}
 }
+
+func TestChatGPTWebGIFAspectRatioZeroFirstSave(t *testing.T) {
+	for _, initial := range []string{"# keep\nport: 8317\n", "# keep\nimages: {}\n", "# keep\nimages:\n  chatgpt-web: {}\n"} {
+		path := filepath.Join(t.TempDir(), "config.yaml")
+		if err := os.WriteFile(path, []byte(initial), 0600); err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := LoadConfig(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		zero := 0.0
+		cfg.Images.ChatGPTWeb.GIFAspectRatioMaxErrorPercent = &zero
+		if err := SaveConfigPreserveComments(path, cfg); err != nil {
+			t.Fatal(err)
+		}
+		loaded, err := LoadConfig(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if loaded.Images.ChatGPTWeb.GIFAspectRatioMaxErrorPercent == nil || loaded.Images.ChatGPTWeb.Resolved().GIFAspectRatioMaxErrorPercent != 0 {
+			t.Fatalf("first save lost explicit zero with original %q", initial)
+		}
+	}
+}
