@@ -4201,7 +4201,8 @@ func SaveConfigPreserveComments(configFile string, cfg *Config) error {
 	if errBootstrap := cfg.Images.ChatGPTWeb.ValidateBootstrap(); errBootstrap != nil {
 		return errBootstrap
 	}
-	if _, errFormats := cfg.Images.NormalizedChatGPTWebModelOutputFormats(); errFormats != nil {
+	normalizedFormats, errFormats := cfg.Images.NormalizedChatGPTWebModelOutputFormats()
+	if errFormats != nil {
 		return errFormats
 	}
 	if errReasoning := cfg.Images.ChatGPTWeb.ValidateReasoningMode(); errReasoning != nil {
@@ -4229,6 +4230,7 @@ func SaveConfigPreserveComments(configFile string, cfg *Config) error {
 		return errMedia
 	}
 	persistCfg := *cfg
+	persistCfg.Images.ChatGPTWeb.ModelOutputFormats = normalizedFormats
 	groups, errNormalizeGroups := NormalizeAPIKeyGroups(persistCfg.APIKeyGroups, persistCfg.APIKeys)
 	if errNormalizeGroups != nil {
 		return errNormalizeGroups
@@ -4470,7 +4472,9 @@ func mergeMappingPreserve(dst, src *yaml.Node, path ...[]string) {
 			dst.Content = append(dst.Content, deepCopyNode(sk), candidate)
 		}
 	}
-	if strings.Join(currentPath, ".") == "routing.priority-overrides.codex" {
+	if strings.Join(currentPath, ".") == "images.chatgpt-web" {
+		pruneMappingToGeneratedKeys(dst, src, "model-output-formats")
+	} else if strings.Join(currentPath, ".") == "routing.priority-overrides.codex" {
 		pruneMissingCredentialYAMLKeys(dst, src, currentPath)
 	} else if isCodexResponseGuardYAMLPath(currentPath) {
 		pruneMissingResponseGuardKeys(dst, src)
