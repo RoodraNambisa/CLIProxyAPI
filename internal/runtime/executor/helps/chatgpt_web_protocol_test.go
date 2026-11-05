@@ -130,8 +130,8 @@ func TestParseChatGPTWebRequestAcceptsSupportedImageFormatsAndCompression(t *tes
 			t.Fatalf("ParseChatGPTWebRequest() %s error = %v", outputFormat, err)
 		}
 	}
-	_, err := ParseChatGPTWebRequest([]byte(`{"model":"gpt-image-2","input":"draw","tools":[{"type":"image_generation","output_format":"gif"}]}`))
-	if err == nil || !strings.Contains(err.Error(), `output_format "gif"`) {
+	_, err := ParseChatGPTWebRequest([]byte(`{"model":"gpt-image-2","input":"draw","tools":[{"type":"image_generation","output_format":"avif"}]}`))
+	if err == nil || !strings.Contains(err.Error(), `output_format "avif"`) {
 		t.Fatalf("ParseChatGPTWebRequest() error = %v", err)
 	}
 	var unsupported *ChatGPTWebUnsupportedToolError

@@ -8399,16 +8399,17 @@ func TestChatGPTWebExecutorDoesNotEnableUnrequestedImagePassthrough(t *testing.T
 
 func TestChatGPTWebExecutorRejectsUnsupportedImageFormatBeforeUpstream(t *testing.T) {
 	executor := NewChatGPTWebExecutor(nil, nil)
+	t.Cleanup(func() { _ = executor.Close() })
 
 	_, err := executor.Execute(context.Background(), chatGPTWebRuntimeAuth(), cliproxyexecutor.Request{
 		Model: "gpt-image-2",
 		Payload: []byte(`{
 			"model":"gpt-5.4",
 			"input":"draw",
-			"tools":[{"type":"image_generation","output_format":"gif"}]
+			"tools":[{"type":"image_generation","output_format":"avif"}]
 		}`),
 	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatCodex, ResponseFormat: sdktranslator.FormatCodex})
-	if err == nil || !strings.Contains(err.Error(), `output_format "gif"`) {
+	if err == nil || !strings.Contains(err.Error(), `output_format "avif"`) {
 		t.Fatalf("Execute() error = %v", err)
 	}
 	var status interface{ StatusCode() int }

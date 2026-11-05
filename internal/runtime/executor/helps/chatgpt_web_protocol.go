@@ -126,6 +126,8 @@ type ChatGPTWebImageRequest struct {
 	Action            string
 	OutputFormat      string
 	OutputCompression int
+	FrameCount        int
+	FrameDurationMS   int
 }
 
 // ChatGPTWebRequest is the subset of canonical Responses understood by the
@@ -553,6 +555,38 @@ func ChatGPTWebEncodedImageSize(value string, maxBytes int) (int, error) {
 }
 
 func validateChatGPTWebImageTool(tool map[string]any, ignoreUnsupportedParams bool) error {
+	format := normalizeChatGPTWebToolOutputFormat(stringFromAny(tool["output_format"]))
+	var frames, duration int
+	for _, field := range []string{"frame_count", "frame_duration_ms"} {
+		if value, exists := tool[field]; exists && value != nil {
+			number, ok := integerFromAny(value)
+			if !ok || number <= 0 {
+				return &ChatGPTWebUnsupportedToolError{Message: field + " must be a positive integer"}
+			}
+			if field == "frame_count" {
+				frames = number
+			} else {
+				duration = number
+			}
+		}
+	}
+	if err := ValidateChatGPTWebAnimationControls(format, frames, duration); err != nil {
+		return &ChatGPTWebUnsupportedToolError{Message: err.Error()}
+	}
+	if format == "gif" {
+		if value, exists := tool["partial_images"]; exists && value != nil && stringFromAny(value) != "0" {
+			return &ChatGPTWebUnsupportedToolError{Message: "chatgpt web GIF output does not support partial_images"}
+		}
+		if mask, ok := tool["input_image_mask"].(map[string]any); ok && len(mask) > 0 {
+			return &ChatGPTWebUnsupportedToolError{Message: "chatgpt web GIF output does not support masks"}
+		}
+		if value, exists := tool["output_compression"]; exists && value != nil {
+			compression, ok := integerFromAny(value)
+			if !ok || compression != 100 {
+				return &ChatGPTWebUnsupportedToolError{Message: "chatgpt web GIF output does not support custom output_compression"}
+			}
+		}
+	}
 	if value, exists := tool["n"]; exists && value != nil {
 		n, ok := integerFromAny(value)
 		if !ok || n < 1 {
@@ -919,6 +953,8 @@ func imageRequestFromMessages(messages []ChatGPTWebMessage, tool map[string]any)
 	if n, ok := integerFromAny(tool["n"]); ok && n > 0 {
 		request.N = n
 	}
+	request.FrameCount, _ = integerFromAny(tool["frame_count"])
+	request.FrameDurationMS, _ = integerFromAny(tool["frame_duration_ms"])
 	if compression, ok := integerFromAny(tool["output_compression"]); ok && compression >= 0 && compression <= 100 {
 		request.OutputCompression = compression
 	}
@@ -1017,8 +1053,8 @@ func normalizeChatGPTWebToolOutputFormat(value string) string {
 		return "png"
 	case "jpg", "jpeg":
 		return "jpeg"
-	case "webp":
-		return "webp"
+	case "webp", "gif":
+		return strings.ToLower(strings.TrimSpace(value))
 	default:
 		return ""
 	}
@@ -1880,6 +1916,9 @@ func (accumulator *ChatGPTWebImageAccumulator) captureReferences(value any) erro
 func (accumulator *ChatGPTWebImageAccumulator) captureReferencesAt(value any, field string, generationIndex int, hasGenerationIndex bool) error {
 	switch typed := value.(type) {
 	case map[string]any:
+		if chatGPTWebAuxiliaryImagePath(stringFromAny(typed["p"])) {
+			return nil
+		}
 		if chatGPTWebImageVisuallyHidden(typed) {
 			accumulator.HiddenOutputSeen = true
 			return nil
@@ -1898,6 +1937,11 @@ func (accumulator *ChatGPTWebImageAccumulator) captureReferencesAt(value any, fi
 			} else if err := accumulator.appendImagePointerWithGeneration(pointer, generationIndex, hasGenerationIndex); err != nil {
 				return err
 			}
+			// An image part owns its output. Generation metadata may contain a
+			// spritesheet and playback variants, which are not extra results.
+			if stringFromAny(typed["content_type"]) == "image_asset_pointer" {
+				return nil
+			}
 		}
 		path := strings.ToLower(strings.TrimSpace(stringFromAny(typed["p"])))
 		if strings.HasSuffix(path, "/asset_pointer") {
@@ -1907,7 +1951,7 @@ func (accumulator *ChatGPTWebImageAccumulator) captureReferencesAt(value any, fi
 		}
 		keys := make([]string, 0, len(typed))
 		for key := range typed {
-			if key != "asset_pointer" {
+			if key != "asset_pointer" && !chatGPTWebAuxiliaryImageField(key) {
 				keys = append(keys, key)
 			}
 		}
@@ -1954,6 +1998,23 @@ func chatGPTWebImageReferenceField(key string) bool {
 	default:
 		return false
 	}
+}
+
+func chatGPTWebAuxiliaryImageField(key string) bool {
+	switch key {
+	case "spritesheet", "gif_speed_variants", "watermarked_gif_speed_variants":
+		return true
+	}
+	return false
+}
+
+func chatGPTWebAuxiliaryImagePath(path string) bool {
+	for _, segment := range strings.Split(path, "/") {
+		if chatGPTWebAuxiliaryImageField(segment) {
+			return true
+		}
+	}
+	return false
 }
 
 func chatGPTWebImageReferenceKind(field string) string {
@@ -2285,6 +2346,9 @@ func chatGPTWebContainsImageReferenceAt(value any, field string) bool {
 		kind, _ := chatGPTWebImagePointerKindID(typed)
 		return kind != ""
 	case map[string]any:
+		if chatGPTWebAuxiliaryImagePath(stringFromAny(typed["p"])) {
+			return false
+		}
 		if pointer, ok := typed["asset_pointer"].(string); ok {
 			kind, _ := chatGPTWebImagePointerKindID(pointer)
 			if kind != "" {
@@ -2303,7 +2367,7 @@ func chatGPTWebContainsImageReferenceAt(value any, field string) bool {
 			if chatGPTWebImageReferenceField(key) {
 				childField = strings.ToLower(strings.TrimSpace(key))
 			}
-			if key != "asset_pointer" && chatGPTWebContainsImageReferenceAt(item, childField) {
+			if key != "asset_pointer" && !chatGPTWebAuxiliaryImageField(key) && chatGPTWebContainsImageReferenceAt(item, childField) {
 				return true
 			}
 		}
