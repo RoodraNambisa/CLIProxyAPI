@@ -4474,6 +4474,9 @@ func mergeMappingPreserve(dst, src *yaml.Node, path ...[]string) {
 	}
 	if strings.Join(currentPath, ".") == "images.chatgpt-web" {
 		pruneMappingToGeneratedKeys(dst, src, "model-output-formats")
+		if findMapKeyIndex(src, "gif-aspect-ratio-max-error-percent") < 0 {
+			removeMapKey(dst, "gif-aspect-ratio-max-error-percent")
+		}
 	} else if strings.Join(currentPath, ".") == "routing.priority-overrides.codex" {
 		pruneMissingCredentialYAMLKeys(dst, src, currentPath)
 	} else if isCodexResponseGuardYAMLPath(currentPath) {
@@ -4607,6 +4610,9 @@ func isKnownDefaultValue(path []string, node *yaml.Node) bool {
 	}
 	if fullPath == "usage-statistics-persistence-enabled" && node != nil && node.Kind == yaml.ScalarNode && node.Tag == "!!bool" {
 		return node.Value == "true"
+	}
+	if fullPath == "images.chatgpt-web.gif-aspect-ratio-max-error-percent" && node != nil && (node.Tag == "!!float" || node.Tag == "!!int") {
+		return false
 	}
 	if preservesExplicitChatGPTWebValue(fullPath, node) {
 		return false

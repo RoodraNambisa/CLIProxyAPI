@@ -263,8 +263,12 @@ type ChatGPTWebImageConfig struct {
 	AdaptSizeToAspectRatio bool `yaml:"adapt-size-to-aspect-ratio,omitempty" json:"adapt-size-to-aspect-ratio,omitempty"`
 	// StrictSize excludes ChatGPT Web when an explicit image size cannot be adapted.
 	StrictSize bool `yaml:"strict-size,omitempty" json:"strict-size,omitempty"`
+	// GIFAllowAspectRatioMismatch retains native GIF dimensions when the output ratio exceeds tolerance.
+	GIFAllowAspectRatioMismatch bool `yaml:"gif-allow-aspect-ratio-mismatch" json:"gif-allow-aspect-ratio-mismatch"`
 	// AspectRatioMaxErrorPercent is the maximum relative error accepted for generated output.
 	AspectRatioMaxErrorPercent *float64 `yaml:"aspect-ratio-max-error-percent,omitempty" json:"aspect-ratio-max-error-percent,omitempty"`
+	// GIFAspectRatioMaxErrorPercent overrides output tolerance for GIF; nil inherits the general tolerance.
+	GIFAspectRatioMaxErrorPercent *float64 `yaml:"gif-aspect-ratio-max-error-percent,omitempty" json:"gif-aspect-ratio-max-error-percent,omitempty"`
 	// MaxResizeEdgePixels limits explicit size adaptation targets.
 	MaxResizeEdgePixels *int `yaml:"max-resize-edge-pixels,omitempty" json:"max-resize-edge-pixels,omitempty"`
 	// ResizeToRequestedSize resizes matched Web image results to the explicit target.
@@ -390,33 +394,35 @@ func ChatGPTWebImageAdmissionWaitDuration(milliseconds int) (time.Duration, erro
 
 // ResolvedChatGPTWebImageConfig contains effective ChatGPT Web image compatibility values.
 type ResolvedChatGPTWebImageConfig struct {
-	UpstreamModel                string
-	ReasoningMode                string
-	RemoteImageURLEnabled        bool
-	RemoteImageURLDownloadMode   string
-	IgnoreUnsupportedParams      bool
-	NormalizeMismatchedImageMIME bool
-	NormalizeRemoteImageMIME     bool
-	SanitizeErrorResponses       bool
-	AutoCleanupLibraryOnFull     bool
-	AdaptSizeToAspectRatio       bool
-	StrictSize                   bool
-	AspectRatioMaxErrorPercent   float64
-	MaxResizeEdgePixels          int
-	ResizeToRequestedSize        bool
-	ResizeFilter                 string
-	MaxImageResponseMegabytes    int
-	MaxN                         int
-	MaxInFlight                  int
-	AdmissionQueueSize           int
-	AdmissionWaitMilliseconds    int
-	MaxFinalizers                int
-	CompletionReserveMegabytes   int
-	MemoryCapacityMegabytes      int
-	PollConcurrency              int
-	PollStallBreakerEnabled      bool
-	PollStallSeconds             int
-	MemoryFinalizerConcurrency   int
+	UpstreamModel                 string
+	ReasoningMode                 string
+	RemoteImageURLEnabled         bool
+	RemoteImageURLDownloadMode    string
+	IgnoreUnsupportedParams       bool
+	NormalizeMismatchedImageMIME  bool
+	NormalizeRemoteImageMIME      bool
+	SanitizeErrorResponses        bool
+	AutoCleanupLibraryOnFull      bool
+	AdaptSizeToAspectRatio        bool
+	StrictSize                    bool
+	GIFAllowAspectRatioMismatch   bool
+	AspectRatioMaxErrorPercent    float64
+	GIFAspectRatioMaxErrorPercent float64
+	MaxResizeEdgePixels           int
+	ResizeToRequestedSize         bool
+	ResizeFilter                  string
+	MaxImageResponseMegabytes     int
+	MaxN                          int
+	MaxInFlight                   int
+	AdmissionQueueSize            int
+	AdmissionWaitMilliseconds     int
+	MaxFinalizers                 int
+	CompletionReserveMegabytes    int
+	MemoryCapacityMegabytes       int
+	PollConcurrency               int
+	PollStallBreakerEnabled       bool
+	PollStallSeconds              int
+	MemoryFinalizerConcurrency    int
 }
 
 // ResolvedUpstreamModel returns the effective ChatGPT Web image conversation model.
@@ -441,6 +447,7 @@ func (cfg ChatGPTWebImageConfig) Resolved() ResolvedChatGPTWebImageConfig {
 		AutoCleanupLibraryOnFull:     cfg.AutoCleanupLibraryOnFull,
 		AdaptSizeToAspectRatio:       cfg.AdaptSizeToAspectRatio,
 		StrictSize:                   cfg.StrictSize,
+		GIFAllowAspectRatioMismatch:  cfg.GIFAllowAspectRatioMismatch,
 		AspectRatioMaxErrorPercent:   DefaultChatGPTWebAspectRatioMaxErrorPercent,
 		MaxResizeEdgePixels:          DefaultChatGPTWebMaxResizeEdgePixels,
 		ResizeToRequestedSize:        cfg.ResizeToRequestedSize,
@@ -466,6 +473,10 @@ func (cfg ChatGPTWebImageConfig) Resolved() ResolvedChatGPTWebImageConfig {
 	}
 	if cfg.AspectRatioMaxErrorPercent != nil {
 		resolved.AspectRatioMaxErrorPercent = *cfg.AspectRatioMaxErrorPercent
+	}
+	resolved.GIFAspectRatioMaxErrorPercent = resolved.AspectRatioMaxErrorPercent
+	if cfg.GIFAspectRatioMaxErrorPercent != nil {
+		resolved.GIFAspectRatioMaxErrorPercent = *cfg.GIFAspectRatioMaxErrorPercent
 	}
 	if cfg.MaxResizeEdgePixels != nil {
 		resolved.MaxResizeEdgePixels = *cfg.MaxResizeEdgePixels
@@ -525,6 +536,10 @@ func (cfg ChatGPTWebImageConfig) Validate() error {
 		resolved.AspectRatioMaxErrorPercent < 0 ||
 		resolved.AspectRatioMaxErrorPercent > MaxChatGPTWebAspectRatioMaxErrorPercent {
 		return fmt.Errorf("images.chatgpt-web.aspect-ratio-max-error-percent must be between 0 and %.0f", MaxChatGPTWebAspectRatioMaxErrorPercent)
+	}
+	if math.IsNaN(resolved.GIFAspectRatioMaxErrorPercent) || math.IsInf(resolved.GIFAspectRatioMaxErrorPercent, 0) ||
+		resolved.GIFAspectRatioMaxErrorPercent < 0 || resolved.GIFAspectRatioMaxErrorPercent > MaxChatGPTWebAspectRatioMaxErrorPercent {
+		return fmt.Errorf("images.chatgpt-web.gif-aspect-ratio-max-error-percent must be between 0 and %.0f", MaxChatGPTWebAspectRatioMaxErrorPercent)
 	}
 	if resolved.MaxResizeEdgePixels < 1 || resolved.MaxResizeEdgePixels > MaxChatGPTWebMaxResizeEdgePixels {
 		return fmt.Errorf("images.chatgpt-web.max-resize-edge-pixels must be between 1 and %d", MaxChatGPTWebMaxResizeEdgePixels)

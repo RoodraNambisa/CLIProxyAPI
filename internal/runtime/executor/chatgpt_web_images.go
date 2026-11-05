@@ -1206,9 +1206,9 @@ func prepareChatGPTWebImageOutputsWithContextAndCompression(
 				output.Height,
 				imageSizeMatch.RatioWidth,
 				imageSizeMatch.RatioHeight,
-				imageConfig.AspectRatioMaxErrorPercent,
+				imageConfig.OutputAspectRatioTolerance(requestedFormat),
 			) {
-				if imageConfig.StrictSize {
+				if imageConfig.StrictSize && !(requestedFormat == "gif" && imageConfig.GIFAllowAspectRatioMismatch) {
 					return nil, chatGPTWebImageSizeMismatchError()
 				}
 				if requestedFormat != "gif" {
@@ -1383,7 +1383,7 @@ func processChatGPTWebGIFOutput(ctx context.Context, data []byte, controls helps
 		return nil, 0, 0, chatGPTWebImageAnimationError(err)
 	}
 	width, height := info.Width, info.Height
-	if imageConfig.ResizeToRequestedSize && match != nil && helps.ChatGPTWebImageRatioMatches(width, height, match.RatioWidth, match.RatioHeight, imageConfig.AspectRatioMaxErrorPercent) {
+	if imageConfig.ResizeToRequestedSize && match != nil && helps.ChatGPTWebImageRatioMatches(width, height, match.RatioWidth, match.RatioHeight, imageConfig.OutputAspectRatioTolerance("gif")) {
 		width, height = match.Width, match.Height
 	}
 	estimated := chatGPTWebGIFWorkingBytes(info, width, height)
@@ -4400,6 +4400,9 @@ func estimateChatGPTWebWholeFinalizationBytes(
 			transientPeak = validationBytes
 		}
 		needsResize := resizeEnabled && (image.width != imageSizeMatch.Width || image.height != imageSizeMatch.Height)
+		if needsResize && requestedFormat == "gif" {
+			needsResize = helps.ChatGPTWebImageRatioMatches(image.width, image.height, imageSizeMatch.RatioWidth, imageSizeMatch.RatioHeight, imageConfig.OutputAspectRatioTolerance(requestedFormat))
+		}
 		needsEncoding := image.format != requestedFormat || requestedFormat == "jpeg" || requestedFormat == "webp"
 		if requestedFormat == "gif" && request.FrameDurationMS > 0 {
 			needsEncoding = true

@@ -489,6 +489,12 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	if oldImageRuntime.NormalizeRemoteImageMIME != newImageRuntime.NormalizeRemoteImageMIME {
 		changes = append(changes, fmt.Sprintf("images.chatgpt-web.normalize-remote-image-mime: %t -> %t", oldImageRuntime.NormalizeRemoteImageMIME, newImageRuntime.NormalizeRemoteImageMIME))
 	}
+	if oldImageRuntime.GIFAspectRatioMaxErrorPercent != newImageRuntime.GIFAspectRatioMaxErrorPercent {
+		changes = append(changes, fmt.Sprintf("images.chatgpt-web.gif-aspect-ratio-max-error-percent: %g -> %g", oldImageRuntime.GIFAspectRatioMaxErrorPercent, newImageRuntime.GIFAspectRatioMaxErrorPercent))
+	}
+	if oldImageRuntime.GIFAllowAspectRatioMismatch != newImageRuntime.GIFAllowAspectRatioMismatch {
+		changes = append(changes, fmt.Sprintf("images.chatgpt-web.gif-allow-aspect-ratio-mismatch: %t -> %t", oldImageRuntime.GIFAllowAspectRatioMismatch, newImageRuntime.GIFAllowAspectRatioMismatch))
+	}
 	if oldImageRuntime.SanitizeErrorResponses != newImageRuntime.SanitizeErrorResponses {
 		changes = append(changes, fmt.Sprintf("images.chatgpt-web.sanitize-error-responses: %t -> %t", oldImageRuntime.SanitizeErrorResponses, newImageRuntime.SanitizeErrorResponses))
 	}

@@ -798,3 +798,13 @@ func TestSessionAffinityUseHistoryChangeDetails(t *testing.T) {
 		t.Fatal("history disable was not reported")
 	}
 }
+
+func TestBuildConfigChangeDetails_ChatGPTWebGIFAspectRatio(t *testing.T) {
+	tolerance := 5.0
+	next := &config.Config{}
+	next.Images.ChatGPTWeb.GIFAllowAspectRatioMismatch = true
+	next.Images.ChatGPTWeb.GIFAspectRatioMaxErrorPercent = &tolerance
+	details := BuildConfigChangeDetails(&config.Config{}, next)
+	expectContains(t, details, "images.chatgpt-web.gif-allow-aspect-ratio-mismatch: false -> true")
+	expectContains(t, details, "images.chatgpt-web.gif-aspect-ratio-max-error-percent: 1 -> 5")
+}

@@ -331,21 +331,23 @@ func (h *BaseAPIHandler) filterChatGPTWebStrictImageSize(
 			resolved = h.Cfg.Images.ChatGPTWeb.Resolved()
 		}
 		snapshot = coreexecutor.ChatGPTWebImageConfigSnapshot{
-			UpstreamModel:                resolved.UpstreamModel,
-			ReasoningMode:                resolved.ReasoningMode,
-			AutoCleanupLibraryOnFull:     resolved.AutoCleanupLibraryOnFull,
-			RemoteImageURLEnabled:        resolved.RemoteImageURLEnabled,
-			RemoteImageURLDownloadMode:   resolved.RemoteImageURLDownloadMode,
-			NormalizeMismatchedImageMIME: resolved.NormalizeMismatchedImageMIME,
-			NormalizeRemoteImageMIME:     resolved.NormalizeRemoteImageMIME,
-			AdaptSizeToAspectRatio:       resolved.AdaptSizeToAspectRatio,
-			StrictSize:                   resolved.StrictSize,
-			AspectRatioMaxErrorPercent:   resolved.AspectRatioMaxErrorPercent,
-			MaxResizeEdgePixels:          resolved.MaxResizeEdgePixels,
-			ResizeToRequestedSize:        resolved.ResizeToRequestedSize,
-			ResizeFilter:                 resolved.ResizeFilter,
-			MaxImageResponseBytes:        resolved.MaxImageResponseMegabytes << 20,
-			MaxN:                         resolved.MaxN,
+			UpstreamModel:                 resolved.UpstreamModel,
+			ReasoningMode:                 resolved.ReasoningMode,
+			AutoCleanupLibraryOnFull:      resolved.AutoCleanupLibraryOnFull,
+			RemoteImageURLEnabled:         resolved.RemoteImageURLEnabled,
+			RemoteImageURLDownloadMode:    resolved.RemoteImageURLDownloadMode,
+			NormalizeMismatchedImageMIME:  resolved.NormalizeMismatchedImageMIME,
+			NormalizeRemoteImageMIME:      resolved.NormalizeRemoteImageMIME,
+			AdaptSizeToAspectRatio:        resolved.AdaptSizeToAspectRatio,
+			StrictSize:                    resolved.StrictSize,
+			GIFAllowAspectRatioMismatch:   resolved.GIFAllowAspectRatioMismatch,
+			AspectRatioMaxErrorPercent:    resolved.AspectRatioMaxErrorPercent,
+			GIFAspectRatioMaxErrorPercent: &resolved.GIFAspectRatioMaxErrorPercent,
+			MaxResizeEdgePixels:           resolved.MaxResizeEdgePixels,
+			ResizeToRequestedSize:         resolved.ResizeToRequestedSize,
+			ResizeFilter:                  resolved.ResizeFilter,
+			MaxImageResponseBytes:         resolved.MaxImageResponseMegabytes << 20,
+			MaxN:                          resolved.MaxN,
 		}
 		imageModelsConfig := config.ImagesConfig{}
 		if h != nil && h.Cfg != nil {

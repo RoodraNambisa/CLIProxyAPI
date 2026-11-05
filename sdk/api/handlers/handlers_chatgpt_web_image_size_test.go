@@ -383,3 +383,22 @@ func registerStrictImageSizeAuth(t *testing.T, manager *coreauth.Manager, provid
 	registry.GetGlobalRegistry().RegisterClient(authID, provider, []*registry.ModelInfo{{ID: model}})
 	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(authID) })
 }
+
+func TestChatGPTWebGIFAspectRatioResponsesSnapshot(t *testing.T) {
+	tolerance := 5.0
+	cfg := &sdkconfig.SDKConfig{}
+	cfg.Images.ChatGPTWeb.GIFAllowAspectRatioMismatch = true
+	cfg.Images.ChatGPTWeb.GIFAspectRatioMaxErrorPercent = &tolerance
+	handler := NewBaseAPIHandlers(cfg, nil)
+	ctx, _, failure := handler.filterChatGPTWebStrictImageSize(context.Background(), []string{constant.ChatGPTWeb}, constant.OpenaiResponse, []byte(`{"tools":[{"type":"image_generation"}]}`))
+	if failure != nil {
+		t.Fatal(failure)
+	}
+	tolerance = 0
+	cfg.Images.ChatGPTWeb.GIFAllowAspectRatioMismatch = false
+	again, _, _ := handler.filterChatGPTWebStrictImageSize(ctx, []string{constant.ChatGPTWeb}, constant.OpenaiResponse, []byte(`{"tools":[{"type":"image_generation"}]}`))
+	snapshot, ok := chatGPTWebImageConfigSnapshot(again)
+	if !ok || !snapshot.GIFAllowAspectRatioMismatch || snapshot.OutputAspectRatioTolerance("gif") != 5 {
+		t.Fatal("in-flight Responses policy changed")
+	}
+}

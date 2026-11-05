@@ -207,27 +207,41 @@ const (
 
 // ChatGPTWebImageConfigSnapshot contains request-scoped Web image adaptation settings.
 type ChatGPTWebImageConfigSnapshot struct {
-	DefaultImageModel            string
-	ModelOutputFormats           map[string][]string
-	UpstreamModel                string
-	ReasoningMode                string
-	AutoCleanupLibraryOnFull     bool
-	RemoteImageURLEnabled        bool
-	RemoteImageURLDownloadMode   string
-	NormalizeMismatchedImageMIME bool
-	NormalizeRemoteImageMIME     bool
-	AdaptSizeToAspectRatio       bool
-	StrictSize                   bool
-	AspectRatioMaxErrorPercent   float64
-	MaxResizeEdgePixels          int
-	ResizeToRequestedSize        bool
-	ResizeFilter                 string
-	MaxImageResponseBytes        int
-	MaxN                         int
+	DefaultImageModel             string
+	ModelOutputFormats            map[string][]string
+	UpstreamModel                 string
+	ReasoningMode                 string
+	AutoCleanupLibraryOnFull      bool
+	RemoteImageURLEnabled         bool
+	RemoteImageURLDownloadMode    string
+	NormalizeMismatchedImageMIME  bool
+	NormalizeRemoteImageMIME      bool
+	AdaptSizeToAspectRatio        bool
+	StrictSize                    bool
+	GIFAllowAspectRatioMismatch   bool
+	AspectRatioMaxErrorPercent    float64
+	GIFAspectRatioMaxErrorPercent *float64
+	MaxResizeEdgePixels           int
+	ResizeToRequestedSize         bool
+	ResizeFilter                  string
+	MaxImageResponseBytes         int
+	MaxN                          int
+}
+
+// OutputAspectRatioTolerance selects only the requested output format's tolerance.
+func (s ChatGPTWebImageConfigSnapshot) OutputAspectRatioTolerance(format string) float64 {
+	if strings.EqualFold(strings.TrimSpace(format), "gif") && s.GIFAspectRatioMaxErrorPercent != nil {
+		return *s.GIFAspectRatioMaxErrorPercent
+	}
+	return s.AspectRatioMaxErrorPercent
 }
 
 // Clone keeps request policies independent of later metadata or config edits.
 func (s ChatGPTWebImageConfigSnapshot) Clone() ChatGPTWebImageConfigSnapshot {
+	if s.GIFAspectRatioMaxErrorPercent != nil {
+		value := *s.GIFAspectRatioMaxErrorPercent
+		s.GIFAspectRatioMaxErrorPercent = &value
+	}
 	if s.ModelOutputFormats != nil {
 		cloned := make(map[string][]string, len(s.ModelOutputFormats))
 		for k, v := range s.ModelOutputFormats {

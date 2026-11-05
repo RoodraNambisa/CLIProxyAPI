@@ -739,6 +739,9 @@ nonstream-keepalive-interval: 0
 #     auto-cleanup-library-on-full: false # Destructive opt-in: after an upload storage rejection, recheck capacity and clear this account's owned first-party files in the background. Never empties trash or resubmits an image.
 #     adapt-size-to-aspect-ratio: false # Map compatible explicit WxH sizes to an exact canvas/aspect-ratio prompt.
 #     strict-size: false                # Exclude Web when an explicit size cannot be adapted; requires adaptation.
+#     gif-allow-aspect-ratio-mismatch: false # GIF output only: retain native dimensions instead of rejecting a ratio mismatch. Input size, frame and resource limits still apply.
+#     # Optional GIF-only tolerance (0–10%); omit to inherit the general output tolerance.
+#     # gif-aspect-ratio-max-error-percent: 5
 #     aspect-ratio-max-error-percent: 1 # Maximum relative error accepted for the generated output ratio.
 #     max-resize-edge-pixels: 3840     # Ignore Web size adaptation when either requested edge exceeds this value.
 #     resize-to-requested-size: false  # Center-crop and resize matched Web results to the requested WxH.

@@ -756,6 +756,9 @@ func TestOpenAIImagesPinsChatGPTWebImageAspectConfig(t *testing.T) {
 	h := newImagesTestHandler(t, executor)
 	h.Cfg.Images.ChatGPTWeb.AdaptSizeToAspectRatio = true
 	h.Cfg.Images.ChatGPTWeb.StrictSize = true
+	h.Cfg.Images.ChatGPTWeb.GIFAllowAspectRatioMismatch = true
+	tolerance := 5.0
+	h.Cfg.Images.ChatGPTWeb.GIFAspectRatioMaxErrorPercent = &tolerance
 	h.Cfg.Images.ChatGPTWeb.NormalizeMismatchedImageMIME = true
 	h.Cfg.Images.ChatGPTWeb.NormalizeRemoteImageMIME = &disabled
 	h.Cfg.Images.ChatGPTWeb.UpstreamModel = "pinned-carrier"
@@ -776,7 +779,7 @@ func TestOpenAIImagesPinsChatGPTWebImageAspectConfig(t *testing.T) {
 	}
 	if !executor.hasImageConfigSnapshot || executor.imageConfigSnapshot.UpstreamModel != "pinned-carrier" || executor.imageConfigSnapshot.ReasoningMode != "high" || !executor.imageConfigSnapshot.AdaptSizeToAspectRatio || !executor.imageConfigSnapshot.StrictSize ||
 		!executor.imageConfigSnapshot.NormalizeMismatchedImageMIME || executor.imageConfigSnapshot.NormalizeRemoteImageMIME ||
-		executor.imageConfigSnapshot.AspectRatioMaxErrorPercent != 1 || executor.imageConfigSnapshot.MaxResizeEdgePixels != 3840 ||
+		!executor.imageConfigSnapshot.GIFAllowAspectRatioMismatch || executor.imageConfigSnapshot.OutputAspectRatioTolerance("gif") != 5 || executor.imageConfigSnapshot.AspectRatioMaxErrorPercent != 1 || executor.imageConfigSnapshot.MaxResizeEdgePixels != 3840 ||
 		executor.imageConfigSnapshot.ResizeFilter != sdkconfig.DefaultChatGPTWebResizeFilter ||
 		executor.imageConfigSnapshot.MaxImageResponseBytes != sdkconfig.DefaultChatGPTWebMaxImageResponseMegabytes<<20 ||
 		executor.imageConfigSnapshot.MaxN != sdkconfig.DefaultChatGPTWebMaxN {

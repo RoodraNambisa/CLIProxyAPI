@@ -17,6 +17,7 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
 	core "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
@@ -120,50 +121,73 @@ func TestChatGPTWebGIFBudgetAndCancellation(t *testing.T) {
 }
 
 func TestChatGPTWebGIFExecutorDownloadsNativeAnimation(t *testing.T) {
-	data := webGIFFixture(t)
-	base := newChatGPTWebImageFixture(t)
-	t.Cleanup(base.Close)
-	var submissions, downloads atomic.Int32
-	var server *httptest.Server
-	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/backend-api/f/conversation":
-			submissions.Add(1)
-			body, err := io.ReadAll(r.Body)
-			if err != nil {
-				t.Error(err)
+	for _, tc := range []struct {
+		name              string
+		strict, exception bool
+	}{
+		{name: "native"}, {name: "strict mismatch", strict: true}, {name: "GIF exception", strict: true, exception: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			data := webGIFFixture(t)
+			base := newChatGPTWebImageFixture(t)
+			t.Cleanup(base.Close)
+			var submissions, downloads atomic.Int32
+			var server *httptest.Server
+			server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/backend-api/f/conversation":
+					submissions.Add(1)
+					body, err := io.ReadAll(r.Body)
+					if err != nil {
+						t.Error(err)
+						return
+					}
+					prompt := gjson.GetBytes(body, "messages.0.content.parts.0").String()
+					if !strings.Contains(prompt, "3 frames") || !strings.Contains(prompt, "180 milliseconds") {
+						t.Errorf("animation controls missing from prompt: %s", prompt)
+					}
+					w.Header().Set("Content-Type", "text/event-stream")
+					_, _ = io.WriteString(w, `data: {"message":{"author":{"role":"tool","name":"image_tool.variant"},"status":"finished_successfully","metadata":{"async_task_type":"image_gen"},"content":{"content_type":"multimodal_text","parts":[{"content_type":"image_asset_pointer","asset_pointer":"file-service://generated-gif","mime_type":"image/gif","width":16,"height":16,"metadata":{"generation":{"width":16,"height":16,"animation":{"rows":1,"columns":3,"frame_count":3,"frame_duration_ms":180},"spritesheet":{"asset_pointer":"file-service://sheet"},"gif_speed_variants":{"2":"file-service://fast"}}}}]}}}`+"\n\n")
+					_, _ = io.WriteString(w, `data: {"message":{"author":{"role":"assistant"},"status":"finished_successfully","end_turn":true,"content":{"content_type":"text","parts":["Here is the animation."]}}}`+"\n\ndata: [DONE]\n\n")
+				case "/backend-api/files/generated-gif/download":
+					_ = json.NewEncoder(w).Encode(map[string]string{"download_url": server.URL + "/native-gif"})
+				case "/native-gif":
+					downloads.Add(1)
+					w.Header().Set("Content-Type", "image/gif")
+					_, _ = w.Write(data)
+				default:
+					base.Config.Handler.ServeHTTP(w, r)
+				}
+			}))
+			t.Cleanup(server.Close)
+			cfg := &config.Config{}
+			cfg.Images.ChatGPTWeb.AdaptSizeToAspectRatio = true
+			cfg.Images.ChatGPTWeb.StrictSize = tc.strict
+			cfg.Images.ChatGPTWeb.ResizeToRequestedSize = tc.strict
+			cfg.Images.ChatGPTWeb.GIFAllowAspectRatioMismatch = tc.exception
+			e := NewChatGPTWebExecutor(cfg, nil)
+			t.Cleanup(func() { _ = e.Close() })
+			e.runtimeBaseURL = server.URL
+			result, err := e.Execute(t.Context(), chatGPTWebRuntimeAuth(), core.Request{Model: "gpt-image-2.6", Payload: []byte(`{"model":"gpt-image-2.6","input":"blue ball bouncing","tools":[{"type":"image_generation","output_format":"gif","size":"1536x864","frame_count":3,"frame_duration_ms":180}]}`)}, core.Options{SourceFormat: sdktranslator.FormatCodex, ResponseFormat: sdktranslator.FormatCodex})
+			if got := fmt.Sprintf("%d/%d", submissions.Load(), downloads.Load()); got != "1/1" {
+				t.Fatalf("submission/download counts = %s, error=%v", got, err)
+			}
+			if tc.strict && !tc.exception {
+				if err == nil || !strings.Contains(err.Error(), "image_size_mismatch") {
+					t.Fatalf("missing strict ratio failure: %v", err)
+				}
 				return
 			}
-			prompt := gjson.GetBytes(body, "messages.0.content.parts.0").String()
-			if !strings.Contains(prompt, "3 frames") || !strings.Contains(prompt, "180 milliseconds") {
-				t.Errorf("animation controls missing from prompt: %s", prompt)
+			if err != nil {
+				t.Fatal(err)
 			}
-			w.Header().Set("Content-Type", "text/event-stream")
-			_, _ = io.WriteString(w, `data: {"message":{"author":{"role":"tool","name":"image_tool.variant"},"status":"finished_successfully","metadata":{"async_task_type":"image_gen"},"content":{"content_type":"multimodal_text","parts":[{"content_type":"image_asset_pointer","asset_pointer":"file-service://generated-gif","mime_type":"image/gif","width":16,"height":16,"metadata":{"generation":{"width":16,"height":16,"animation":{"rows":1,"columns":3,"frame_count":3,"frame_duration_ms":180},"spritesheet":{"asset_pointer":"file-service://sheet"},"gif_speed_variants":{"2":"file-service://fast"}}}}]}}}`+"\n\n")
-			_, _ = io.WriteString(w, `data: {"message":{"author":{"role":"assistant"},"status":"finished_successfully","end_turn":true,"content":{"content_type":"text","parts":["Here is the animation."]}}}`+"\n\ndata: [DONE]\n\n")
-		case "/backend-api/files/generated-gif/download":
-			_ = json.NewEncoder(w).Encode(map[string]string{"download_url": server.URL + "/native-gif"})
-		case "/native-gif":
-			downloads.Add(1)
-			w.Header().Set("Content-Type", "image/gif")
-			_, _ = w.Write(data)
-		default:
-			base.Config.Handler.ServeHTTP(w, r)
-		}
-	}))
-	t.Cleanup(server.Close)
-	e := NewChatGPTWebExecutor(nil, nil)
-	t.Cleanup(func() { _ = e.Close() })
-	e.runtimeBaseURL = server.URL
-	result, err := e.Execute(t.Context(), chatGPTWebRuntimeAuth(), core.Request{Model: "gpt-image-2.6", Payload: []byte(`{"model":"gpt-image-2.6","input":"blue ball bouncing","tools":[{"type":"image_generation","output_format":"gif","frame_count":3,"frame_duration_ms":180}]}`)}, core.Options{SourceFormat: sdktranslator.FormatCodex, ResponseFormat: sdktranslator.FormatCodex})
-	if err != nil {
-		t.Fatal(err)
-	}
-	output, err := base64.StdEncoding.DecodeString(gjson.GetBytes(result.Payload, "response.output.0.result").String())
-	if err != nil || !bytes.Equal(output, data) {
-		t.Fatal("executor changed the native GIF")
-	}
-	if got := fmt.Sprintf("%d/%d", submissions.Load(), downloads.Load()); got != "1/1" {
-		t.Fatalf("submission/download counts = %s", got)
+			output, err := base64.StdEncoding.DecodeString(gjson.GetBytes(result.Payload, "response.output.0.result").String())
+			if err != nil || !bytes.Equal(output, data) {
+				t.Fatal("executor changed the native GIF")
+			}
+			if got := fmt.Sprintf("%d/%d", submissions.Load(), downloads.Load()); got != "1/1" {
+				t.Fatalf("submission/download counts = %s, error=%v", got, err)
+			}
+		})
 	}
 }
