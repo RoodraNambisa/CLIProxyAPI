@@ -336,7 +336,7 @@ func TestServiceChatGPTWebModelsUsesLastCatalog(t *testing.T) {
 		Models:             []*registry.ModelInfo{chatGPTWebTextModelInfo("remote-model", "", 0, "")},
 	})
 	models := service.chatGPTWebModelsForAuth(auth)
-	if got := registeredModelIDs(models); len(got) != 5 || got[0] != "remote-model" || got[1] != "gpt-image-2" || got[4] != "gpt-image-2.5-sunburst" {
+	if got := registeredModelIDs(models); len(got) != 8 || got[0] != "remote-model" || got[1] != "gpt-image-2" || got[4] != "gpt-image-2.5-sunburst" || got[7] != "gpt-image-2.6-sunburst" {
 		t.Fatalf("models = %v, want cached remote model and configured image models", got)
 	}
 	models[0].ID = "mutated"

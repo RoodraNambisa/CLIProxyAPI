@@ -612,7 +612,8 @@ func TestImageResponsesProvidersExcludeChatGPTWebForUnsupportedInputs(t *testing
 		{name: "PNG output format", req: openAIImageRequest{OutputFormat: "png"}, want: []string{constant.Codex, constant.ChatGPTWeb}},
 		{name: "JPEG output format", req: openAIImageRequest{OutputFormat: "jpeg", OutputCompression: intPointer(75)}, want: []string{constant.Codex, constant.ChatGPTWeb}},
 		{name: "WebP output format", req: openAIImageRequest{OutputFormat: "webp", OutputCompression: intPointer(75)}, want: []string{constant.Codex, constant.ChatGPTWeb}},
-		{name: "unsupported output format", req: openAIImageRequest{OutputFormat: "gif"}, want: []string{constant.Codex}},
+		{name: "GIF output format", req: openAIImageRequest{OutputFormat: "gif"}, want: []string{constant.Codex, constant.ChatGPTWeb}},
+		{name: "unsupported output format", req: openAIImageRequest{OutputFormat: "avif"}, want: []string{constant.Codex}},
 		{name: "PNG compression", req: openAIImageRequest{OutputFormat: "png", OutputCompression: intPointer(75)}, want: []string{constant.Codex}},
 		{name: "partial images", req: openAIImageRequest{PartialImages: intPointer(1)}, want: []string{constant.Codex}},
 		{name: "webp mask", req: openAIImageRequest{
@@ -1082,7 +1083,7 @@ func TestOpenAIImagesMixedProvidersUseWebOnlyForEquivalentRequests(t *testing.T)
 		t.Fatalf("equivalent request calls: web=%d codex=%d", webExecutor.calls, codexExecutor.calls)
 	}
 
-	request = httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(`{"model":"gpt-image-2","prompt":"draw","output_format":"gif"}`))
+	request = httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(`{"model":"gpt-image-2","prompt":"draw","output_format":"avif"}`))
 	request.Header.Set("Content-Type", "application/json")
 	response = httptest.NewRecorder()
 	router.ServeHTTP(response, request)

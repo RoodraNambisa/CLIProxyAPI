@@ -723,7 +723,9 @@ nonstream-keepalive-interval: 0
 #                                 # Instant requires upstream-model auto. Other explicit modes require a supported
 #                                 # effort in this credential's cached catalog; unsupported modes never silently downgrade.
 #                                 # Only new Web image requests are affected; this does not disable safety checks.
-#     image-models: ["gpt-image-2", "gpt-image-2.5", "gpt-image-2.5-flare", "gpt-image-2.5-sunburst"] # Independent public aliases, not upstream image engine selectors. All share quota.
+#     image-models: ["gpt-image-2", "gpt-image-2.5", "gpt-image-2.5-flare", "gpt-image-2.5-sunburst", "gpt-image-2.6", "gpt-image-2.6-flare", "gpt-image-2.6-sunburst"] # Independent public aliases, not upstream image engine selectors. All share quota.
+#     # output_format=gif preserves native animation; frame_count (2-64) and frame_duration_ms (20-2000) select animation instructions.
+#     # GIF frame count is verified; frame delays are normalized to 10 ms. PNG/JPEG/WebP remain still-image formats.
 #     remote-image-url-enabled: false # Fetch public HTTP(S) image_url inputs with SSRF and 50 MiB safeguards.
 #     remote-image-url-download-mode: direct # direct or credential-proxy; missing credential proxy falls back to direct.
 #     ignore-unsupported-params: false # Drop unsupported size/quality/etc. instead of excluding Web routing.

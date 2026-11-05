@@ -146,6 +146,8 @@ type openAIImageRequest struct {
 	Background        string           `json:"background"`
 	OutputFormat      string           `json:"output_format"`
 	OutputCompression *int             `json:"output_compression"`
+	FrameCount        *int             `json:"frame_count,omitempty"`
+	FrameDurationMS   *int             `json:"frame_duration_ms,omitempty"`
 	InputFidelity     string           `json:"input_fidelity"`
 	Moderation        string           `json:"moderation"`
 	Stream            bool             `json:"stream"`
@@ -1276,6 +1278,16 @@ func parseMultipartImageEditRequest(c *gin.Context) (openAIImageRequest, error) 
 	req.XAIAspectRatio = multipartValue(form, "aspect_ratio")
 	req.XAIResolution = multipartValue(form, "resolution")
 	req.Stream = parseBoolValue(multipartValue(form, "stream"))
+	if frames, ok, err := parseOptionalInt(multipartValue(form, "frame_count")); err != nil {
+		return req, err
+	} else if ok {
+		req.FrameCount = &frames
+	}
+	if duration, ok, err := parseOptionalInt(multipartValue(form, "frame_duration_ms")); err != nil {
+		return req, err
+	} else if ok {
+		req.FrameDurationMS = &duration
+	}
 	if n, ok, err := parseOptionalInt(multipartValue(form, "n")); err != nil {
 		return req, err
 	} else if ok {
@@ -1476,6 +1488,12 @@ func buildCodexImageResponsesPayload(req openAIImageRequest, op imageOperation, 
 	setOptionalString(tool, "quality", req.Quality)
 	setOptionalString(tool, "background", req.Background)
 	setOptionalString(tool, "output_format", req.OutputFormat)
+	if req.FrameCount != nil {
+		tool["frame_count"] = *req.FrameCount
+	}
+	if req.FrameDurationMS != nil {
+		tool["frame_duration_ms"] = *req.FrameDurationMS
+	}
 	if shouldForwardInputFidelity(overrideInputFidelity) {
 		setOptionalString(tool, "input_fidelity", req.InputFidelity)
 	}
@@ -1517,6 +1535,12 @@ func buildNativeImageRequestJSON(req openAIImageRequest) ([]byte, error) {
 	setOptionalString(body, "quality", req.Quality)
 	setOptionalString(body, "background", req.Background)
 	setOptionalString(body, "output_format", req.OutputFormat)
+	if req.FrameCount != nil {
+		body["frame_count"] = *req.FrameCount
+	}
+	if req.FrameDurationMS != nil {
+		body["frame_duration_ms"] = *req.FrameDurationMS
+	}
 	setOptionalString(body, "input_fidelity", req.InputFidelity)
 	setOptionalString(body, "moderation", req.Moderation)
 	setOptionalString(body, "response_format", req.ResponseFormat)
@@ -2403,6 +2427,23 @@ func imageResponseBudgetError(limit int) error {
 }
 
 func chatGPTWebImageRequestCompatibilityError(req openAIImageRequest, ignoreUnsupportedParams bool, imageConfig coreexecutor.ChatGPTWebImageConfigSnapshot) *chatGPTWebImageCompatibilityError {
+	format := normalizeChatGPTWebRequestedOutputFormat(req.OutputFormat)
+	frames, duration := 0, 0
+	if req.FrameCount != nil {
+		frames = *req.FrameCount
+	}
+	if req.FrameDurationMS != nil {
+		duration = *req.FrameDurationMS
+	}
+	if (req.FrameCount != nil && frames <= 0) || (req.FrameDurationMS != nil && duration <= 0) {
+		return &chatGPTWebImageCompatibilityError{parameter: "frame_count/frame_duration_ms", message: "GIF frame controls must be positive integers", providerFiltered: true}
+	}
+	if err := executorhelps.ValidateChatGPTWebAnimationControls(format, frames, duration); err != nil {
+		return &chatGPTWebImageCompatibilityError{parameter: "frame_count/frame_duration_ms", message: err.Error(), providerFiltered: true}
+	}
+	if format == "gif" && (req.Mask != nil || (req.PartialImages != nil && *req.PartialImages > 0) || (req.OutputCompression != nil && *req.OutputCompression != 100)) {
+		return &chatGPTWebImageCompatibilityError{parameter: "output_format", message: "chatgpt web GIF output does not support masks, partial images, or custom output_compression", providerFiltered: true}
+	}
 	maxN := imageConfig.MaxN
 	if maxN <= 0 {
 		maxN = sdkconfig.DefaultChatGPTWebMaxN
@@ -2438,7 +2479,7 @@ func chatGPTWebImageRequestCompatibilityError(req openAIImageRequest, ignoreUnsu
 		background := strings.ToLower(strings.TrimSpace(req.Background))
 		moderation := strings.ToLower(strings.TrimSpace(req.Moderation))
 		outputFormat := normalizeChatGPTWebRequestedOutputFormat(req.OutputFormat)
-		validOutputFormat := outputFormat == "png" || outputFormat == "jpeg" || outputFormat == "webp"
+		validOutputFormat := outputFormat == "png" || outputFormat == "jpeg" || outputFormat == "webp" || outputFormat == "gif"
 		unsupported := []struct {
 			parameter string
 			present   bool
@@ -2523,8 +2564,8 @@ func normalizeChatGPTWebRequestedOutputFormat(value string) string {
 		return "png"
 	case "jpg", "jpeg":
 		return "jpeg"
-	case "webp":
-		return "webp"
+	case "webp", "gif":
+		return strings.ToLower(strings.TrimSpace(value))
 	default:
 		return ""
 	}

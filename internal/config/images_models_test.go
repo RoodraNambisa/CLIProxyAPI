@@ -14,7 +14,7 @@ func TestResolvedImageModelLists(t *testing.T) {
 		cfg       ImagesConfig
 		tool, web []string
 	}{
-		{name: "defaults", tool: defaults, web: defaults},
+		{name: "defaults", tool: defaults, web: append(slices.Clone(defaults), "gpt-image-2.6", "gpt-image-2.6-flare", "gpt-image-2.6-sunburst")},
 		{name: "legacy alias", cfg: ImagesConfig{ImageModel: " old-image "}, tool: []string{"old-image"}, web: []string{"old-image"}},
 		{name: "independent lists", cfg: ImagesConfig{
 			ImageModels: []string{" gpt-image-2.5 ", "GPT-IMAGE-2.5", "", "custom-tool"},
