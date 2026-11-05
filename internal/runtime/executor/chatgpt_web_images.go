@@ -1081,13 +1081,12 @@ func (e *ChatGPTWebExecutor) finishChatGPTWebImage(ctx context.Context, client *
 	}
 	encodeStarted := time.Now()
 	setChatGPTWebImageTaskStage(ctx, "encoding")
-	// Public Web aliases do not select an image engine. Retain the existing
-	// usage estimate while reporting the requested alias separately.
+	// Public Web aliases share one image engine; report the requested alias separately.
 	outputImages, err := prepareChatGPTWebImageOutputsWithContextAndCompression(
 		ctx,
 		imageRequest.OutputFormat,
 		outputCompression,
-		chatgptwebauth.ImageModel,
+		helps.ChatGPTWebImageUsageModel,
 		imageRequest.Quality,
 		images,
 		prepared.imageSizeMatch,
@@ -1096,6 +1095,13 @@ func (e *ChatGPTWebExecutor) finishChatGPTWebImage(ctx context.Context, client *
 	)
 	if err != nil {
 		return nil, err
+	}
+	references := accumulator.OutputReferences(prepared.maxImageResults)
+	for index := range outputImages {
+		output := &outputImages[index]
+		if output.Animation.FrameCount > 1 && index < len(references) {
+			output.Animation = references[index].Animation.ForFrames(output.Animation.FrameCount, output.Width, output.Height)
+		}
 	}
 	usage := e.completeChatGPTWebUpstreamImageUsage(prepared, accumulator.ToolUsage)
 	if usage == nil {
@@ -1192,8 +1198,16 @@ func prepareChatGPTWebImageOutputsWithContextAndCompression(
 		if errConfig != nil {
 			return nil, statusErr{code: http.StatusBadGateway, msg: "chatgpt web returned an invalid image", skipAuthResult: true, retryOtherAuth: true}
 		}
+		animation := helps.ChatGPTWebImageAnimation{}
+		if requestedFormat == "gif" {
+			info, errGIF := helps.InspectChatGPTWebGIF(ctx, bytes.NewReader(imageData), int64(chatGPTWebMaxOutputImagePixels))
+			if errGIF != nil {
+				return nil, chatGPTWebImageAnimationError(errGIF)
+			}
+			animation.FrameCount = info.Frames
+		}
 		originalOutputs = append(originalOutputs, helps.ChatGPTWebUsageImage{
-			Model: model, Use: "image_generation_output", Width: decodedConfig.Width, Height: decodedConfig.Height, Quality: quality,
+			Model: model, Use: "image_generation_output", Width: decodedConfig.Width, Height: decodedConfig.Height, Quality: quality, Animation: animation,
 		})
 		originalTotalBytes += len(imageData)
 	}
@@ -1253,7 +1267,7 @@ func prepareChatGPTWebImageOutputsWithContextAndCompression(
 			candidates[index] = candidate
 			candidateTotalBytes += len(candidate)
 			changed = changed || !bytes.Equal(candidate, imageData)
-			candidateOutputs = append(candidateOutputs, helps.ChatGPTWebUsageImage{Model: model, Use: "image_generation_output", Width: width, Height: height, Quality: quality})
+			candidateOutputs = append(candidateOutputs, helps.ChatGPTWebUsageImage{Model: model, Use: "image_generation_output", Width: width, Height: height, Quality: quality, Animation: originalOutputs[index].Animation})
 			continue
 		}
 		needsResize := resizeEnabled &&
@@ -4115,16 +4129,7 @@ func (e *ChatGPTWebExecutor) chatGPTWebImageDownloadURLs(
 	accumulator *helps.ChatGPTWebImageAccumulator,
 	maxResults int,
 ) ([]string, error) {
-	references := accumulator.References
-	if len(references) == 0 {
-		references = make([]helps.ChatGPTWebImageReference, 0, len(accumulator.FileIDs)+len(accumulator.SedimentIDs))
-		for _, fileID := range accumulator.FileIDs {
-			references = append(references, helps.ChatGPTWebImageReference{Kind: "file", ID: fileID})
-		}
-		for _, sedimentID := range accumulator.SedimentIDs {
-			references = append(references, helps.ChatGPTWebImageReference{Kind: "sediment", ID: sedimentID})
-		}
-	}
+	references := accumulator.OutputReferences(maxResults)
 	urls := make([]string, 0, len(references))
 	for _, reference := range references {
 		if maxResults > 0 && len(urls) >= maxResults {

@@ -95,12 +95,13 @@ type chatGPTWebUsageFilesystemProbe struct {
 
 // ChatGPTWebUsageImage describes one decoded image without retaining its payload.
 type ChatGPTWebUsageImage struct {
-	Model   string
-	Detail  string
-	Use     string
-	Width   int
-	Height  int
-	Quality string
+	Model     string
+	Detail    string
+	Use       string
+	Width     int
+	Height    int
+	Quality   string
+	Animation ChatGPTWebImageAnimation
 }
 
 // ChatGPTWebUsageCache owns compact per-request accounting projections.
@@ -879,7 +880,7 @@ func (projection *ChatGPTWebUsageProjection) Estimate(outputText string, outputI
 	}
 	var outputImageTokens int64
 	for _, image := range outputImages {
-		tokens, errCount := ChatGPTWebImageOutputTokenCount(image.Model, image.Quality, projection.autoOutputQuality, image.Width, image.Height)
+		tokens, errCount := ChatGPTWebImageUsageOutputTokenCount(image, projection.autoOutputQuality)
 		if errCount != nil {
 			errorsFound = append(errorsFound, errCount)
 			continue

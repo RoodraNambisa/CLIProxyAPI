@@ -1356,6 +1356,8 @@ type ChatGPTWebImageAccumulator struct {
 	responseMessageSet    map[string]struct{}
 	pendingReferenceSet   map[string]struct{}
 	referenceSet          map[string]struct{}
+	usageMessageID        string
+	usageParts            map[int]chatGPTWebImageUsagePart
 }
 
 // ChatGPTWebImageTurn identifies the user message that started one image
@@ -1373,6 +1375,7 @@ type ChatGPTWebImageReference struct {
 	ID                 string
 	GenerationIndex    int
 	HasGenerationIndex bool
+	Animation          ChatGPTWebImageAnimation
 }
 
 // ChatGPTWebImageTaskState summarizes image tasks associated with one
@@ -1911,13 +1914,16 @@ func (accumulator *ChatGPTWebImageAccumulator) applyImageContextPatch(event map[
 			return err
 		}
 	}
+	accumulator.captureImageUsagePatch(event)
 	return nil
 }
 
 func (accumulator *ChatGPTWebImageAccumulator) captureReferences(value any) error {
+	accumulator.captureImageUsageMessage(value)
 	if err := accumulator.captureReferencesAt(value, "", 0, false); err != nil {
 		return err
 	}
+	accumulator.applyImageUsageParts()
 	accumulator.sortReferences()
 	return nil
 }
@@ -1943,7 +1949,7 @@ func (accumulator *ChatGPTWebImageAccumulator) captureReferencesAt(value any, fi
 			} else if chatGPTWebImagePointerIncomplete(typed) {
 				accumulator.IncompleteOutputSeen = true
 				accumulator.markPendingImagePointer(pointer)
-			} else if err := accumulator.appendImagePointerWithGeneration(pointer, generationIndex, hasGenerationIndex); err != nil {
+			} else if err := accumulator.appendImagePointerWithGeneration(pointer, generationIndex, hasGenerationIndex, chatGPTWebImageAnimationFromPart(typed)); err != nil {
 				return err
 			}
 			// An image part owns its output. Generation metadata may contain a
@@ -2056,12 +2062,16 @@ func (accumulator *ChatGPTWebImageAccumulator) appendImagePointer(pointer string
 	return accumulator.appendImagePointerWithGeneration(pointer, 0, false)
 }
 
-func (accumulator *ChatGPTWebImageAccumulator) appendImagePointerWithGeneration(pointer string, generationIndex int, hasGenerationIndex bool) error {
+func (accumulator *ChatGPTWebImageAccumulator) appendImagePointerWithGeneration(pointer string, generationIndex int, hasGenerationIndex bool, animation ...ChatGPTWebImageAnimation) error {
 	kind, id := chatGPTWebImagePointerKindID(pointer)
 	if kind == "" {
 		return nil
 	}
-	return accumulator.appendReferenceWithMetadata(ChatGPTWebImageReference{Kind: kind, ID: id, GenerationIndex: generationIndex, HasGenerationIndex: hasGenerationIndex})
+	reference := ChatGPTWebImageReference{Kind: kind, ID: id, GenerationIndex: generationIndex, HasGenerationIndex: hasGenerationIndex}
+	if len(animation) > 0 {
+		reference.Animation = animation[0]
+	}
+	return accumulator.appendReferenceWithMetadata(reference)
 }
 
 func (accumulator *ChatGPTWebImageAccumulator) appendReference(kind, id string) error {
@@ -2084,14 +2094,16 @@ func (accumulator *ChatGPTWebImageAccumulator) appendReferenceWithMetadata(refer
 	}
 	key := reference.Kind + "\x00" + id
 	if _, exists := accumulator.referenceSet[key]; exists {
-		if reference.HasGenerationIndex {
-			for index := range accumulator.References {
-				if accumulator.References[index].Kind == reference.Kind && accumulator.References[index].ID == id && !accumulator.References[index].HasGenerationIndex {
-					accumulator.References[index].GenerationIndex = reference.GenerationIndex
-					accumulator.References[index].HasGenerationIndex = true
-					break
-				}
+		for index := range accumulator.References {
+			existing := &accumulator.References[index]
+			if existing.Kind != reference.Kind || existing.ID != id {
+				continue
 			}
+			if reference.HasGenerationIndex && !existing.HasGenerationIndex {
+				existing.GenerationIndex, existing.HasGenerationIndex = reference.GenerationIndex, true
+			}
+			existing.Animation = mergeChatGPTWebImageAnimation(existing.Animation, reference.Animation)
+			break
 		}
 		return nil
 	}

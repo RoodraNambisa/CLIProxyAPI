@@ -53,7 +53,7 @@ func TestGetChatGPTWebUsageCacheReturnsDefaultsAndRuntimeStats(t *testing.T) {
 		t.Fatalf("GET status = %d, want 200: %s", recorder.Code, recorder.Body.String())
 	}
 	response := decodeChatGPTWebUsageCacheResponse(t, recorder)
-	if !response.EstimateTokenUsage || response.UsageCache.Enabled ||
+	if response.ImageOutputEstimator != helps.ChatGPTWebImageUsageEstimator || !response.EstimateTokenUsage || response.UsageCache.Enabled ||
 		response.UsageCache.DiskThresholdMB != config.DefaultChatGPTWebUsageCacheThresholdMB ||
 		response.UsageCache.MaxDiskSizeMB != config.DefaultChatGPTWebUsageCacheMaxDiskSizeMB ||
 		!response.UsageCache.ResourceGuardEnabled ||

@@ -171,35 +171,84 @@ func chatGPTWebGPTImageTokenCount(width, height int) int64 {
 	return int64(65 + chatGPTWebTileCount(width, height, 512)*129)
 }
 
-// ChatGPTWebImageOutputTokenCount estimates final GPT Image 2 output tokens.
+// ChatGPTWebImageOutputTokenCount estimates output tokens using the selected image profile.
 func ChatGPTWebImageOutputTokenCount(model, requestedQuality, autoQuality string, width, height int) (int64, error) {
 	if width <= 0 || height <= 0 {
 		return 0, fmt.Errorf("image output dimensions are invalid")
 	}
-	if normalizeChatGPTWebUsageModel(model) != "gpt-image-2" {
-		return 0, fmt.Errorf("image output token estimation is not available for model %q", strings.TrimSpace(model))
+	model = normalizeChatGPTWebUsageModel(model)
+	modern := model == "gpt-image-2.5" || strings.HasPrefix(model, "gpt-image-2.5-") ||
+		model == "gpt-image-2.6" || strings.HasPrefix(model, "gpt-image-2.6-")
+	if model != "gpt-image-2" && !modern {
+		return 0, fmt.Errorf("image output token estimation is not available for model %q", model)
 	}
 	quality := strings.ToLower(strings.TrimSpace(requestedQuality))
 	if quality == "" || quality == "auto" {
 		quality = normalizeChatGPTWebOutputQuality(autoQuality)
 	}
-	qualityFactor := 0
+	factor := 0
 	switch quality {
 	case "low":
-		qualityFactor = 16
+		factor = 16
 	case "medium":
-		qualityFactor = 48
+		factor = 48
 	case "high":
-		qualityFactor = 96
-	default:
+		factor = 96
+	case "xhigh":
+		if modern {
+			factor = 64
+		}
+	case "max":
+		if modern {
+			factor = 96
+		}
+	}
+	if modern && quality == "medium" {
+		factor = 24
+	}
+	if modern && quality == "high" {
+		factor = 48
+	}
+	if factor == 0 {
 		return 0, fmt.Errorf("unsupported image output quality %q", quality)
 	}
-	longSide := max(width, height)
-	shortSide := min(width, height)
-	minorGrid := int(math.Round(float64(qualityFactor*shortSide) / float64(longSide)))
-	grid := int64(qualityFactor * max(1, minorGrid))
+	minor := float64(factor) * float64(min(width, height)) / float64(max(width, height))
+	rounded := math.Round(minor)
+	if modern {
+		rounded = math.RoundToEven(minor)
+	}
+	grid := int64(factor) * max(1, int64(rounded))
+	const maxInt64 = int64(^uint64(0) >> 1)
+	if int64(width) > maxInt64/int64(height) {
+		return 0, fmt.Errorf("image output dimensions exceed token arithmetic limits")
+	}
 	pixels := int64(width) * int64(height)
-	return int64(math.Ceil(float64(grid*(2_000_000+pixels)) / 4_000_000)), nil
+	if pixels > maxInt64/grid-2_000_000 {
+		return 0, fmt.Errorf("image output dimensions exceed token arithmetic limits")
+	}
+	numerator := grid * (2_000_000 + pixels)
+	tokens := numerator / 4_000_000
+	if numerator%4_000_000 != 0 {
+		tokens++
+	}
+	multiplier := int64(10)
+	if model == "gpt-image-2.6" || strings.HasPrefix(model, "gpt-image-2.6-") {
+		switch quality {
+		case "low":
+			multiplier = 42
+		case "medium":
+			multiplier = 33
+		}
+	}
+	if tokens > maxInt64/multiplier {
+		return 0, fmt.Errorf("image output tokens exceed arithmetic limits")
+	}
+	numerator = tokens * multiplier
+	tokens = numerator / 10
+	if numerator%10 != 0 {
+		tokens++
+	}
+	return tokens, nil
 }
 
 func chatGPTWebTileCount(width, height, shortestSide int) int {

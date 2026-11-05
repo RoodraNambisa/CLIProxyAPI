@@ -158,6 +158,7 @@ chatgpt-web:
     path: ""
   image-usage:
     # Billing-only fallback for quality=auto; this does not change Web output quality.
+    # Local output estimates use GPT Image 2.6 and delivered dimensions. GIF estimates use the animation sheet layout.
     auto-output-quality: "medium"
     # Used only after a successful image request when token estimation is disabled
     # and the upstream response contains no image usage.

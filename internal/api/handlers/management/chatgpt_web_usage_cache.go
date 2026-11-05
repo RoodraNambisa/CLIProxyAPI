@@ -54,11 +54,12 @@ type chatGPTWebImageUsageResponse struct {
 }
 
 type chatGPTWebUsageCacheResponse struct {
-	EstimateTokenUsage bool                                      `json:"estimate-token-usage"`
-	UsageCache         config.ResolvedChatGPTWebUsageCacheConfig `json:"usage-cache"`
-	ImageUsage         chatGPTWebImageUsageResponse              `json:"image-usage"`
-	Stats              helps.ChatGPTWebUsageCacheSnapshot        `json:"stats"`
-	Filesystem         systemmetrics.FilesystemSnapshot          `json:"filesystem"`
+	ImageOutputEstimator string                                    `json:"image-output-estimator"`
+	EstimateTokenUsage   bool                                      `json:"estimate-token-usage"`
+	UsageCache           config.ResolvedChatGPTWebUsageCacheConfig `json:"usage-cache"`
+	ImageUsage           chatGPTWebImageUsageResponse              `json:"image-usage"`
+	Stats                helps.ChatGPTWebUsageCacheSnapshot        `json:"stats"`
+	Filesystem           systemmetrics.FilesystemSnapshot          `json:"filesystem"`
 }
 
 // GetChatGPTWebUsageCache returns effective accounting settings and runtime storage statistics.
@@ -73,8 +74,9 @@ func (h *Handler) GetChatGPTWebUsageCache(c *gin.Context) {
 		return
 	}
 	response := chatGPTWebUsageCacheResponse{
-		EstimateTokenUsage: cfg.ChatGPTWeb.TokenUsageEstimationEnabled(),
-		UsageCache:         cfg.ChatGPTWeb.UsageCache.Resolved(),
+		ImageOutputEstimator: helps.ChatGPTWebImageUsageEstimator,
+		EstimateTokenUsage:   cfg.ChatGPTWeb.TokenUsageEstimationEnabled(),
+		UsageCache:           cfg.ChatGPTWeb.UsageCache.Resolved(),
 		ImageUsage: chatGPTWebImageUsageResponse{
 			AutoOutputQuality: cfg.ChatGPTWeb.ImageUsage.ResolvedAutoOutputQuality(),
 			FallbackUsage:     cfg.ChatGPTWeb.ImageUsage.FallbackUsage.Resolved(),
