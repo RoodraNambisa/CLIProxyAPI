@@ -779,6 +779,12 @@ func (e *ChatGPTWebExecutor) prepareRuntimeRequestTemplate(ctx context.Context, 
 		MaxImageResponseBytes:        resolvedImageConfig.MaxImageResponseMegabytes << 20,
 		MaxN:                         resolvedImageConfig.MaxN,
 	}
+	imageModelsConfig := config.ImagesConfig{}
+	if cfg != nil {
+		imageModelsConfig = cfg.Images
+	}
+	imageConfigSnapshot.ModelOutputFormats = imageModelsConfig.ResolvedChatGPTWebModelOutputFormats()
+	imageConfigSnapshot.DefaultImageModel = imageModelsConfig.ResolvedChatGPTWebDefaultImageModel()
 	if pinned, ok := opts.Metadata[cliproxyexecutor.ChatGPTWebImageConfigSnapshotMetadataKey].(cliproxyexecutor.ChatGPTWebImageConfigSnapshot); ok {
 		imageConfigSnapshot = pinned
 	} else if opaque, ok := cliproxyexecutor.ProviderPreparedRequest(opts, e.Identifier()); ok {
@@ -786,6 +792,7 @@ func (e *ChatGPTWebExecutor) prepareRuntimeRequestTemplate(ctx context.Context, 
 			imageConfigSnapshot = previous.imageConfigSnapshot
 		}
 	}
+	imageConfigSnapshot = imageConfigSnapshot.Clone()
 	canonicalBody = helps.ApplyPayloadConfigWithRequest(cfg, baseModel, sdktranslator.FormatCodex.String(), opts.SourceFormat.String(), "",
 		canonicalBody, originalSource, routeModel, helps.PayloadRequestPath(opts), opts.Headers)
 	forcedTool := ""
@@ -872,6 +879,15 @@ func (e *ChatGPTWebExecutor) prepareRuntimeRequestTemplate(ctx context.Context, 
 	}
 	if ignoreUnsupportedImageParams {
 		ignoreUnsupportedChatGPTWebImageParams(parsed.Image)
+	}
+	if parsed.Image != nil {
+		toolModel := ""
+		if parsed.Image.ExplicitModel {
+			toolModel = parsed.Image.Model
+		}
+		if errFormat := helps.ValidateChatGPTWebImageOutputFormat(imageConfigSnapshot, routeModel, baseModel, toolModel, parsed.Image.OutputFormat); errFormat != nil {
+			return nil, errFormat
+		}
 	}
 	if err = validateChatGPTWebImageRequest(parsed.Image, imageConfigSnapshot.RemoteImageURLEnabled); err != nil {
 		return nil, err

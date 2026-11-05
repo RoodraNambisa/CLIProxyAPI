@@ -615,6 +615,10 @@ func (e *ChatGPTWebExecutor) PrepareProviderRequest(ctx context.Context, req cli
 		return prepared, nil
 	}
 	var retryOtherProvider interface{ RetryOtherAuth() bool }
+	var formatErr *helps.ChatGPTWebImageOutputFormatError
+	if errors.As(errPrepare, &formatErr) {
+		return nil, cliproxyexecutor.NewProviderIncompatibleRequestPreparationError(errPrepare)
+	}
 	if errors.As(errPrepare, &retryOtherProvider) && retryOtherProvider.RetryOtherAuth() {
 		return nil, cliproxyexecutor.NewProviderIncompatibleRequestPreparationError(errPrepare)
 	}

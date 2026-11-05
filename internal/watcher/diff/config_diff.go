@@ -478,6 +478,9 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	if oldCfg.Images.ChatGPTWeb.IgnoreUnsupportedParams != newCfg.Images.ChatGPTWeb.IgnoreUnsupportedParams {
 		changes = append(changes, fmt.Sprintf("images.chatgpt-web.ignore-unsupported-params: %t -> %t", oldCfg.Images.ChatGPTWeb.IgnoreUnsupportedParams, newCfg.Images.ChatGPTWeb.IgnoreUnsupportedParams))
 	}
+	if !reflect.DeepEqual(oldCfg.Images.ChatGPTWeb.ModelOutputFormats, newCfg.Images.ChatGPTWeb.ModelOutputFormats) {
+		changes = append(changes, "images.chatgpt-web.model-output-formats: updated")
+	}
 	oldImageRuntime := oldCfg.Images.ChatGPTWeb.Resolved()
 	newImageRuntime := newCfg.Images.ChatGPTWeb.Resolved()
 	if oldImageRuntime.NormalizeMismatchedImageMIME != newImageRuntime.NormalizeMismatchedImageMIME {

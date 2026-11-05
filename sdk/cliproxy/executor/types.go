@@ -207,6 +207,8 @@ const (
 
 // ChatGPTWebImageConfigSnapshot contains request-scoped Web image adaptation settings.
 type ChatGPTWebImageConfigSnapshot struct {
+	DefaultImageModel            string
+	ModelOutputFormats           map[string][]string
 	UpstreamModel                string
 	ReasoningMode                string
 	AutoCleanupLibraryOnFull     bool
@@ -222,6 +224,18 @@ type ChatGPTWebImageConfigSnapshot struct {
 	ResizeFilter                 string
 	MaxImageResponseBytes        int
 	MaxN                         int
+}
+
+// Clone keeps request policies independent of later metadata or config edits.
+func (s ChatGPTWebImageConfigSnapshot) Clone() ChatGPTWebImageConfigSnapshot {
+	if s.ModelOutputFormats != nil {
+		cloned := make(map[string][]string, len(s.ModelOutputFormats))
+		for k, v := range s.ModelOutputFormats {
+			cloned[k] = append([]string(nil), v...)
+		}
+		s.ModelOutputFormats = cloned
+	}
+	return s
 }
 
 // ImageGenerationStreamPassthroughState reports whether the selected upstream request

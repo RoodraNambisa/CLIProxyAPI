@@ -2442,6 +2442,13 @@ func imageResponseBudgetError(limit int) error {
 }
 
 func chatGPTWebImageRequestCompatibilityError(req openAIImageRequest, ignoreUnsupportedParams bool, imageConfig coreexecutor.ChatGPTWebImageConfigSnapshot) *chatGPTWebImageCompatibilityError {
+	effectiveFormat := req.OutputFormat
+	if ignoreUnsupportedParams && normalizeChatGPTWebRequestedOutputFormat(effectiveFormat) == "" {
+		effectiveFormat = "png"
+	}
+	if errFormat := executorhelps.ValidateChatGPTWebImageOutputFormat(imageConfig, req.Model, "", "", effectiveFormat); errFormat != nil {
+		return &chatGPTWebImageCompatibilityError{parameter: "output_format", payload: []byte(errFormat.Error())}
+	}
 	if !ignoreUnsupportedParams {
 		for _, field := range []struct {
 			name  string
@@ -2921,6 +2928,8 @@ func (h *OpenAIImagesAPIHandler) chatGPTWebImageConfigSnapshot() coreexecutor.Ch
 		resolved = h.Cfg.Images.ChatGPTWeb.Resolved()
 	}
 	return coreexecutor.ChatGPTWebImageConfigSnapshot{
+		ModelOutputFormats:           h.imageModelsConfig().ResolvedChatGPTWebModelOutputFormats(),
+		DefaultImageModel:            h.imageModelsConfig().ResolvedChatGPTWebDefaultImageModel(),
 		UpstreamModel:                resolved.UpstreamModel,
 		ReasoningMode:                resolved.ReasoningMode,
 		AutoCleanupLibraryOnFull:     resolved.AutoCleanupLibraryOnFull,

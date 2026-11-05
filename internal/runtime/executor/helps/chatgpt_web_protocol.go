@@ -128,6 +128,7 @@ type ChatGPTWebImageRequest struct {
 	OutputCompression int
 	FrameCount        int
 	FrameDurationMS   int
+	ExplicitModel     bool
 }
 
 // ChatGPTWebRequest is the subset of canonical Responses understood by the
@@ -961,6 +962,7 @@ func imageRequestFromMessages(messages []ChatGPTWebMessage, tool map[string]any)
 		request.N = n
 	}
 	request.FrameCount, _ = integerFromAny(tool["frame_count"])
+	request.ExplicitModel = request.Model != ""
 	request.FrameDurationMS, _ = integerFromAny(tool["frame_duration_ms"])
 	if compression, ok := integerFromAny(tool["output_compression"]); ok && compression >= 0 && compression <= 100 {
 		request.OutputCompression = compression

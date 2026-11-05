@@ -726,6 +726,10 @@ nonstream-keepalive-interval: 0
 #     image-models: ["gpt-image-2", "gpt-image-2.5", "gpt-image-2.5-flare", "gpt-image-2.5-sunburst", "gpt-image-2.6", "gpt-image-2.6-flare", "gpt-image-2.6-sunburst"] # Independent public aliases, not upstream image engine selectors. All share quota.
 #     # output_format=gif preserves native animation; frame_count (2-64) and frame_duration_ms (20-2000) select animation instructions.
 #     # GIF frame count is verified; frame delays are normalized to 10 ms. PNG/JPEG/WebP remain still-image formats.
+#     # Only the three built-in 2.6 aliases allow GIF by default. Other aliases default to PNG/JPEG/WebP.
+#     model-output-formats:          # Optional overrides for registered Web aliases; inputs are unaffected.
+#       gpt-image-2.6: [png, jpeg, webp, gif]
+#       gpt-image-2.5: [png, jpeg, webp]
 #     remote-image-url-enabled: false # Fetch public HTTP(S) image_url inputs with SSRF and 50 MiB safeguards.
 #     remote-image-url-download-mode: direct # direct or credential-proxy; missing credential proxy falls back to direct.
 #     ignore-unsupported-params: false # Drop unsupported size/quality/etc. instead of excluding Web routing.

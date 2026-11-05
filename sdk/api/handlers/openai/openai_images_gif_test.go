@@ -85,7 +85,7 @@ func TestOpenAIImagesGIFInvalidControlsCannotBeIgnored(t *testing.T) {
 		frames int
 		delay  int
 	}{{"gif", 0, 180}, {"gif", 1, 180}, {"gif", 65, 180}, {"gif", 9, 0}, {"gif", 9, 19}, {"gif", 9, 2001}, {"png", 9, 180}} {
-		request := openAIImageRequest{OutputFormat: tc.format, FrameCount: &tc.frames, FrameDurationMS: &tc.delay}
+		request := openAIImageRequest{Model: "gpt-image-2.6", OutputFormat: tc.format, FrameCount: &tc.frames, FrameDurationMS: &tc.delay}
 		if err := chatGPTWebImageRequestCompatibilityError(request, true, core.ChatGPTWebImageConfigSnapshot{}); err == nil || !err.providerFiltered {
 			t.Fatalf("invalid animation controls accepted: %+v", tc)
 		}

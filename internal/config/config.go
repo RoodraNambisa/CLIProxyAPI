@@ -2510,6 +2510,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	}
 	cfg.Images.ImageModels = normalizeImageModelIDs(cfg.Images.ImageModels)
 	cfg.Images.ChatGPTWeb.ImageModels = normalizeImageModelIDs(cfg.Images.ChatGPTWeb.ImageModels)
+	if cfg.Images.ChatGPTWeb.ModelOutputFormats, err = cfg.Images.NormalizedChatGPTWebModelOutputFormats(); err != nil {
+		return nil, err
+	}
 	cfg.Images.ChatGPTWeb.UpstreamModel = cfg.Images.ChatGPTWeb.ResolvedUpstreamModel()
 	if err = cfg.Images.ValidateRequestTimeouts(); err != nil {
 		return nil, err
@@ -4197,6 +4200,9 @@ func SaveConfigPreserveComments(configFile string, cfg *Config) error {
 	}
 	if errBootstrap := cfg.Images.ChatGPTWeb.ValidateBootstrap(); errBootstrap != nil {
 		return errBootstrap
+	}
+	if _, errFormats := cfg.Images.NormalizedChatGPTWebModelOutputFormats(); errFormats != nil {
+		return errFormats
 	}
 	if errReasoning := cfg.Images.ChatGPTWeb.ValidateReasoningMode(); errReasoning != nil {
 		return errReasoning

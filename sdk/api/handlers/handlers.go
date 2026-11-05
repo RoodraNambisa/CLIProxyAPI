@@ -196,7 +196,7 @@ func WithChatGPTWebImageConfigSnapshot(ctx context.Context, snapshot coreexecuto
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	return context.WithValue(ctx, chatGPTWebImageConfigSnapshotContextKey{}, snapshot)
+	return context.WithValue(ctx, chatGPTWebImageConfigSnapshotContextKey{}, snapshot.Clone())
 }
 
 func chatGPTWebImageConfigSnapshot(ctx context.Context) (coreexecutor.ChatGPTWebImageConfigSnapshot, bool) {
@@ -347,6 +347,12 @@ func (h *BaseAPIHandler) filterChatGPTWebStrictImageSize(
 			MaxImageResponseBytes:        resolved.MaxImageResponseMegabytes << 20,
 			MaxN:                         resolved.MaxN,
 		}
+		imageModelsConfig := config.ImagesConfig{}
+		if h != nil && h.Cfg != nil {
+			imageModelsConfig = h.Cfg.Images
+		}
+		snapshot.ModelOutputFormats = imageModelsConfig.ResolvedChatGPTWebModelOutputFormats()
+		snapshot.DefaultImageModel = imageModelsConfig.ResolvedChatGPTWebDefaultImageModel()
 		ctx = WithChatGPTWebImageConfigSnapshot(ctx, snapshot)
 	}
 	size, requestCount, hasImageTool := executorhelps.ChatGPTWebImageControlsFromResponsesPayload(rawJSON)

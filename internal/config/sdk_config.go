@@ -239,6 +239,8 @@ type ChatGPTWebImageConfig struct {
 	BootstrapRetries int `yaml:"bootstrap-retries" json:"bootstrap-retries"`
 	// ImageModels lists public aliases for the shared Web image capability, not upstream engines.
 	ImageModels []string `yaml:"image-models,omitempty" json:"image-models,omitempty"`
+	// ModelOutputFormats overrides public Web aliases' permitted delivery formats.
+	ModelOutputFormats map[string][]string `yaml:"model-output-formats,omitempty" json:"model-output-formats,omitempty"`
 	// UpstreamModel is the ChatGPT Web conversation model that invokes picture_v2.
 	UpstreamModel string `yaml:"upstream-model,omitempty" json:"upstream-model,omitempty"`
 	// ReasoningMode selects the image conversation carrier, not the image tool's quality.
