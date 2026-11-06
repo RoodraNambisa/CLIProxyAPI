@@ -213,10 +213,7 @@ func ChatGPTWebImageOutputTokenCount(model, requestedQuality, autoQuality string
 		return 0, fmt.Errorf("unsupported image output quality %q", quality)
 	}
 	minor := float64(factor) * float64(min(width, height)) / float64(max(width, height))
-	rounded := math.Round(minor)
-	if modern {
-		rounded = math.RoundToEven(minor)
-	}
+	rounded := math.RoundToEven(minor)
 	grid := int64(factor) * max(1, int64(rounded))
 	const maxInt64 = int64(^uint64(0) >> 1)
 	if int64(width) > maxInt64/int64(height) {

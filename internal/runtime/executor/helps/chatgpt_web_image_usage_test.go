@@ -5,6 +5,32 @@ import (
 	"testing"
 )
 
+func TestChatGPTWebImageUsageOfficialProfiles(t *testing.T) {
+	for _, tc := range []struct {
+		model, quality string
+		width, height  int
+		want           int64
+	}{
+		{"gpt-image-2", "low", 1024, 1024, 196},
+		{"gpt-image-2", "medium", 1024, 1024, 1756},
+		{"gpt-image-2", "high", 1024, 1024, 7024},
+		{"gpt-image-2", "low", 1024, 800, 136},
+		{"gpt-image-2", "low", 800, 1024, 136},
+		{"gpt-image-2.5-sunburst", "low", 1024, 1024, 196},
+		{"gpt-image-2.5-sunburst", "medium", 1024, 1024, 439},
+		{"gpt-image-2.5-sunburst", "high", 1024, 1024, 1756},
+		{"gpt-image-2.5-sunburst", "low", 1024, 800, 136},
+		{"gpt-image-2.6-sunburst", "medium", 1024, 1024, 1449},
+	} {
+		t.Run(fmt.Sprintf("%s/%s/%dx%d", tc.model, tc.quality, tc.width, tc.height), func(t *testing.T) {
+			got, err := ChatGPTWebImageOutputTokenCount(tc.model, tc.quality, "medium", tc.width, tc.height)
+			if err != nil || got != tc.want {
+				t.Fatalf("tokens = %d, error = %v; want %d", got, err, tc.want)
+			}
+		})
+	}
+}
+
 func TestChatGPTWeb26OutputUsage(t *testing.T) {
 	for _, tc := range []struct {
 		quality       string
