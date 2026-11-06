@@ -63,7 +63,7 @@ func TestChatGPTWebGIFSheetUsage(t *testing.T) {
 		{9, 512, "low", 1172}, {10, 512, "low", 1038}, {16, 512, "low", 1668}, {16, 256, "low", 824},
 		{9, 512, "medium", 2073}, {10, 512, "high", 2223},
 	} {
-		image := ChatGPTWebUsageImage{Model: ChatGPTWebImageUsageModel, Width: tc.edge, Height: tc.edge, Quality: tc.quality, Animation: ChatGPTWebImageAnimation{FrameCount: tc.frames}}
+		image := ChatGPTWebUsageImage{Model: "gpt-image-2.6", Width: tc.edge, Height: tc.edge, Quality: tc.quality, Animation: ChatGPTWebImageAnimation{FrameCount: tc.frames}}
 		got, err := ChatGPTWebImageUsageOutputTokenCount(image, "medium")
 		if err != nil || got != tc.want {
 			t.Fatalf("%+v: got %d err %v", tc, got, err)
@@ -86,10 +86,10 @@ func TestChatGPTWebGIFSheetMetadataAndBounds(t *testing.T) {
 		}
 	}
 	for _, image := range []ChatGPTWebUsageImage{
-		{Model: ChatGPTWebImageUsageModel, Width: 0, Height: 512},
-		{Model: ChatGPTWebImageUsageModel, Width: int(^uint(0) >> 1), Height: 2},
-		{Model: ChatGPTWebImageUsageModel, Width: 512, Height: 512, Animation: ChatGPTWebImageAnimation{FrameCount: 65}},
-		{Model: ChatGPTWebImageUsageModel, Width: int(^uint(0) >> 1), Height: 1, Animation: ChatGPTWebImageAnimation{FrameCount: 9}},
+		{Model: "gpt-image-2.6", Width: 0, Height: 512},
+		{Model: "gpt-image-2.6", Width: int(^uint(0) >> 1), Height: 2},
+		{Model: "gpt-image-2.6", Width: 512, Height: 512, Animation: ChatGPTWebImageAnimation{FrameCount: 65}},
+		{Model: "gpt-image-2.6", Width: int(^uint(0) >> 1), Height: 1, Animation: ChatGPTWebImageAnimation{FrameCount: 9}},
 	} {
 		if _, err := ChatGPTWebImageUsageOutputTokenCount(image, "medium"); err == nil {
 			t.Fatalf("accepted invalid dimensions: %+v", image)
@@ -106,7 +106,7 @@ func TestChatGPTWebGIFUsageProjectionUsesDeliveredSheetOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	image := ChatGPTWebUsageImage{Model: ChatGPTWebImageUsageModel, Width: 512, Height: 512, Quality: "auto", Animation: ChatGPTWebImageAnimation{Rows: 3, Columns: 3, FrameCount: 9}}
+	image := ChatGPTWebUsageImage{Model: "gpt-image-2.6", Width: 512, Height: 512, Quality: "auto", Animation: ChatGPTWebImageAnimation{Rows: 3, Columns: 3, FrameCount: 9}}
 	one, errs := projection.Estimate("", []ChatGPTWebUsageImage{image})
 	if len(errs) != 0 {
 		t.Fatal(errs)

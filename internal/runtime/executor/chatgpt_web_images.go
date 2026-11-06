@@ -1081,12 +1081,12 @@ func (e *ChatGPTWebExecutor) finishChatGPTWebImage(ctx context.Context, client *
 	}
 	encodeStarted := time.Now()
 	setChatGPTWebImageTaskStage(ctx, "encoding")
-	// Public Web aliases share one image engine; report the requested alias separately.
+	// The frozen accounting profile does not change the upstream engine or response alias.
 	outputImages, err := prepareChatGPTWebImageOutputsWithContextAndCompression(
 		ctx,
 		imageRequest.OutputFormat,
 		outputCompression,
-		helps.ChatGPTWebImageUsageModel,
+		prepared.imageUsageProfile,
 		imageRequest.Quality,
 		images,
 		prepared.imageSizeMatch,

@@ -539,6 +539,15 @@ func chatGPTWebPersonaOutcomeError(err error) (int, bool, bool) {
 	return 0, cloudflare, sentinel
 }
 
+// ImageUsagePolicySnapshot freezes accounting settings independently of the SDK configuration.
+func (e *ChatGPTWebExecutor) ImageUsagePolicySnapshot() (string, map[string]string, string) {
+	policy := config.ChatGPTWebImageUsageConfig{}
+	if cfg := e.configSnapshot(); cfg != nil {
+		policy = cfg.ChatGPTWeb.ImageUsage
+	}
+	return policy.ResolvedEstimationProfile(), policy.ResolvedModelProfiles(), policy.ResolvedAutoOutputQuality()
+}
+
 // UsageCacheSnapshot returns active storage and cumulative accounting outcomes.
 func (e *ChatGPTWebExecutor) UsageCacheSnapshot() helps.ChatGPTWebUsageCacheSnapshot {
 	if e == nil || e.usageCache == nil {

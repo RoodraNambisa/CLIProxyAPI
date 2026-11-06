@@ -2,9 +2,7 @@ package helps
 
 import "fmt"
 
-// Public Web aliases share the current image engine and do not select billing profiles.
-const ChatGPTWebImageUsageModel = "gpt-image-2.6"
-const ChatGPTWebImageUsageEstimator = "gpt-image-2.6-sheet-v1"
+const ChatGPTWebImageUsageEstimator = "model-profiles-sheet-v1"
 
 // ChatGPTWebImageAnimation contains bounded layout metadata, without image payloads.
 type ChatGPTWebImageAnimation struct {

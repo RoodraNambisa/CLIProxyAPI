@@ -93,6 +93,7 @@ type chatGPTWebPreparedRequest struct {
 	usageProjectionOn      bool
 	usageProjectionOpts    helps.ChatGPTWebUsageCacheOptions
 	imageFallbackUsage     config.ResolvedChatGPTWebImageFallbackUsageConfig
+	imageUsageProfile      string
 	imageConfigSnapshot    cliproxyexecutor.ChatGPTWebImageConfigSnapshot
 	imageSizeMatch         *helps.ChatGPTWebImageSizeMatch
 	bodyRelease            *cliproxyexecutor.RequestBodyReleaseController
@@ -787,6 +788,13 @@ func (e *ChatGPTWebExecutor) prepareRuntimeRequestTemplate(ctx context.Context, 
 	}
 	imageConfigSnapshot.ModelOutputFormats = imageModelsConfig.ResolvedChatGPTWebModelOutputFormats()
 	imageConfigSnapshot.DefaultImageModel = imageModelsConfig.ResolvedChatGPTWebDefaultImageModel()
+	imageUsageConfig := config.ChatGPTWebImageUsageConfig{}
+	if cfg != nil {
+		imageUsageConfig = cfg.ChatGPTWeb.ImageUsage
+	}
+	imageConfigSnapshot.UsageEstimationProfile = imageUsageConfig.ResolvedEstimationProfile()
+	imageConfigSnapshot.UsageModelProfiles = imageUsageConfig.ResolvedModelProfiles()
+	imageConfigSnapshot.UsageAutoOutputQuality = imageUsageConfig.ResolvedAutoOutputQuality()
 	if pinned, ok := opts.Metadata[cliproxyexecutor.ChatGPTWebImageConfigSnapshotMetadataKey].(cliproxyexecutor.ChatGPTWebImageConfigSnapshot); ok {
 		imageConfigSnapshot = pinned
 	} else if opaque, ok := cliproxyexecutor.ProviderPreparedRequest(opts, e.Identifier()); ok {
@@ -904,6 +912,16 @@ func (e *ChatGPTWebExecutor) prepareRuntimeRequestTemplate(ctx context.Context, 
 			return nil, err
 		}
 	}
+	imageUsageProfile := ""
+	if parsed.Image != nil {
+		toolModel := ""
+		if parsed.Image.ExplicitModel {
+			toolModel = parsed.Image.Model
+		}
+		alias := helps.ResolveChatGPTWebImageAlias(imageConfigSnapshot, routeModel, baseModel, toolModel)
+		policy := config.ChatGPTWebImageUsageConfig{EstimationProfile: imageConfigSnapshot.UsageEstimationProfile, ModelProfiles: imageConfigSnapshot.UsageModelProfiles}
+		imageUsageProfile = policy.ProfileForModel(alias)
+	}
 	var usageProjectionOn bool
 	var usageProjectionOpts helps.ChatGPTWebUsageCacheOptions
 	fallbackUsage := config.ChatGPTWebImageFallbackUsageConfig{}.Resolved()
@@ -923,6 +941,9 @@ func (e *ChatGPTWebExecutor) prepareRuntimeRequestTemplate(ctx context.Context, 
 		if cfg != nil {
 			resolvedCache = cfg.ChatGPTWeb.UsageCache.Resolved()
 			autoOutputQuality = cfg.ChatGPTWeb.ImageUsage.ResolvedAutoOutputQuality()
+		}
+		if imageConfigSnapshot.UsageAutoOutputQuality != "" {
+			autoOutputQuality = imageConfigSnapshot.UsageAutoOutputQuality
 		}
 		usageProjectionOpts = helps.ChatGPTWebUsageCacheOptions{
 			Enabled:                  resolvedCache.Enabled,
@@ -955,6 +976,7 @@ func (e *ChatGPTWebExecutor) prepareRuntimeRequestTemplate(ctx context.Context, 
 		usageProjectionOpts: usageProjectionOpts,
 		imageFallbackUsage:  fallbackUsage,
 		imageConfigSnapshot: imageConfigSnapshot,
+		imageUsageProfile:   imageUsageProfile,
 		imageSizeMatch:      imageSizeMatch,
 	}, nil
 }

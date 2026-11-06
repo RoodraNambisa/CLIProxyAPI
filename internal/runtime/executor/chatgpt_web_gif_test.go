@@ -204,7 +204,7 @@ func TestChatGPTWebGIFUsageKeepsDeliveredSizeAndIgnoresPlaybackSpeed(t *testing.
 		data := [][]byte{webGIFFixture(t)}
 		cfg := core.ChatGPTWebImageConfigSnapshot{ResizeToRequestedSize: tc.resize, StrictSize: true, AspectRatioMaxErrorPercent: 1, MaxImageResponseBytes: 16 << 20}
 		match := &helps.ChatGPTWebImageSizeMatch{Width: 512, Height: 512, RatioWidth: 1, RatioHeight: 1}
-		outputs, err := prepareChatGPTWebImageOutputsWithContextAndCompression(t.Context(), "gif", 100, helps.ChatGPTWebImageUsageModel, "auto", data, match, cfg, helps.ChatGPTWebGIFControls{FrameCount: 3, FrameDurationMS: tc.duration})
+		outputs, err := prepareChatGPTWebImageOutputsWithContextAndCompression(t.Context(), "gif", 100, "gpt-image-2.6", "auto", data, match, cfg, helps.ChatGPTWebGIFControls{FrameCount: 3, FrameDurationMS: tc.duration})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -214,7 +214,7 @@ func TestChatGPTWebGIFUsageKeepsDeliveredSizeAndIgnoresPlaybackSpeed(t *testing.
 		}
 	}
 	data := [][]byte{webGIFFixture(t)}
-	outputs, err := prepareChatGPTWebImageOutputsWithContextAndCompression(t.Context(), "png", 100, helps.ChatGPTWebImageUsageModel, "auto", data, nil, core.ChatGPTWebImageConfigSnapshot{})
+	outputs, err := prepareChatGPTWebImageOutputsWithContextAndCompression(t.Context(), "png", 100, "gpt-image-2.6", "auto", data, nil, core.ChatGPTWebImageConfigSnapshot{})
 	if err != nil || outputs[0].Animation.FrameCount != 0 {
 		t.Fatalf("static delivery retained GIF frame billing: %v", err)
 	}

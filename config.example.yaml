@@ -158,7 +158,11 @@ chatgpt-web:
     path: ""
   image-usage:
     # Billing-only fallback for quality=auto; this does not change Web output quality.
-    # Local output estimates use GPT Image 2.6 and delivered dimensions. GIF estimates use the animation sheet layout.
+    # Billing only: by-model, gpt-image-2, gpt-image-2.5, or gpt-image-2.6.
+    # GIF estimates use the animation sheet layout and delivered frame dimensions.
+    estimation-profile: by-model
+    # Overrides apply only in by-model mode and must name configured Web image aliases.
+    model-profiles: {}
     auto-output-quality: "medium"
     # Used only after a successful image request when token estimation is disabled
     # and the upstream response contains no image usage.

@@ -418,6 +418,12 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	if oldCfg.ChatGPTWeb.ImageUsage.ResolvedAutoOutputQuality() != newCfg.ChatGPTWeb.ImageUsage.ResolvedAutoOutputQuality() {
 		changes = append(changes, fmt.Sprintf("chatgpt-web.image-usage.auto-output-quality: %s -> %s", oldCfg.ChatGPTWeb.ImageUsage.ResolvedAutoOutputQuality(), newCfg.ChatGPTWeb.ImageUsage.ResolvedAutoOutputQuality()))
 	}
+	if oldCfg.ChatGPTWeb.ImageUsage.ResolvedEstimationProfile() != newCfg.ChatGPTWeb.ImageUsage.ResolvedEstimationProfile() {
+		changes = append(changes, fmt.Sprintf("chatgpt-web.image-usage.estimation-profile: %s -> %s", oldCfg.ChatGPTWeb.ImageUsage.ResolvedEstimationProfile(), newCfg.ChatGPTWeb.ImageUsage.ResolvedEstimationProfile()))
+	}
+	if !reflect.DeepEqual(oldCfg.ChatGPTWeb.ImageUsage.ModelProfiles, newCfg.ChatGPTWeb.ImageUsage.ModelProfiles) {
+		changes = append(changes, "chatgpt-web.image-usage.model-profiles: updated")
+	}
 	oldFallbackUsage := oldCfg.ChatGPTWeb.ImageUsage.FallbackUsage.Resolved()
 	newFallbackUsage := newCfg.ChatGPTWeb.ImageUsage.FallbackUsage.Resolved()
 	if oldFallbackUsage.Enabled != newFallbackUsage.Enabled {

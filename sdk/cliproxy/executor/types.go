@@ -207,6 +207,9 @@ const (
 
 // ChatGPTWebImageConfigSnapshot contains request-scoped Web image adaptation settings.
 type ChatGPTWebImageConfigSnapshot struct {
+	UsageEstimationProfile        string
+	UsageModelProfiles            map[string]string
+	UsageAutoOutputQuality        string
 	DefaultImageModel             string
 	ModelOutputFormats            map[string][]string
 	UpstreamModel                 string
@@ -238,6 +241,13 @@ func (s ChatGPTWebImageConfigSnapshot) OutputAspectRatioTolerance(format string)
 
 // Clone keeps request policies independent of later metadata or config edits.
 func (s ChatGPTWebImageConfigSnapshot) Clone() ChatGPTWebImageConfigSnapshot {
+	if s.UsageModelProfiles != nil {
+		cloned := make(map[string]string, len(s.UsageModelProfiles))
+		for k, v := range s.UsageModelProfiles {
+			cloned[k] = v
+		}
+		s.UsageModelProfiles = cloned
+	}
 	if s.GIFAspectRatioMaxErrorPercent != nil {
 		value := *s.GIFAspectRatioMaxErrorPercent
 		s.GIFAspectRatioMaxErrorPercent = &value

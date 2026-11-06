@@ -314,6 +314,20 @@ func restrictExecutionProviders(ctx context.Context, providers []string) ([]stri
 	return nil, providerNotAllowedError()
 }
 
+// ChatGPTWebImageUsagePolicySnapshot reads the provider-owned accounting policy once.
+func (h *BaseAPIHandler) ChatGPTWebImageUsagePolicySnapshot() (string, map[string]string, string) {
+	if h != nil && h.AuthManager != nil {
+		if provider, ok := h.AuthManager.Executor("chatgpt-web"); ok {
+			if source, ok := provider.(interface {
+				ImageUsagePolicySnapshot() (string, map[string]string, string)
+			}); ok {
+				return source.ImageUsagePolicySnapshot()
+			}
+		}
+	}
+	return "by-model", nil, "medium"
+}
+
 func (h *BaseAPIHandler) filterChatGPTWebStrictImageSize(
 	ctx context.Context,
 	providers []string,
@@ -355,6 +369,7 @@ func (h *BaseAPIHandler) filterChatGPTWebStrictImageSize(
 		}
 		snapshot.ModelOutputFormats = imageModelsConfig.ResolvedChatGPTWebModelOutputFormats()
 		snapshot.DefaultImageModel = imageModelsConfig.ResolvedChatGPTWebDefaultImageModel()
+		snapshot.UsageEstimationProfile, snapshot.UsageModelProfiles, snapshot.UsageAutoOutputQuality = h.ChatGPTWebImageUsagePolicySnapshot()
 		ctx = WithChatGPTWebImageConfigSnapshot(ctx, snapshot)
 	}
 	size, requestCount, hasImageTool := executorhelps.ChatGPTWebImageControlsFromResponsesPayload(rawJSON)

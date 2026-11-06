@@ -2927,7 +2927,11 @@ func (h *OpenAIImagesAPIHandler) chatGPTWebImageConfigSnapshot() coreexecutor.Ch
 	if h != nil && h.Cfg != nil {
 		resolved = h.Cfg.Images.ChatGPTWeb.Resolved()
 	}
+	usageProfile, usageModels, autoQuality := h.ChatGPTWebImageUsagePolicySnapshot()
 	return coreexecutor.ChatGPTWebImageConfigSnapshot{
+		UsageEstimationProfile:        usageProfile,
+		UsageModelProfiles:            usageModels,
+		UsageAutoOutputQuality:        autoQuality,
 		ModelOutputFormats:            h.imageModelsConfig().ResolvedChatGPTWebModelOutputFormats(),
 		DefaultImageModel:             h.imageModelsConfig().ResolvedChatGPTWebDefaultImageModel(),
 		UpstreamModel:                 resolved.UpstreamModel,

@@ -27,7 +27,8 @@ func (*ChatGPTWebImageOutputFormatError) ExecutionResultErrorCode() string {
 	return "unsupported_parameter"
 }
 
-func ValidateChatGPTWebImageOutputFormat(snapshot core.ChatGPTWebImageConfigSnapshot, outerModel, executionModel, toolModel, format string) *ChatGPTWebImageOutputFormatError {
+// ResolveChatGPTWebImageAlias shares identity selection between admission and accounting.
+func ResolveChatGPTWebImageAlias(snapshot core.ChatGPTWebImageConfigSnapshot, outerModel, executionModel, toolModel string) string {
 	model := ""
 	for _, candidate := range []string{outerModel, executionModel} {
 		candidate = strings.TrimSpace(thinking.ParseSuffix(candidate).ModelName)
@@ -46,6 +47,11 @@ func ValidateChatGPTWebImageOutputFormat(snapshot core.ChatGPTWebImageConfigSnap
 	if model == "" {
 		model = "gpt-image-2"
 	}
+	return model
+}
+
+func ValidateChatGPTWebImageOutputFormat(snapshot core.ChatGPTWebImageConfigSnapshot, outerModel, executionModel, toolModel, format string) *ChatGPTWebImageOutputFormatError {
+	model := ResolveChatGPTWebImageAlias(snapshot, outerModel, executionModel, toolModel)
 	allowed, exists := snapshot.ModelOutputFormats[strings.ToLower(model)]
 	if !exists {
 		allowed = config.DefaultChatGPTWebImageOutputFormats(model)

@@ -36,6 +36,8 @@ type chatGPTWebUsageCacheSettingsRequest struct {
 }
 
 type chatGPTWebImageUsageRequest struct {
+	EstimationProfile json.RawMessage `json:"estimation-profile"`
+	ModelProfiles     json.RawMessage `json:"model-profiles"`
 	AutoOutputQuality json.RawMessage `json:"auto-output-quality"`
 	FallbackUsage     json.RawMessage `json:"fallback-usage"`
 }
@@ -49,8 +51,11 @@ type chatGPTWebImageFallbackUsageRequest struct {
 }
 
 type chatGPTWebImageUsageResponse struct {
-	AutoOutputQuality string                                            `json:"auto-output-quality"`
-	FallbackUsage     config.ResolvedChatGPTWebImageFallbackUsageConfig `json:"fallback-usage"`
+	EstimationProfile      string                                            `json:"estimation-profile"`
+	ModelProfiles          map[string]string                                 `json:"model-profiles"`
+	EffectiveModelProfiles map[string]string                                 `json:"effective-model-profiles"`
+	AutoOutputQuality      string                                            `json:"auto-output-quality"`
+	FallbackUsage          config.ResolvedChatGPTWebImageFallbackUsageConfig `json:"fallback-usage"`
 }
 
 type chatGPTWebUsageCacheResponse struct {
@@ -78,9 +83,15 @@ func (h *Handler) GetChatGPTWebUsageCache(c *gin.Context) {
 		EstimateTokenUsage:   cfg.ChatGPTWeb.TokenUsageEstimationEnabled(),
 		UsageCache:           cfg.ChatGPTWeb.UsageCache.Resolved(),
 		ImageUsage: chatGPTWebImageUsageResponse{
-			AutoOutputQuality: cfg.ChatGPTWeb.ImageUsage.ResolvedAutoOutputQuality(),
-			FallbackUsage:     cfg.ChatGPTWeb.ImageUsage.FallbackUsage.Resolved(),
+			EstimationProfile:      cfg.ChatGPTWeb.ImageUsage.ResolvedEstimationProfile(),
+			ModelProfiles:          cfg.ChatGPTWeb.ImageUsage.ResolvedModelProfiles(),
+			EffectiveModelProfiles: cfg.ChatGPTWeb.ImageUsage.EffectiveModelProfiles(cfg.Images),
+			AutoOutputQuality:      cfg.ChatGPTWeb.ImageUsage.ResolvedAutoOutputQuality(),
+			FallbackUsage:          cfg.ChatGPTWeb.ImageUsage.FallbackUsage.Resolved(),
 		},
+	}
+	if response.ImageUsage.ModelProfiles == nil {
+		response.ImageUsage.ModelProfiles = map[string]string{}
 	}
 	h.mu.Lock()
 	manager := h.authManager
@@ -136,7 +147,10 @@ func (h *Handler) updateChatGPTWebUsageCache(c *gin.Context, replace bool) {
 		candidate.EstimateTokenUsage = nil
 		candidate.UsageCache = config.ChatGPTWebUsageCacheConfig{}
 		candidate.UsageCache.OrphanRetentionMinutes = orphanRetentionMinutes
-		candidate.ImageUsage = config.ChatGPTWebImageUsageConfig{}
+		candidate.ImageUsage = config.ChatGPTWebImageUsageConfig{
+			EstimationProfile: previous.ImageUsage.EstimationProfile,
+			ModelProfiles:     previous.ImageUsage.ModelProfiles,
+		}
 	}
 	if errApply := request.apply(&candidate, replace); errApply != nil {
 		h.mu.Unlock()
@@ -148,6 +162,12 @@ func (h *Handler) updateChatGPTWebUsageCache(c *gin.Context, replace bool) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": errValidate.Error()})
 		return
 	}
+	if errProfiles := candidate.ImageUsage.ValidateModelProfiles(h.cfg.Images); errProfiles != nil {
+		h.mu.Unlock()
+		c.JSON(http.StatusBadRequest, gin.H{"error": errProfiles.Error()})
+		return
+	}
+	candidate.ImageUsage.ModelProfiles = candidate.ImageUsage.ResolvedModelProfiles()
 	h.cfg.ChatGPTWeb = candidate
 	if !h.persistLocked(c) {
 		if h.cfg != nil {
@@ -229,6 +249,18 @@ func (request chatGPTWebUsageCacheRequest) apply(candidate *config.ChatGPTWebCon
 		}
 		if replace && !decoded.complete() {
 			return fmt.Errorf("all image-usage fields are required")
+		}
+		if len(decoded.EstimationProfile) > 0 {
+			if bytes.Equal(bytes.TrimSpace(decoded.EstimationProfile), []byte("null")) || json.Unmarshal(decoded.EstimationProfile, &candidate.ImageUsage.EstimationProfile) != nil || candidate.ImageUsage.EstimationProfile == "" {
+				return fmt.Errorf("invalid image-usage.estimation-profile")
+			}
+		}
+		if len(decoded.ModelProfiles) > 0 {
+			var profiles map[string]string
+			if bytes.Equal(bytes.TrimSpace(decoded.ModelProfiles), []byte("null")) || json.Unmarshal(decoded.ModelProfiles, &profiles) != nil {
+				return fmt.Errorf("invalid image-usage.model-profiles")
+			}
+			candidate.ImageUsage.ModelProfiles = profiles
 		}
 		if len(decoded.AutoOutputQuality) > 0 {
 			var value string

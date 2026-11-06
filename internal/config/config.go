@@ -925,6 +925,8 @@ func (cfg ChatGPTWebUsageCacheConfig) Validate() error {
 
 // ChatGPTWebImageUsageConfig controls local image token accounting.
 type ChatGPTWebImageUsageConfig struct {
+	EstimationProfile string                             `yaml:"estimation-profile,omitempty" json:"estimation-profile,omitempty"`
+	ModelProfiles     map[string]string                  `yaml:"model-profiles,omitempty" json:"model-profiles,omitempty"`
 	AutoOutputQuality string                             `yaml:"auto-output-quality,omitempty" json:"auto-output-quality,omitempty"`
 	FallbackUsage     ChatGPTWebImageFallbackUsageConfig `yaml:"fallback-usage,omitempty" json:"fallback-usage,omitempty"`
 }
@@ -981,6 +983,12 @@ func (cfg ChatGPTWebImageUsageConfig) ResolvedAutoOutputQuality() string {
 
 // Validate rejects unsupported automatic output quality mappings.
 func (cfg ChatGPTWebImageUsageConfig) Validate() error {
+	if profile := cfg.ResolvedEstimationProfile(); profile != ChatGPTWebImageUsageByModel && !validChatGPTWebImageUsageProfile(profile) {
+		return fmt.Errorf("chatgpt-web.image-usage.estimation-profile must be by-model, gpt-image-2, gpt-image-2.5, or gpt-image-2.6")
+	}
+	if _, err := cfg.NormalizedModelProfiles(); err != nil {
+		return err
+	}
 	switch cfg.ResolvedAutoOutputQuality() {
 	case "low", "medium", "high":
 	default:
@@ -2513,6 +2521,11 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	if cfg.Images.ChatGPTWeb.ModelOutputFormats, err = cfg.Images.NormalizedChatGPTWebModelOutputFormats(); err != nil {
 		return nil, err
 	}
+	if err = cfg.ChatGPTWeb.ImageUsage.ValidateModelProfiles(cfg.Images); err != nil {
+		return nil, err
+	}
+	cfg.ChatGPTWeb.ImageUsage.ModelProfiles = cfg.ChatGPTWeb.ImageUsage.ResolvedModelProfiles()
+	cfg.ChatGPTWeb.ImageUsage.EstimationProfile = cfg.ChatGPTWeb.ImageUsage.ResolvedEstimationProfile()
 	cfg.Images.ChatGPTWeb.UpstreamModel = cfg.Images.ChatGPTWeb.ResolvedUpstreamModel()
 	if err = cfg.Images.ValidateRequestTimeouts(); err != nil {
 		return nil, err
@@ -4201,6 +4214,9 @@ func SaveConfigPreserveComments(configFile string, cfg *Config) error {
 	if errBootstrap := cfg.Images.ChatGPTWeb.ValidateBootstrap(); errBootstrap != nil {
 		return errBootstrap
 	}
+	if errProfiles := cfg.ChatGPTWeb.ImageUsage.ValidateModelProfiles(cfg.Images); errProfiles != nil {
+		return errProfiles
+	}
 	normalizedFormats, errFormats := cfg.Images.NormalizedChatGPTWebModelOutputFormats()
 	if errFormats != nil {
 		return errFormats
@@ -4231,6 +4247,7 @@ func SaveConfigPreserveComments(configFile string, cfg *Config) error {
 	}
 	persistCfg := *cfg
 	persistCfg.Images.ChatGPTWeb.ModelOutputFormats = normalizedFormats
+	persistCfg.ChatGPTWeb.ImageUsage.ModelProfiles = cfg.ChatGPTWeb.ImageUsage.ResolvedModelProfiles()
 	groups, errNormalizeGroups := NormalizeAPIKeyGroups(persistCfg.APIKeyGroups, persistCfg.APIKeys)
 	if errNormalizeGroups != nil {
 		return errNormalizeGroups
@@ -4477,6 +4494,8 @@ func mergeMappingPreserve(dst, src *yaml.Node, path ...[]string) {
 		if findMapKeyIndex(src, "gif-aspect-ratio-max-error-percent") < 0 {
 			removeMapKey(dst, "gif-aspect-ratio-max-error-percent")
 		}
+	} else if strings.Join(currentPath, ".") == "chatgpt-web.image-usage" {
+		pruneMappingToGeneratedKeys(dst, src, "model-profiles")
 	} else if strings.Join(currentPath, ".") == "routing.priority-overrides.codex" {
 		pruneMissingCredentialYAMLKeys(dst, src, currentPath)
 	} else if isCodexResponseGuardYAMLPath(currentPath) {
@@ -4679,6 +4698,8 @@ func isKnownDefaultValue(path []string, node *yaml.Node) bool {
 	// Check string defaults
 	if node.Kind == yaml.ScalarNode && node.Tag == "!!str" {
 		switch fullPath {
+		case "chatgpt-web.image-usage.estimation-profile":
+			return node.Value == ChatGPTWebImageUsageByModel
 		case "pprof.addr":
 			return node.Value == DefaultPprofAddr
 		case "remote-management.panel-github-repository":
