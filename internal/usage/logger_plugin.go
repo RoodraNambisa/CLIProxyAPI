@@ -177,6 +177,8 @@ type authModelStats struct {
 
 // RequestDetail stores the timestamp, latency, and token usage for a single request.
 type RequestDetail struct {
+	ImageAggregation coreusage.ImageAggregation `json:"image_aggregation,omitzero"`
+
 	Timestamp               time.Time  `json:"timestamp"`
 	LatencyMs               int64      `json:"latency_ms"`
 	TTFTMs                  int64      `json:"ttft_ms,omitempty"`
@@ -315,6 +317,7 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 	}
 	metadata, _ := coreusage.RequestMetadataFromContext(ctx)
 	requestDetail := RequestDetail{
+		ImageAggregation:        record.ImageAggregation,
 		Timestamp:               timestamp,
 		LatencyMs:               normaliseLatency(record.Latency),
 		TTFTMs:                  normaliseLatency(record.TTFT),
@@ -384,7 +387,7 @@ func (s *RequestStatistics) recordPreparedLocked(record preparedUsageRecord, now
 	requestDetail.RequestServiceTier = s.internStringLocked(requestDetail.RequestServiceTier)
 	requestDetail.ResponseServiceTier = s.internStringLocked(requestDetail.ResponseServiceTier)
 	totalTokens := nonNegativeInt64(requestDetail.Tokens.TotalTokens)
-	if !requestDetail.Auxiliary {
+	if requestDetail.countsAsRequest() {
 		s.totalRequests = saturatingAddInt64(s.totalRequests, 1)
 		if requestDetail.Failed {
 			s.failureCount = saturatingAddInt64(s.failureCount, 1)
@@ -412,7 +415,7 @@ func (s *RequestStatistics) recordPreparedLocked(record preparedUsageRecord, now
 	})
 	dayKey := requestDetail.Timestamp.Format("2006-01-02")
 	hourKey := requestDetail.Timestamp.Hour()
-	if !requestDetail.Auxiliary {
+	if requestDetail.countsAsRequest() {
 		s.requestsByDay[dayKey] = saturatingAddInt64(s.requestsByDay[dayKey], 1)
 		s.requestsByHour[hourKey] = saturatingAddInt64(s.requestsByHour[hourKey], 1)
 	}
@@ -489,7 +492,7 @@ func (s *RequestStatistics) updateAuthStats(model string, detail RequestDetail) 
 }
 
 func updateUsageAggregate(totalRequests, successCount, failureCount, totalTokens *int64, tokens *TokenStats, detail RequestDetail) {
-	if !detail.Auxiliary {
+	if detail.countsAsRequest() {
 		if totalRequests != nil {
 			*totalRequests = saturatingAddInt64(*totalRequests, 1)
 		}
@@ -1092,7 +1095,7 @@ func (s *RequestStatistics) removeDetailAggregatesLocked(apiName, modelName stri
 	s.removeFromTimeBucketLocked(s.minuteBuckets, time.Minute, apiName, modelName, detail)
 	dayKey := detail.Timestamp.Format("2006-01-02")
 	hourKey := detail.Timestamp.Hour()
-	if !detail.Auxiliary {
+	if detail.countsAsRequest() {
 		subtractStringCounter(s.requestsByDay, dayKey, 1)
 		subtractIntCounter(s.requestsByHour, hourKey, 1)
 	}
@@ -1382,7 +1385,7 @@ func (s *RequestStatistics) removeLegacyHourEntryLocked(detail RequestDetail) {
 	wantedAuth := strings.TrimSpace(detail.AuthIndex)
 	wantedTokens := normaliseTokenStats(detail.Tokens).TotalTokens
 	wantedRequests := int64(1)
-	if detail.Auxiliary {
+	if !detail.countsAsRequest() {
 		wantedRequests = 0
 	}
 	for index, entry := range stats.Entries {
@@ -1412,7 +1415,7 @@ func (s *RequestStatistics) removeFromTimeBucketLocked(buckets map[int64]*usageA
 }
 
 func subtractUsageAggregate(totalRequests, successCount, failureCount, totalTokens *int64, tokens *TokenStats, detail RequestDetail) {
-	if !detail.Auxiliary {
+	if detail.countsAsRequest() {
 		*totalRequests = subtractNonNegativeInt64(*totalRequests, 1)
 		if detail.Failed {
 			*failureCount = subtractNonNegativeInt64(*failureCount, 1)
@@ -1440,7 +1443,7 @@ func (s *RequestStatistics) recordImported(apiName, modelName string, stats *api
 		totalTokens = 0
 	}
 
-	if !detail.Auxiliary {
+	if detail.countsAsRequest() {
 		s.totalRequests = saturatingAddInt64(s.totalRequests, 1)
 		if detail.Failed {
 			s.failureCount = saturatingAddInt64(s.failureCount, 1)
@@ -1465,7 +1468,7 @@ func (s *RequestStatistics) recordImported(apiName, modelName string, stats *api
 	dayKey := detail.Timestamp.Format("2006-01-02")
 	hourKey := detail.Timestamp.Hour()
 
-	if !detail.Auxiliary {
+	if detail.countsAsRequest() {
 		s.requestsByDay[dayKey] = saturatingAddInt64(s.requestsByDay[dayKey], 1)
 		s.requestsByHour[hourKey] = saturatingAddInt64(s.requestsByHour[hourKey], 1)
 	}
@@ -1557,7 +1560,7 @@ func (s *RequestStatistics) rebuildLocked() {
 				modelStatsValue.Details[idx] = detail
 
 				totalTokens := nonNegativeInt64(detail.Tokens.TotalTokens)
-				if !detail.Auxiliary {
+				if detail.countsAsRequest() {
 					s.totalRequests = saturatingAddInt64(s.totalRequests, 1)
 					if detail.Failed {
 						s.failureCount = saturatingAddInt64(s.failureCount, 1)
@@ -1575,7 +1578,7 @@ func (s *RequestStatistics) rebuildLocked() {
 
 				dayKey := detail.Timestamp.Format("2006-01-02")
 				hourKey := detail.Timestamp.Hour()
-				if !detail.Auxiliary {
+				if detail.countsAsRequest() {
 					s.requestsByDay[dayKey] = saturatingAddInt64(s.requestsByDay[dayKey], 1)
 					s.requestsByHour[hourKey] = saturatingAddInt64(s.requestsByHour[hourKey], 1)
 				}
@@ -1622,7 +1625,7 @@ func (s *RequestStatistics) markChangedLocked() {
 func dedupKey(apiName, modelName string, detail RequestDetail) string {
 	timestamp := detail.Timestamp.UTC().Format(time.RFC3339Nano)
 	tokens := normaliseTokenStats(detail.Tokens)
-	return fmt.Sprintf(
+	key := fmt.Sprintf(
 		"%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%t|%t|%d|%d|%d|%d|%d|%d",
 		apiName,
 		modelName,
@@ -1643,6 +1646,10 @@ func dedupKey(apiName, modelName string, detail RequestDetail) string {
 		tokens.CacheCreationTokens,
 		tokens.TotalTokens,
 	)
+	if detail.ImageAggregation.Role != "" {
+		key += fmt.Sprintf("|%s|%s|%d|%d", detail.ImageAggregation.Role, detail.ImageAggregation.BatchID, detail.ImageAggregation.ImageIndex, detail.ImageAggregation.AttemptIndex)
+	}
+	return key
 }
 
 func resolveAPIIdentifier(ctx context.Context, record coreusage.Record) string {

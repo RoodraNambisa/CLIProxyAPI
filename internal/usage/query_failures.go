@@ -38,7 +38,7 @@ func (v *usageFailureCounts) init() {
 }
 
 func (v *usageFailureCounts) add(model string, detail RequestDetail, delta int64) {
-	if !detail.Failed {
+	if !detail.Failed || detail.ImageAggregation.Role == "attempt" {
 		return
 	}
 	v.init()

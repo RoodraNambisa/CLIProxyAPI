@@ -15,6 +15,8 @@ const DefaultServiceTier = "default"
 
 // Record contains the usage statistics captured for a single provider request.
 type Record struct {
+	ImageAggregation ImageAggregation
+
 	Provider            string
 	Model               string
 	APIKey              string
@@ -286,7 +288,9 @@ func DefaultManager() *Manager { return defaultManager }
 func RegisterPlugin(plugin Plugin) { DefaultManager().Register(plugin) }
 
 // PublishRecord publishes a record using the default manager.
-func PublishRecord(ctx context.Context, record Record) { DefaultManager().Publish(ctx, record) }
+func PublishRecord(ctx context.Context, record Record) {
+	DefaultManager().Publish(ctx, annotateImageAggregation(ctx, record))
+}
 
 // StartDefault starts the default manager's dispatcher.
 func StartDefault(ctx context.Context) { DefaultManager().Start(ctx) }

@@ -510,17 +510,36 @@ func parseUsageDetailQuery(c *gin.Context) (usage.DetailQuery, bool) {
 		return usage.DetailQuery{}, false
 	}
 	query := usage.DetailQuery{
-		API:         strings.TrimSpace(c.Query("api")),
-		Model:       strings.TrimSpace(c.Query("model")),
-		AuthIndex:   strings.TrimSpace(c.Query("auth_index")),
-		Source:      strings.TrimSpace(c.Query("source")),
-		ClientIP:    strings.TrimSpace(c.Query("client_ip")),
-		RequestPath: strings.TrimSpace(c.Query("request_path")),
-		TimeRange:   timeRange,
-		SortBy:      sortBy,
-		SortOrder:   sortOrder,
-		Limit:       usage.DefaultDetailsLimit,
+		ImageAggregationRole:  strings.TrimSpace(c.Query("image_aggregation_role")),
+		ImageAggregationBatch: strings.TrimSpace(c.Query("image_aggregation_batch")),
+		API:                   strings.TrimSpace(c.Query("api")),
+		Model:                 strings.TrimSpace(c.Query("model")),
+		AuthIndex:             strings.TrimSpace(c.Query("auth_index")),
+		Source:                strings.TrimSpace(c.Query("source")),
+		ClientIP:              strings.TrimSpace(c.Query("client_ip")),
+		RequestPath:           strings.TrimSpace(c.Query("request_path")),
+		TimeRange:             timeRange,
+		SortBy:                sortBy,
+		SortOrder:             sortOrder,
+		Limit:                 usage.DefaultDetailsLimit,
 	}
+	if query.ImageAggregationRole != "" && query.ImageAggregationRole != "all" && query.ImageAggregationRole != "attempt" && query.ImageAggregationRole != "delivery" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid image_aggregation_role"})
+		return usage.DetailQuery{}, false
+	}
+	if raw := c.Query("image_aggregation_index"); raw != "" {
+		index, err := strconv.Atoi(raw)
+		if err != nil || index < 0 || index > 9 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid image_aggregation_index"})
+			return usage.DetailQuery{}, false
+		}
+		query.ImageAggregationIndex = &index
+	}
+	if len(query.ImageAggregationBatch) > 64 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid image_aggregation_batch"})
+		return usage.DetailQuery{}, false
+	}
+
 	if rawOffset := strings.TrimSpace(c.Query("offset")); rawOffset != "" {
 		offset, err := strconv.Atoi(rawOffset)
 		if err != nil {

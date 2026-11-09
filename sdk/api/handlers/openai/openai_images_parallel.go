@@ -22,6 +22,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers"
 	auth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	core "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
+	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/sjson"
 )
@@ -103,6 +104,12 @@ func (h *OpenAIImagesAPIHandler) handleParallelWebImages(c *gin.Context, rawJSON
 	defer cancel()
 	slots := make([]webImageAggregationSlot, count)
 	batchID := uuid.NewString()
+	accounting := newWebImageBatchAccounting(count, batchID, imageModel)
+	accountingCtx, finishAccounting := h.GetContextWithCancel(h, c, batchCtx)
+	defer finishAccounting()
+	batchCtx = usage.WithImageAggregationObserver(accountingCtx, accounting.observe)
+	var retryStarts atomic.Int32
+	defer func() { accounting.publish(accountingCtx, slots, int(retryStarts.Load())) }()
 	// The immutable canonical input remains owned by the parent input lease until
 	// every round ends. Child body-release controllers only release their own references.
 	defer func() {
@@ -187,7 +194,6 @@ func (h *OpenAIImagesAPIHandler) handleParallelWebImages(c *gin.Context, rawJSON
 		}
 	}
 	used := 0
-	var retryStarts atomic.Int32
 	var retainedBytes atomic.Int64
 	inputUsageSent := false
 	pending := make([]int, count)
@@ -222,6 +228,7 @@ func (h *OpenAIImagesAPIHandler) handleParallelWebImages(c *gin.Context, rawJSON
 					if attempt > 0 {
 						retryStarts.Add(1)
 					}
+					accounting.start(index)
 					attemptSnapshot := snapshot.Clone()
 					remaining := imageResponseByteLimit(snapshot) - int(retainedBytes.Load())
 					if remaining <= 0 {

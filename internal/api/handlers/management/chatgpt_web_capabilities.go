@@ -26,7 +26,7 @@ func (h *Handler) GetChatGPTWebCapabilities(c *gin.Context) {
 	}
 	c.JSON(http.StatusOK, gin.H{
 		"credential_schema_versions": []int{1, 2, 3},
-		"features":                   []string{"webauthn_v1", "api798_login_v1", "advanced_account_security_v1", "tls_trust_anchors_v1", "image_model_output_formats_v1", "gif_aspect_ratio_exception_v1", "image_usage_profiles_v1", "image_n_parallel_v1", "image_n_parallel_v2"},
+		"features":                   []string{"webauthn_v1", "api798_login_v1", "advanced_account_security_v1", "tls_trust_anchors_v1", "image_model_output_formats_v1", "gif_aspect_ratio_exception_v1", "image_usage_profiles_v1", "image_n_parallel_v1", "image_n_parallel_v2", "image_n_refill_delivery_v1"},
 		"image_model_output_formats": gin.H{
 			"supported_formats": config.ChatGPTWebImageOutputFormats(),
 			"default_formats":   config.DefaultChatGPTWebImageOutputFormats(""),

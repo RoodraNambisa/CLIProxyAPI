@@ -147,6 +147,10 @@ type SourceFacet struct {
 
 // DetailQuery filters usage request details.
 type DetailQuery struct {
+	ImageAggregationRole  string
+	ImageAggregationBatch string
+	ImageAggregationIndex *int
+
 	API       string
 	Model     string
 	AuthIndex string
@@ -728,6 +732,20 @@ func authUsageSnapshot(authIndex string, stats *authStats) AuthUsageSnapshot {
 }
 
 func detailMatchesQuery(detail RequestDetail, query DetailQuery) bool {
+	if query.ImageAggregationRole == "attempt" {
+		if detail.ImageAggregation.Role != "attempt" {
+			return false
+		}
+	} else if query.ImageAggregationRole == "delivery" && detail.ImageAggregation.Role == "attempt" {
+		return false
+	}
+	if query.ImageAggregationBatch != "" && detail.ImageAggregation.BatchID != query.ImageAggregationBatch {
+		return false
+	}
+	if query.ImageAggregationIndex != nil && detail.ImageAggregation.ImageIndex != *query.ImageAggregationIndex {
+		return false
+	}
+
 	if query.RequestPath != "" && !strings.Contains(detail.RequestPath, query.RequestPath) {
 		return false
 	}

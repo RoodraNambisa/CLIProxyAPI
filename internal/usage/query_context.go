@@ -252,7 +252,7 @@ func (s *RequestStatistics) DetailsContext(ctx context.Context, query DetailQuer
 	k = min(k, len(s.detailLocations))
 	selected := make([]usageQueryCandidate, 0, min(k, query.Limit))
 	compare := func(a, b usageQueryCandidate) int { return compareUsageCandidates(a, b, query.SortBy, query.SortOrder) }
-	unfiltered := query.API == "" && query.Model == "" && query.AuthIndex == "" && query.Source == "" && query.ClientIP == "" && query.RequestPath == "" && query.Failed == nil
+	unfiltered := (query.ImageAggregationRole == "" || query.ImageAggregationRole == "all") && query.ImageAggregationBatch == "" && query.ImageAggregationIndex == nil && query.API == "" && query.Model == "" && query.AuthIndex == "" && query.Source == "" && query.ClientIP == "" && query.RequestPath == "" && query.Failed == nil
 	knownCount := unfiltered && s.detailIndexTombstones == 0
 	total := 0
 	if knownCount {
