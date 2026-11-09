@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	. "github.com/router-for-me/CLIProxyAPI/v6/internal/constant"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	helps "github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
@@ -27,19 +28,19 @@ import (
 
 // Mixed-provider and native routes keep their existing aggregation semantics.
 func (h *OpenAIImagesAPIHandler) webImageAggregationConcurrency(c *gin.Context, providers []string, count int, snapshot core.ChatGPTWebImageConfigSnapshot) int {
-	if count < 2 || snapshot.NAggregationConcurrency < 2 || h.AuthManager == nil || nativeImageRequest(c) != nil || !imageProvidersContain(providers, ChatGPTWeb) {
-		return 1
+	if count < 2 || h.AuthManager == nil || nativeImageRequest(c) != nil || !imageProvidersContain(providers, ChatGPTWeb) {
+		return 0
 	}
 	if !chatGPTWebAllowedWithoutCodex(c) {
 		for _, provider := range providers {
 			if provider != ChatGPTWeb {
 				if h.AuthManager.HasProviderCredentials(provider) {
-					return 1
+					return 0
 				}
 			}
 		}
 	}
-	return min(count, snapshot.NAggregationConcurrency)
+	return min(count, max(1, snapshot.NAggregationConcurrency))
 }
 
 type parallelWebImageEvent struct {
@@ -99,24 +100,22 @@ func sendParallelWebImageEvent(ctx context.Context, events chan<- parallelWebIma
 
 func (h *OpenAIImagesAPIHandler) handleParallelWebImages(c *gin.Context, rawJSON []byte, imageModel, codexModel string, req openAIImageRequest, op imageOperation, count int, responseFormat string, ignoreUnsupported bool, snapshot core.ChatGPTWebImageConfigSnapshot, concurrency int) {
 	batchCtx, cancel := context.WithCancel(auth.WithChatGPTWebImageAggregation(c.Request.Context()))
-	events := make(chan parallelWebImageEvent)
-	var wg sync.WaitGroup
-	var next atomic.Int32
-	results := make([]parallelWebImageResult, count)
-	// Copy Gin contexts before workers start. Each child owns its request body
-	// controller, error source, and finalization leases; only the caller writes HTTP.
-	children := make([]*gin.Context, count)
-	for i := range children {
-		children[i] = c.Copy()
-		children[i].Request = c.Request.Clone(batchCtx)
-	}
+	defer cancel()
+	slots := make([]webImageAggregationSlot, count)
+	batchID := uuid.NewString()
+	// The immutable canonical input remains owned by the parent input lease until
+	// every round ends. Child body-release controllers only release their own references.
+	defer func() {
+		for _, slot := range slots {
+			removeWebImageSpool(slot.result.path, slot.result.spoolTracker)
+		}
+	}()
 	stopKeepAlive := func() {}
 	var flusher http.Flusher
 	if req.Stream {
 		var ok bool
 		flusher, ok = c.Writer.(http.Flusher)
 		if !ok {
-			cancel()
 			h.writeImagesError(c, http.StatusInternalServerError, errors.New("streaming not supported"))
 			return
 		}
@@ -128,32 +127,27 @@ func (h *OpenAIImagesAPIHandler) handleParallelWebImages(c *gin.Context, rawJSON
 		c.Header("Content-Type", "application/json")
 		stopKeepAlive = h.StartNonStreamingKeepAlive(c, batchCtx)
 	}
-	defer func() {
-		cancel()
-		wg.Wait()
+	defer stopKeepAlive()
+	writeError := func(msg *interfaces.ErrorMessage) {
 		stopKeepAlive()
-		for _, result := range results {
-			removeWebImageSpool(result.path, result.spoolTracker)
+		if req.Stream {
+			body, _ := h.BuildPublicErrorResponseBody(c, msg)
+			observeImageResponseWrite(c, func() { _, _ = fmt.Fprintf(c.Writer, "\nevent: error\ndata: %s\n\n", body); flusher.Flush() })
+		} else {
+			h.WriteErrorResponse(c, msg)
 		}
-	}()
-	for worker := 0; worker < concurrency; worker++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for batchCtx.Err() == nil {
-				index := int(next.Add(1) - 1)
-				if index >= count {
-					return
-				}
-				h.executeParallelWebImage(batchCtx, children[index], events, index, rawJSON, imageModel, codexModel, req, count, ignoreUnsupported, snapshot)
-			}
-		}()
 	}
-	finished := make(chan struct{})
-	go func() { wg.Wait(); close(events); close(finished) }()
-	limit, used, completed := imageResponseByteLimit(snapshot), 0, 0
-	mappers := make(map[int]*imageStreamMapper)
-	headersWritten := false
+	processingError := func(ctx context.Context, err error) *interfaces.ErrorMessage {
+		return h.RewriteExecutionErrorResponseForContext(ctx, imageConversionErrorMessage(markChatGPTWebImageProcessingError(err, true)))
+	}
+	var heartbeat <-chan time.Time
+	if req.Stream {
+		if interval := handlers.StreamingKeepAliveInterval(h.Cfg); interval > 0 {
+			ticker := time.NewTicker(interval)
+			defer ticker.Stop()
+			heartbeat = ticker.C
+		}
+	}
 	flushInterval := time.Duration(0)
 	if interval := imageStreamFlushInterval(h.Cfg); interval != nil {
 		flushInterval = *interval
@@ -162,23 +156,24 @@ func (h *OpenAIImagesAPIHandler) handleParallelWebImages(c *gin.Context, rawJSON
 	var flushTimer *time.Timer
 	var flushC <-chan time.Time
 	pendingBytes := 0
-	stopFlushTimer := func() {
+	flushPending := func() {
+		if pendingBytes > 0 {
+			flusher.Flush()
+			pendingBytes = 0
+		}
 		if flushTimer != nil {
 			flushTimer.Stop()
 			flushTimer = nil
 			flushC = nil
 		}
 	}
-	defer stopFlushTimer()
-	flushPending := func() {
-		if pendingBytes > 0 {
-			flusher.Flush()
-			pendingBytes = 0
+	defer func() {
+		if flushTimer != nil {
+			flushTimer.Stop()
 		}
-		stopFlushTimer()
-	}
-	noteWrite := func(bytes int, force bool) {
-		pendingBytes += max(bytes, 0)
+	}()
+	noteWrite := func(n int, force bool) {
+		pendingBytes += max(n, 0)
 		if pendingBytes == 0 {
 			return
 		}
@@ -191,132 +186,203 @@ func (h *OpenAIImagesAPIHandler) handleParallelWebImages(c *gin.Context, rawJSON
 			flushC = flushTimer.C
 		}
 	}
-	var keepAliveC <-chan time.Time
-	if req.Stream {
-		if interval := handlers.StreamingKeepAliveInterval(h.Cfg); interval > 0 {
-			ticker := time.NewTicker(interval)
-			defer ticker.Stop()
-			keepAliveC = ticker.C
+	used := 0
+	var retryStarts atomic.Int32
+	var retainedBytes atomic.Int64
+	inputUsageSent := false
+	pending := make([]int, count)
+	for i := range pending {
+		pending[i] = i
+	}
+	for attempt := 0; len(pending) > 0; attempt++ {
+		events := make(chan parallelWebImageEvent)
+		var wg sync.WaitGroup
+		var next atomic.Int32
+		children := make(map[int]*gin.Context, len(pending))
+		cancels := make(map[int]context.CancelFunc, len(pending))
+		for _, index := range pending {
+			ctx, stop := context.WithCancel(core.WithImageAggregationAttempt(batchCtx, core.ImageAggregationAttempt{BatchID: batchID, ImageIndex: index, AttemptIndex: attempt, Requested: count}))
+			child := c.Copy()
+			child.Request = c.Request.Clone(ctx)
+			children[index], cancels[index] = child, stop
+			slots[index].err = nil
+			slots[index].attempt = attempt
 		}
-	}
-	writeError := func(errMsg *interfaces.ErrorMessage) {
-		cancel()
-		stopKeepAlive()
-		if req.Stream {
-			flushPending()
-			body, _ := h.BuildPublicErrorResponseBody(c, errMsg)
-			observeImageResponseWrite(c, func() { _, _ = fmt.Fprintf(c.Writer, "\nevent: error\ndata: %s\n\n", body); flusher.Flush() })
-		} else {
-			h.WriteErrorResponse(c, errMsg)
+		roundPending := pending
+		for worker := 0; worker < min(concurrency, len(roundPending)); worker++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for batchCtx.Err() == nil {
+					position := int(next.Add(1) - 1)
+					if position >= len(roundPending) {
+						return
+					}
+					index := roundPending[position]
+					if attempt > 0 {
+						retryStarts.Add(1)
+					}
+					attemptSnapshot := snapshot.Clone()
+					remaining := imageResponseByteLimit(snapshot) - int(retainedBytes.Load())
+					if remaining <= 0 {
+						sendParallelWebImageEvent(batchCtx, events, parallelWebImageEvent{index: index, err: processingError(children[index].Request.Context(), imageResponseBudgetError(imageResponseByteLimit(snapshot)))})
+						continue
+					}
+					attemptSnapshot.MaxImageResponseBytes = remaining
+					h.executeParallelWebImage(children[index].Request.Context(), children[index], events, index, rawJSON, imageModel, codexModel, req, count, ignoreUnsupported, attemptSnapshot)
+				}
+			}()
 		}
-	}
-	processingError := func(ctx context.Context, err error) *interfaces.ErrorMessage {
-		return h.RewriteExecutionErrorResponseForContext(ctx, imageConversionErrorMessage(markChatGPTWebImageProcessingError(err, true)))
-	}
-receiveEvents:
-	for {
-		var event parallelWebImageEvent
-		select {
-		case nextEvent, ok := <-events:
-			if !ok {
-				break receiveEvents
+		go func() { wg.Wait(); close(events) }()
+		mappers := make(map[int]*imageStreamMapper)
+		var stopErr *interfaces.ErrorMessage
+		writer := &webImageDeliveryWriter{ctx: batchCtx, writer: c.Writer}
+		for {
+			var event parallelWebImageEvent
+			var ok bool
+			select {
+			case event, ok = <-events:
+				if !ok {
+					goto roundFinished
+				}
+			case <-flushC:
+				flushPending()
+				continue
+			case <-heartbeat:
+				if batchCtx.Err() == nil {
+					_, _ = writer.Write([]byte(": keep-alive\n\n"))
+					flusher.Flush()
+					if writer.err != nil {
+						cancel()
+					}
+				}
+				continue
 			}
-			event = nextEvent
-		case <-flushC:
-			flushPending()
-			continue
-		case <-keepAliveC:
-			before := max(c.Writer.Size(), 0)
-			observeImageResponseWrite(c, func() { _, _ = c.Writer.Write([]byte(": keep-alive\n\n")) })
-			noteWrite(c.Writer.Size()-before, true)
-			continue
-		case <-batchCtx.Done():
-			return
-		}
-		if event.path != "" {
-			results[event.index] = parallelWebImageResult{event.path, event.size, event.headers, event.metadata, event.spoolTracker}
-		}
-		if event.err != nil {
-			cancel()
+			slot := &slots[event.index]
+			if event.path != "" {
+				slot.result = parallelWebImageResult{event.path, event.size, event.headers, event.metadata, event.spoolTracker}
+			}
+			if timeout := h.ImageRequestTimeoutResponseForGin(c); timeout != nil {
+				stopErr = timeout
+				cancel()
+			}
+			if batchCtx.Err() != nil {
+				close(event.ack)
+				continue
+			}
+			if slot.err != nil || slot.generated {
+				close(event.ack)
+				continue
+			}
+			if event.err != nil {
+				slot.err = event.err
+				if webImageBatchStopped(event.err) {
+					stopErr = event.err
+					cancel()
+				}
+				cancels[event.index]()
+			} else if !req.Stream {
+				if event.binaryBytes > imageResponseByteLimit(snapshot)-used {
+					slot.err = processingError(event.ctx, imageResponseBudgetError(imageResponseByteLimit(snapshot)))
+					removeWebImageSpool(slot.result.path, slot.result.spoolTracker)
+					slot.result = parallelWebImageResult{}
+				} else {
+					used += event.binaryBytes
+					retainedBytes.Store(int64(used))
+					slot.generated = true
+				}
+			} else {
+				mapper := mappers[event.index]
+				if mapper == nil {
+					index := event.index
+					mapper = &imageStreamMapper{requestContext: event.ctx, operation: op, responseFormat: responseFormat, maxResults: 1, maxBinaryBytes: imageResponseByteLimit(snapshot), imageIndex: &index, attemptIndex: &slot.attempt, projectWebImageErrors: true, parser: imageSSEParser{maxPendingBytes: imageSSEPendingByteLimit(snapshot)}}
+					mapper.reserveResultBytes = func(n int) bool {
+						if n > imageResponseByteLimit(snapshot)-used {
+							return false
+						}
+						used += n
+						retainedBytes.Store(int64(used))
+						return true
+					}
+					mapper.onCompleted = func() { slot.generated = true; slot.delivered = true; inputUsageSent = true }
+					mappers[index] = mapper
+				}
+				mapper.omitInputUsage = inputUsageSent
+				beforeWrite := max(c.Writer.Size(), 0)
+				observeImageResponseWrite(c, func() {
+					if event.done {
+						mapper.flush(writer)
+					} else {
+						mapper.writeChunk(writer, event.chunk)
+					}
+				})
+				noteWrite(c.Writer.Size()-beforeWrite, mapper.consumeForceFlush() || event.done || slot.delivered)
+				if writer.err != nil {
+					cancel()
+				} else if err := mapper.fatalError(); err != nil {
+					slot.err = processingError(event.ctx, err)
+					cancels[event.index]()
+				}
+			}
 			close(event.ack)
-			writeError(event.err)
-			return
+		}
+	roundFinished:
+		for _, stop := range cancels {
+			stop()
 		}
 		if timeout := h.ImageRequestTimeoutResponseForGin(c); timeout != nil {
-			cancel()
-			close(event.ack)
-			writeError(timeout)
+			stopErr = timeout
+		}
+		if stopErr != nil {
+			writeError(stopErr)
 			return
 		}
 		if batchCtx.Err() != nil {
-			close(event.ack)
 			return
 		}
-		if !req.Stream {
-			used += event.binaryBytes
-			if used > limit {
-				cancel()
-				close(event.ack)
-				writeError(processingError(event.ctx, imageResponseBudgetError(limit)))
-				return
-			}
-			completed++
-		} else {
-			mapper := mappers[event.index]
-			if mapper == nil {
-				index := event.index
-				mapper = &imageStreamMapper{requestContext: event.ctx, operation: op, responseFormat: responseFormat, maxResults: 1, maxBinaryBytes: limit, omitInputUsage: index > 0, imageIndex: &index, projectWebImageErrors: true, parser: imageSSEParser{maxPendingBytes: imageSSEPendingByteLimit(snapshot)}}
-				mapper.reserveResultBytes = func(bytes int) bool {
-					if bytes > limit-used {
-						return false
-					}
-					used += bytes
-					return true
-				}
-				mappers[index] = mapper
-				if !headersWritten {
-					handlers.WriteUpstreamHeaders(c.Writer.Header(), event.headers)
-					headersWritten = true
-				}
-			}
-			beforeWrite := max(c.Writer.Size(), 0)
-			observeImageResponseWrite(c, func() {
-				if event.done {
-					mapper.flush(c.Writer)
-				} else {
-					mapper.writeChunk(c.Writer, event.chunk)
-				}
-			})
-			noteWrite(c.Writer.Size()-beforeWrite, event.done || mapper.consumeForceFlush())
-			if err := mapper.fatalError(); err != nil {
-				cancel()
-				close(event.ack)
-				writeError(processingError(event.ctx, err))
-				return
-			}
-			if event.done {
-				completed++
-				delete(mappers, event.index)
+		pending = nil
+		succeeded := 0
+		for i := range slots {
+			if slots[i].generated {
+				succeeded++
+			} else {
+				pending = append(pending, i)
 			}
 		}
-		close(event.ack)
+		if len(pending) == 0 || attempt >= snapshot.NAggregationMaxRetries || (attempt == 0 && !webImageCanRefill(count, succeeded)) {
+			break
+		}
 	}
-	<-finished
 	stopKeepAlive()
-	if timeout := h.ImageRequestTimeoutResponseForGin(c); timeout != nil {
-		writeError(timeout)
-		return
-	}
-	if batchCtx.Err() != nil {
-		return
-	}
-	if completed != count {
-		writeError(processingError(batchCtx, errors.New("image aggregation ended before all images completed")))
-		return
-	}
+	summary := webImageBatchSummary(slots, int(retryStarts.Load()))
 	if req.Stream {
 		flushPending()
+		if summary.Generated < count {
+			writeError(h.RewriteExecutionErrorResponseForContext(batchCtx, handlers.ExecutionErrorMessage(&webImageAggregationError{summary: summary})))
+		}
 		return
+	}
+	if summary.Generated == 0 || summary.Generated < count && !snapshot.NAggregationReturnPartial {
+		writeError(h.RewriteExecutionErrorResponseForContext(batchCtx, handlers.ExecutionErrorMessage(&webImageAggregationError{summary: summary})))
+		return
+	}
+	successful := make([]parallelWebImageResult, 0, summary.Generated)
+	for _, slot := range slots {
+		if slot.generated {
+			successful = append(successful, slot.result)
+		}
+	}
+	summary.Delivered = summary.Generated
+	if h.writeWebImageBatch(c, batchCtx, successful, summary, writeError) {
+		for i := range slots {
+			slots[i].delivered = slots[i].generated
+		}
+	}
+}
+
+func (h *OpenAIImagesAPIHandler) writeWebImageBatch(c *gin.Context, batchCtx context.Context, results []parallelWebImageResult, summary *webImageAggregationSummary, writeError func(*interfaces.ErrorMessage)) bool {
+	processingError := func(ctx context.Context, err error) *interfaces.ErrorMessage {
+		return h.RewriteExecutionErrorResponseForContext(ctx, imageConversionErrorMessage(markChatGPTWebImageProcessingError(err, true)))
 	}
 	// Assemble directly from bounded spools. Re-decoding all base64 strings
 	// would duplicate the entire batch several times before writing HTTP.
@@ -327,17 +393,18 @@ receiveEvents:
 	releaseTurn, err := leases.BeginFinalization(finalCtx)
 	if err != nil {
 		writeError(processingError(finalCtx, err))
-		return
+		return false
 	}
 	defer releaseTurn()
 	if err = leases.Acquire(finalCtx, 64<<10); err != nil {
 		writeError(processingError(finalCtx, err))
-		return
+		return false
 	}
 	// Streaming disk bytes to a slow client must not hold the global finalizer turn.
 	releaseTurn()
 	combined := results[0].metadata
 	combined.Usage = nil
+	combined.Aggregation = summary
 	files := make([]*os.File, 0, len(results))
 	defer func() {
 		for _, file := range files {
@@ -351,13 +418,13 @@ receiveEvents:
 		file, errOpen := os.Open(result.path)
 		if errOpen != nil {
 			writeError(processingError(finalCtx, errors.New("read image aggregation spool failed")))
-			return
+			return false
 		}
 		files = append(files, file)
 		stat, errStat := file.Stat()
 		if errStat != nil || stat.Size() != result.size {
 			writeError(processingError(finalCtx, errors.New("invalid image aggregation spool")))
-			return
+			return false
 		}
 	}
 	started := time.Now()
@@ -368,11 +435,11 @@ receiveEvents:
 	observeImageRequestPhase(c, core.ImagePhaseResponseEncode, started)
 	if err != nil {
 		writeError(processingError(finalCtx, err))
-		return
+		return false
 	}
 	if timeout := h.ImageRequestTimeoutResponseForGin(c); timeout != nil {
 		writeError(timeout)
-		return
+		return false
 	}
 	readers := []io.Reader{bytes.NewReader(header[:len(header)-1]), strings.NewReader(",\"data\":[")}
 	for i, file := range files {
@@ -387,14 +454,14 @@ receiveEvents:
 		_, err = io.CopyBuffer(webImageContextWriter{finalCtx, c.Writer}, io.MultiReader(readers...), make([]byte, 32<<10))
 	})
 	if err != nil {
-		cancel()
 		log.Warn("Web image aggregation response write interrupted")
+		return false
 	}
-
+	return true
 }
 
 func (h *OpenAIImagesAPIHandler) executeParallelWebImage(batchCtx context.Context, child *gin.Context, events chan<- parallelWebImageEvent, index int, rawJSON []byte, imageModel, codexModel string, req openAIImageRequest, count int, ignoreUnsupported bool, snapshot core.ChatGPTWebImageConfigSnapshot) {
-	leases := helps.NewChatGPTWebImageChildMemoryLeaseSet(estimateImageRequestResidentBytes(child.Request))
+	leases := helps.NewChatGPTWebImageChildMemoryLeaseSet(max(estimateImageRequestResidentBytes(child.Request), int64(len(rawJSON))))
 	child.Set(helps.ChatGPTWebImageMemoryLeaseSetMetadataKey, leases)
 	defer leases.Release()
 	ctx, finish := h.GetContextWithCancel(h, child, batchCtx)
@@ -433,6 +500,7 @@ func (h *OpenAIImagesAPIHandler) executeParallelWebImage(batchCtx context.Contex
 		for data != nil || errs != nil {
 			select {
 			case <-ctx.Done():
+				fail(handlers.ExecutionErrorMessage(core.ImageRequestContextError(ctx, ctx.Err())))
 				return
 			case err, ok := <-errs:
 				if !ok {
@@ -464,6 +532,10 @@ func (h *OpenAIImagesAPIHandler) executeParallelWebImage(batchCtx context.Contex
 	parsed, err := parseResponsesToImagesResponse(payload, time.Now().Unix())
 	if err != nil {
 		localError(err)
+		return
+	}
+	if len(parsed.Data) == 0 {
+		localError(errors.New("upstream did not return image output"))
 		return
 	}
 	if len(parsed.Data) > 1 {

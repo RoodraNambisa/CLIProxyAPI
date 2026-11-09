@@ -489,6 +489,12 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	}
 	oldImageRuntime := oldCfg.Images.ChatGPTWeb.Resolved()
 	newImageRuntime := newCfg.Images.ChatGPTWeb.Resolved()
+	if oldImageRuntime.NAggregationMaxRetries != newImageRuntime.NAggregationMaxRetries {
+		changes = append(changes, fmt.Sprintf("images.chatgpt-web.n-aggregation-max-retries: %d -> %d", oldImageRuntime.NAggregationMaxRetries, newImageRuntime.NAggregationMaxRetries))
+	}
+	if oldImageRuntime.NAggregationReturnPartial != newImageRuntime.NAggregationReturnPartial {
+		changes = append(changes, fmt.Sprintf("images.chatgpt-web.n-aggregation-return-partial: %t -> %t", oldImageRuntime.NAggregationReturnPartial, newImageRuntime.NAggregationReturnPartial))
+	}
 	if oldImageRuntime.NAggregationConcurrency != newImageRuntime.NAggregationConcurrency {
 		changes = append(changes, fmt.Sprintf("images.chatgpt-web.n-aggregation-concurrency: %d -> %d", oldImageRuntime.NAggregationConcurrency, newImageRuntime.NAggregationConcurrency))
 	}

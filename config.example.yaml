@@ -753,6 +753,8 @@ nonstream-keepalive-interval: 0
 #     resize-filter: "catmull-rom"     # catmull-rom for quality, or approx-bilinear for throughput.
 #     max-image-response-megabytes: 128 # Maximum compressed image bytes returned by one request.
 #     n-aggregation-concurrency: 3 # Parallel attempts per Web-only Images request; 1 preserves serial aggregation. Web max-n > 1 enables aggregation.
+#     n-aggregation-max-retries: 1 # Additional rounds per failed slot (0-3), when initial success is at least half and at least two images.
+#     n-aggregation-return-partial: false # Deliver partial JSON results when retries cannot complete n; streaming always retains delivered images.
 #     max-n: 1                          # Maximum images in one logical ChatGPT Web image request (1-10).
 #     max-in-flight: 64                 # Complete Web image attempts, including sleeping polls (recommended: 1-4096).
 #     admission-queue-size: 64          # Bounded pre-upstream waiters; excess requests fail fast (recommended: 0-4096).

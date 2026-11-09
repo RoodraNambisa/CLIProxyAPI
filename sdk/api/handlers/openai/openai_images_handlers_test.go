@@ -1409,7 +1409,7 @@ func TestOpenAIImagesGenerationsEnforcesAggregateWebResponseBudget(t *testing.T)
 	resp := httptest.NewRecorder()
 	router.ServeHTTP(resp, req)
 
-	if resp.Code != http.StatusBadGateway || !strings.Contains(resp.Body.String(), "image response exceeds 1048576 bytes") {
+	if resp.Code != http.StatusBadGateway || !strings.Contains(resp.Body.String(), "image_aggregation_incomplete") {
 		t.Fatalf("status=%d body=%s", resp.Code, resp.Body.String())
 	}
 	if executor.calls != 2 || len(executor.imageConfigSnapshots) != 2 {
@@ -2500,7 +2500,7 @@ func TestOpenAIImagesStreamingEnforcesAggregateWebResponseBudget(t *testing.T) {
 	if count := strings.Count(body, "event: image_generation.completed"); count != 1 {
 		t.Fatalf("completed event count = %d, want 1", count)
 	}
-	if count := strings.Count(body, "event: error"); count != 1 || !strings.Contains(body, "image response exceeds") {
+	if count := strings.Count(body, "event: error"); count != 1 || !strings.Contains(body, "image_aggregation_incomplete") {
 		t.Fatalf("stream budget error missing: %s", body)
 	}
 	if executor.streamCalls != 2 || len(executor.imageConfigSnapshots) != 2 {

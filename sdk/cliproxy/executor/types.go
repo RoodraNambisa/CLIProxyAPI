@@ -230,6 +230,8 @@ type ChatGPTWebImageConfigSnapshot struct {
 	MaxImageResponseBytes         int
 	MaxN                          int
 	NAggregationConcurrency       int
+	NAggregationMaxRetries        int
+	NAggregationReturnPartial     bool
 }
 
 // OutputAspectRatioTolerance selects only the requested output format's tolerance.

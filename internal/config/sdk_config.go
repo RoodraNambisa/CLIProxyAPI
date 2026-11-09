@@ -281,6 +281,10 @@ type ChatGPTWebImageConfig struct {
 	MaxN *int `yaml:"max-n,omitempty" json:"max-n,omitempty"`
 	// NAggregationConcurrency bounds parallel image attempts within one Images API request.
 	NAggregationConcurrency *int `yaml:"n-aggregation-concurrency,omitempty" json:"n-aggregation-concurrency,omitempty"`
+	// NAggregationMaxRetries bounds additional generation rounds for failed image slots.
+	NAggregationMaxRetries *int `yaml:"n-aggregation-max-retries,omitempty" json:"n-aggregation-max-retries,omitempty"`
+	// NAggregationReturnPartial permits partial non-streaming delivery after retries.
+	NAggregationReturnPartial bool `yaml:"n-aggregation-return-partial" json:"n-aggregation-return-partial"`
 	// MaxInFlight bounds complete ChatGPT Web image attempts, including sleeping polls.
 	MaxInFlight *int `yaml:"max-in-flight,omitempty" json:"max-in-flight,omitempty"`
 	// AdmissionQueueSize bounds requests waiting to enter the Web image lifecycle.
@@ -322,6 +326,7 @@ const (
 	MinChatGPTWebMaxImageResponseMegabytes       = 1
 	MaxChatGPTWebMaxImageResponseMegabytes       = 256
 	DefaultChatGPTWebNAggregationConcurrency     = 3
+	DefaultChatGPTWebNAggregationMaxRetries      = 1
 	DefaultChatGPTWebMaxN                        = 1
 	MinChatGPTWebMaxN                            = 1
 	MaxChatGPTWebMaxN                            = 10
@@ -417,6 +422,8 @@ type ResolvedChatGPTWebImageConfig struct {
 	MaxImageResponseMegabytes     int
 	MaxN                          int
 	NAggregationConcurrency       int
+	NAggregationMaxRetries        int
+	NAggregationReturnPartial     bool
 	MaxInFlight                   int
 	AdmissionQueueSize            int
 	AdmissionWaitMilliseconds     int
@@ -459,6 +466,8 @@ func (cfg ChatGPTWebImageConfig) Resolved() ResolvedChatGPTWebImageConfig {
 		MaxImageResponseMegabytes:    DefaultChatGPTWebMaxImageResponseMegabytes,
 		MaxN:                         DefaultChatGPTWebMaxN,
 		NAggregationConcurrency:      DefaultChatGPTWebNAggregationConcurrency,
+		NAggregationMaxRetries:       DefaultChatGPTWebNAggregationMaxRetries,
+		NAggregationReturnPartial:    cfg.NAggregationReturnPartial,
 		MaxInFlight:                  DefaultChatGPTWebImageMaxInFlight,
 		AdmissionQueueSize:           DefaultChatGPTWebImageAdmissionQueueSize,
 		AdmissionWaitMilliseconds:    DefaultChatGPTWebImageAdmissionWaitMS,
@@ -497,6 +506,9 @@ func (cfg ChatGPTWebImageConfig) Resolved() ResolvedChatGPTWebImageConfig {
 	}
 	if cfg.NAggregationConcurrency != nil {
 		resolved.NAggregationConcurrency = *cfg.NAggregationConcurrency
+	}
+	if cfg.NAggregationMaxRetries != nil {
+		resolved.NAggregationMaxRetries = *cfg.NAggregationMaxRetries
 	}
 	if cfg.MaxInFlight != nil {
 		resolved.MaxInFlight = *cfg.MaxInFlight
@@ -571,6 +583,9 @@ func (cfg ChatGPTWebImageConfig) Validate() error {
 	}
 	if resolved.MaxN < MinChatGPTWebMaxN || resolved.MaxN > MaxChatGPTWebMaxN {
 		return fmt.Errorf("images.chatgpt-web.max-n must be between %d and %d", MinChatGPTWebMaxN, MaxChatGPTWebMaxN)
+	}
+	if resolved.NAggregationMaxRetries < 0 || resolved.NAggregationMaxRetries > 3 {
+		return fmt.Errorf("images.chatgpt-web.n-aggregation-max-retries must be between 0 and 3")
 	}
 	if resolved.NAggregationConcurrency < 1 || resolved.NAggregationConcurrency > MaxChatGPTWebMaxN {
 		return fmt.Errorf("images.chatgpt-web.n-aggregation-concurrency must be between 1 and %d", MaxChatGPTWebMaxN)

@@ -51,3 +51,55 @@ func TestChatGPTWebImageAggregationConfig(t *testing.T) {
 		})
 	}
 }
+
+func TestChatGPTWebImageRefillConfig(t *testing.T) {
+	defaults := (ChatGPTWebImageConfig{}).Resolved()
+	if defaults.NAggregationMaxRetries != 1 || defaults.NAggregationReturnPartial {
+		t.Fatal("invalid defaults")
+	}
+	for _, tc := range []struct {
+		value string
+		valid bool
+	}{
+		{"n-aggregation-max-retries: 0\n    n-aggregation-return-partial: false", true},
+		{"n-aggregation-max-retries: 3\n    n-aggregation-return-partial: true", true},
+		{"n-aggregation-max-retries: -1", false}, {"n-aggregation-max-retries: 4", false}, {"n-aggregation-max-retries: 1.5", false}, {"n-aggregation-max-retries: null", false},
+		{"n-aggregation-return-partial: 1", false}, {"n-aggregation-return-partial: \"false\"", false},
+	} {
+		t.Run(tc.value, func(t *testing.T) {
+			file := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(file, []byte("port: 8317\nimages:\n  chatgpt-web:\n    "+tc.value+"\n"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := LoadConfig(file)
+			if !tc.valid {
+				if err == nil {
+					t.Fatal("accepted invalid config")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			clone, err := Clone(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			original := cfg.Images.ChatGPTWeb.Resolved()
+			*clone.Images.ChatGPTWeb.NAggregationMaxRetries = 2
+			if cfg.Images.ChatGPTWeb.Resolved().NAggregationMaxRetries != original.NAggregationMaxRetries {
+				t.Fatal("clone aliases source")
+			}
+			if err := SaveConfigPreserveComments(file, cfg); err != nil {
+				t.Fatal(err)
+			}
+			restored, err := LoadConfig(file)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if restored.Images.ChatGPTWeb.Resolved().NAggregationMaxRetries != original.NAggregationMaxRetries || restored.Images.ChatGPTWeb.NAggregationReturnPartial != original.NAggregationReturnPartial {
+				t.Fatal("round trip changed policy")
+			}
+		})
+	}
+}

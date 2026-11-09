@@ -236,7 +236,7 @@ func TestWebImageParallelCancellationAndFailure(t *testing.T) {
 				for e.active.Load() != 0 && time.Now().Before(deadline) {
 					time.Sleep(time.Millisecond)
 				}
-				if e.calls.Load() > 3 || e.active.Load() != 0 {
+				if (failure && e.calls.Load() != 10) || (!failure && e.calls.Load() > 3) || e.active.Load() != 0 {
 					t.Fatalf("continued or leaked: calls=%d active=%d", e.calls.Load(), e.active.Load())
 				}
 				if failure && ((!stream && w.Code == 200) || (stream && strings.Count(w.Body.String(), "event: error") != 1)) {
@@ -334,7 +334,7 @@ func TestWebImageParallelRouteIsolation(t *testing.T) {
 	if _, err := h.AuthManager.Register(t.Context(), &auth.Auth{ID: "mixed-route-codex", Provider: "codex", Status: auth.StatusActive}); err != nil {
 		t.Fatal(err)
 	}
-	if h.webImageAggregationConcurrency(c, []string{"codex", "chatgpt-web"}, 10, s) != 1 {
+	if h.webImageAggregationConcurrency(c, []string{"codex", "chatgpt-web"}, 10, s) != 0 {
 		t.Fatal("mixed route changed")
 	}
 	s.NAggregationConcurrency = 1

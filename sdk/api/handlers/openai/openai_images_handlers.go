@@ -218,13 +218,14 @@ type imageResult struct {
 }
 
 type imagesResponse struct {
-	Created      int64           `json:"created"`
-	Data         []imageResult   `json:"data"`
-	Usage        json.RawMessage `json:"usage,omitempty"`
-	Background   string          `json:"background,omitempty"`
-	OutputFormat string          `json:"output_format,omitempty"`
-	Quality      string          `json:"quality,omitempty"`
-	Size         string          `json:"size,omitempty"`
+	Aggregation  *webImageAggregationSummary `json:"aggregation,omitempty"`
+	Created      int64                       `json:"created"`
+	Data         []imageResult               `json:"data"`
+	Usage        json.RawMessage             `json:"usage,omitempty"`
+	Background   string                      `json:"background,omitempty"`
+	OutputFormat string                      `json:"output_format,omitempty"`
+	Quality      string                      `json:"quality,omitempty"`
+	Size         string                      `json:"size,omitempty"`
 }
 
 type responsesImageObject struct {
@@ -258,6 +259,7 @@ type imageStreamEvent struct {
 	RevisedPrompt     string          `json:"revised_prompt,omitempty"`
 	PartialImageIndex *int            `json:"partial_image_index,omitempty"`
 	ImageIndex        *int            `json:"image_index,omitempty"`
+	AttemptIndex      *int            `json:"attempt_index,omitempty"`
 	Usage             json.RawMessage `json:"usage,omitempty"`
 }
 
@@ -735,7 +737,7 @@ func (h *OpenAIImagesAPIHandler) handleImagesRequest(c *gin.Context, req openAII
 		defer releaseAdmission()
 		c.Request = c.Request.WithContext(coreauth.InheritClientRequest(c.Request.Context(), admissionCtx))
 	}
-	if concurrency := h.webImageAggregationConcurrency(c, providers, count, imageConfig); concurrency > 1 {
+	if concurrency := h.webImageAggregationConcurrency(c, providers, count, imageConfig); concurrency > 0 {
 		h.handleParallelWebImages(c, rawJSON, imageModel, codexModel, req, op, count, responseFormat, ignoreUnsupportedImageParams, imageConfig, concurrency)
 		return
 	}
@@ -2220,6 +2222,8 @@ type imageStreamMapper struct {
 	finalUsage            json.RawMessage
 	omitInputUsage        bool
 	imageIndex            *int
+	attemptIndex          *int
+	onCompleted           func()
 	responseFormat        string
 	maxResults            int
 	maxBinaryBytes        int
@@ -2712,7 +2716,9 @@ func (m *imageStreamMapper) writeCompleted(w io.Writer, result imageResult, usag
 		}
 		event.Usage = usage
 	}
-	m.writeSSE(w, m.operation.completedEvent, event)
+	if m.writeSSE(w, m.operation.completedEvent, event) && m.onCompleted != nil {
+		m.onCompleted()
+	}
 }
 
 func (m *imageStreamMapper) applyStreamImageFormat(event *imageStreamEvent, outputFormat string) {
@@ -2723,19 +2729,25 @@ func (m *imageStreamMapper) applyStreamImageFormat(event *imageStreamEvent, outp
 	event.B64JSON = ""
 }
 
-func (m *imageStreamMapper) writeSSE(w io.Writer, eventName string, payload imageStreamEvent) {
+func (m *imageStreamMapper) writeSSE(w io.Writer, eventName string, payload imageStreamEvent) bool {
 	payload.ImageIndex = m.imageIndex
+	payload.AttemptIndex = m.attemptIndex
 	if w == nil {
-		return
+		return false
 	}
 	data, err := json.Marshal(payload)
 	if err != nil {
-		return
+		return false
 	}
 	if coreexecutor.ImageRequestContextError(m.requestContext, nil) != nil {
-		return
+		return false
 	}
-	_, _ = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", eventName, string(data))
+	_, err = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", eventName, string(data))
+	if err != nil {
+		m.fatalErr = err
+		return false
+	}
+	return true
 }
 
 type imageSSEParser struct {
@@ -2974,6 +2986,8 @@ func (h *OpenAIImagesAPIHandler) chatGPTWebImageConfigSnapshot() coreexecutor.Ch
 		MaxImageResponseBytes:         resolved.MaxImageResponseMegabytes << 20,
 		MaxN:                          resolved.MaxN,
 		NAggregationConcurrency:       resolved.NAggregationConcurrency,
+		NAggregationMaxRetries:        resolved.NAggregationMaxRetries,
+		NAggregationReturnPartial:     resolved.NAggregationReturnPartial,
 	}
 }
 
