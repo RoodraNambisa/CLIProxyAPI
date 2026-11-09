@@ -246,7 +246,7 @@ func newImagesTestHandler(t *testing.T, executor *imageCaptureExecutor, register
 		registry.GetGlobalRegistry().UnregisterClient(auth.ID)
 	})
 	base := handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{
-		Images: sdkconfig.ImagesConfig{CodexModel: "gpt-5.4-mini"},
+		Images: sdkconfig.ImagesConfig{CodexModel: "gpt-5.4-mini", ChatGPTWeb: sdkconfig.ChatGPTWebImageConfig{NAggregationConcurrency: new(1)}},
 	}, manager)
 	return NewOpenAIImagesAPIHandler(base)
 }

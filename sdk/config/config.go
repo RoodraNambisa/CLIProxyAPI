@@ -159,9 +159,10 @@ const (
 	RecommendedMinChatGPTWebImageMemoryCapacityMB = internalconfig.RecommendedMinChatGPTWebImageMemoryCapacityMB
 	RecommendedMaxChatGPTWebImageMemoryCapacityMB = internalconfig.RecommendedMaxChatGPTWebImageMemoryCapacityMB
 	// Deprecated: this advisory alias is not a validation limit. Use RecommendedMaxChatGPTWebImageMemoryCapacityMB.
-	MaxChatGPTWebImageMemoryCapacityMB = internalconfig.MaxChatGPTWebImageMemoryCapacityMB
-	MinChatGPTWebMaxN                  = internalconfig.MinChatGPTWebMaxN
-	MaxChatGPTWebMaxN                  = internalconfig.MaxChatGPTWebMaxN
+	MaxChatGPTWebImageMemoryCapacityMB       = internalconfig.MaxChatGPTWebImageMemoryCapacityMB
+	DefaultChatGPTWebNAggregationConcurrency = internalconfig.DefaultChatGPTWebNAggregationConcurrency
+	MinChatGPTWebMaxN                        = internalconfig.MinChatGPTWebMaxN
+	MaxChatGPTWebMaxN                        = internalconfig.MaxChatGPTWebMaxN
 )
 
 const (

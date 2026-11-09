@@ -489,6 +489,9 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	}
 	oldImageRuntime := oldCfg.Images.ChatGPTWeb.Resolved()
 	newImageRuntime := newCfg.Images.ChatGPTWeb.Resolved()
+	if oldImageRuntime.NAggregationConcurrency != newImageRuntime.NAggregationConcurrency {
+		changes = append(changes, fmt.Sprintf("images.chatgpt-web.n-aggregation-concurrency: %d -> %d", oldImageRuntime.NAggregationConcurrency, newImageRuntime.NAggregationConcurrency))
+	}
 	if oldImageRuntime.NormalizeMismatchedImageMIME != newImageRuntime.NormalizeMismatchedImageMIME {
 		changes = append(changes, fmt.Sprintf("images.chatgpt-web.normalize-mismatched-image-mime: %t -> %t", oldImageRuntime.NormalizeMismatchedImageMIME, newImageRuntime.NormalizeMismatchedImageMIME))
 	}

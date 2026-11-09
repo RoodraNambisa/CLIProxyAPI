@@ -279,6 +279,8 @@ type ChatGPTWebImageConfig struct {
 	MaxImageResponseMegabytes *int `yaml:"max-image-response-megabytes,omitempty" json:"max-image-response-megabytes,omitempty"`
 	// MaxN limits the number of images requested from ChatGPT Web in one logical request.
 	MaxN *int `yaml:"max-n,omitempty" json:"max-n,omitempty"`
+	// NAggregationConcurrency bounds parallel image attempts within one Images API request.
+	NAggregationConcurrency *int `yaml:"n-aggregation-concurrency,omitempty" json:"n-aggregation-concurrency,omitempty"`
 	// MaxInFlight bounds complete ChatGPT Web image attempts, including sleeping polls.
 	MaxInFlight *int `yaml:"max-in-flight,omitempty" json:"max-in-flight,omitempty"`
 	// AdmissionQueueSize bounds requests waiting to enter the Web image lifecycle.
@@ -319,6 +321,7 @@ const (
 	DefaultChatGPTWebMaxImageResponseMegabytes   = 128
 	MinChatGPTWebMaxImageResponseMegabytes       = 1
 	MaxChatGPTWebMaxImageResponseMegabytes       = 256
+	DefaultChatGPTWebNAggregationConcurrency     = 3
 	DefaultChatGPTWebMaxN                        = 1
 	MinChatGPTWebMaxN                            = 1
 	MaxChatGPTWebMaxN                            = 10
@@ -413,6 +416,7 @@ type ResolvedChatGPTWebImageConfig struct {
 	ResizeFilter                  string
 	MaxImageResponseMegabytes     int
 	MaxN                          int
+	NAggregationConcurrency       int
 	MaxInFlight                   int
 	AdmissionQueueSize            int
 	AdmissionWaitMilliseconds     int
@@ -454,6 +458,7 @@ func (cfg ChatGPTWebImageConfig) Resolved() ResolvedChatGPTWebImageConfig {
 		ResizeFilter:                 DefaultChatGPTWebResizeFilter,
 		MaxImageResponseMegabytes:    DefaultChatGPTWebMaxImageResponseMegabytes,
 		MaxN:                         DefaultChatGPTWebMaxN,
+		NAggregationConcurrency:      DefaultChatGPTWebNAggregationConcurrency,
 		MaxInFlight:                  DefaultChatGPTWebImageMaxInFlight,
 		AdmissionQueueSize:           DefaultChatGPTWebImageAdmissionQueueSize,
 		AdmissionWaitMilliseconds:    DefaultChatGPTWebImageAdmissionWaitMS,
@@ -489,6 +494,9 @@ func (cfg ChatGPTWebImageConfig) Resolved() ResolvedChatGPTWebImageConfig {
 	}
 	if cfg.MaxN != nil {
 		resolved.MaxN = *cfg.MaxN
+	}
+	if cfg.NAggregationConcurrency != nil {
+		resolved.NAggregationConcurrency = *cfg.NAggregationConcurrency
 	}
 	if cfg.MaxInFlight != nil {
 		resolved.MaxInFlight = *cfg.MaxInFlight
@@ -563,6 +571,9 @@ func (cfg ChatGPTWebImageConfig) Validate() error {
 	}
 	if resolved.MaxN < MinChatGPTWebMaxN || resolved.MaxN > MaxChatGPTWebMaxN {
 		return fmt.Errorf("images.chatgpt-web.max-n must be between %d and %d", MinChatGPTWebMaxN, MaxChatGPTWebMaxN)
+	}
+	if resolved.NAggregationConcurrency < 1 || resolved.NAggregationConcurrency > MaxChatGPTWebMaxN {
+		return fmt.Errorf("images.chatgpt-web.n-aggregation-concurrency must be between 1 and %d", MaxChatGPTWebMaxN)
 	}
 	if resolved.MaxInFlight < MinChatGPTWebImageMaxInFlight {
 		return fmt.Errorf("images.chatgpt-web.max-in-flight must be at least %d", MinChatGPTWebImageMaxInFlight)

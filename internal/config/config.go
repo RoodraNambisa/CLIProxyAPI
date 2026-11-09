@@ -2353,6 +2353,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	defaultImagesNAggregation := false
 	cfg.Images.EnableNAggregation = &defaultImagesNAggregation
 	cfg.Images.UnsupportedStatusCode = http.StatusBadRequest
+	if errAggregation := validateWebImageAggregationYAML(data); errAggregation != nil {
+		return nil, errAggregation
+	}
 	if lifecycleErr := validateChatGPTWebLifecycleOptionsYAML(data); lifecycleErr != nil {
 		return nil, fmt.Errorf("failed to parse config file: %w", lifecycleErr)
 	}

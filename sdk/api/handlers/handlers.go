@@ -151,7 +151,7 @@ func imageGenerationMaxResults(ctx context.Context) int {
 }
 
 // WithChatGPTWebImageRequestCount preserves the logical Images API count while
-// n aggregation executes one provider request at a time.
+// n aggregation executes separate single-image provider requests.
 func WithChatGPTWebImageRequestCount(ctx context.Context, count int) context.Context {
 	if count <= 0 {
 		return ctx

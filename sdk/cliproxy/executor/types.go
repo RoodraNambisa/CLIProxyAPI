@@ -229,6 +229,7 @@ type ChatGPTWebImageConfigSnapshot struct {
 	ResizeFilter                  string
 	MaxImageResponseBytes         int
 	MaxN                          int
+	NAggregationConcurrency       int
 }
 
 // OutputAspectRatioTolerance selects only the requested output format's tolerance.

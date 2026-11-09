@@ -711,7 +711,7 @@ nonstream-keepalive-interval: 0
 #   codex-request-timeout-seconds: 0 # Logical image request budget for Codex tool/native paths (0 disables; 1-86400 seconds). Retries and n share one start time.
 #   image-models: ["gpt-image-2", "gpt-image-2.5", "gpt-image-2.5-flare", "gpt-image-2.5-sunburst"] # Codex tool models; the requested model is forwarded, not rotated.
 #   enable-free-plan-image-model: false # Allow Codex free-plan auths to register/use the image model.
-#   enable-n-aggregation: false     # Split n > 1 into multiple Codex image calls and aggregate results.
+#   enable-n-aggregation: false     # Aggregate separate image calls for n > 1; Web-only routes use n-aggregation-concurrency.
 #   unsupported-status-code: 400    # Status code for unsupported image options such as response_format=url.
 #   override-response-format-url: false # Coerce response_format=url to b64_json.
 #   response-format-url-data-url: false # Return data: URLs for response_format=url instead of rejecting it.
@@ -752,6 +752,7 @@ nonstream-keepalive-interval: 0
 #     resize-to-requested-size: false  # Center-crop and resize matched Web results to the requested WxH.
 #     resize-filter: "catmull-rom"     # catmull-rom for quality, or approx-bilinear for throughput.
 #     max-image-response-megabytes: 128 # Maximum compressed image bytes returned by one request.
+#     n-aggregation-concurrency: 3 # Parallel attempts per Web-only Images request; 1 preserves serial aggregation. Requires enable-n-aggregation and max-n > 1.
 #     max-n: 1                          # Maximum images in one logical ChatGPT Web image request (1-10).
 #     max-in-flight: 64                 # Complete Web image attempts, including sleeping polls (recommended: 1-4096).
 #     admission-queue-size: 64          # Bounded pre-upstream waiters; excess requests fail fast (recommended: 0-4096).

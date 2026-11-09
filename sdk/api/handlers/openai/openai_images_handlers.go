@@ -257,6 +257,7 @@ type imageStreamEvent struct {
 	URL               string          `json:"url,omitempty"`
 	RevisedPrompt     string          `json:"revised_prompt,omitempty"`
 	PartialImageIndex *int            `json:"partial_image_index,omitempty"`
+	ImageIndex        *int            `json:"image_index,omitempty"`
 	Usage             json.RawMessage `json:"usage,omitempty"`
 }
 
@@ -724,6 +725,10 @@ func (h *OpenAIImagesAPIHandler) handleImagesRequest(c *gin.Context, req openAII
 		}
 		defer releaseAdmission()
 		c.Request = c.Request.WithContext(coreauth.InheritClientRequest(c.Request.Context(), admissionCtx))
+	}
+	if concurrency := h.webImageAggregationConcurrency(c, providers, count, imageConfig); concurrency > 1 {
+		h.handleParallelWebImages(c, rawJSON, imageModel, codexModel, req, op, count, responseFormat, ignoreUnsupportedImageParams, imageConfig, concurrency)
+		return
 	}
 	if req.Stream {
 		h.handleStreamingImagesResponse(c, rawJSON, imageModel, codexModel, op, count, responseFormat, providers, ignoreUnsupportedImageParams, imageConfig)
@@ -2205,10 +2210,12 @@ type imageStreamMapper struct {
 	finals                []imageResult
 	finalUsage            json.RawMessage
 	omitInputUsage        bool
+	imageIndex            *int
 	responseFormat        string
 	maxResults            int
 	maxBinaryBytes        int
 	completedBinaryBytes  int
+	reserveResultBytes    func(int) bool
 	completed             bool
 	forceFlush            bool
 	assistantTextSeen     bool
@@ -2379,6 +2386,11 @@ func (m *imageStreamMapper) writeCompletedSet(w io.Writer, results []imageResult
 		return
 	}
 	if m.maxBinaryBytes > 0 && resultBytes > m.maxBinaryBytes-m.completedBinaryBytes {
+		m.completed = true
+		m.fatalErr = imageResponseBudgetError(m.maxBinaryBytes)
+		return
+	}
+	if m.reserveResultBytes != nil && !m.reserveResultBytes(resultBytes) {
 		m.completed = true
 		m.fatalErr = imageResponseBudgetError(m.maxBinaryBytes)
 		return
@@ -2703,6 +2715,7 @@ func (m *imageStreamMapper) applyStreamImageFormat(event *imageStreamEvent, outp
 }
 
 func (m *imageStreamMapper) writeSSE(w io.Writer, eventName string, payload imageStreamEvent) {
+	payload.ImageIndex = m.imageIndex
 	if w == nil {
 		return
 	}
@@ -2951,6 +2964,7 @@ func (h *OpenAIImagesAPIHandler) chatGPTWebImageConfigSnapshot() coreexecutor.Ch
 		ResizeFilter:                  resolved.ResizeFilter,
 		MaxImageResponseBytes:         resolved.MaxImageResponseMegabytes << 20,
 		MaxN:                          resolved.MaxN,
+		NAggregationConcurrency:       resolved.NAggregationConcurrency,
 	}
 }
 

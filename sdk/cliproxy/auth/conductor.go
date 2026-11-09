@@ -10495,6 +10495,11 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 }
 
 func (m *Manager) pickNextMixedImmediate(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}, pickAllowed ...func(*Auth) bool) (*Auth, ProviderExecutor, string, error) {
+	if ctx != nil {
+		if a, e, p, err, handled := m.pickWebImageAggregation(ctx, providers, model, opts, tried, pickAllowed); handled {
+			return a, e, p, err
+		}
+	}
 	ctx = cliproxyexecutor.WithResponseGuardRequest(m.WithRoutingPolicySnapshot(ctx))
 	if ctx != nil && ctx.Err() != nil {
 		return nil, nil, "", ctx.Err()

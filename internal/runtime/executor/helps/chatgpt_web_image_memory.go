@@ -78,6 +78,7 @@ type chatGPTWebImageMemoryWaiter struct {
 // ChatGPTWebImageMemoryLeaseSet owns all long-lived image buffers for one request.
 type ChatGPTWebImageMemoryLeaseSet struct {
 	mu                  sync.Mutex
+	externallyHeldBytes int64
 	inputRelease        func()
 	completionRelease   func()
 	completionBytes     int64
@@ -134,6 +135,13 @@ func NewChatGPTWebImageMemoryAdmission(capacityBytes int64) *ChatGPTWebImageMemo
 // NewChatGPTWebImageMemoryLeaseSet creates an empty request-scoped lease owner.
 func NewChatGPTWebImageMemoryLeaseSet() *ChatGPTWebImageMemoryLeaseSet {
 	return &ChatGPTWebImageMemoryLeaseSet{}
+}
+
+// NewChatGPTWebImageChildMemoryLeaseSet accounts for shared input retained by
+// a parallel aggregation parent. Impossible allocations fail rather than wait
+// for input that cannot be released until this child completes.
+func NewChatGPTWebImageChildMemoryLeaseSet(inputBytes int64) *ChatGPTWebImageMemoryLeaseSet {
+	return &ChatGPTWebImageMemoryLeaseSet{externallyHeldBytes: max(inputBytes, 0)}
 }
 
 // AcquireChatGPTWebImageMemory reserves estimated decoded image memory. A
@@ -734,6 +742,7 @@ func (leases *ChatGPTWebImageMemoryLeaseSet) AcquireTransient(ctx context.Contex
 
 func (leases *ChatGPTWebImageMemoryLeaseSet) reserveRetainedWeight(estimatedBytes int64) (int64, int64, error) {
 	requestedWeight, weight, capacity := normalizedChatGPTWebImageLeaseWeight(estimatedBytes)
+	capacity -= leases.externallyHeldBytes
 	leases.mu.Lock()
 	defer leases.mu.Unlock()
 	if leases.released {
@@ -756,6 +765,7 @@ func (leases *ChatGPTWebImageMemoryLeaseSet) reserveExactRetainedWeight(estimate
 	if capacity < 1 {
 		capacity = 1
 	}
+	capacity -= leases.externallyHeldBytes
 	leases.mu.Lock()
 	defer leases.mu.Unlock()
 	if leases.released {
@@ -798,6 +808,7 @@ func (leases *ChatGPTWebImageMemoryLeaseSet) cancelRetainedWeight(weight int64) 
 
 func (leases *ChatGPTWebImageMemoryLeaseSet) reserveTransientWeight(estimatedBytes int64) (int64, int64, error) {
 	requestedWeight, weight, capacity := normalizedChatGPTWebImageLeaseWeight(estimatedBytes)
+	capacity -= leases.externallyHeldBytes
 	leases.mu.Lock()
 	defer leases.mu.Unlock()
 	if leases.released {
