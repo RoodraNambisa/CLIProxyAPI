@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"strings"
 	"sync"
 
 	core "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
@@ -48,4 +49,15 @@ func (m *Manager) pickWebImageAggregation(ctx context.Context, providers []strin
 		group.used[auth.ID] = struct{}{}
 	}
 	return auth, executor, provider, err, true
+}
+
+// HasProviderCredentials conservatively includes disabled credentials when
+// deciding whether a request can enter the Web-only aggregation path.
+func (m *Manager) HasProviderCredentials(provider string) bool {
+	if m == nil {
+		return false
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return len(m.providerAuthIDs[strings.ToLower(strings.TrimSpace(provider))]) > 0
 }

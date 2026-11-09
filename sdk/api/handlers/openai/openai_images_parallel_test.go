@@ -328,6 +328,12 @@ func TestWebImageParallelRouteIsolation(t *testing.T) {
 		t.Fatal("Web route not parallel")
 	}
 	h.AuthManager.RegisterExecutor(&imageCaptureExecutor{provider: "codex"})
+	if h.webImageAggregationConcurrency(c, []string{"codex", "chatgpt-web"}, 10, s) != 3 {
+		t.Fatal("empty Codex executor incorrectly made the route mixed")
+	}
+	if _, err := h.AuthManager.Register(t.Context(), &auth.Auth{ID: "mixed-route-codex", Provider: "codex", Status: auth.StatusActive}); err != nil {
+		t.Fatal(err)
+	}
 	if h.webImageAggregationConcurrency(c, []string{"codex", "chatgpt-web"}, 10, s) != 1 {
 		t.Fatal("mixed route changed")
 	}

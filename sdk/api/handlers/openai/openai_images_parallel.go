@@ -33,7 +33,7 @@ func (h *OpenAIImagesAPIHandler) webImageAggregationConcurrency(c *gin.Context, 
 	if !chatGPTWebAllowedWithoutCodex(c) {
 		for _, provider := range providers {
 			if provider != ChatGPTWeb {
-				if _, exists := h.AuthManager.Executor(provider); exists {
+				if h.AuthManager.HasProviderCredentials(provider) {
 					return 1
 				}
 			}

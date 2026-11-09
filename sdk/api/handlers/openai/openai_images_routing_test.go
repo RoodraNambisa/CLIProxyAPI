@@ -143,26 +143,34 @@ func TestMixedNativeImageRetryKeepsProviderFormats(t *testing.T) {
 func TestNativeImageNDoesNotDuplicateBatches(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	for _, aggregation := range []bool{false, true} {
-		t.Run(fmt.Sprint(aggregation), func(t *testing.T) {
-			codex := &imageCaptureExecutor{response: []byte(`{"created":1,"data":[{"b64_json":"bmF0aXZl"},{"b64_json":"bmF0aXZl"}]}`)}
-			web := &imageCaptureExecutor{provider: "chatgpt-web"}
-			h := newMixedImagesTestHandler(t, codex, web)
-			h.Cfg.Images.Native.Generations.Enabled = true
-			h.Cfg.Images.EnableNAggregation = &aggregation
-			maxN := 2
-			h.Cfg.Images.ChatGPTWeb.MaxN = &maxN
-			response := serveImageModelRequest(h, "generations", `{"model":"gpt-image-2","prompt":"draw","n":2}`)
-			if response.Code != http.StatusOK || len(gjson.Get(response.Body.String(), "data").Array()) != 2 {
-				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
-			}
-			if aggregation {
-				if web.calls != 2 || codex.calls != 0 {
-					t.Fatalf("Web aggregation changed: Web=%d Code=%d", web.calls, codex.calls)
+		for _, first := range []string{"codex", "chatgpt-web"} {
+			t.Run(fmt.Sprintf("legacy=%t/first=%s", aggregation, first), func(t *testing.T) {
+				codex := &imageCaptureExecutor{response: []byte(`{"created":1,"data":[{"b64_json":"bmF0aXZl"},{"b64_json":"bmF0aXZl"}]}`)}
+				web := &imageCaptureExecutor{provider: "chatgpt-web"}
+				h := newMixedImagesTestHandler(t, codex, web)
+				h.Cfg.Images.Native.Generations.Enabled = true
+				h.Cfg.Images.EnableNAggregation = &aggregation
+				h.Cfg.Images.ChatGPTWeb.MaxN = new(2)
+				if first == "codex" {
+					a, _ := h.AuthManager.GetByID("codex-mixed-auth")
+					a.Attributes["priority"] = "2"
+					if _, err := h.AuthManager.Update(t.Context(), a); err != nil {
+						t.Fatal(err)
+					}
 				}
-			} else if web.calls != 0 || codex.calls != 1 || gjson.GetBytes(codex.payload, "n").Int() != 2 {
-				t.Fatalf("native batch duplicated or n lost: Web=%d Code=%d payload=%s", web.calls, codex.calls, codex.payload)
-			}
-		})
+				response := serveImageModelRequest(h, "generations", `{"model":"gpt-image-2","prompt":"draw","n":2}`)
+				if response.Code != http.StatusOK || len(gjson.Get(response.Body.String(), "data").Array()) != 2 {
+					t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+				}
+				if first == "chatgpt-web" {
+					if web.calls != 2 || codex.calls != 0 {
+						t.Fatalf("Web aggregation changed: Web=%d Code=%d", web.calls, codex.calls)
+					}
+				} else if web.calls != 0 || codex.calls != 1 || gjson.GetBytes(codex.payload, "n").Int() != 2 {
+					t.Fatalf("native batch duplicated or n lost: Web=%d Code=%d payload=%s", web.calls, codex.calls, codex.payload)
+				}
+			})
+		}
 	}
 }
 

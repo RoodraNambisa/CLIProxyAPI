@@ -707,12 +707,21 @@ func (h *OpenAIImagesAPIHandler) handleImagesRequest(c *gin.Context, req openAII
 		return
 	}
 	count := imageRequestCount(req)
-	if count > 1 && !h.imagesNAggregationEnabled() {
-		h.writeImagesRequestError(c, unsupportedImageErrorf("n > 1 is not supported"))
-		return
-	}
 	responseFormat := strings.ToLower(strings.TrimSpace(req.ResponseFormat))
 	providers := h.configuredImageProviders(req, op, ignoreUnsupportedImageParams, imageConfig)
+	if count > 1 && !h.imagesNAggregationEnabled() && nativeImageRequest(c) == nil {
+		// The legacy switch controls Codex Responses aggregation. Web admission
+		// is independently bounded by max-n in the frozen compatibility policy.
+		if !imageProvidersContain(providers, ChatGPTWeb) || !handlers.ExecutionProviderAllowedForGin(c, ChatGPTWeb) || h.AuthManager == nil || !h.AuthManager.HasProviderCredentials(ChatGPTWeb) {
+			h.writeImagesRequestError(c, unsupportedImageErrorf("n > 1 is not supported"))
+			return
+		}
+		if incompatibility := chatGPTWebImageRequestCompatibilityError(req, ignoreUnsupportedImageParams, imageConfig); incompatibility != nil {
+			h.writeImagesError(c, http.StatusBadRequest, chatGPTWebUnsupportedParameterError(incompatibility))
+			return
+		}
+		providers = []string{ChatGPTWeb}
+	}
 	h.PinChatGPTWebImageErrorSanitization(c, imageProvidersContain(providers, ChatGPTWeb))
 
 	if h.AuthManager != nil {

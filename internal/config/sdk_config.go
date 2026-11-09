@@ -203,7 +203,7 @@ type ImagesConfig struct {
 	ImageModels []string `yaml:"image-models,omitempty" json:"image-models,omitempty"`
 	// EnableFreePlanImageModel controls whether Codex free-plan auths register the configured image model.
 	EnableFreePlanImageModel bool `yaml:"enable-free-plan-image-model,omitempty" json:"enable-free-plan-image-model,omitempty"`
-	// EnableNAggregation enables multi-call aggregation for Images API n > 1 requests.
+	// EnableNAggregation enables Codex Responses aggregation; Web aggregation uses ChatGPTWeb.MaxN.
 	EnableNAggregation *bool `yaml:"enable-n-aggregation,omitempty" json:"enable-n-aggregation,omitempty"`
 	// UnsupportedStatusCode is used for unsupported Images API options.
 	UnsupportedStatusCode int `yaml:"unsupported-status-code,omitempty" json:"unsupported-status-code,omitempty"`

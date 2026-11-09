@@ -94,9 +94,6 @@ func (h *OpenAIImagesAPIHandler) handleNativeImagesRequest(c *gin.Context, rawJS
 		}
 		webErr = normalizeChatGPTWebImageRequestMIME(&webReq)
 	}
-	if webErr == nil && imageRequestCount(webReq) > 1 && !h.imagesNAggregationEnabled() {
-		webErr = unsupportedImageErrorf("n > 1 is not supported")
-	}
 	if webErr == nil {
 		if incompatibility := chatGPTWebImageRequestCompatibilityError(webReq, h.chatGPTWebIgnoreUnsupportedImageParams(), h.chatGPTWebImageConfigSnapshot()); incompatibility != nil && !incompatibility.providerFiltered {
 			webErr = chatGPTWebUnsupportedParameterError(incompatibility)

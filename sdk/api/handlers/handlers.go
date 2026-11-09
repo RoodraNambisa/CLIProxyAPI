@@ -289,6 +289,16 @@ func allowedProviderSetFromGin(c *gin.Context) (map[string]struct{}, bool) {
 	return allowed, true
 }
 
+// ExecutionProviderAllowedForGin reports the authenticated client provider restriction.
+func ExecutionProviderAllowedForGin(c *gin.Context, provider string) bool {
+	allowed, restricted := allowedProviderSetFromGin(c)
+	if !restricted {
+		return true
+	}
+	_, ok := allowed[strings.ToLower(strings.TrimSpace(provider))]
+	return ok
+}
+
 func allowedProviderSetFromContext(ctx context.Context) (map[string]struct{}, bool) {
 	if ctx == nil {
 		return nil, false
