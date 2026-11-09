@@ -228,7 +228,7 @@ func (h *OpenAIImagesAPIHandler) handleParallelWebImages(c *gin.Context, rawJSON
 					if attempt > 0 {
 						retryStarts.Add(1)
 					}
-					accounting.start(index)
+					accounting.start(index, attempt)
 					attemptSnapshot := snapshot.Clone()
 					remaining := imageResponseByteLimit(snapshot) - int(retainedBytes.Load())
 					if remaining <= 0 {
@@ -334,6 +334,9 @@ func (h *OpenAIImagesAPIHandler) handleParallelWebImages(c *gin.Context, rawJSON
 			close(event.ack)
 		}
 	roundFinished:
+		for _, index := range roundPending {
+			accounting.ensureAttempt(children[index].Request.Context(), index, attempt, slots[index].generated, slots[index].err)
+		}
 		for _, stop := range cancels {
 			stop()
 		}

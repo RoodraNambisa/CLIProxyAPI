@@ -3,9 +3,10 @@ package usage
 import (
 	"context"
 	"encoding/json"
-	coreusage "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
 	"testing"
 	"time"
+
+	coreusage "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
 )
 
 func TestImageAggregationDeliveryAccountingAndRestore(t *testing.T) {

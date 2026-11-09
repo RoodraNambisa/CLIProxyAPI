@@ -1,9 +1,11 @@
 package openai
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -23,9 +25,14 @@ type refillExecutor struct {
 	code                       string
 	calls                      map[int]int
 	inputs                     [][]byte
+	beforeRun                  func()
+	beforeOnce                 sync.Once
 }
 
 func (e *refillExecutor) run(ctx context.Context, req core.Request, opts core.Options) ([]byte, error) {
+	if e.beforeRun != nil {
+		e.beforeOnce.Do(e.beforeRun)
+	}
 	a, _ := core.ImageAggregationAttemptFromContext(ctx)
 	e.mu.Lock()
 	e.calls[a.ImageIndex]++
@@ -183,5 +190,70 @@ func TestWebImageRefillBrokenWriterStops(t *testing.T) {
 		req := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(string(body)))
 		req.Header.Set("Content-Type", "application/json")
 		router.ServeHTTP(&failImageWrite{httptest.NewRecorder()}, req)
+	}
+}
+
+func TestWebImageRefillFreezesPolicyAndStopsOnAdministratorCancel(t *testing.T) {
+	h, e := refillHandler(t, 2, 0, 1)
+	e.beforeRun = func() {
+		h.Cfg.Images.ChatGPTWeb.NAggregationMaxRetries = new(0)
+		h.Cfg.Images.ChatGPTWeb.NAggregationReturnPartial = true
+	}
+	w, done := runParallelImages(h, t.Context(), false, 3)
+	waitParallelDone(t, done)
+	if w.Code != 200 || gjson.Get(w.Body.String(), "data.#").Int() != 3 || e.calls[2] != 2 {
+		t.Fatalf("in-flight policy changed: %d %s calls=%v", w.Code, w.Body.String(), e.calls)
+	}
+	e.calls = map[int]int{}
+	w, done = runParallelImages(h, t.Context(), false, 3)
+	waitParallelDone(t, done)
+	if w.Code != 200 || gjson.Get(w.Body.String(), "data.#").Int() != 2 || e.calls[2] != 1 {
+		t.Fatalf("new policy not applied: %d %s calls=%v", w.Code, w.Body.String(), e.calls)
+	}
+	h, e = refillHandler(t, 0, 3, 1)
+	e.code = "chatgpt_web_image_task_canceled"
+	w, done = runParallelImages(h, t.Context(), false, 10)
+	waitParallelDone(t, done)
+	if len(e.calls) != 1 || e.calls[0] != 1 {
+		t.Fatalf("admin cancellation dispatched more work: %v", e.calls)
+	}
+}
+
+func TestWebImageRefillMultipartReusesCanonicalReference(t *testing.T) {
+	h, e := refillHandler(t, 2, 0, 1)
+	var body bytes.Buffer
+	w := multipart.NewWriter(&body)
+	for key, value := range map[string]string{"model": "gpt-image-2", "prompt": "edit this", "n": "3"} {
+		if err := w.WriteField(key, value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	part, err := w.CreateFormFile("image[]", "image.png")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = part.Write([]byte("\x89PNG\r\n\x1a\nimage-data")); err != nil {
+		t.Fatal(err)
+	}
+	if err = w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	router := gin.New()
+	router.POST("/v1/images/edits", h.Edits)
+	r := httptest.NewRequest(http.MethodPost, "/v1/images/edits", &body)
+	r.Header.Set("Content-Type", w.FormDataContentType())
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, r)
+	if response.Code != 200 || len(e.inputs) != 4 || e.calls[2] != 2 {
+		t.Fatalf("status=%d calls=%v body=%s", response.Code, e.calls, response.Body.String())
+	}
+	reference := gjson.GetBytes(e.inputs[0], "input.0.content.1.image_url").String()
+	if !strings.HasPrefix(reference, "data:image/png;base64,") {
+		t.Fatal("reference missing")
+	}
+	for _, payload := range e.inputs {
+		if gjson.GetBytes(payload, "input.0.content.1.image_url").String() != reference {
+			t.Fatal("reference changed or disappeared after release")
+		}
 	}
 }

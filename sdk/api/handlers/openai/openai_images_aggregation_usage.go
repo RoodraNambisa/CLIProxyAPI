@@ -2,9 +2,11 @@ package openai
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	helps "github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
 	core "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
@@ -13,6 +15,9 @@ import (
 
 // Retain only the last primary record per bounded slot, never image bytes.
 type webImageBatchAccounting struct {
+	startedAttempts []uint8
+	seenAttempts    []uint8
+
 	mu             sync.Mutex
 	last           []usage.Record
 	seen           []bool
@@ -22,7 +27,7 @@ type webImageBatchAccounting struct {
 }
 
 func newWebImageBatchAccounting(n int, id, model string) *webImageBatchAccounting {
-	return &webImageBatchAccounting{last: make([]usage.Record, n), seen: make([]bool, n), started: make([]bool, n), startedAt: time.Now(), batchID: id, model: model}
+	return &webImageBatchAccounting{last: make([]usage.Record, n), startedAttempts: make([]uint8, n), seenAttempts: make([]uint8, n), seen: make([]bool, n), started: make([]bool, n), startedAt: time.Now(), batchID: id, model: model}
 }
 func (a *webImageBatchAccounting) observe(r usage.Record) {
 	if r.Auxiliary {
@@ -32,11 +37,17 @@ func (a *webImageBatchAccounting) observe(r usage.Record) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if i >= 0 && i < len(a.last) && (!a.seen[i] || r.ImageAggregation.AttemptIndex >= a.last[i].ImageAggregation.AttemptIndex) {
+		a.seenAttempts[i] |= 1 << r.ImageAggregation.AttemptIndex
 		a.last[i] = r
 		a.seen[i] = true
 	}
 }
-func (a *webImageBatchAccounting) start(i int) { a.mu.Lock(); a.started[i] = true; a.mu.Unlock() }
+func (a *webImageBatchAccounting) start(i, attempt int) {
+	a.mu.Lock()
+	a.started[i] = true
+	a.startedAttempts[i] |= 1 << attempt
+	a.mu.Unlock()
+}
 func (a *webImageBatchAccounting) publish(ctx context.Context, slots []webImageAggregationSlot, retries int) {
 	summary := webImageBatchSummary(slots, retries)
 	a.mu.Lock()
@@ -55,6 +66,10 @@ func (a *webImageBatchAccounting) publish(ctx context.Context, slots []webImageA
 		originalCode, originalStage := record.ErrorCode, record.FailureStage
 		if slot.err != nil {
 			originalCode = webImageErrorCode(slot.err)
+			var staged interface{ ChatGPTWebFailureStage() string }
+			if errors.As(slot.err.Error, &staged) {
+				originalStage = staged.ChatGPTWebFailureStage()
+			}
 		}
 		record.ImageAggregation = usage.ImageAggregation{Role: "delivery", BatchID: a.batchID, ImageIndex: i, AttemptIndex: slot.attempt, Requested: len(slots), Generated: summary.Generated, Delivered: summary.Delivered, RetryAttempts: retries, Executed: started[i], OriginalCode: originalCode, OriginalStage: originalStage}
 		record.Detail = usage.Detail{}
@@ -90,4 +105,29 @@ func (a *webImageBatchAccounting) publish(ctx context.Context, slots []webImageA
 		}
 		usage.PublishRecord(ctx, record)
 	}
+}
+
+// Selection and local conversion errors may never instantiate an executor usage
+// reporter. Preserve a zero-token attempt without inventing upstream consumption.
+func (a *webImageBatchAccounting) ensureAttempt(ctx context.Context, index, attempt int, generated bool, msg *interfaces.ErrorMessage) {
+	a.mu.Lock()
+	missing := a.startedAttempts[index]&(1<<attempt) != 0 && a.seenAttempts[index]&(1<<attempt) == 0
+	a.mu.Unlock()
+	if !missing {
+		return
+	}
+	record := usage.Record{Provider: "chatgpt-web", Model: a.model, APIKey: helps.APIKeyFromContext(ctx), RequestedAt: a.startedAt, Latency: time.Since(a.startedAt), Stream: usage.StreamFromContext(ctx), Failed: !generated, RequestID: logging.GetRequestID(ctx)}
+	if record.Failed {
+		record.ErrorCode = webImageErrorCode(msg)
+		record.FailureStage = "aggregation"
+		record.StatusCode = 502
+		if msg != nil {
+			record.StatusCode = msg.StatusCode
+			var staged interface{ ChatGPTWebFailureStage() string }
+			if errors.As(msg.Error, &staged) {
+				record.FailureStage = staged.ChatGPTWebFailureStage()
+			}
+		}
+	}
+	usage.PublishRecord(ctx, record)
 }

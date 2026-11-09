@@ -114,3 +114,8 @@ func (w *webImageDeliveryWriter) Write(p []byte) (int, error) {
 	w.err = err
 	return n, err
 }
+
+// Aggregation failures belong to Web but are not failures of a selected credential.
+func (*webImageAggregationError) ErrorResponseSource() core.ErrorResponseSourceSnapshot {
+	return core.ErrorResponseSourceSnapshot{Provider: "chatgpt-web"}
+}

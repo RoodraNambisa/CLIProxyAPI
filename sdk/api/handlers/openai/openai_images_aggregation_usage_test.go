@@ -2,9 +2,13 @@ package openai
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 
+	"github.com/gin-gonic/gin"
 	helps "github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
 	stats "github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
 	auth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
@@ -104,6 +108,51 @@ func TestWebImageBatchCountsDeliveryWithoutLosingAttemptTokens(t *testing.T) {
 			}
 			if tc.name == "discarded" && discarded != 9 {
 				t.Fatalf("discarded=%d", discarded)
+			}
+		})
+	}
+}
+
+func TestWebImageBatchMissingReporterAndWriteFailure(t *testing.T) {
+	for _, brokenWriter := range []bool{false, true} {
+		t.Run(map[bool]string{false: "missing_reporter", true: "write_failure"}[brokenWriter], func(t *testing.T) {
+			capture := &imageBatchUsageCapture{done: t.Context().Done()}
+			usage.RegisterPlugin(capture)
+			h, e := refillHandler(t, 3, 0, 1)
+			if brokenWriter {
+				h.AuthManager.RegisterExecutor(&reportingRefillExecutor{e})
+			}
+			router := gin.New()
+			router.POST("/v1/images/generations", h.Generations)
+			r := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(`{"model":"gpt-image-2","prompt":"test","n":3}`))
+			r.Header.Set("Content-Type", "application/json")
+			var w http.ResponseWriter = httptest.NewRecorder()
+			if brokenWriter {
+				w = &failImageWrite{httptest.NewRecorder()}
+			}
+			router.ServeHTTP(w, r)
+			if err := usage.DefaultManager().Barrier(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			capture.mu.Lock()
+			defer capture.mu.Unlock()
+			attempts, delivered, failures, tokens := 0, 0, 0, int64(0)
+			for _, row := range capture.rows {
+				tokens += row.Detail.TotalTokens
+				if row.ImageAggregation.Role == "attempt" {
+					attempts++
+				} else {
+					delivered++
+					if row.Failed {
+						failures++
+						if row.ErrorCode != "image_aggregation_discarded" {
+							t.Fatalf("wrong delivery code: %s", row.ErrorCode)
+						}
+					}
+				}
+			}
+			if attempts != 3 || delivered != 3 || failures != map[bool]int{false: 0, true: 3}[brokenWriter] || tokens != map[bool]int64{false: 0, true: 30}[brokenWriter] {
+				t.Fatalf("attempts=%d delivery=%d failures=%d tokens=%d", attempts, delivered, failures, tokens)
 			}
 		})
 	}
