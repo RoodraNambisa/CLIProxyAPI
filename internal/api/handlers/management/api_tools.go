@@ -121,6 +121,9 @@ func (h *Handler) APICall(c *gin.Context) {
 
 	authIndex := firstNonEmptyString(body.AuthIndexSnake, body.AuthIndexCamel, body.AuthIndexPascal)
 	auth := h.authByIndex(authIndex)
+	if draft, ok := c.Get("provider_models_draft_auth"); ok {
+		auth, _ = draft.(*coreauth.Auth)
+	}
 	if auth != nil {
 		if coreauth.ChatGPTWebAuthRetainedForDependents(auth) {
 			c.JSON(http.StatusConflict, gin.H{"error": "credential is retained for Web dependents"})

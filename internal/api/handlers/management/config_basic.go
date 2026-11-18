@@ -15,6 +15,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/watcher/synthesizer"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/proxyutil"
 	log "github.com/sirupsen/logrus"
@@ -33,6 +34,7 @@ type safeRemoteManagementConfig struct {
 }
 
 type configResponse struct {
+	APIManagementSupported                    bool   `json:"api-credential-management-supported"`
 	AuthModelExclusionsImagePrioritySupported bool   `json:"auth-model-exclusions-image-priority-supported"`
 	FillOrderSupported                        bool   `json:"fill-order-supported"`
 	SessionAffinityCapacitySpilloverSupported bool   `json:"session-affinity-capacity-spillover-supported"`
@@ -64,6 +66,7 @@ func (h *Handler) GetConfig(c *gin.Context) {
 		role = "sentinel-solver"
 	}
 	c.JSON(200, &configResponse{
+		APIManagementSupported:                    true,
 		AuthModelExclusionsImagePrioritySupported: true,
 		RuntimeRole: role, FillOrderSupported: h.authManager != nil && h.authManager.FillOrderSupported(), SessionAffinityCapacitySpilloverSupported: true, AdmissionSupported: true, TrafficSupported: true, CodexIdentityPolicySupported: true,
 		Config: &snapshot,
@@ -196,7 +199,7 @@ func (h *Handler) PutConfigYAML(c *gin.Context) {
 	defer func() {
 		_ = os.Remove(tempFile)
 	}()
-	_, err = config.LoadConfigOptional(tempFile, false)
+	validatedCfg, err := config.LoadConfigOptional(tempFile, false)
 	if err != nil {
 		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": "invalid_config", "message": err.Error()})
 		return
@@ -214,6 +217,24 @@ func (h *Handler) PutConfigYAML(c *gin.Context) {
 		h.mu.Unlock()
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "read_failed", "message": "failed to load current config"})
 		return
+	}
+	if changed, errPrepare := synthesizer.PrepareManagedCredentialsWithPrevious(validatedCfg, previousCfg); errPrepare != nil {
+		h.mu.Unlock()
+		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": "invalid_config", "message": errPrepare.Error()})
+		return
+	} else if changed {
+		if errSave := config.SaveConfigPreserveComments(tempFile, validatedCfg); errSave != nil {
+			h.mu.Unlock()
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "write_failed", "message": errSave.Error()})
+			return
+		}
+		var errRead error
+		body, errRead = os.ReadFile(tempFile)
+		if errRead != nil {
+			h.mu.Unlock()
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "read_failed", "message": errRead.Error()})
+			return
+		}
 	}
 	if WriteConfig(h.configFilePath, body) != nil {
 		h.mu.Unlock()

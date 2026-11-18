@@ -21,6 +21,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/proxypool"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/sentinelservice"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/watcher/synthesizer"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v6/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
@@ -151,7 +152,7 @@ func isManagementConfigMutation(method, fullPath string) bool {
 			return true
 		}
 	case http.MethodPost:
-		return fullPath == "/proxy-pools"
+		return fullPath == "/proxy-pools" || fullPath == "/provider-credentials"
 	case http.MethodDelete:
 		if fullPath == "/usage/prices" || strings.HasPrefix(fullPath, "/usage/prices/") {
 			return true
@@ -163,7 +164,7 @@ func isManagementConfigMutation(method, fullPath string) bool {
 			"/oauth-model-alias":
 			return true
 		}
-		return strings.HasPrefix(fullPath, "/proxy-pools/")
+		return strings.HasPrefix(fullPath, "/proxy-pools/") || strings.HasPrefix(fullPath, "/provider-credentials/")
 	default:
 		return false
 	}
@@ -796,13 +797,23 @@ func (h *Handler) persistLocked(c *gin.Context) bool {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to snapshot runtime configuration"})
 		return false
 	}
+	config.RetainAPIManagement(candidate, previousCfg)
+	if _, errPrepare := synthesizer.PrepareManagedCredentials(candidate); errPrepare != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errPrepare.Error()})
+		return false
+	}
 	publishedCandidate, errPublishedCandidate := config.Clone(candidate)
 	if errPublishedCandidate != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to snapshot published configuration"})
 		return false
 	}
+	localCandidate, errLocalCandidate := config.Clone(candidate)
+	if errLocalCandidate != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to snapshot editable configuration"})
+		return false
+	}
 	// Preserve comments when writing.
-	if err := config.SaveConfigPreserveComments(h.configFilePath, h.cfg); err != nil {
+	if err := config.SaveConfigPreserveComments(h.configFilePath, candidate); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to save config: %v", err)})
 		return false
 	}
@@ -828,6 +839,7 @@ func (h *Handler) persistLocked(c *gin.Context) bool {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "runtime_update_failed", "message": errApply.Error()})
 		return false
 	}
+	*h.cfg = *localCandidate
 	h.configSnapshot.Store(publishedCandidate)
 	response := gin.H{"status": "ok", "applied": result.Applied}
 	if rawFields, exists := c.Get(managementResponseFieldsKey); exists {

@@ -10,36 +10,44 @@ import (
 )
 
 type geminiKeyWithAuthIndex struct {
+	Revision string `json:"revision"`
 	config.GeminiKey
 	AuthIndex string `json:"auth-index,omitempty"`
 }
 
 type claudeKeyWithAuthIndex struct {
+	Revision string `json:"revision"`
 	config.ClaudeKey
 	AuthIndex string `json:"auth-index,omitempty"`
 }
 
 type xaiKeyWithAuthIndex struct {
+	Revision string `json:"revision"`
 	config.XAIKey
 	AuthIndex string `json:"auth-index,omitempty"`
 }
 
 type codexKeyWithAuthIndex struct {
+	Revision string `json:"revision"`
 	config.CodexKey
 	AuthIndex string `json:"auth-index,omitempty"`
 }
 
 type vertexCompatKeyWithAuthIndex struct {
+	Revision string `json:"revision"`
 	config.VertexCompatKey
 	AuthIndex string `json:"auth-index,omitempty"`
 }
 
 type openAICompatibilityAPIKeyWithAuthIndex struct {
+	Revision string `json:"revision"`
 	config.OpenAICompatibilityAPIKey
 	AuthIndex string `json:"auth-index,omitempty"`
 }
 
 type openAICompatibilityWithAuthIndex struct {
+	Revision string `json:"revision"`
+	config.APIManagement
 	RequestScopedErrors []config.RequestScopedErrorRule          `json:"request-scoped-errors,omitempty"`
 	RequestRetry        *int                                     `json:"request-retry,omitempty"`
 	Name                string                                   `json:"name"`
@@ -86,10 +94,14 @@ func (h *Handler) geminiKeysWithAuthIndex() []geminiKeyWithAuthIndex {
 		if key := strings.TrimSpace(entry.APIKey); key != "" {
 			id, _ := idGen.Next("gemini:apikey", key, entry.BaseURL)
 			authIndex = liveIndexByID[id]
+			if entry.CredentialIndex != "" {
+				authIndex = entry.CredentialIndex
+			}
 		}
 		entry.ProxyURL = proxyutil.MaskProxyURL(entry.ProxyURL)
 		out[i] = geminiKeyWithAuthIndex{
 			GeminiKey: entry,
+			Revision:  config.APICredentialRef{Value: &cfg.GeminiKey[i]}.Revision(),
 			AuthIndex: authIndex,
 		}
 	}
@@ -115,10 +127,14 @@ func (h *Handler) interactionsKeysWithAuthIndex() []geminiKeyWithAuthIndex {
 		if key := strings.TrimSpace(entry.APIKey); key != "" {
 			id, _ := idGen.Next("gemini-interactions:apikey", key, entry.BaseURL)
 			authIndex = liveIndexByID[id]
+			if entry.CredentialIndex != "" {
+				authIndex = entry.CredentialIndex
+			}
 		}
 		entry.ProxyURL = proxyutil.MaskProxyURL(entry.ProxyURL)
 		out[i] = geminiKeyWithAuthIndex{
 			GeminiKey: entry,
+			Revision:  config.APICredentialRef{Value: &cfg.InteractionsKey[i]}.Revision(),
 			AuthIndex: authIndex,
 		}
 	}
@@ -144,10 +160,14 @@ func (h *Handler) claudeKeysWithAuthIndex() []claudeKeyWithAuthIndex {
 		if key := strings.TrimSpace(entry.APIKey); key != "" {
 			id, _ := idGen.Next("claude:apikey", key, entry.BaseURL)
 			authIndex = liveIndexByID[id]
+			if entry.CredentialIndex != "" {
+				authIndex = entry.CredentialIndex
+			}
 		}
 		entry.ProxyURL = proxyutil.MaskProxyURL(entry.ProxyURL)
 		out[i] = claudeKeyWithAuthIndex{
 			ClaudeKey: entry,
+			Revision:  config.APICredentialRef{Value: &cfg.ClaudeKey[i]}.Revision(),
 			AuthIndex: authIndex,
 		}
 	}
@@ -173,10 +193,14 @@ func (h *Handler) codexKeysWithAuthIndex() []codexKeyWithAuthIndex {
 		if key := strings.TrimSpace(entry.APIKey); key != "" {
 			id, _ := idGen.Next("codex:apikey", key, entry.BaseURL)
 			authIndex = liveIndexByID[id]
+			if entry.CredentialIndex != "" {
+				authIndex = entry.CredentialIndex
+			}
 		}
 		entry.ProxyURL = proxyutil.MaskProxyURL(entry.ProxyURL)
 		out[i] = codexKeyWithAuthIndex{
 			CodexKey:  entry,
+			Revision:  config.APICredentialRef{Value: &cfg.CodexKey[i]}.Revision(),
 			AuthIndex: authIndex,
 		}
 	}
@@ -200,9 +224,13 @@ func (h *Handler) vertexCompatKeysWithAuthIndex() []vertexCompatKeyWithAuthIndex
 		entry := cfg.VertexCompatAPIKey[i]
 		id, _ := idGen.Next("vertex:apikey", entry.APIKey, entry.BaseURL, entry.ProxyURL)
 		authIndex := liveIndexByID[id]
+		if entry.CredentialIndex != "" {
+			authIndex = entry.CredentialIndex
+		}
 		entry.ProxyURL = proxyutil.MaskProxyURL(entry.ProxyURL)
 		out[i] = vertexCompatKeyWithAuthIndex{
 			VertexCompatKey: entry,
+			Revision:        config.APICredentialRef{Value: &cfg.VertexCompatAPIKey[i]}.Revision(),
 			AuthIndex:       authIndex,
 		}
 	}
@@ -229,6 +257,8 @@ func (h *Handler) openAICompatibilityWithAuthIndex() []openAICompatibilityWithAu
 		idKind := fmt.Sprintf("openai-compatibility:%s", providerName)
 
 		response := openAICompatibilityWithAuthIndex{
+			Revision:            config.APICredentialRef{Value: &cfg.OpenAICompatibility[i]}.Revision(),
+			APIManagement:       entry.APIManagement,
 			RequestRetry:        entry.RequestRetry,
 			RequestScopedErrors: entry.RequestScopedErrors,
 			Name:                entry.Name,
@@ -244,6 +274,9 @@ func (h *Handler) openAICompatibilityWithAuthIndex() []openAICompatibilityWithAu
 			if !entry.Disabled {
 				id, _ := idGen.Next(idKind, entry.BaseURL)
 				response.AuthIndex = liveIndexByID[id]
+				if entry.CredentialIndex != "" {
+					response.AuthIndex = entry.CredentialIndex
+				}
 			}
 		} else {
 			response.APIKeyEntries = make([]openAICompatibilityAPIKeyWithAuthIndex, len(entry.APIKeyEntries))
@@ -255,8 +288,12 @@ func (h *Handler) openAICompatibilityWithAuthIndex() []openAICompatibilityWithAu
 				if !entry.Disabled {
 					id, _ := idGen.Next(idKind, apiKeyEntry.APIKey, entry.BaseURL, rawProxyURL)
 					authIndex = liveIndexByID[id]
+					if apiKeyEntry.CredentialIndex != "" {
+						authIndex = apiKeyEntry.CredentialIndex
+					}
 				}
 				response.APIKeyEntries[j] = openAICompatibilityAPIKeyWithAuthIndex{
+					Revision:                  config.APICredentialRef{Value: &cfg.OpenAICompatibility[i].APIKeyEntries[j], Parent: &cfg.OpenAICompatibility[i], KeyPosition: j}.Revision(),
 					OpenAICompatibilityAPIKey: apiKeyEntry,
 					AuthIndex:                 authIndex,
 				}
@@ -286,10 +323,14 @@ func (h *Handler) xaiKeysWithAuthIndex() []xaiKeyWithAuthIndex {
 		if key := strings.TrimSpace(entry.APIKey); key != "" {
 			id, _ := idGen.Next("xai:apikey", key, entry.BaseURL)
 			authIndex = liveIndexByID[id]
+			if entry.CredentialIndex != "" {
+				authIndex = entry.CredentialIndex
+			}
 		}
 		entry.ProxyURL = proxyutil.MaskProxyURL(entry.ProxyURL)
 		out[i] = xaiKeyWithAuthIndex{
 			XAIKey:    entry,
+			Revision:  config.APICredentialRef{Value: &cfg.XAIKey[i]}.Revision(),
 			AuthIndex: authIndex,
 		}
 	}

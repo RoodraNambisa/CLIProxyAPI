@@ -46,6 +46,8 @@ type authFilesCachedQuery struct {
 }
 
 type authFilesListQuery struct {
+	includeConfig bool
+	source        string
 	page          int
 	pageSize      int
 	provider      string
@@ -95,6 +97,7 @@ type authFilesFacetsResponse struct {
 
 func authFilesQueryCacheKey(query authFilesListQuery) string {
 	return strings.Join([]string{
+		strconv.FormatBool(query.includeConfig), query.source,
 		query.provider,
 		query.plan,
 		query.priority,
@@ -251,6 +254,11 @@ func parseAuthFilesListQuery(c *gin.Context, pagination bool) (authFilesListQuer
 	}
 	if c == nil || c.Request == nil || c.Request.URL == nil {
 		return query, nil
+	}
+	query.includeConfig = c.Query("include_config") == "true"
+	query.source = c.DefaultQuery("source", "all")
+	if query.source != "all" && query.source != "file" && query.source != "api" {
+		return query, fmt.Errorf("invalid source filter")
 	}
 	values := c.Request.URL.Query()
 	var err error
@@ -462,6 +470,9 @@ func (h *Handler) listAuthFilesPaged(c *gin.Context, manager *coreauth.Manager) 
 			continue
 		}
 		applyChatGPTWebDependencySummary(entry, auth, graph)
+		if auth.Attributes["config_id"] != "" && !query.includeConfig {
+			entry["runtime_only"] = true
+		}
 		files = append(files, entry)
 	}
 	c.JSON(http.StatusOK, gin.H{
@@ -516,12 +527,14 @@ func (h *Handler) ListAuthFileSelection(c *gin.Context) {
 	}
 	for _, record := range matched {
 		current := authByID[record.id]
-		if current == nil || record.runtimeOnly || record.retired {
+		if current == nil || record.runtimeOnly || record.retired || current.Attributes["config_id"] != "" && !query.includeConfig {
 			continue
 		}
 		currentRecord := *record
 		currentRecord.auth = current
-		files = append(files, buildAuthFileSelectionEntry(&currentRecord, graph, now))
+		selection := buildAuthFileSelectionEntry(&currentRecord, graph, now)
+		applyProviderCredentialSummary(selection, current)
+		files = append(files, selection)
 	}
 	c.JSON(http.StatusOK, gin.H{"files": files, "total": len(files)})
 }
@@ -538,12 +551,13 @@ func (h *Handler) authFileListRecordsFromSummaries(auths []*coreauth.Auth) ([]*a
 		if auth == nil {
 			continue
 		}
-		runtimeOnly := isRuntimeOnlyAuth(auth)
+		configBacked := auth.Attributes["config_id"] != ""
+		runtimeOnly := isRuntimeOnlyAuth(auth) && !configBacked
 		if runtimeOnly && (auth.Disabled || auth.Status == coreauth.StatusDisabled) {
 			continue
 		}
 		path := strings.TrimSpace(authAttribute(auth, "path"))
-		if path == "" && !runtimeOnly {
+		if path == "" && !runtimeOnly && !configBacked {
 			continue
 		}
 		managedName := ""
@@ -613,7 +627,7 @@ func authFileRecordForAuth(auth *coreauth.Auth, name string, runtimeOnly bool) *
 		priority = 0
 	}
 	note := authFileNote(auth)
-	searchValues := []string{name, provider, plan, string(auth.Status), note, statusMessage, authEmail(auth)}
+	searchValues := []string{auth.Label, auth.Attributes["base_url"], auth.Attributes["config_parent_name"], name, provider, plan, string(auth.Status), note, statusMessage, authEmail(auth)}
 	if auth.LastError != nil {
 		searchValues = append(searchValues, auth.LastError.Code, auth.LastError.Message)
 	}
@@ -703,6 +717,11 @@ func filterAuthFileStatusRecords(records []*authFileListRecord, query authFilesL
 	filtered := make([]*authFileListRecord, 0, len(records))
 	for _, record := range records {
 		if record == nil || (query.problemOnly && !record.problem) || (query.enabledOnly && record.disabled) || (query.disabledOnly && !record.disabled) {
+			continue
+		}
+		isConfig := record.auth != nil && record.auth.Attributes["config_id"] != ""
+		legacyRuntime := isConfig && isRuntimeOnlyAuth(record.auth) && !record.disabled
+		if isConfig && (!query.includeConfig && !legacyRuntime || query.source == "file") || !isConfig && query.source == "api" {
 			continue
 		}
 		filtered = append(filtered, record)

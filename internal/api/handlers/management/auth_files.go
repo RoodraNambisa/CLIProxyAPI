@@ -295,6 +295,9 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 	runtimeSummaries := h.authFileRuntimeSummariesForManager(manager)
 	now := time.Now()
 	for _, auth := range auths {
+		if auth.Attributes["config_id"] != "" && (c.Query("include_config") != "true" && (!isRuntimeOnlyAuth(auth) || auth.Disabled) || c.Query("source") == "file") || auth.Attributes["config_id"] == "" && c.Query("source") == "api" {
+			continue
+		}
 		managedName, managed := h.managedAuthBackingFileName(auth)
 		if managed && !isTopLevelManagedAuthName(managedName) {
 			continue
@@ -302,6 +305,9 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 		runtimeSummary := authFileRuntimeSummaryForAuth(auth, dependencyGraph, runtimeSummaries)
 		if entry := h.buildAuthFileEntryAtWithRuntime(auth, now, runtimeSummary); entry != nil {
 			applyChatGPTWebDependencySummary(entry, auth, dependencyGraph)
+			if auth.Attributes["config_id"] != "" && c.Query("include_config") != "true" {
+				entry["runtime_only"] = true
+			}
 			files = append(files, entry)
 			if managed && managedName != "" {
 				managedEntryIndexes[managedAuthNameKey(managedName)] = len(files) - 1
@@ -670,12 +676,13 @@ func (h *Handler) buildAuthFileEntryAtWithRuntime(auth *coreauth.Auth, now time.
 		return nil
 	}
 	auth.EnsureIndex()
-	runtimeOnly := isRuntimeOnlyAuth(auth)
+	configBacked := auth.Attributes["config_id"] != ""
+	runtimeOnly := isRuntimeOnlyAuth(auth) && !configBacked
 	if runtimeOnly && (auth.Disabled || auth.Status == coreauth.StatusDisabled) {
 		return nil
 	}
 	path := strings.TrimSpace(authAttribute(auth, "path"))
-	if path == "" && !runtimeOnly {
+	if path == "" && !runtimeOnly && !configBacked {
 		return nil
 	}
 	name := strings.TrimSpace(auth.FileName)
@@ -701,6 +708,7 @@ func (h *Handler) buildAuthFileEntryAtWithRuntime(auth *coreauth.Auth, now time.
 		"source":         "memory",
 		"size":           int64(0),
 	}
+	applyProviderCredentialSummary(entry, auth)
 	applyAuthCooldownStatus(entry, summarizeAuthCooldown(auth, now))
 	entry["proxy_route"] = h.authFileProxyRoute(auth, runtimeSummary)
 	if auth.ExecutionProvider() == "codex" {
@@ -743,7 +751,7 @@ func (h *Handler) buildAuthFileEntryAtWithRuntime(auth *coreauth.Auth, now time.
 	if runtimeSummary.proxyBinding != nil {
 		entry["proxy_binding"] = *runtimeSummary.proxyBinding
 	}
-	if accountType, account := auth.AccountInfo(); accountType != "" || account != "" {
+	if accountType, account := auth.AccountInfo(); !configBacked && (accountType != "" || account != "") {
 		if accountType != "" {
 			entry["account_type"] = accountType
 		}

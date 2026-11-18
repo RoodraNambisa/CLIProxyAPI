@@ -91,7 +91,11 @@ func (h *Handler) ProbeAuthFileModel(c *gin.Context) {
 		c.JSON(503, gin.H{"error": "credential manager unavailable"})
 		return
 	}
-	auth := h.findManagedAuthWithManager(input.Name, manager)
+	lookupName := input.Name
+	if ref, ok := h.currentConfig().APICredentialByID(input.Name); ok && ref.Management.RuntimeID != "" {
+		lookupName = ref.Management.RuntimeID
+	}
+	auth := h.findManagedAuthWithManager(lookupName, manager)
 	if auth == nil {
 		c.JSON(404, gin.H{"error": "credential not found"})
 		return

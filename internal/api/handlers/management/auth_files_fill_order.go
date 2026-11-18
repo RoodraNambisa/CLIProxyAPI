@@ -49,7 +49,14 @@ func (h *Handler) fillOrderOperation(c *gin.Context, commit bool) {
 		if !ok {
 			return nil
 		}
-		return gin.H{"record_id": r.ID, "name": a.FileName, "auth_index": a.Index, "priority": r.Priority, "fill_order": manager.FillOrderSummary(a)}
+		name := a.FileName
+		if a.Attributes["config_id"] != "" {
+			name = a.Label
+		}
+		if name == "" {
+			name = a.ID
+		}
+		return gin.H{"record_id": r.ID, "name": name, "auth_index": a.Index, "priority": r.Priority, "fill_order": manager.FillOrderSummary(a)}
 	}
 	c.JSON(http.StatusOK, gin.H{"record": describe(&p.Record), "before": describe(p.Before), "after": describe(p.After), "revision": p.Revision})
 }
