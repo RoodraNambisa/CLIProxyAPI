@@ -113,6 +113,13 @@ func (cfg *Config) ValidateModelThinking() error {
 		}
 	}
 	for i, entry := range cfg.OpenAICompatibility {
+		for j, key := range entry.APIKeyEntries {
+			if key.Models != nil {
+				if err := validateModelThinkingEntries(fmt.Sprintf("openai-compatibility[%d].api-key-entries[%d]", i, j), *key.Models); err != nil {
+					return err
+				}
+			}
+		}
 		if err := validateModelThinkingEntries(fmt.Sprintf("openai-compatibility[%d]", i), entry.Models); err != nil {
 			return err
 		}

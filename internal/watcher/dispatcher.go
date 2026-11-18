@@ -204,6 +204,13 @@ func (w *Watcher) refreshAuthState(force bool) authUpdateStats {
 	return stats
 }
 
+// RefreshConfiguredAuths publishes the current configuration credentials and
+// waits for the same dispatch barrier used by startup synchronization.
+func (w *Watcher) RefreshConfiguredAuths(ctx context.Context) error {
+	w.refreshAuthState(false)
+	return w.WaitForAuthUpdates(ctx)
+}
+
 func (w *Watcher) filterRetiredPathAuthsLocked(auths []*coreauth.Auth) []*coreauth.Auth {
 	if w == nil || len(w.retiredAuthPaths) == 0 || len(auths) == 0 {
 		return auths

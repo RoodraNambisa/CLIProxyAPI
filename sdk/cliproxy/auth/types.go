@@ -242,6 +242,7 @@ type Auth struct {
 }
 
 type authInstanceState struct {
+	draining        bool
 	mu              sync.Mutex
 	retired         atomic.Bool
 	executorOwners  []ProviderExecutor
@@ -407,7 +408,7 @@ func (a *Auth) BeginRuntimeExecution(ctx context.Context) (context.Context, func
 		return ctx, func() bool { return state.retired.Load() }, !state.retired.Load()
 	}
 	state.mu.Lock()
-	if state.retired.Load() || (state.maintenance && ctx.Value(authMaintenanceContextKey{}) != state) {
+	if state.retired.Load() || state.draining || (state.maintenance && ctx.Value(authMaintenanceContextKey{}) != state) {
 		state.mu.Unlock()
 		return ctx, func() bool { return true }, false
 	}
@@ -595,6 +596,11 @@ func (a *Auth) indexSeed() string {
 func (a *Auth) EnsureIndex() string {
 	if a == nil {
 		return ""
+	}
+	if index := a.Attributes["config_usage_index"]; index != "" {
+		a.Index = index
+		a.indexAssigned = true
+		return index
 	}
 	if a.indexAssigned && a.Index != "" {
 		return a.Index

@@ -954,11 +954,15 @@ xai:
 # For OpenAI compatibility, put the rules on the provider entry.
 # codex-api-key:
 #   - api-key: "sk-atSM..."
+#     channel-name: "Primary Codex" # display name in credential management
+#     disabled: false
+#     models-mode: selected # default preserves existing provider behavior; selected only registers the models below
+#     # models-endpoint: "https://www.example.com/v1/models" # optional discovery endpoint
 #     prefix: "test" # optional: require calls like "test/gpt-5-codex" to target this credential
 #     base-url: "https://www.example.com" # use the custom codex API endpoint
 #     # Boolean, default false. Enable only when this endpoint supports /alpha/search.
 #     # Changes apply to later requests after reload; OAuth search needs no opt-in.
-#     # Credential edits retain the existing retirement and in-flight cancellation rules.
+#     # Managed API credential edits let active requests finish with their original credential.
 #     alpha-search: false
 #     headers:
 #       X-Custom-Header: "custom-value"
@@ -1282,6 +1286,7 @@ xai:
 # OpenAI compatibility providers
 # openai-compatibility:
 #   - name: "openrouter" # The name of the provider; it will be used in the user agent and other places.
+#     channel-name: "Shared upstream" # editable display name; runtime identity is retained
 #     disabled: false # optional: keep this provider saved but prevent it from being registered.
 #     prefix: "test" # optional: require calls like "test/kimi-k2" to target this provider's credentials
 #     base-url: "https://openrouter.ai/api/v1" # The base URL of the provider.
@@ -1289,6 +1294,9 @@ xai:
 #       X-Custom-Header: "custom-value"
 #     api-key-entries:
 #       - api-key: "sk-or-v1-...b780"
+#         channel-name: "Primary key"
+#         # priority: 0 # optional override; omission inherits the parent priority
+#         # models: [{name: "upstream-model", alias: "public-model"}] # optional per-key override
 #         proxy-url: "socks5://proxy.example.com:1080" # optional: per-key proxy override
 #         # proxy-url: "direct" # optional: explicit direct connect for this credential
 #       - api-key: "sk-or-v1-...b781" # without proxy-url

@@ -59,6 +59,13 @@ func (cfg *Config) ValidateModelContextLengths() error {
 		}
 	}
 	for index, entry := range cfg.OpenAICompatibility {
+		for j, key := range entry.APIKeyEntries {
+			if key.Models != nil {
+				if err := validateModelContextEntries(fmt.Sprintf("openai-compatibility[%d].api-key-entries[%d]", index, j), *key.Models); err != nil {
+					return err
+				}
+			}
+		}
 		if err := validateModelContextEntries(fmt.Sprintf("openai-compatibility[%d]", index), entry.Models); err != nil {
 			return err
 		}

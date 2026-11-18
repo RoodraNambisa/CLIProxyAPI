@@ -457,6 +457,12 @@ func (e *OpenAICompatExecutor) resolveCompatConfig(auth *cliproxyauth.Auth) *con
 	if auth == nil || e.cfg == nil {
 		return nil
 	}
+	if ref, ok := e.cfg.APICredentialByID(auth.Attributes["config_id"]); ok && ref.Parent != nil {
+		if key, ok := ref.Value.(*config.OpenAICompatibilityAPIKey); ok {
+			return config.EffectiveOpenAIEntry(ref.Parent, key)
+		}
+		return ref.Parent
+	}
 	candidates := make([]string, 0, 3)
 	if auth.Attributes != nil {
 		if v := strings.TrimSpace(auth.Attributes["compat_name"]); v != "" {
@@ -476,7 +482,7 @@ func (e *OpenAICompatExecutor) resolveCompatConfig(auth *cliproxyauth.Auth) *con
 		}
 		for _, candidate := range candidates {
 			if candidate != "" && strings.EqualFold(strings.TrimSpace(candidate), compat.Name) {
-				return compat
+				return config.EffectiveOpenAIKey(compat, auth.Attributes["config_id"], auth.Attributes["api_key"])
 			}
 		}
 	}

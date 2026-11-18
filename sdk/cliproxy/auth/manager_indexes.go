@@ -15,6 +15,8 @@ import (
 )
 
 var managementCatalogAttributeKeys = [...]string{
+	"config_id", "config_kind", "config_revision", "config_parent_id", "config_parent_name",
+
 	"auth_kind",
 	"credential_uid",
 	"note",

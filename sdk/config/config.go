@@ -101,6 +101,8 @@ const (
 
 const RecommendedMaxChatGPTWebManualReloginConcurrency = internalconfig.RecommendedMaxChatGPTWebManualReloginConcurrency
 
+type APIManagement = internalconfig.APIManagement
+
 type GeminiKey = internalconfig.GeminiKey
 type GeminiModel = internalconfig.GeminiModel
 type CodexKey = internalconfig.CodexKey

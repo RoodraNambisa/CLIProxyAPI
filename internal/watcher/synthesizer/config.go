@@ -50,6 +50,7 @@ func (s *ConfigSynthesizer) Synthesize(ctx *SynthesisContext) ([]*coreauth.Auth,
 	// Vertex-compat
 	out = append(out, s.synthesizeVertexCompat(ctx)...)
 
+	finalizeManagedCredentials(ctx.Config, out)
 	return out, nil
 }
 
@@ -111,6 +112,7 @@ func (s *ConfigSynthesizer) synthesizeGeminiKeyEntries(ctx *SynthesisContext, en
 			CreatedAt:  now,
 			UpdatedAt:  now,
 		}
+		applyManagedCredential(a, &entry.APIManagement, entry.Disabled, sourceName, i, -1, nil)
 		ApplyAuthExcludedModelsMeta(a, cfg, entry.ExcludedModels, "apikey")
 		applyConfigCredentialRequestRetry(a, entry.RequestRetry)
 		applyConfigRequestScopedErrors(a, entry.RequestScopedErrors)
@@ -162,6 +164,7 @@ func (s *ConfigSynthesizer) synthesizeClaudeKeys(ctx *SynthesisContext) []*corea
 			CreatedAt:  now,
 			UpdatedAt:  now,
 		}
+		applyManagedCredential(a, &ck.APIManagement, ck.Disabled, "claude", i, -1, nil)
 		ApplyAuthExcludedModelsMeta(a, cfg, ck.ExcludedModels, "apikey")
 		applyConfigCredentialRequestRetry(a, ck.RequestRetry)
 		applyConfigRequestScopedErrors(a, ck.RequestScopedErrors)
@@ -227,6 +230,7 @@ func (s *ConfigSynthesizer) synthesizeCodexKeys(ctx *SynthesisContext) []*coreau
 			}
 			a.Metadata[config.ProxyRegionMetadataKey] = ck.ProxyRegion
 		}
+		applyManagedCredential(a, &ck.APIManagement, ck.Disabled, "codex", i, -1, nil)
 		ApplyAuthExcludedModelsMeta(a, cfg, ck.ExcludedModels, "apikey")
 		applyConfigCredentialRequestRetry(a, ck.RequestRetry)
 		applyConfigRequestScopedErrors(a, ck.RequestScopedErrors)
@@ -244,7 +248,7 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 	out := make([]*coreauth.Auth, 0)
 	for i := range cfg.OpenAICompatibility {
 		compat := &cfg.OpenAICompatibility[i]
-		if compat.Disabled {
+		if compat.Disabled && (compat.CredentialID == "" || len(compat.APIKeyEntries) == 0) {
 			continue
 		}
 		prefix := strings.TrimSpace(compat.Prefix)
@@ -265,14 +269,15 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 				"compat_name":  compat.Name,
 				"provider_key": providerName,
 			}
-			if compat.Priority != 0 {
-				attrs["priority"] = strconv.Itoa(compat.Priority)
+			effective := config.EffectiveOpenAIEntry(compat, entry)
+			if effective.Priority != 0 {
+				attrs["priority"] = strconv.Itoa(effective.Priority)
 			}
 			applyConfigCredentialWeight(attrs, entry.Weight)
 			if key != "" {
 				attrs["api_key"] = key
 			}
-			if hash := diff.ComputeOpenAICompatModelsHash(compat.Models); hash != "" {
+			if hash := diff.ComputeOpenAICompatModelsHash(effective.Models); hash != "" {
 				attrs["models_hash"] = hash
 			}
 			addConfigHeadersToAttrs(compat.Headers, attrs)
@@ -287,6 +292,7 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 				CreatedAt:  now,
 				UpdatedAt:  now,
 			}
+			applyManagedCredential(a, &entry.APIManagement, compat.Disabled || entry.Disabled, "openai", i, j, compat)
 			applyConfigCredentialRequestRetry(a, compat.RequestRetry)
 			applyConfigRequestScopedErrors(a, compat.RequestScopedErrors)
 			out = append(out, a)
@@ -319,6 +325,7 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 				CreatedAt:  now,
 				UpdatedAt:  now,
 			}
+			applyManagedCredential(a, &compat.APIManagement, compat.Disabled, "openai", i, -1, nil)
 			applyConfigCredentialRequestRetry(a, compat.RequestRetry)
 			applyConfigRequestScopedErrors(a, compat.RequestScopedErrors)
 			out = append(out, a)
@@ -384,6 +391,7 @@ func (s *ConfigSynthesizer) synthesizeVertexCompat(ctx *SynthesisContext) []*cor
 			CreatedAt:  now,
 			UpdatedAt:  now,
 		}
+		applyManagedCredential(a, &compat.APIManagement, compat.Disabled, "vertex", i, -1, nil)
 		ApplyAuthExcludedModelsMeta(a, cfg, compat.ExcludedModels, "apikey")
 		applyConfigCredentialRequestRetry(a, compat.RequestRetry)
 		applyConfigRequestScopedErrors(a, compat.RequestScopedErrors)
@@ -437,6 +445,7 @@ func (s *ConfigSynthesizer) synthesizeXAIKeys(ctx *SynthesisContext) []*coreauth
 			CreatedAt:  now,
 			UpdatedAt:  now,
 		}
+		applyManagedCredential(a, &ck.APIManagement, ck.Disabled, "xai", i, -1, nil)
 		ApplyAuthExcludedModelsMeta(a, cfg, ck.ExcludedModels, "apikey")
 		applyConfigCredentialRequestRetry(a, ck.RequestRetry)
 		applyConfigRequestScopedErrors(a, ck.RequestScopedErrors)

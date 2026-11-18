@@ -53,3 +53,65 @@ func TestReloadConfigKeepsPreviousRuntimeAndExternalFileWhenApplyFails(t *testin
 		t.Fatalf("external config was overwritten after failed apply:\n%s", gotBody)
 	}
 }
+
+func TestReloadAPIIdentitiesPersistAndRollbackWithFailedApply(t *testing.T) {
+	dir := t.TempDir()
+	authDir := filepath.Join(dir, "auths")
+	if err := os.MkdirAll(authDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "config.yaml")
+	body := []byte("auth-dir: " + authDir + "\ncodex-api-key:\n  - api-key: first\n    base-url: https://example.invalid\n    channel-name: Primary\n")
+	if err := os.WriteFile(path, body, 0600); err != nil {
+		t.Fatal(err)
+	}
+	w, err := NewWatcher(path, authDir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := w.watcher.Close(); err != nil {
+			t.Error(err)
+		}
+	}()
+	w.SetConfig(&config.Config{AuthDir: authDir})
+	if !w.reloadConfig() {
+		t.Fatal("reload failed")
+	}
+	saved, err := config.LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if saved.CodexKey[0].CredentialID == "" || saved.CodexKey[0].CredentialIndex == "" {
+		t.Fatal("reload did not persist management identity")
+	}
+	originalID := saved.CodexKey[0].CredentialID
+	if err := os.WriteFile(path, body, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if !w.reloadConfig() {
+		t.Fatal("legacy rewrite failed")
+	}
+	saved, err = config.LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if saved.CodexKey[0].CredentialID != originalID {
+		t.Fatal("legacy rewrite changed identity")
+	}
+	failing := append(append([]byte(nil), body...), []byte("  - api-key: second\n    base-url: https://example.invalid\n")...)
+	if err := os.WriteFile(path, failing, 0600); err != nil {
+		t.Fatal(err)
+	}
+	w.SetConfigApply(func(*config.Config) (*config.Config, error) { return nil, errors.New("apply failed") })
+	if w.reloadConfig() {
+		t.Fatal("failed runtime apply accepted")
+	}
+	actual, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(actual) != string(failing) {
+		t.Fatal("failed reload modified external config")
+	}
+}

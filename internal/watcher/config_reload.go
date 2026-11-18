@@ -3,8 +3,10 @@
 package watcher
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"os"
 	"reflect"
 	"time"
@@ -12,9 +14,9 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/watcher/diff"
-	"gopkg.in/yaml.v3"
-
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/watcher/synthesizer"
 	log "github.com/sirupsen/logrus"
+	"gopkg.in/yaml.v3"
 )
 
 func (w *Watcher) stopConfigReloadTimer() {
@@ -104,15 +106,22 @@ func (w *Watcher) reloadConfig() bool {
 	_ = yaml.Unmarshal(w.oldConfigYaml, &oldConfig)
 	w.clientsMutex.RUnlock()
 
+	rollbackIdentities, errIdentities := w.prepareReloadedAPIIdentities(newConfig, oldRuntimeConfig)
+	if errIdentities != nil {
+		log.WithError(errIdentities).Error("failed to prepare API credentials; previous runtime retained")
+		return false
+	}
 	appliedConfig := newConfig
 	if configApply != nil {
 		var errApply error
 		appliedConfig, errApply = configApply(newConfig)
 		if errApply != nil {
+			rollbackIdentities()
 			log.WithError(errApply).Error("failed to apply reloaded config; previous runtime retained")
 			return false
 		}
 		if appliedConfig == nil {
+			rollbackIdentities()
 			log.Error("config apply returned no runtime snapshot; previous runtime retained")
 			return false
 		}
@@ -152,4 +161,30 @@ func (w *Watcher) reloadConfig() bool {
 	log.Infof("config successfully reloaded, triggering client reload")
 	w.reloadClientsWithOptions(authDirChanged, affectedOAuthProviders, forceAuthRefresh, false, configApply == nil)
 	return true
+}
+
+func (w *Watcher) prepareReloadedAPIIdentities(next, previous *config.Config) (func(), error) {
+	changed, err := synthesizer.PrepareManagedCredentialsWithPrevious(next, previous)
+	if err != nil || !changed {
+		return func() {}, err
+	}
+	original, err := os.ReadFile(w.configPath)
+	if err != nil {
+		return nil, err
+	}
+	if err := config.SaveConfigPreserveComments(w.configPath, next); err != nil {
+		return nil, fmt.Errorf("persist API credential identities: %w", err)
+	}
+	prepared, err := os.ReadFile(w.configPath)
+	if err != nil {
+		return nil, err
+	}
+	return func() {
+		current, errRead := os.ReadFile(w.configPath)
+		if errRead == nil && bytes.Equal(current, prepared) {
+			if errRestore := os.WriteFile(w.configPath, original, 0600); errRestore != nil {
+				log.WithError(errRestore).Error("failed to restore config after API credential migration")
+			}
+		}
+	}, nil
 }

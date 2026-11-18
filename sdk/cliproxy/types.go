@@ -83,8 +83,9 @@ type WatcherFactory func(configPath, authDir string, reload func(*config.Config)
 
 // WatcherWrapper exposes the subset of watcher methods required by the SDK.
 type WatcherWrapper struct {
-	start func(ctx context.Context) error
-	stop  func() error
+	refreshConfiguredAuths func(context.Context) error
+	start                  func(ctx context.Context) error
+	stop                   func() error
 
 	setConfig             func(cfg *config.Config)
 	setConfigApply        func(func(*config.Config) (*config.Config, error))
@@ -190,4 +191,11 @@ func (w *WatcherWrapper) WaitForAuthUpdates(ctx context.Context) error {
 		return nil
 	}
 	return w.waitForAuthUpdates(ctx)
+}
+
+func (w *WatcherWrapper) RefreshConfiguredAuths(ctx context.Context) error {
+	if w == nil || w.refreshConfiguredAuths == nil {
+		return nil
+	}
+	return w.refreshConfiguredAuths(ctx)
 }

@@ -1513,6 +1513,14 @@ func (r *ModelRegistry) GetFirstAvailableModel(handlerType string) (string, erro
 	return "", fmt.Errorf("no available clients for any model in handler type: %s", handlerType)
 }
 
+// ClientModelCount reads the registered model total without copying model metadata.
+func (r *ModelRegistry) ClientModelCount(clientID string) (int, bool) {
+	r.mutex.RLock()
+	defer r.mutex.RUnlock()
+	models, ok := r.clientModels[clientID]
+	return len(models), ok
+}
+
 // GetModelsForClient returns the models registered for a specific client.
 // Parameters:
 //   - clientID: The client identifier (typically auth file name or auth ID)

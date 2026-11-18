@@ -33,6 +33,15 @@ func (cfg *Config) ValidateModelInputModalities() error {
 		return nil
 	}
 	for index, provider := range cfg.OpenAICompatibility {
+		for keyIndex, key := range provider.APIKeyEntries {
+			if key.Models != nil {
+				for modelIndex, model := range *key.Models {
+					if _, err := NormalizeModelInputModalities(model.InputModalities); err != nil {
+						return fmt.Errorf("openai-compatibility[%d].api-key-entries[%d].models[%d]: %w", index, keyIndex, modelIndex, err)
+					}
+				}
+			}
+		}
 		for modelIndex, model := range provider.Models {
 			if _, err := NormalizeModelInputModalities(model.InputModalities); err != nil {
 				return fmt.Errorf("openai-compatibility[%d].models[%d]: %w", index, modelIndex, err)

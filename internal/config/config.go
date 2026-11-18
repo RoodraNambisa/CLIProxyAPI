@@ -290,6 +290,7 @@ func mergedConfigContainsDeprecatedAmp(node *yaml.Node, visited map[*yaml.Node]s
 
 // Config represents the application's configuration, loaded from a YAML file.
 type Config struct {
+	apiCredentialIndex map[string]APICredentialRef
 	// ManagementUI stores shared control-panel display preferences.
 	ManagementUI ManagementUIConfig `yaml:"management-ui,omitempty" json:"management-ui"`
 	ProxyIP      *ProxyIPConfig     `yaml:"proxy-ip,omitempty" json:"proxy-ip,omitempty"`
@@ -512,6 +513,7 @@ func Clone(input *Config) (*Config, error) {
 	snapshot.legacyMigrationPending = input.legacyMigrationPending
 	clonePayloadRawValues(snapshot.Payload.DefaultRaw, input.Payload.DefaultRaw)
 	clonePayloadRawValues(snapshot.Payload.OverrideRaw, input.Payload.OverrideRaw)
+	snapshot.IndexAPICredentials()
 	return &snapshot, nil
 }
 
@@ -1976,6 +1978,8 @@ type CloakConfig struct {
 // ClaudeKey represents the configuration for a Claude API key,
 // including the API key itself and an optional base URL for the API endpoint.
 type ClaudeKey struct {
+	APIManagement       `yaml:",inline"`
+	Disabled            bool                     `yaml:"disabled,omitempty" json:"disabled,omitempty"`
 	RequestScopedErrors []RequestScopedErrorRule `yaml:"request-scoped-errors,omitempty" json:"request-scoped-errors,omitempty"`
 	// RequestRetry overrides additional credential retry rounds. Nil inherits;
 	// negative values act as zero. Values above MaxCredentialRequestRetry are invalid.
@@ -2051,6 +2055,8 @@ func (m ClaudeModel) GetThinking() *registry.ThinkingSupport { return m.Thinking
 // CodexKey represents the configuration for a Codex API key,
 // including the API key itself and an optional base URL for the API endpoint.
 type CodexKey struct {
+	APIManagement       `yaml:",inline"`
+	Disabled            bool                     `yaml:"disabled,omitempty" json:"disabled,omitempty"`
 	ProxyRegion         ProxyRegionConfig        `yaml:"proxy-region,omitempty" json:"proxy-region,omitempty"`
 	TimeContext         *CodexTimeContextConfig  `yaml:"time-context,omitempty" json:"time-context,omitempty"`
 	RequestScopedErrors []RequestScopedErrorRule `yaml:"request-scoped-errors,omitempty" json:"request-scoped-errors,omitempty"`
@@ -2130,6 +2136,8 @@ func (m CodexModel) GetXAIImageCapabilities() *XAIImageCapabilities { return m.I
 // GeminiKey represents the configuration for a Gemini API key,
 // including optional overrides for upstream base URL, proxy routing, and headers.
 type GeminiKey struct {
+	APIManagement       `yaml:",inline"`
+	Disabled            bool                     `yaml:"disabled,omitempty" json:"disabled,omitempty"`
 	RequestScopedErrors []RequestScopedErrorRule `yaml:"request-scoped-errors,omitempty" json:"request-scoped-errors,omitempty"`
 	// RequestRetry overrides additional credential retry rounds. Nil inherits;
 	// negative values act as zero. Values above MaxCredentialRequestRetry are invalid.
@@ -2196,6 +2204,7 @@ func (m GeminiModel) GetThinking() *registry.ThinkingSupport { return m.Thinking
 // OpenAICompatibility represents the configuration for OpenAI API compatibility
 // with external providers, allowing model aliases to be routed through OpenAI API format.
 type OpenAICompatibility struct {
+	APIManagement       `yaml:",inline"`
 	RequestScopedErrors []RequestScopedErrorRule `yaml:"request-scoped-errors,omitempty" json:"request-scoped-errors,omitempty"`
 	// RequestRetry applies to credentials of this provider. Nil inherits;
 	// negative values act as zero. Values above MaxCredentialRequestRetry are invalid.
@@ -2228,6 +2237,10 @@ type OpenAICompatibility struct {
 
 // OpenAICompatibilityAPIKey represents an API key configuration with optional proxy setting.
 type OpenAICompatibilityAPIKey struct {
+	APIManagement `yaml:",inline"`
+	Disabled      bool                        `yaml:"disabled,omitempty" json:"disabled,omitempty"`
+	Priority      *int                        `yaml:"priority,omitempty" json:"priority,omitempty"`
+	Models        *[]OpenAICompatibilityModel `yaml:"models,omitempty" json:"models,omitempty"`
 	// Weight applies to this credential, independently of the provider priority.
 	Weight *int `yaml:"weight,omitempty" json:"weight,omitempty"`
 	// APIKey is the authentication key for accessing the external API services.
@@ -2695,6 +2708,10 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	// }
 
 	// Return the populated configuration struct.
+	if errManaged := cfg.ValidateAPICredentials(); errManaged != nil {
+		return nil, errManaged
+	}
+	cfg.IndexAPICredentials()
 	return &cfg, nil
 }
 
@@ -3962,6 +3979,9 @@ func sanitizeGeminiKeyEntries(entries []GeminiKey) []GeminiKey {
 		entry.Headers = NormalizeHeaders(entry.Headers)
 		entry.ExcludedModels = NormalizeExcludedModels(entry.ExcludedModels)
 		uniqueKey := entry.APIKey + "|" + entry.BaseURL
+		if entry.CredentialID != "" {
+			uniqueKey = "id:" + entry.CredentialID
+		}
 		if _, exists := seen[uniqueKey]; exists {
 			continue
 		}

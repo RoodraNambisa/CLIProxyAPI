@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/admission"
 	"io"
 	"net/http"
 	"path/filepath"
@@ -20,6 +19,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/admission"
 	chatgptwebauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/chatgptweb"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/authfileguard"
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
@@ -1572,7 +1572,7 @@ func (m *Manager) resolveOpenAICompatUpstreamModelPool(auth *Auth, requestedMode
 		providerKey = strings.TrimSpace(auth.Attributes["provider_key"])
 		compatName = strings.TrimSpace(auth.Attributes["compat_name"])
 	}
-	entry := resolveOpenAICompatConfig(cfg, providerKey, compatName, auth.Provider)
+	entry := resolveOpenAICompatAuthConfig(cfg, auth, providerKey, compatName, auth.Provider)
 	if entry == nil {
 		return nil
 	}
@@ -2934,7 +2934,7 @@ func buildAPIKeyModelAliasTable(auths map[string]*Auth, cfg *internalconfig.Conf
 				compatName = strings.TrimSpace(auth.Attributes["compat_name"])
 			}
 			if compatName != "" || strings.EqualFold(strings.TrimSpace(auth.Provider), "openai-compatibility") {
-				if entry := resolveOpenAICompatConfig(cfg, providerKey, compatName, auth.Provider); entry != nil {
+				if entry := resolveOpenAICompatAuthConfig(cfg, auth, providerKey, compatName, auth.Provider); entry != nil {
 					compileAPIKeyModelAliasForModels(byAlias, entry.Models)
 				}
 			}
@@ -3564,6 +3564,7 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 		return nil, err
 	}
 	var replaced *Auth
+	var drainReplacement bool
 	m.mu.Lock()
 	if m.shouldPersistAuth(ctx, auth) {
 		m.installPersistedAuthIndexLocked(auth)
@@ -3581,7 +3582,12 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 		instanceState = existing.instanceState
 		prepareAuthReplacement(existing, auth, skipStateCarryForward)
 	} else if existing != nil {
-		m.beginAuthInstanceCleanupLocked(auth.ID)
+		if managedAPIAuth(existing) && managedAPIAuth(auth) {
+			drainReplacement = true
+			existing.beginManagedAPIDrain()
+		} else {
+			m.beginAuthInstanceCleanupLocked(auth.ID)
+		}
 		replaced = existing.Clone()
 	}
 	if instanceID == "" {
@@ -3623,7 +3629,9 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 		}
 		m.Hook().OnAuthUpdated(hookCtx, installed.Clone())
 	}
-	if replaced != nil {
+	if drainReplacement {
+		m.finishManagedAPIReplacement(replaced, notifyUpdated)
+	} else if replaced != nil {
 		m.finishAuthSessionCleanup(auth.ID, replaced, "auth_replaced", notifyUpdated)
 	} else {
 		notifyUpdated()
@@ -3703,39 +3711,7 @@ func (m *Manager) finishAuthSessionCleanup(id string, removed *Auth, reason stri
 		removed.retireInstance()
 		m.waitForRefreshExecutions(removed)
 	}
-	if removed != nil {
-		executorOwners := removed.executorOwners()
-		currentExecutor := m.executorFor(executorKeyFromAuth(removed))
-		if len(executorOwners) == 0 {
-			if currentExecutor != nil {
-				executorOwners = append(executorOwners, currentExecutor)
-			}
-		} else if tracker, ok := currentExecutor.(PassiveAuthInstanceStateTracker); ok &&
-			tracker != nil &&
-			tracker.HasPassiveAuthInstanceState(id, removed.RuntimeInstanceID()) {
-			tracked := false
-			for _, owner := range executorOwners {
-				if sameProviderExecutor(owner, currentExecutor) {
-					tracked = true
-					break
-				}
-			}
-			if !tracked {
-				executorOwners = append(executorOwners, currentExecutor)
-			}
-		}
-		for _, providerExecutor := range executorOwners {
-			if closer, ok := providerExecutor.(AuthInstanceExecutionSessionCloser); ok && closer != nil {
-				m.runSessionCleanupCallback(id, reason, "execution_sessions", func() {
-					closer.CloseAuthInstanceExecutionSessions(id, removed.RuntimeInstanceID(), reason)
-				})
-			} else if closer, ok := providerExecutor.(AuthExecutionSessionCloser); ok && closer != nil {
-				m.runSessionCleanupCallback(id, reason, "execution_sessions", func() {
-					closer.CloseAuthExecutionSessions(id, reason)
-				})
-			}
-		}
-	}
+	m.closeRuntimeAuthSessions(removed, reason, false)
 	m.runSessionCleanupCallback(id, reason, "session_affinity", func() {
 		m.invalidateSessionAffinity(id)
 	})
@@ -3957,6 +3933,9 @@ func authStateCarryForwardAllowed(existing *Auth, next *Auth) bool {
 	if existing.Disabled || existing.Status == StatusDisabled || next.Disabled || next.Status == StatusDisabled {
 		return false
 	}
+	if managedAPIAuth(existing) && managedAPIAuth(next) {
+		return managedAPIExecutionEquivalent(existing, next)
+	}
 	existingHash := authSourceHash(existing)
 	nextHash := authSourceHash(next)
 	if existingHash == "" || nextHash == "" {
@@ -3974,6 +3953,9 @@ func authRuntimeInstanceEquivalent(existing *Auth, next *Auth) bool {
 	}
 	if existing.Disabled || existing.Status == StatusDisabled || next.Disabled || next.Status == StatusDisabled {
 		return false
+	}
+	if managedAPIAuth(existing) && managedAPIAuth(next) {
+		return managedAPIExecutionEquivalent(existing, next)
 	}
 	existingHash := authSourceHash(existing)
 	nextHash := authSourceHash(next)
@@ -7614,7 +7596,7 @@ func (m *Manager) resolveAPIKeyModelAliasWithResult(auth *Auth, requestedModel s
 			compatName = strings.TrimSpace(auth.Attributes["compat_name"])
 		}
 		if compatName != "" || strings.EqualFold(strings.TrimSpace(auth.Provider), "openai-compatibility") {
-			if entry := resolveOpenAICompatConfig(cfg, providerKey, compatName, auth.Provider); entry != nil {
+			if entry := resolveOpenAICompatAuthConfig(cfg, auth, providerKey, compatName, auth.Provider); entry != nil {
 				models = asModelAliasEntries(entry.Models)
 			}
 		}
@@ -7638,6 +7620,13 @@ type APIKeyConfigEntry interface {
 func resolveAPIKeyConfig[T APIKeyConfigEntry](entries []T, auth *Auth) *T {
 	if auth == nil || len(entries) == 0 {
 		return nil
+	}
+	if id := auth.Attributes["config_id"]; id != "" {
+		for i := range entries {
+			if managed, ok := any(entries[i]).(interface{ GetCredentialID() string }); ok && managed.GetCredentialID() == id {
+				return &entries[i]
+			}
+		}
 	}
 	attrKey, attrBase := "", ""
 	if auth.Attributes != nil {
@@ -7678,6 +7667,13 @@ func resolveAPIKeyConfigExact[T APIKeyConfigEntry](entries []T, auth *Auth) *T {
 	if auth == nil || len(entries) == 0 {
 		return nil
 	}
+	if id := auth.Attributes["config_id"]; id != "" {
+		for i := range entries {
+			if managed, ok := any(entries[i]).(interface{ GetCredentialID() string }); ok && managed.GetCredentialID() == id {
+				return &entries[i]
+			}
+		}
+	}
 	attrKey, attrBase := "", ""
 	if auth.Attributes != nil {
 		attrKey = strings.TrimSpace(auth.Attributes["api_key"])
@@ -7703,12 +7699,26 @@ func resolveGeminiAPIKeyConfig(cfg *internalconfig.Config, auth *Auth) *internal
 	if cfg == nil {
 		return nil
 	}
+	if auth != nil {
+		if ref, ok := cfg.APICredentialByID(auth.Attributes["config_id"]); ok {
+			if value, ok := ref.Value.(*internalconfig.GeminiKey); ok {
+				return value
+			}
+		}
+	}
 	return resolveAPIKeyConfig(cfg.GeminiKey, auth)
 }
 
 func resolveInteractionsAPIKeyConfig(cfg *internalconfig.Config, auth *Auth) *internalconfig.GeminiKey {
 	if cfg == nil {
 		return nil
+	}
+	if auth != nil {
+		if ref, ok := cfg.APICredentialByID(auth.Attributes["config_id"]); ok {
+			if value, ok := ref.Value.(*internalconfig.GeminiKey); ok {
+				return value
+			}
+		}
 	}
 	return resolveAPIKeyConfigExact(cfg.InteractionsKey, auth)
 }
@@ -7717,6 +7727,13 @@ func resolveClaudeAPIKeyConfig(cfg *internalconfig.Config, auth *Auth) *internal
 	if cfg == nil {
 		return nil
 	}
+	if auth != nil {
+		if ref, ok := cfg.APICredentialByID(auth.Attributes["config_id"]); ok {
+			if value, ok := ref.Value.(*internalconfig.ClaudeKey); ok {
+				return value
+			}
+		}
+	}
 	return resolveAPIKeyConfig(cfg.ClaudeKey, auth)
 }
 
@@ -7724,12 +7741,26 @@ func resolveCodexAPIKeyConfig(cfg *internalconfig.Config, auth *Auth) *internalc
 	if cfg == nil {
 		return nil
 	}
+	if auth != nil {
+		if ref, ok := cfg.APICredentialByID(auth.Attributes["config_id"]); ok {
+			if value, ok := ref.Value.(*internalconfig.CodexKey); ok {
+				return value
+			}
+		}
+	}
 	return resolveAPIKeyConfig(cfg.CodexKey, auth)
 }
 
 func resolveVertexAPIKeyConfig(cfg *internalconfig.Config, auth *Auth) *internalconfig.VertexCompatKey {
 	if cfg == nil {
 		return nil
+	}
+	if auth != nil {
+		if ref, ok := cfg.APICredentialByID(auth.Attributes["config_id"]); ok {
+			if value, ok := ref.Value.(*internalconfig.VertexCompatKey); ok {
+				return value
+			}
+		}
 	}
 	return resolveAPIKeyConfig(cfg.VertexCompatAPIKey, auth)
 }
@@ -7784,7 +7815,7 @@ func resolveUpstreamModelForOpenAICompatAPIKey(cfg *internalconfig.Config, auth 
 	if compatName == "" && !strings.EqualFold(strings.TrimSpace(auth.Provider), "openai-compatibility") {
 		return ""
 	}
-	entry := resolveOpenAICompatConfig(cfg, providerKey, compatName, auth.Provider)
+	entry := resolveOpenAICompatAuthConfig(cfg, auth, providerKey, compatName, auth.Provider)
 	if entry == nil {
 		return ""
 	}
@@ -14215,5 +14246,50 @@ func resolveXAIAPIKeyConfig(cfg *internalconfig.Config, auth *Auth) *internalcon
 	if cfg == nil {
 		return nil
 	}
+	if auth != nil {
+		if ref, ok := cfg.APICredentialByID(auth.Attributes["config_id"]); ok {
+			if value, ok := ref.Value.(*internalconfig.XAIKey); ok {
+				return value
+			}
+		}
+	}
 	return resolveAPIKeyConfigExact(cfg.XAIKey, auth)
+}
+
+func (m *Manager) closeRuntimeAuthSessions(removed *Auth, reason string, instanceOnly bool) {
+	if removed == nil {
+		return
+	}
+	id := removed.ID
+	executorOwners := removed.executorOwners()
+	currentExecutor := m.executorFor(executorKeyFromAuth(removed))
+	if len(executorOwners) == 0 {
+		if currentExecutor != nil {
+			executorOwners = append(executorOwners, currentExecutor)
+		}
+	} else if tracker, ok := currentExecutor.(PassiveAuthInstanceStateTracker); ok &&
+		tracker != nil &&
+		tracker.HasPassiveAuthInstanceState(id, removed.RuntimeInstanceID()) {
+		tracked := false
+		for _, owner := range executorOwners {
+			if sameProviderExecutor(owner, currentExecutor) {
+				tracked = true
+				break
+			}
+		}
+		if !tracked {
+			executorOwners = append(executorOwners, currentExecutor)
+		}
+	}
+	for _, providerExecutor := range executorOwners {
+		if closer, ok := providerExecutor.(AuthInstanceExecutionSessionCloser); ok && closer != nil {
+			m.runSessionCleanupCallback(id, reason, "execution_sessions", func() {
+				closer.CloseAuthInstanceExecutionSessions(id, removed.RuntimeInstanceID(), reason)
+			})
+		} else if closer, ok := providerExecutor.(AuthExecutionSessionCloser); !instanceOnly && ok && closer != nil {
+			m.runSessionCleanupCallback(id, reason, "execution_sessions", func() {
+				closer.CloseAuthExecutionSessions(id, reason)
+			})
+		}
+	}
 }

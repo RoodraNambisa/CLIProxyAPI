@@ -179,7 +179,7 @@ func compileAPIKeyModelCapabilitiesForAuth(cfg *config.Config, auth *Auth) map[s
 		}
 	default:
 		if isOpenAICompatAPIKeyAuth(auth) {
-			if entry := resolveOpenAICompatConfig(cfg, auth.Attributes["provider_key"], auth.Attributes["compat_name"], auth.Provider); entry != nil {
+			if entry := resolveOpenAICompatAuthConfig(cfg, auth, auth.Attributes["provider_key"], auth.Attributes["compat_name"], auth.Provider); entry != nil {
 				compileConfiguredModelCapabilities(out, entry.Models, "openai-compatibility")
 			}
 		}

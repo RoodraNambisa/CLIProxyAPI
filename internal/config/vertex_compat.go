@@ -13,6 +13,8 @@ import (
 //
 // Example services: zenmux.ai and similar Vertex-compatible providers.
 type VertexCompatKey struct {
+	APIManagement       `yaml:",inline"`
+	Disabled            bool                     `yaml:"disabled,omitempty" json:"disabled,omitempty"`
 	RequestScopedErrors []RequestScopedErrorRule `yaml:"request-scoped-errors,omitempty" json:"request-scoped-errors,omitempty"`
 	// RequestRetry overrides additional credential retry rounds. Nil inherits;
 	// negative values act as zero. Values above MaxCredentialRequestRetry are invalid.

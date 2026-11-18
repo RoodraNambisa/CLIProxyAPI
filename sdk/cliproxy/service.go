@@ -29,12 +29,14 @@ import (
 	xaiauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/xai"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/authfileguard"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/codexcookie"
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/proxypool"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor"
 	executorhelps "github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
 	internalusage "github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/watcher"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/watcher/synthesizer"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/wsrelay"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v6/sdk/access"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v6/sdk/auth"
@@ -4948,6 +4950,11 @@ func (s *Service) ApplyRuntimeConfig(ctx context.Context, requested *config.Conf
 	}
 	if s.watcher != nil {
 		s.watcher.SetConfig(runtimeCfg)
+		if apiCredentialDefinitionsChanged(previous, runtimeCfg) {
+			if errSync := s.watcher.RefreshConfiguredAuths(ctx); errSync != nil {
+				return result, fmt.Errorf("synchronize API credentials: %w", errSync)
+			}
+		}
 	}
 	s.runtimeConfigDigest = digest
 	s.runtimeConfigHashed = true
@@ -5202,6 +5209,20 @@ func (s *Service) Run(ctx context.Context) error {
 		log.WithError(errMigration).Warn("legacy auth maintenance files require attention after migration")
 	}
 
+	prepared, errManaged := config.Clone(s.cfg)
+	if errManaged != nil {
+		return errManaged
+	}
+	changedManaged, errManaged := synthesizer.PrepareManagedCredentials(prepared)
+	if errManaged != nil {
+		return fmt.Errorf("prepare API credentials: %w", errManaged)
+	}
+	if changedManaged && s.configPath != "" {
+		if errSave := config.SaveConfigPreserveComments(s.configPath, prepared); errSave != nil {
+			return fmt.Errorf("persist API credential identities: %w", errSave)
+		}
+	}
+	s.cfg = prepared
 	s.applyRetryConfig(s.cfg)
 	if errQuarantine := watcher.LoadAuthDeleteQuarantine(s.configPath, s.cfg.AuthDir); errQuarantine != nil {
 		return fmt.Errorf("cliproxy: load auth deletion quarantine: %w", errQuarantine)
@@ -5785,8 +5806,21 @@ func (s *Service) registerModelsForAuthWithState(a *coreauth.Auth, preserveTrans
 					isCompatAuth = true
 				}
 			}
-			for i := range s.cfg.OpenAICompatibility {
-				compat := &s.cfg.OpenAICompatibility[i]
+			candidates := s.cfg.OpenAICompatibility
+			managedCandidate := false
+			if ref, ok := s.cfg.APICredentialByID(a.Attributes["config_id"]); ok && ref.Parent != nil {
+				effective := ref.Parent
+				if key, ok := ref.Value.(*internalconfig.OpenAICompatibilityAPIKey); ok {
+					effective = internalconfig.EffectiveOpenAIEntry(ref.Parent, key)
+				}
+				candidates = []config.OpenAICompatibility{*effective}
+				managedCandidate = true
+			}
+			for i := range candidates {
+				compat := &candidates[i]
+				if !managedCandidate {
+					compat = internalconfig.EffectiveOpenAIKey(compat, a.Attributes["config_id"], a.Attributes["api_key"])
+				}
 				if compat.Disabled {
 					continue
 				}
@@ -5849,6 +5883,7 @@ func (s *Service) registerModelsForAuthWithState(a *coreauth.Auth, preserveTrans
 			}
 		}
 	}
+	models = filterSelectedAPIModels(a, models)
 	models = applyOAuthModelAlias(s.cfg, provider, authKind, models)
 	if len(models) > 0 {
 		key := provider
@@ -5921,6 +5956,9 @@ func (s *Service) resolveConfigClaudeKey(auth *coreauth.Auth) *config.ClaudeKey 
 	if auth == nil || s.cfg == nil {
 		return nil
 	}
+	if entry := managedAPIConfig[config.ClaudeKey](s.cfg, auth); entry != nil {
+		return entry
+	}
 	var attrKey, attrBase string
 	if auth.Attributes != nil {
 		attrKey = strings.TrimSpace(auth.Attributes["api_key"])
@@ -5967,12 +6005,22 @@ func (s *Service) resolveConfigInteractionsKey(auth *coreauth.Auth) *config.Gemi
 	if s == nil || s.cfg == nil {
 		return nil
 	}
+	if entry := managedAPIConfig[config.GeminiKey](s.cfg, auth); entry != nil {
+		return entry
+	}
 	return resolveConfigGeminiKeyEntryExact(auth, s.cfg.InteractionsKey)
 }
 
 func resolveConfigGeminiKeyEntryExact(auth *coreauth.Auth, entries []config.GeminiKey) *config.GeminiKey {
 	if auth == nil {
 		return nil
+	}
+	if id := auth.Attributes["config_id"]; id != "" {
+		for i := range entries {
+			if entries[i].CredentialID == id {
+				return &entries[i]
+			}
+		}
 	}
 	attrKey, attrBase := "", ""
 	if auth.Attributes != nil {
@@ -6025,6 +6073,9 @@ func (s *Service) resolveConfigVertexCompatKey(auth *coreauth.Auth) *config.Vert
 	if auth == nil || s.cfg == nil {
 		return nil
 	}
+	if entry := managedAPIConfig[config.VertexCompatKey](s.cfg, auth); entry != nil {
+		return entry
+	}
 	var attrKey, attrBase string
 	if auth.Attributes != nil {
 		attrKey = strings.TrimSpace(auth.Attributes["api_key"])
@@ -6058,6 +6109,9 @@ func (s *Service) resolveConfigVertexCompatKey(auth *coreauth.Auth) *config.Vert
 func (s *Service) resolveConfigCodexKey(auth *coreauth.Auth) *config.CodexKey {
 	if auth == nil || s.cfg == nil {
 		return nil
+	}
+	if entry := managedAPIConfig[config.CodexKey](s.cfg, auth); entry != nil {
+		return entry
 	}
 	var attrKey, attrBase string
 	if auth.Attributes != nil {
@@ -6912,6 +6966,9 @@ func applyOAuthModelAlias(cfg *config.Config, provider, authKind string, models 
 func (s *Service) resolveConfigXAIKey(auth *coreauth.Auth) *config.XAIKey {
 	if auth == nil || s.cfg == nil {
 		return nil
+	}
+	if entry := managedAPIConfig[config.XAIKey](s.cfg, auth); entry != nil {
+		return entry
 	}
 	var attrKey, attrBase string
 	if auth.Attributes != nil {

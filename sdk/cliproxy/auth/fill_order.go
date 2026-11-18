@@ -70,7 +70,11 @@ func (m *Manager) fillOrderInput(a *Auth) fillorder.Input {
 		base = ResolveCodexUpstream(a, m.currentConfig()).BaseURL
 	}
 	scope := sha256.Sum256([]byte(strings.ToLower(strings.TrimSpace(a.Provider)) + "\x00" + base))
-	return fillorder.Input{Key: a.ID, Priority: authPriority(a), Identity: fillOrderIdentity(a, base), Scope: hex.EncodeToString(scope[:])}
+	scopeValue := hex.EncodeToString(scope[:])
+	if stable := a.Attributes["config_fill_scope"]; stable != "" {
+		scopeValue = stable
+	}
+	return fillorder.Input{Key: a.ID, Priority: authPriority(a), Identity: fillOrderIdentity(a, base), Scope: scopeValue}
 }
 
 // Identity describes a principal, not a token generation. Unknown principals stay source-scoped.

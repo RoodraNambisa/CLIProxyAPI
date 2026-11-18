@@ -99,10 +99,26 @@ func matchCredentialYAMLSequenceElement(original []*yaml.Node, used []bool, targ
 	default:
 		return -1, false
 	}
+	managedID := ""
+	if typ := credentialYAMLMappingType(path); typ != nil {
+		if _, ok := typ.FieldByName("APIManagement"); ok {
+			managedID = mappingScalarValue(target, "credential-id")
+		}
+	}
+	if managedID != "" {
+		for index, node := range original {
+			if !used[index] && mappingScalarValue(node, "credential-id") == managedID {
+				return index, true
+			}
+		}
+	}
 	key, qualifier := mappingScalarValue(target, primary), mappingScalarValue(target, secondary)
 	count, sole, exact := 0, -1, -1
 	for index, node := range original {
 		if used[index] || node == nil || node.Kind != yaml.MappingNode || mappingScalarValue(node, primary) != key {
+			continue
+		}
+		if managedID != "" && mappingScalarValue(node, "credential-id") != "" {
 			continue
 		}
 		count++

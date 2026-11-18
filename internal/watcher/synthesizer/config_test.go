@@ -428,7 +428,7 @@ func TestConfigSynthesizer_OpenAICompat(t *testing.T) {
 			wantLen: 1,
 		},
 		{
-			name: "disabled provider skipped",
+			name: "disabled unmanaged provider skipped",
 			compat: []config.OpenAICompatibility{
 				{
 					Name:     "DisabledProvider",
