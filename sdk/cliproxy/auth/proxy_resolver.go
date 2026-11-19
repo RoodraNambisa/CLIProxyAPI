@@ -43,6 +43,27 @@ func (m *Manager) SetProxyResolver(resolver ProxyResolver) {
 	m.mu.Unlock()
 }
 
+// ResolveProxyForProbe resolves a draft using the installed proxy policy.
+func (m *Manager) ResolveProxyForProbe(ctx context.Context, auth *Auth) (ResolvedProxy, error) {
+	if auth == nil {
+		return ResolvedProxy{}, nil
+	}
+	if m != nil {
+		m.mu.RLock()
+		resolver := m.proxyResolver
+		m.mu.RUnlock()
+		if probe, ok := resolver.(interface {
+			ResolveForProbe(context.Context, *Auth) (ResolvedProxy, error)
+		}); ok {
+			return probe.ResolveForProbe(ctx, auth)
+		}
+		if resolver != nil {
+			return resolver.Resolve(ctx, auth)
+		}
+	}
+	return ResolvedProxy{URL: auth.ProxyURL}, nil
+}
+
 // ResolveProxyAuth returns an execution clone carrying the resolved pool URL.
 // The persisted ProxyURL remains unchanged.
 func (m *Manager) ResolveProxyAuth(ctx context.Context, auth *Auth) (*Auth, error) {

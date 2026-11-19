@@ -955,7 +955,7 @@ func (m *Manager) Rebind(ctx context.Context, authIDs []string) []RebindResult {
 			results = append(results, result)
 			continue
 		}
-		resolved, errResolve := m.resolveRuleBinding(memoryCtx, snapshot, authID, coreauth.ChatGPTWebCredentialUID(auth), targets, true)
+		resolved, errResolve := m.resolveRuleBinding(memoryCtx, snapshot, authID, coreauth.ChatGPTWebCredentialUID(auth), targets, replaceBinding)
 		unlock()
 		if errResolve != nil {
 			unlockMemory()

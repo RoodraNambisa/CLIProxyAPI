@@ -1959,3 +1959,36 @@ func (s *sequencedListAuthSource) GetByID(id string) (*coreauth.Auth, bool) {
 	}
 	return nil, false
 }
+
+func TestResolveForProbeReusesBindingsAndReleasesTemporaryNodes(t *testing.T) {
+	cfg := proxyPoolTestConfig("10000-10003")
+	cfg.ProxyPools[0].SpreadBindings = true
+	manager := newTestManager(t, filepath.Join(t.TempDir(), "config.yaml"), cfg)
+	manager.check = successfulTrace
+	saved := proxyPoolTestAuth("saved")
+	bound, err := manager.Resolve(t.Context(), saved)
+	if err != nil || bound.BindingID == "" {
+		t.Fatalf("prepare saved binding: %v", err)
+	}
+	reused, err := manager.ResolveForProbe(t.Context(), saved)
+	if err != nil || reused != bound {
+		t.Fatal("discovery did not reuse the existing healthy binding", err)
+	}
+	for range 3 {
+		route, err := manager.ResolveForProbe(t.Context(), proxyPoolTestAuth(""))
+		if err != nil || route.Source != "pool" || route.URL == "" || route.BindingID != "" {
+			t.Fatal("missing temporary route", err)
+		}
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if _, err := manager.ResolveForProbe(ctx, proxyPoolTestAuth("")); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled probe returned %v", err)
+	}
+	if len(manager.SortedBindings()) != 1 || len(manager.health) != 1 || len(manager.reserved) != 0 || len(manager.targetReserved) != 0 {
+		t.Fatal("draft probes retained bindings, health or reservations")
+	}
+	if _, retained := manager.bindLocks.Load("__anonymous__"); retained {
+		t.Fatal("draft probes created a persistent anonymous lock")
+	}
+}

@@ -1,16 +1,22 @@
 package management
 
 import (
-	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
+	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/constant"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/proxypool"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/watcher/synthesizer"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v6/sdk/proxyutil"
 )
 
 // DiscoverProviderCredentialModels delegates transport and cancellation to APICall.
@@ -25,84 +31,20 @@ func (h *Handler) DiscoverProviderCredentialModels(c *gin.Context) {
 		c.JSON(400, gin.H{"error": "invalid discovery request"})
 		return
 	}
-	ref, ok := findProviderCredential(h.currentConfig(), c.Param("id"))
-	if c.Param("id") == "" {
-		ref = config.APICredentialRef{Kind: input.Kind, Value: input.Values, Management: &config.APIManagement{}}
-		ok = input.Values != nil
+	ref := config.APICredentialRef{Kind: input.Kind, Management: &config.APIManagement{}}
+	ok := input.Values != nil
+	if id := c.Param("id"); id != "" {
+		ref, ok = findProviderCredential(h.currentConfig(), id)
 	}
 	if !ok {
 		c.JSON(404, gin.H{"error": "API credential not found"})
 		return
 	}
-	value := ref.Value
-	if ref.Parent != nil {
-		value = ref.Parent
+	fields, auth, err := providerCatalogDraft(ref, input.Values)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
 	}
-	raw, _ := json.Marshal(value)
-	combined := map[string]json.RawMessage{}
-	_ = json.Unmarshal(raw, &combined)
-	if ref.Parent != nil && ref.KeyPosition >= 0 {
-		keyRaw, _ := json.Marshal(ref.Value)
-		child := map[string]json.RawMessage{}
-		_ = json.Unmarshal(keyRaw, &child)
-		for _, key := range []string{"api-key", "proxy-url", "models-endpoint"} {
-			if v, ok := child[key]; ok {
-				combined[key] = v
-			}
-		}
-	} else if ref.IsParent() {
-		for _, key := range ref.Parent.APIKeyEntries {
-			if !key.Disabled && key.APIKey != "" {
-				combined["api-key"], _ = json.Marshal(key.APIKey)
-				combined["proxy-url"], _ = json.Marshal(key.ProxyURL)
-				break
-			}
-		}
-	}
-	for _, key := range []string{"api-key", "base-url", "proxy-url", "headers", "models-endpoint"} {
-		v, ok := input.Values[key]
-		if !ok {
-			continue
-		}
-		if key == "api-key" {
-			var k string
-			_ = json.Unmarshal(v, &k)
-			if strings.TrimSpace(k) == "" {
-				continue
-			}
-		}
-		if key == "proxy-url" {
-			var old, next string
-			_ = json.Unmarshal(combined[key], &old)
-			_ = json.Unmarshal(v, &next)
-			restored, err := applyProxyURLPatch(old, &next, false)
-			if err != nil {
-				c.JSON(400, gin.H{"error": err.Error()})
-				return
-			}
-			v, _ = json.Marshal(restored)
-		}
-		combined[key] = v
-	}
-	b, _ := json.Marshal(combined)
-	var fields struct {
-		BaseURL        string            `json:"base-url"`
-		Headers        map[string]string `json:"headers"`
-		ModelsEndpoint string            `json:"models-endpoint"`
-		APIKey         string            `json:"api-key"`
-		ProxyURL       string            `json:"proxy-url"`
-	}
-	_ = json.Unmarshal(b, &fields)
-	transient := &coreauth.Auth{Provider: ref.Kind, ProxyURL: fields.ProxyURL, Attributes: map[string]string{"api_key": fields.APIKey, "base_url": fields.BaseURL, "runtime_only": "true"}}
-	if ref.Management.CredentialIndex != "" {
-		if existing := h.authByIndex(ref.Management.CredentialIndex); existing != nil {
-			transient = existing.Clone()
-			transient.ProxyURL = fields.ProxyURL
-			transient.Attributes["api_key"] = fields.APIKey
-			transient.Attributes["base_url"] = fields.BaseURL
-		}
-	}
-	c.Set("provider_models_draft_auth", transient)
 	endpoint := fields.ModelsEndpoint
 	base := strings.TrimRight(strings.TrimSpace(fields.BaseURL), "/")
 	if endpoint == "" {
@@ -183,13 +125,133 @@ func (h *Handler) DiscoverProviderCredentialModels(c *gin.Context) {
 			headers["anthropic-version"] = "2023-06-01"
 		}
 	default:
-		if !has("authorization") && (ref.Management.CredentialIndex != "" || fields.APIKey != "") {
+		if !has("authorization") && fields.APIKey != "" {
 			headers["Authorization"] = "Bearer $TOKEN$"
 		}
 	}
-	payload, _ := json.Marshal(map[string]any{"auth_index": ref.Management.CredentialIndex, "method": "GET", "url": u.String(), "header": headers})
-	c.Request = c.Request.Clone(c.Request.Context())
-	c.Request.Body = io.NopCloser(bytes.NewReader(payload))
-	c.Request.ContentLength = int64(len(payload))
-	h.APICall(c)
+	h.executeAPICall(c, apiCallRequest{Method: http.MethodGet, URL: u.String(), Header: headers}, auth)
+}
+
+type catalogFields struct {
+	BaseURL        string            `json:"base-url"`
+	Headers        map[string]string `json:"headers"`
+	ModelsEndpoint string            `json:"models-endpoint"`
+	APIKey         string            `json:"api-key"`
+	ProxyURL       string            `json:"proxy-url"`
+	Priority       int               `json:"priority"`
+}
+
+func providerCatalogDraft(ref config.APICredentialRef, values map[string]json.RawMessage) (catalogFields, *coreauth.Auth, error) {
+	var fields catalogFields
+	value := ref.Value
+	owner := ref.Management
+	provider := ref.Kind
+	if ref.Parent != nil {
+		value = ref.Parent
+	}
+	if raw, err := json.Marshal(value); err != nil || json.Unmarshal(raw, &fields) != nil {
+		return fields, nil, errors.New("invalid catalog configuration")
+	}
+	switch ref.Kind {
+	case "openai":
+		name := ""
+		if ref.Parent != nil {
+			name = ref.Parent.Name
+		}
+		provider = synthesizer.OpenAICompatRuntimeProviderName(name)
+	case "interactions":
+		provider = constant.GeminiInteractions
+	case "codex", "claude", "gemini", "xai", "vertex":
+	default:
+		return fields, nil, errors.New("unsupported API credential type")
+	}
+
+	applyChild := func(key *config.OpenAICompatibilityAPIKey) {
+		owner = &key.APIManagement
+		fields.APIKey, fields.ProxyURL = key.APIKey, key.ProxyURL
+		if key.Priority != nil {
+			fields.Priority = *key.Priority
+		}
+		if key.ModelsEndpoint != "" {
+			fields.ModelsEndpoint = key.ModelsEndpoint
+		}
+	}
+	isChild := ref.Parent != nil && ref.KeyPosition >= 0
+	if isChild {
+		applyChild(&ref.Parent.APIKeyEntries[ref.KeyPosition])
+	}
+	// Omitted fields retain their saved values. An empty secret retains the
+	// selected key; an empty proxy explicitly restores routing inheritance.
+	currentKey, currentProxy := fields.APIKey, fields.ProxyURL
+	if _, changed := values["headers"]; changed {
+		fields.Headers = nil
+	}
+	patch, err := json.Marshal(values)
+	if err != nil || json.Unmarshal(patch, &fields) != nil {
+		return fields, nil, errors.New("invalid catalog connection settings")
+	}
+	if strings.TrimSpace(fields.APIKey) == "" {
+		fields.APIKey = currentKey
+	}
+	fields.ProxyURL, err = applyProxyURLPatch(currentProxy, &fields.ProxyURL, false)
+	if err != nil {
+		return fields, nil, err
+	}
+	if isChild {
+		if strings.TrimSpace(string(values["priority"])) == "null" {
+			fields.Priority = ref.Parent.Priority
+		}
+		if fields.ModelsEndpoint == "" {
+			fields.ModelsEndpoint = ref.Parent.ModelsEndpoint
+		}
+	} else if ref.IsParent() {
+		for i := range ref.Parent.APIKeyEntries {
+			key := &ref.Parent.APIKeyEntries[i]
+			if !key.Disabled && strings.TrimSpace(key.APIKey) != "" {
+				applyChild(key)
+				break
+			}
+		}
+	}
+	if _, err := proxyutil.Parse(fields.ProxyURL); err != nil {
+		return fields, nil, errors.New("invalid_proxy_url")
+	}
+	id := owner.RuntimeID
+	if id == "" {
+		id = owner.CredentialID
+	}
+	auth := &coreauth.Auth{ID: id, Provider: provider, ProxyURL: fields.ProxyURL, Attributes: map[string]string{
+		"api_key": fields.APIKey, "base_url": fields.BaseURL, "priority": strconv.Itoa(fields.Priority), "runtime_only": "true",
+	}}
+	return fields, auth, nil
+}
+
+func (h *Handler) providerCatalogTransport(ctx context.Context, auth *coreauth.Auth) (*http.Transport, error) {
+	var route coreauth.ResolvedProxy
+	var err error
+	if pool := h.proxyPoolRuntimeManager(); pool != nil {
+		route, err = pool.ResolveForProbe(ctx, auth)
+	} else {
+		route, err = h.coreAuthRuntimeManager().ResolveProxyForProbe(ctx, auth)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if route.URL == "" && route.Source == "" {
+		if cfg := h.currentConfig(); cfg != nil {
+			priority, _ := strconv.Atoi(auth.Attributes["priority"])
+			if _, matched := config.MatchProxyRuleTargets(cfg.ProxyRules, auth.Provider, priority); matched {
+				return nil, &proxypool.UnavailableError{}
+			}
+			route.URL = cfg.ProxyURL
+		}
+	}
+	transport, _, err := proxyutil.BuildHTTPTransport(route.URL)
+	if err != nil {
+		return nil, &proxypool.UnavailableError{Cause: err}
+	}
+	if transport == nil {
+		transport = proxyutil.NewDirectTransport()
+	}
+	return transport, nil
 }

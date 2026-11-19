@@ -13,6 +13,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/proxypool"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/proxyutil"
@@ -102,6 +103,10 @@ func (h *Handler) APICall(c *gin.Context) {
 		return
 	}
 
+	h.executeAPICall(c, body, nil)
+}
+
+func (h *Handler) executeAPICall(c *gin.Context, body apiCallRequest, draft *coreauth.Auth) {
 	method := strings.ToUpper(strings.TrimSpace(body.Method))
 	if method == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "missing method"})
@@ -119,10 +124,9 @@ func (h *Handler) APICall(c *gin.Context) {
 		return
 	}
 
-	authIndex := firstNonEmptyString(body.AuthIndexSnake, body.AuthIndexCamel, body.AuthIndexPascal)
-	auth := h.authByIndex(authIndex)
-	if draft, ok := c.Get("provider_models_draft_auth"); ok {
-		auth, _ = draft.(*coreauth.Auth)
+	auth := draft
+	if auth == nil {
+		auth = h.authByIndex(firstNonEmptyString(body.AuthIndexSnake, body.AuthIndexCamel, body.AuthIndexPascal))
 	}
 	if auth != nil {
 		if coreauth.ChatGPTWebAuthRetainedForDependents(auth) {
@@ -140,21 +144,24 @@ func (h *Handler) APICall(c *gin.Context) {
 			return
 		}
 	}
-	if auth != nil && h.authManager != nil {
-		resolvedAuth, errProxy := h.authManager.ResolveProxyAuth(c.Request.Context(), auth)
-		if errProxy != nil {
-			if writeManagementProxyError(c, errProxy) {
-				return
-			}
-			if errors.Is(errProxy, context.Canceled) || errors.Is(errProxy, context.DeadlineExceeded) {
-				c.JSON(http.StatusRequestTimeout, gin.H{"error": "proxy_resolution_canceled"})
-				return
-			}
-			log.WithError(errProxy).Debug("management APICall proxy resolution failed")
-			c.JSON(http.StatusBadGateway, gin.H{"error": "proxy_resolution_failed"})
+	var catalogTransport *http.Transport
+	var errProxy error
+	if draft != nil {
+		catalogTransport, errProxy = h.providerCatalogTransport(c.Request.Context(), draft)
+	} else if auth != nil && h.authManager != nil {
+		auth, errProxy = h.authManager.ResolveProxyAuth(c.Request.Context(), auth)
+	}
+	if errProxy != nil {
+		if writeManagementProxyError(c, errProxy) {
 			return
 		}
-		auth = resolvedAuth
+		if errors.Is(errProxy, context.Canceled) || errors.Is(errProxy, context.DeadlineExceeded) {
+			c.JSON(http.StatusRequestTimeout, gin.H{"error": "proxy_resolution_canceled"})
+			return
+		}
+		log.WithError(errProxy).Debug("management APICall proxy resolution failed")
+		c.JSON(http.StatusBadGateway, gin.H{"error": "proxy_resolution_failed"})
+		return
 	}
 
 	reqHeaders := body.Header
@@ -177,7 +184,11 @@ func (h *Handler) APICall(c *gin.Context) {
 			credentialAuthorization = true
 		}
 		if !tokenResolved {
-			token, tokenErr = h.resolveTokenForAuth(c.Request.Context(), auth)
+			if draft != nil {
+				token = tokenValueForAuth(draft)
+			} else {
+				token, tokenErr = h.resolveTokenForAuth(c.Request.Context(), auth)
+			}
 			tokenResolved = true
 		}
 		if auth != nil && token == "" {
@@ -232,7 +243,12 @@ func (h *Handler) APICall(c *gin.Context) {
 	httpClient := &http.Client{
 		Timeout: defaultAPICallTimeout,
 	}
-	httpClient.Transport = h.apiCallTransport(auth)
+	if catalogTransport != nil {
+		httpClient.Transport = catalogTransport
+		defer catalogTransport.CloseIdleConnections()
+	} else {
+		httpClient.Transport = h.apiCallTransport(auth)
+	}
 
 	// Only retry credential-owned, read-only Grok queries. Arbitrary API calls
 	// and explicitly overridden Authorization headers keep their existing behavior.
@@ -622,7 +638,12 @@ func writeManagementProxyError(c *gin.Context, err error) bool {
 			c.Writer.Header().Set("Retry-After", retryAfter)
 		}
 	}
-	c.JSON(http.StatusServiceUnavailable, gin.H{"error": "proxy_unavailable"})
+	body := gin.H{"error": "proxy_unavailable"}
+	var unavailable *proxypool.UnavailableError
+	if errors.As(err, &unavailable) && unavailable.Pool != "" {
+		body["proxy_pool"] = unavailable.Pool
+	}
+	c.JSON(http.StatusServiceUnavailable, body)
 	return true
 }
 
